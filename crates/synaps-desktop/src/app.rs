@@ -7121,7 +7121,10 @@ impl AppView {
     fn refresh_session_menu(&mut self) {
         let Some((m, t)) = self.smenu.as_ref() else { return };
         let pane = |a: SessionAct| {
-            matches!(a, SessionAct::OpenSide | SessionAct::SplitRight | SessionAct::SplitDown | SessionAct::MoveToNewPane | SessionAct::ClosePane)
+            matches!(
+                a,
+                SessionAct::OpenSide | SessionAct::SplitRight | SessionAct::SplitDown | SessionAct::MoveToNewPane | SessionAct::ClosePane
+            )
         };
         let now = self.session_menu_items(t, None);
         if now.len() != m.items.len() || now.iter().zip(&m.items).any(|(a, b)| a.act != b.act) {

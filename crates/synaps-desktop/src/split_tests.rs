@@ -3209,7 +3209,8 @@ fn a_closing_pane_slides_out_with_its_rows(cx: &mut TestAppContext) {
 /// Shady #42 r2-L1: four panes, one closes, and a split within its flight
 /// is handed the closing pane's id (the only one free): no pane jumps
 /// (its share keeps closing, a ghost's ground), and every frame steps by
-/// at most one frame's spring.
+/// at most one frame's spring. The new pane and the closing share draw
+/// under different element ids (Shady #59 L5.1).
 #[gpui_kit::test]
 fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-reuse", None);
@@ -3242,6 +3243,16 @@ fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppC
     key(cx, window, "ctrl-shift-\\");
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "the split took the id");
     assert!(view.read_with(cx, |v, _| v.panes.get(closing).is_some()), "the closing pane's id is the new pane's");
+    // Shady #59 L5.1 (#55 n1), the id's reuse: in the same frame the new
+    // pane draws under its own `("pane", n)` and the closing share under a
+    // ghost's, past `PANES_MAX` (never an open pane's: their element state
+    // stays apart).
+    let ghosts = view.read_with(cx, |v, _| v.panes.flight.as_ref().map(|f| f.ghosts.clone()).unwrap_or_default());
+    assert_eq!(ghosts.len(), 1, "the closing share, a ghost now: {ghosts:?}");
+    assert!(ghosts[0].index() >= crate::pane::PANES_MAX, "a ghost's id is past the open panes': {ghosts:?}");
+    assert!(drawn(cx, window, format!("pane {}", closing.index())).is_some(), "the new pane drawn under its id");
+    assert!(drawn(cx, window, format!("pane-closing {}", ghosts[0].index())).is_some(), "the closing share drawn under the ghost's");
+    assert!(drawn(cx, window, format!("pane-closing {}", closing.index())).is_none(), "no closing share under the open pane's id");
     let mut frames = 0;
     loop {
         bound = bound.max(step(cx));
@@ -5954,9 +5965,11 @@ fn a_tabs_menu_leads_with_the_pane_items(cx: &mut TestAppContext) {
 
 /// Split panes step 6 (architecture §7, split.md §10): at Reduced and at
 /// Off a split, an equalise and a close each land in the frame that makes
-/// them (no flight left after it), the panels with them, and with the
-/// window's focus on its root (no caret) nothing asks for a frame after
-/// the next one: no spring is left armed at rest.
+/// them, the panels with them: every frame drawn, recorded at its paint
+/// (#61's [`draws`]), is landed, the move's own first. With the window's
+/// focus on its root (no caret) and a Reduced fade's `quick` over, a second
+/// at 144 Hz drawing only the frames the app asks for ([`idle_step`])
+/// draws none: no spring is left armed at rest.
 #[gpui_kit::test]
 fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_armed(cx: &mut TestAppContext) {
     use crate::palette::AppAct;
@@ -5985,15 +5998,28 @@ fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_arm
             ("close", Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-w"))),
         ];
         for (what, act) in steps.iter() {
+            // Every frame drawn from here (#61's per-draw probe, Shady #59
+            // L5.3: a check after `frame` helpers that drain the executor
+            // could miss a draw between them).
+            let seen = draws(cx, &view, |v| (v.panes.flight.is_some() || v.panel_fx.moving(), v.panes.len()));
             act(cx);
-            frame(cx, window);
-            let (flight, panels) = view.read_with(cx, |v, _| (v.panes.flight.is_some(), v.panel_fx.moving()));
-            assert!(!flight && !panels, "{l:?}, {what}: landed in its frame");
+            // The move's own frame (a key's: `key` draws it), and one more
+            // only if the app asks for it.
+            asked_frame(cx, window, &view);
+            let drawn = seen.borrow().clone();
+            assert!(!drawn.is_empty(), "{l:?}, {what}: drawn");
+            assert!(drawn.iter().all(|d| !d.0), "{l:?}, {what}: every frame drawn landed, the first too: {drawn:?}");
+            // Off the composer (its caret blinks a frame every 500 ms), a
+            // Reduced fade's frames over (`quick`), then a second at 144
+            // Hz drawing only what the app asks for: nothing.
             let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
-            frame(cx, window);
-            frame(cx, window);
+            idle_step(cx, window, &view, Duration::from_millis(300));
+            let at_rest = seen.borrow().len();
+            let ran: usize = (0..144).map(|_| idle_step(cx, window, &view, Duration::from_micros(6944))).sum();
+            assert_eq!(ran, 0, "{l:?}, {what}: frames at rest: {:?}", &seen.borrow()[at_rest..]);
             assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "{l:?}, {what}: a frame asked for at rest");
         }
+        view.update(cx, |v, _| v.on_draw = None);
         assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{l:?}: one pane again");
     }
     view.update(cx, |v, _| v.client = None);
@@ -6079,7 +6105,12 @@ fn jump_off(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<Option<St
 }
 
 /// The session menu opened at `at` (a right-click's), its items' acts.
-fn menu_acts(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, at: crate::app::SessionAt) -> Vec<crate::app::SessionAct> {
+fn menu_acts(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    at: crate::app::SessionAt,
+) -> Vec<crate::app::SessionAct> {
     cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.open_session_menu(at, gpui_kit::point(px(400.), px(300.)), w, cx)))
         .unwrap();
     view.read_with(cx, |v, _| v.smenu.as_ref().map(|(m, _)| m.items.iter().map(|i| i.act).collect()).unwrap_or_default())
@@ -6158,7 +6189,9 @@ fn the_pane_menus_refusals_follow_the_window_while_it_is_open(cx: &mut TestAppCo
     for _ in 0..3 {
         frame(cx, window);
     }
-    let split = view.read_with(cx, |v, _| (v.panes.len(), matches!(&v.panes.tree, crate::split::Node::Split { axis, .. } if *axis == crate::split::Axis::Column)));
+    let split = view.read_with(cx, |v, _| {
+        (v.panes.len(), matches!(&v.panes.tree, crate::split::Node::Split { axis, .. } if *axis == crate::split::Axis::Column))
+    });
     assert_eq!(split, (2, true), "Enter split down");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
@@ -6231,18 +6264,23 @@ fn a_delayed_layout_write_under_way_never_lands_after_the_quit_flush(cx: &mut Te
     frame(cx, window);
     key(cx, window, "ctrl-\\");
     wait_saved(cx, window);
-    let focused = |cx: &mut TestAppContext| crate::theme::load_layout(&path, &k).map(|l| l.focused);
+    let focused = |_: &mut TestAppContext| crate::theme::load_layout(&path, &k).map(|l| l.focused);
     assert_eq!(focused(cx), Some(1), "G0: the new pane focused, saved");
     let order = view.read_with(cx, |v, _| v.reading_order());
+    let taken =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).taken);
     view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
     frame(cx, window);
-    let taken = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).taken);
     let before = taken(cx);
-    cx.executor().advance_clock(crate::app::SAVE_DELAY + Duration::from_millis(50));
+    // Timer by timer, one task at a time (the executor's `advance_clock`
+    // runs every task it wakes): stopped as G1's job has read its layout.
     let mut n = 0;
     while taken(cx) == before {
-        assert!(cx.dispatcher.tick(false) && n < 10_000, "G1's delayed save never read its layout");
+        if !cx.dispatcher.tick(false) {
+            assert!(cx.dispatcher.advance_clock_to_next_timer(), "no timer left: G1's save never came");
+        }
         n += 1;
+        assert!(n < 100_000, "G1's delayed save never read its layout");
     }
     assert_eq!(focused(cx), Some(1), "G1's write is still to come");
     view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
@@ -6274,7 +6312,20 @@ fn a_press_held_through_the_last_close_is_still_a_click(cx: &mut TestAppContext)
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
     level(cx, crate::motion::Level::Off);
+    // A's card armed (its buttons act `ARM` after it is shown: a press
+    // before then is refused, whatever the layout does).
+    let armed =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(pa).is_some_and(|p| p.card.as_ref().is_some_and(|c| c.armed())));
+    for _ in 0..100 {
+        if armed(cx) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        frame(cx, window);
+    }
+    assert!(armed(cx), "A's card armed");
     let at = in_pane_at(cx, window, "allow-fill", pa);
+    VisualTestContext::from_window(window, cx).simulate_mouse_move(at, None, Default::default());
     mouse(cx, window, at, "down", 1);
     assert!(names(&mut a).is_empty(), "a press alone answers nothing");
     view.update(cx, |v, cx| {
@@ -6286,9 +6337,21 @@ fn a_press_held_through_the_last_close_is_still_a_click(cx: &mut TestAppContext)
     assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some())), (1, false), "one pane, landed");
     let mut vcx = VisualTestContext::from_window(window, cx);
     let now = vcx.debug_bounds("allow-fill").or_else(|| vcx.debug_bounds("allow-outline")).expect("A's Allow").center();
-    mouse(cx, window, now, "up", 1);
+    // The pointer, held, to where Allow is now; let go there.
+    mouse(cx, window, now, "move", 1);
     frame(cx, window);
-    assert_eq!(names(&mut a), ["answer"], "the press held through the landing, let go on Allow: a click");
+    mouse(cx, window, now, "up", 1);
+    // The answer goes out on the client's thread: waited for (the tests
+    // run at once, each 400 ms read can come up short).
+    let mut sent = Vec::new();
+    for _ in 0..10 {
+        frame(cx, window);
+        sent.extend(names(&mut a));
+        if !sent.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(sent, ["answer"], "the press held through the landing, let go on Allow: a click");
     while attaches.try_recv().is_ok() {}
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
