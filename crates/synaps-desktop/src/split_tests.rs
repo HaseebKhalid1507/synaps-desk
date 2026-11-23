@@ -5119,8 +5119,10 @@ fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_f
         "{fails:#?}\n{:#?}",
         seen.iter().map(|s| (s.left, s.held, s.rows.len(), s.sticky, s.k, s.thumb.is_some())).collect::<Vec<_>>()
     );
-    // The arm run out: Allow answers, once.
+    // The arm run out: Allow answers, once (its repaint on the test's
+    // clock too, as in `arm_from_whole`).
     crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
+    cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     let allow = in_pane_at(cx, window, "allow-fill", new);
     click_at(cx, window, allow);
