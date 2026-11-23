@@ -770,6 +770,7 @@ impl AppView {
         self.menu = None;
         self.smenu = None;
         self.wmenu = None;
+        self.choice.menu = None;
         if self.model.lives[self.panes.cur.live].cancels.disarm() {
             self.panes.cur.cancel_tick = None;
         }
