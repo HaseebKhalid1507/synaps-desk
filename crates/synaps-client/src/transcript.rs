@@ -1985,7 +1985,8 @@ mod outcome_tests {
         let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
         let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
         let attach = |history: Vec<Value>| {
-            let a = json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": history}, "input_owner": 2});
+            let a =
+                json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": history}, "input_owner": 2});
             let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
             a
         };
@@ -2010,7 +2011,8 @@ mod outcome_tests {
         };
         let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "bash", "input": {}}]});
         let res = |id: &str, r: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": r}]});
-        let mut history = vec![json!({"role": "user", "content": "go"}), call("b"), res("b", "ok"), call("a"), res("a", "Canceled by user")];
+        let mut history =
+            vec![json!({"role": "user", "content": "go"}), call("b"), res("b", "ok"), call("a"), res("a", "Canceled by user")];
         for id in &others[1..] {
             history.push(call(id));
             history.push(res(id, "ok"));
