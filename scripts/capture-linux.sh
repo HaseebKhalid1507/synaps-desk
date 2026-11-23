@@ -12,7 +12,10 @@
 #                                driver's own path, for showing the capture artefact
 #   CAPTURE_FPS=30               the recording's frame rate (60 for frame-by-frame motion)
 #   CAPTURE_HZ=144               gamescope's refresh (the app's display rate)
-# Leaves <outdir>/clip.mkv (libx264rgb -qp 0: every pixel as drawn), app.log, gs.log.
+# Leaves <outdir>/clip.mkv (libx264rgb -qp 0: every pixel as drawn), app.log, gs.log, and
+# load.txt: the load average and any cargo/rustc running as the recording starts and ends. A
+# build beside a capture drops its frames (#54 FU-A: every third frame of a flight repeated); it
+# warns when one runs.
 # Frame-by-frame: scripts/frame-dips.py <outdir>/clip.mkv.
 #
 # Why MESA_VK_WSI_DEBUG=sw: x11grab (like `import -window`) reads the window's pixmap through
@@ -29,7 +32,13 @@ set -euo pipefail
 bin=$(realpath "$1"); out="$2"; secs="$3"; shift 3
 size="${CAPTURE_SIZE:-1920x1080}"; w="${size%x*}"; h="${size#*x}"
 mkdir -p "$out"; out=$(realpath "$out")
-rm -f "$out/clip.mkv" "$out/display" "$out/app.log" "$out/gs.log"
+rm -f "$out/clip.mkv" "$out/display" "$out/app.log" "$out/gs.log" "$out/load.txt"
+load() {
+  local busy; busy=$(pgrep -a -f '(^|/)(cargo|rustc)( |$)' | cut -c1-160 || true)
+  { echo "$1 $(date +%T) load $(cut -d' ' -f1-3 /proc/loadavg)"; [ -n "$busy" ] && echo "$busy"; } >> "$out/load.txt"
+  [ -z "$busy" ] || echo "capture: a build is running ($1 of the recording): its frame timing is not the app's alone" >&2
+}
+load start
 cfg="$out/config"; rm -rf "$cfg"; mkdir -p "$cfg/synaps-desktop"
 default_settings='{"text_size": 16, "theme": "nord"}'
 echo "${CAPTURE_SETTINGS:-$default_settings}" > "$cfg/synaps-desktop/settings.json"
@@ -69,4 +78,5 @@ sleep 0.5
 # The window's own pixels (-window_id): recording the root under gamescope gives black frames.
 ffmpeg -loglevel error -f x11grab -window_id "$wid" -framerate "${CAPTURE_FPS:-30}" -i "$DISPLAY" -t "$secs" \
   -c:v libx264rgb -qp 0 -preset ultrafast -y "$out/clip.mkv"
+load end
 echo "$out/clip.mkv (${CAPTURE_WSI:-sw}, ${secs} s)"
