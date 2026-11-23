@@ -769,8 +769,7 @@ impl Transcript {
         let pending = if same { std::mem::take(&mut self.pending) } else { Vec::new() };
         let stuck = if same { std::mem::take(&mut self.stuck) } else { Vec::new() };
         // Which calls ran: the same session's calls still are what they were.
-        let (past_gate, past_gate_cap) =
-            if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
+        let (past_gate, past_gate_cap) = if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
         *self = Transcript {
             next_id,
             clean_len,
