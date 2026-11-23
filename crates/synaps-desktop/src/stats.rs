@@ -104,10 +104,12 @@ fn same_model(a: &str, b: &str) -> bool {
     a == b || bare(a) == bare(b)
 }
 
-/// The same prompt cache: the same provider-qualified model. Providers
-/// don't share a cache, so `bedrock/m` is not `anthropic/m`. The one alias
-/// is the default provider's: `anthropic/m` is `m` (SynapsCLI `models.rs`).
-fn same_cache_model(a: &str, b: &str) -> bool {
+/// The same model: the same provider-qualified id. Providers don't share a
+/// prompt cache, a route or a credential, so `bedrock/m` is not
+/// `anthropic/m`. The one alias is the default provider's: `anthropic/m`
+/// is `m` (SynapsCLI `models.rs`; the daemon's `model_options` matches the
+/// same way). The prompt cache and the pickers both use it.
+pub(crate) fn same_model_id(a: &str, b: &str) -> bool {
     let id = |m: &str| m.strip_prefix("anthropic/").unwrap_or(m).to_owned();
     id(a) == id(b)
 }
@@ -247,7 +249,7 @@ impl Stats {
                 if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {
                     // Only an effective change of model: a refused or
                     // same-model `Set`, or a thinking change, keeps it.
-                    new_cache = self.view.as_ref().is_some_and(|o| !same_cache_model(&o.model, &v.model));
+                    new_cache = self.view.as_ref().is_some_and(|o| !same_model_id(&o.model, &v.model));
                     self.view = Some(v);
                 }
             }
