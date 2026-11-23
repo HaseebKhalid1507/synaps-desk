@@ -73,14 +73,18 @@ pub const FRAME: f64 = 1.56;
 /// so its `card_hi` row and its `frame` both still read on it.
 pub const CARD: f64 = 1.32;
 
-/// Cards D (cards4/proposal.md §1): `card_d` at least this off the canvas
-/// (a surface step, read with its hairline), and so its hover and its
-/// well off it.
+/// Cards D (cards4/proposal.md §1): a card's hover and its well at least
+/// this off it.
 pub const D_CARD: f64 = 1.06;
-/// The step `card_d` and its hover are drawn at, and the well's.
+/// `card_d` off the canvas: the card has no outline (Haseeb, 07:18), so it
+/// reads by its fill alone, a [`SURFACE`] off the canvas as `user` and
+/// `code` do (it was 1.06, read with a `line` hairline).
+pub const D_FILL: f64 = SURFACE;
+/// The step a card's hover is drawn at, and the well's.
 pub const D_STEP: f64 = 1.08;
 pub const D_WELL: f64 = 1.07;
-/// The card's hairline on the card, the canvas and the hover.
+/// `line` (an opened run's rule, a ghost button's outline) on the card,
+/// the canvas and the hover.
 pub const D_LINE: f64 = 1.25;
 /// The authorize card's accent edge on the card.
 pub const D_ACC_LINE: f64 = 1.4;
@@ -669,13 +673,14 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // A run's rows sit bare on the canvas (Q1 cards, F1), `tool_out` under
     // the hovered one; the worker chips are on `tool`.
     // Cards D (cards4/proposal.md §1): the card a surface step off the
-    // canvas (toward white on a light canvas, else toward the ink), its
-    // hover a step on toward the ink, its body's well a step back.
+    // canvas (toward white on a light canvas, else toward the ink: paper's
+    // white is short of it), its hover a step on toward the ink, its body's
+    // well a step back.
     let rise = |g: u32, toward: u32, target: f64| {
         (1..=200u8).map(|i| mix(g, toward, f64::from(i) * 0.005)).find(|&c| contrast(c, g) >= target).unwrap_or(toward)
     };
     let light = luminance(canvas) > 0.4;
-    let card_d = if light && contrast(0xffffff, canvas) >= D_CARD { rise(canvas, 0xffffff, D_STEP) } else { rise(canvas, ink, D_STEP) };
+    let card_d = if light && contrast(0xffffff, canvas) >= D_FILL { rise(canvas, 0xffffff, D_FILL) } else { rise(canvas, ink, D_FILL) };
     let hover = rise(card_d, ink, D_STEP);
     let well_d = rise(card_d, if light { ink } else { 0x000000 }, D_WELL);
     // A failed row's wash at rest and at its flush's peak (§8 #6), not
@@ -705,7 +710,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
         well_d,
         ..Roles::default()
     };
-    f.log.push(Check { role: "card_d", from: canvas, color: card_d, grounds: vec![canvas], floor: D_CARD });
+    f.log.push(Check { role: "card_d", from: canvas, color: card_d, grounds: vec![canvas], floor: D_FILL });
     f.log.push(Check { role: "hover", from: card_d, color: hover, grounds: vec![card_d], floor: D_CARD });
     f.log.push(Check { role: "well_d", from: card_d, color: well_d, grounds: vec![card_d], floor: D_CARD });
     r.line = f.at("line", t.separator, ink, &[card_d, canvas, hover], D_LINE);
@@ -2353,7 +2358,7 @@ mod tests {
 
     /// Cards D's roles (cards4/proposal.md §1) meet their floors in every
     /// theme and accent preset: the card a surface step off the canvas, its
-    /// hover and well off it, its hairline on all three; every text a row
+    /// hover and well off it, `line` on all three; every text a row
     /// draws on the card, its hover and the fail wash (at rest and at the
     /// flush's 18 % peak, "Exit N"); `acc` on the card, the Ask pill and
     /// the waiting wash; the Allow fill on the card and its text on it.
@@ -2367,7 +2372,7 @@ mod tests {
                         assert!(contrast(c, g) >= f - 1e-9, "{name} {a:?}: {what} #{c:06x} on #{g:06x} is {:.3} < {f}", contrast(c, g));
                     }
                 };
-                at(r.card_d, &[r.canvas], D_CARD, "card_d");
+                at(r.card_d, &[r.canvas], D_FILL, "card_d");
                 at(r.hover, &[r.card_d], D_CARD, "hover");
                 at(r.well_d, &[r.card_d], D_CARD, "well_d");
                 at(r.line, &[r.card_d, r.canvas, r.hover], D_LINE, "line");

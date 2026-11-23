@@ -4912,7 +4912,7 @@ impl AppView {
         let head = match (summary.and_then(|ix| self.panes.cur.disp.get(ix)), self.panes.cur.metrics_last.get()) {
             (Some(d), Some(m)) => {
                 let g = crate::cards::Geo::of(&m);
-                turns::gap_of(d.gap, &m) + g.inset + 1. + g.row
+                turns::gap_of(d.gap, &m) + g.edge + g.inset + g.row
             }
             _ => 41.,
         };
@@ -8424,7 +8424,8 @@ impl AppView {
             let rows = this.fold_rows(&g.rows, cx);
             let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
             let p = theme::palette(cx);
-            let room = crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
+            let room =
+                crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.edge + geo.inset)).debug_selector(|| "fold-gap".into());
             el = div().w_full().child(el).child(room).into_any_element();
         }
         // The room an answered card gave up, under the last row.

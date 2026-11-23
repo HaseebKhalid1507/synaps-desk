@@ -1,5 +1,6 @@
 //! Cards D (cards4/proposal.md §1–§4): a run of tool calls is one
-//! square card (Haseeb, #23 r7) on `card_d` in a 1 px `line` hairline; each call is
+//! square card (Haseeb, #23 r7) on `card_d`, read by its fill alone (no
+//! outline: Haseeb, 07:18 "remove border outlines from tool boxes"); each call is
 //! one quiet 34 px row inside it (a life glyph, the verb in Sans, the
 //! target in mono, the facts right in small grey Sans, a state word, the
 //! chevron); its body sits in a `well_d` lined up under the verb. The list
@@ -22,6 +23,9 @@ use crate::turns::{Disp, Gap, Kind};
 pub(crate) struct Geo {
     /// The card's inner padding (its rows sit this far in).
     pub inset: f32,
+    /// Where the card's 1 px hairline was, padding now: the card has no
+    /// outline, and nothing in it moved when it went.
+    pub edge: f32,
     pub row: f32,
     pub pad: f32,
     pub gap: f32,
@@ -47,6 +51,7 @@ impl Geo {
         let (pad, gap, glyph) = (px(10.), px(10.), crate::glyph::LIFE);
         Geo {
             inset: 3.,
+            edge: 1.,
             row: px(34.),
             pad,
             gap,
@@ -95,20 +100,18 @@ pub(crate) fn mark_edges(mut out: Vec<Disp>) -> Vec<Disp> {
     out
 }
 
-/// A card's slice for one list row (§3): `card_d` with the `line` hairline
-/// down both sides, its top edge and corners on its first row, its bottom
-/// on its last, and the 3 px inner padding on those.
+/// A card's slice for one list row (§3): `card_d`, no outline; its top
+/// edge and corners on its first row, its bottom on its last. Its padding
+/// is the old hairline's 1 px and the 3 px inset, down both sides and on
+/// those edges, so its rows sit where they sat in the outlined card.
 pub(crate) fn slab(top: bool, bottom: bool, body: impl IntoElement, p: &Palette, g: Geo) -> Div {
-    let r = px(g.radius);
+    let (r, pad) = (px(g.radius), px(g.edge + g.inset));
     div()
         .w_full()
         .bg(p.card_d)
-        .border_color(p.line)
-        .border_l_1()
-        .border_r_1()
-        .px(px(g.inset))
-        .when(top, |d| d.border_t_1().rounded_tl(r).rounded_tr(r).pt(px(g.inset)))
-        .when(bottom, |d| d.border_b_1().rounded_bl(r).rounded_br(r).pb(px(g.inset)))
+        .px(pad)
+        .when(top, |d| d.rounded_tl(r).rounded_tr(r).pt(pad))
+        .when(bottom, |d| d.rounded_bl(r).rounded_br(r).pb(pad))
         .child(body)
 }
 
@@ -275,6 +278,28 @@ mod tests {
         assert_eq!(marked[3].rev, EDGE_BOTTOM);
         assert_eq!(marked[5].rev, EDGE_TOP | EDGE_BOTTOM);
         assert_eq!(marked[2].rev, 0);
+    }
+
+    /// No outline (Haseeb, 07:18): a card's slice draws no border, and
+    /// its padding is the old hairline's 1 px plus the 3 px inset, where
+    /// the border and the inset were, so no row moved when it went.
+    #[test]
+    fn a_card_reads_by_its_fill_alone() {
+        use gpui_kit::{Styled as _, div, px};
+        let g = super::Geo::of(&crate::theme::Metrics::at(crate::theme::DEFAULT_TEXT));
+        assert_eq!((g.edge, g.inset), (1., 3.));
+        let p = crate::theme::Palette::of(&crate::theme::resolve(&crate::palettes::THEMES[0].1, None).0);
+        for (top, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut slab = super::slab(top, bottom, div(), &p, g);
+            let s = slab.style();
+            let b = &s.border_widths;
+            assert!([b.top, b.right, b.bottom, b.left].iter().all(Option::is_none), "({top}, {bottom}): no outline");
+            assert_eq!(s.border_color, None);
+            let pad = Some(gpui_kit::DefiniteLength::from(px(4.)));
+            let e = &s.padding;
+            assert_eq!((e.left, e.right), (pad, pad), "({top}, {bottom}): both sides");
+            assert_eq!((e.top, e.bottom), (top.then_some(pad).flatten(), bottom.then_some(pad).flatten()), "({top}, {bottom})");
+        }
     }
 
     #[test]
