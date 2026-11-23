@@ -48,6 +48,38 @@ pub use types::*;
 
 use sanitize::{Lines as L, cut_chars};
 
+/// One card off the wire (a `surface` event's, an `Attached.surfaces`
+/// entry), as SynapsCLI's `wire::lenient_card` reads it (v3.4 #4): a verb
+/// this build doesn't know is one it doesn't implement, so it leaves
+/// `offers` and the card stays; any other shape this build can't read (an
+/// unknown field or phase, a missing one) is `None`. Then the doc must
+/// revalidate ([`revalidate`]): the state type's own rule for a doc off the
+/// wire, and what lets a renderer trust the doc's bounds. `None` is a bug
+/// guard, never a planned path: the caller counts it, never fails a frame.
+pub fn read_card(mut card: serde_json::Value) -> Option<SurfaceState> {
+    if let Some(offers) = card.get_mut("offers").and_then(serde_json::Value::as_array_mut) {
+        offers.retain(|v| serde_json::from_value::<Verb>(v.clone()).is_ok());
+    }
+    let card: SurfaceState = serde_json::from_value(card).ok()?;
+    revalidate(&card.doc).is_ok().then_some(card)
+}
+
+/// `Attached.surfaces` ([`read_card`] each): the cards read, and how many
+/// weren't. Absent or `null` is no cards; anything but a list is one
+/// rejected, and the frame still decodes.
+pub fn read_cards(raw: serde_json::Value) -> (Vec<SurfaceState>, usize) {
+    match raw {
+        serde_json::Value::Null => (Vec::new(), 0),
+        serde_json::Value::Array(cards) => {
+            let n = cards.len();
+            let read: Vec<SurfaceState> = cards.into_iter().filter_map(read_card).collect();
+            let rejected = n - read.len();
+            (read, rejected)
+        }
+        _ => (Vec::new(), 1),
+    }
+}
+
 /// The longest refusal path and message, in characters (Shady #439 M1).
 pub const ERROR_PATH_MAX: usize = 80;
 pub const ERROR_MESSAGE_MAX: usize = 240;
