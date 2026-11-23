@@ -406,6 +406,10 @@ pub struct Transcript {
     /// in the transcript are let go.
     past_gate: std::collections::HashSet<String>,
     past_gate_cap: usize,
+    /// Rows are being rebuilt (an attach with its replay, a history append
+    /// or replace): some calls are out of `items` for now, so
+    /// [`Transcript::past_gate`] lets go of none until it is done.
+    rebuilding: bool,
     subagents: Vec<Value>,
     cost_usd: f64,
     /// The conversation was swapped (clear, resume, compaction): the next
@@ -502,16 +506,36 @@ impl Transcript {
         if tool_id.is_empty() || !self.past_gate.insert(tool_id.to_string()) {
             return;
         }
+        if !self.rebuilding {
+            self.prune_past_gate();
+        }
+    }
+
+    /// Past its size, let go of the calls no longer in the transcript (a
+    /// bounded worker's dropped rows, another session's): only theirs. Never
+    /// halfway through a rebuild (Shady #64 r3, C64-1), when a call still
+    /// to be refolded is out of `items`.
+    fn prune_past_gate(&mut self) {
         if self.past_gate.len() > self.past_gate_cap.max(PAST_GATE_KEPT) {
-            // Let go of calls no longer in the transcript (a bounded
-            // worker's dropped rows, another session's): only theirs.
             let held: std::collections::HashSet<&str> =
                 self.items.iter().filter_map(|i| i.tool.as_ref()).map(|t| t.tool_id.as_str()).collect();
             let mut kept = std::mem::take(&mut self.past_gate);
-            kept.retain(|id| held.contains(id.as_str()) || id == tool_id);
+            kept.retain(|id| held.contains(id.as_str()));
             self.past_gate = kept;
             self.past_gate_cap = 2 * self.past_gate.len();
         }
+    }
+
+    /// Run `f`, a rebuild of the rows: [`Transcript::past_gate`] lets go
+    /// of nothing until the outermost one is done.
+    fn rebuild<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = std::mem::replace(&mut self.rebuilding, true);
+        let r = f(self);
+        self.rebuilding = outer;
+        if !outer {
+            self.prune_past_gate();
+        }
+        r
     }
 
     /// A result for `tool_id`: evidence it got past its gate, if it is.
@@ -779,6 +803,7 @@ impl Transcript {
             stuck,
             past_gate,
             past_gate_cap,
+            rebuilding: true,
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
@@ -811,6 +836,9 @@ impl Transcript {
             self.settle();
         }
         self.keep_revs(carry);
+        // The rows, the history's and the replay's, are all back.
+        self.rebuilding = false;
+        self.prune_past_gate();
         Ok(())
     }
 
@@ -821,9 +849,9 @@ impl Transcript {
                 if *base_len != self.history_len {
                     return Err(TranscriptError::OutOfSync { have: self.history_len, base_len: *base_len });
                 }
-                self.append_history(messages);
+                self.rebuild(|t| t.append_history(messages));
             }
-            HistoryUpdate::Replace { messages } => self.replace_history(messages),
+            HistoryUpdate::Replace { messages } => self.rebuild(|t| t.replace_history(messages)),
         }
         Ok(())
     }
@@ -832,12 +860,14 @@ impl Transcript {
     /// replays): longer or equal is taken as an append, shorter as a
     /// replacement. Clients get [`HistoryUpdate`]s instead, which tell.
     pub fn apply_history(&mut self, messages: &[Value]) {
-        if messages.len() >= self.history_len {
-            let start = self.history_len;
-            self.append_history(&messages[start..]);
-        } else {
-            self.replace_history(messages);
-        }
+        self.rebuild(|t| {
+            if messages.len() >= t.history_len {
+                let start = t.history_len;
+                t.append_history(&messages[start..]);
+            } else {
+                t.replace_history(messages);
+            }
+        });
     }
 
     /// Fold `messages` after the history folded so far. Live rows since
@@ -1941,6 +1971,64 @@ mod outcome_tests {
         assert!(t.past_gate("a"), "a re-attach to the same session keeps it");
         t.load_attached(&attach("other")).unwrap();
         assert!(!t.past_gate("a"), "another session's calls are not this one's");
+    }
+
+    /// Shady #64 r3 C64-1: a rebuild that crosses the size watermark lets
+    /// go of nothing until its rows are all back. 256 calls ran, `a` among
+    /// them, known only from its output (its result is the bare cancel, so
+    /// the history can't tell again). A rebuild whose first call `b` is new
+    /// and ran (the 257th) keeps `a`; a call the rebuild left out (`o0`)
+    /// goes once it is done. A history replace, an append and a re-attach
+    /// to the same session. On `7e35605`, `a` was let go at `b`.
+    #[test]
+    fn a_rebuild_past_the_watermark_keeps_a_later_calls_evidence() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
+        let attach = |history: Vec<Value>| {
+            let a = json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": history}, "input_owner": 2});
+            let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+            a
+        };
+        let others: Vec<String> = (0..PAST_GATE_KEPT - 1).map(|k| format!("o{k}")).collect();
+        let ran = || {
+            let mut t = Transcript::new();
+            t.load_attached(&attach(Vec::new())).unwrap();
+            t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+            for id in std::iter::once("a").chain(others.iter().map(String::as_str)) {
+                t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "bash", "tool_id": id, "input": {}})));
+                t.apply(&llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})));
+                if id == "a" {
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": "a", "delta": "removed 3 files\n"})));
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "a", "result": "Canceled by user"})));
+                } else {
+                    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "ok"})));
+                }
+            }
+            t.apply(&SessionEvent::Idle);
+            assert!(t.past_gate("a") && t.past_gate("o0"));
+            t
+        };
+        let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "bash", "input": {}}]});
+        let res = |id: &str, r: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": r}]});
+        let mut history = vec![json!({"role": "user", "content": "go"}), call("b"), res("b", "ok"), call("a"), res("a", "Canceled by user")];
+        for id in &others[1..] {
+            history.push(call(id));
+            history.push(res(id, "ok"));
+        }
+        let (mut replace, mut append, mut attached) = (ran(), ran(), ran());
+        replace.apply_update(&HistoryUpdate::Replace { messages: history.clone() }).unwrap();
+        append.apply_update(&HistoryUpdate::Append { base_len: 0, messages: history.clone() }).unwrap();
+        attached.load_attached(&attach(history)).unwrap();
+        // Per rebuild: a's row is there, a still ran, b and o1 ran, o0 (no
+        // longer there) went once the rebuild was done.
+        let got: Vec<_> = [("replace", &replace), ("append", &append), ("re-attach", &attached)]
+            .into_iter()
+            .map(|(how, t)| {
+                let row = t.items().iter().any(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "a"));
+                (how, row, t.past_gate("a"), t.past_gate("b") && t.past_gate("o1"), t.past_gate("o0"))
+            })
+            .collect();
+        assert!(got.iter().all(|&(_, row, a, others, o0)| row && a && others && !o0), "{got:?}");
     }
 
     /// Subagent notices are on by default; off, they stay off across an
