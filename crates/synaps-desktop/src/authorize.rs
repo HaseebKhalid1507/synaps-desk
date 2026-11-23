@@ -27,7 +27,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::protocol::PromptRequest;
-use synaps_client::transcript::{Item, ToolStatus};
+use synaps_client::transcript::{GateNote, Item, ToolCall, ToolStatus, gate_note};
 
 use crate::app::{ARM, AppView, Arm, authorize_ready, hidden, lines_below, mono};
 use crate::fonts;
@@ -318,10 +318,22 @@ impl Receipt {
     /// What it says once its call's end is known (Shady L4): resolved with
     /// no answer from here, and the call cancelled, it was a cancel (a HALT
     /// from another client resolves the prompt while the turn still runs).
-    /// Read when drawn, from the call's final status: no race.
-    pub(crate) fn answer_for(&self, call: Option<ToolStatus>) -> Answer {
+    /// A yes from here whose call shows it was held at its gate (#25:
+    /// `applied`, [`applied`]) is `denied` (another client's Deny came
+    /// first, the prompt timed out) or `cancelled` (a HALT crossed it, or
+    /// one ran silently: the call can't say which), not `allowed`. That is
+    /// an inference from the call, not the daemon's word: the answer sent
+    /// stays in [`Receipt::answer`]. Read when drawn: no race.
+    pub(crate) fn answer_for(&self, call: Option<ToolStatus>, applied: Option<bool>) -> Answer {
         match self.answer {
             Answer::Elsewhere | Answer::Resolved if call == Some(ToolStatus::Cancelled) => Answer::Cancelled,
+            Answer::Allowed | Answer::AllowedAll | Answer::Provided if applied == Some(false) => {
+                if call == Some(ToolStatus::Denied) {
+                    Answer::Denied
+                } else {
+                    Answer::Cancelled
+                }
+            }
             a => a,
         }
     }
@@ -337,6 +349,42 @@ impl Receipt {
             Answer::Elsewhere => "answered elsewhere",
             Answer::Resolved => "resolved",
         }
+    }
+}
+
+/// Whether a yes to the prompt that gated `call` got it past its gate, as
+/// far as the call shows (#25). An inference, not an acknowledgement: a
+/// daemon that doesn't say what it applied resolves the prompt with no
+/// answer in it, and this window's answer is sent, not acknowledged
+/// (another client's Deny, a HALT or the prompt's timeout can cross it).
+///
+/// `Some(true)`: it got past (`past`: [`Transcript::past_gate`], output
+/// streamed or a result said it ran, kept once seen so a later bare cancel
+/// or a settle doesn't take it back, Shady C64-1), or it ended on its own
+/// (done, failed, stopped at its limit). `Some(false)`: its whole result is
+/// one of the engine's own forms for a call held at its gate
+/// ([`gate_note`]: the confirm's deny, a bare cancel), or the turn ended
+/// before it reported and nothing streamed. A bare cancel is also what a
+/// call that ran silently gets: it reads `cancelled`, unlit, not proven
+/// either way. `None`: not known (queued, running, silent; any other
+/// result). Tool output is never searched for a phrase (Shady C64-2); a
+/// tool whose whole output is byte for byte a gate form reads as one.
+///
+/// [`Transcript::past_gate`]: synaps_client::Transcript::past_gate
+pub(crate) fn applied(call: Option<&ToolCall>, past: bool) -> Option<bool> {
+    if past {
+        return Some(true);
+    }
+    let t = call?;
+    match t.status? {
+        ToolStatus::Done | ToolStatus::Failed | ToolStatus::Unknown => Some(true),
+        s @ (ToolStatus::Denied | ToolStatus::Cancelled) => match gate_note(&t.result, &t.tail) {
+            Some(GateNote::Denied | GateNote::BareCancel) => Some(false),
+            Some(GateNote::StartedCancel) => Some(true),
+            None => (s == ToolStatus::Cancelled && t.result.is_empty()).then_some(false),
+        },
+        // Queued, running, streaming (the status is `non_exhaustive`).
+        _ => None,
     }
 }
 
@@ -699,7 +747,8 @@ impl AppView {
             return None;
         }
         let r = self.row_receipt(call)?;
-        let words = self.receipt_words(r, r.answer_for(status), running, p);
+        let applied = self.call_applied(&r.call);
+        let words = self.receipt_words(r, r.answer_for(status, applied), applied == Some(true), running, p);
         let row = r.row;
         // The meta's 8 px gap is the separator's first space.
         // Cards D: the facts' dot before it (cards4/proposal.md §3).
@@ -723,7 +772,16 @@ impl AppView {
         self.receipts.get(sid)?.iter().rev().find(|r| !r.own && r.call == call)
     }
 
-    fn receipt_words(&self, r: &Receipt, answer: Answer, running: bool, p: &Palette) -> Div {
+    /// [`applied`] for call `call` (its tool-use id), from the transcript.
+    pub(crate) fn call_applied(&self, call: &str) -> Option<bool> {
+        let t = &self.model.lives[self.panes.cur.live].transcript;
+        let items = t.items();
+        applied(call_ix(items, call).and_then(|i| items[i].tool.as_ref()), t.past_gate(call))
+    }
+
+    /// The receipt's words; `applied`: its call shows the daemon applied
+    /// the answer ([`applied`]).
+    fn receipt_words(&self, r: &Receipt, answer: Answer, applied: bool, running: bool, p: &Palette) -> Div {
         let (_, rest) = r.words_while(running);
         let word = Receipt::word(answer);
         let k = self.fx.shot(Some(r.landed), Duration::ZERO, crate::motion::QUICK, &crate::motion::ease::OUT, crate::motion::Kind::Fade);
@@ -732,8 +790,12 @@ impl AppView {
         // the accent as it lands and decays to `dim` (`glow` from +240); a
         // Deny's stays `err`. Nothing else lights (Shady #23 L9: attention
         // follows the accent; a cancel, another client's answer, `dim`).
-        let lights = matches!(answer, Answer::Allowed | Answer::AllowedAll | Answer::Provided);
+        // Only once its call shows the daemon applied it (#25): until then
+        // `dim`, and if it never does, it is not an Allow.
+        let lights = applied && matches!(answer, Answer::Allowed | Answer::AllowedAll | Answer::Provided);
         let lit = if lights { self.fx.decay(Some(r.landed + Duration::from_millis(240)), Duration::ZERO, crate::motion::GLOW) } else { 0. };
+        #[cfg(test)]
+        RECEIPT_LIT.with(|l| l.borrow_mut().push((r.row, Receipt::word(answer), lit > 0.)));
         let rest_color = crate::motion::mix(p.dim_t, p.acc, lit);
         let word_color = if answer == Answer::Denied { p.err } else { rest_color };
         let row = r.row;
@@ -780,6 +842,9 @@ impl AppView {
         let sid = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str()).unwrap_or_default();
         let Some(rc) = self.receipts.get(sid).and_then(|v| v.iter().find(|x| x.row == d.id)) else { return div().into_any_element() };
         let kind = if rc.secret { "secret" } else { "confirm" };
+        let items = self.model.lives[self.panes.cur.live].transcript.items();
+        let status = call_ix(items, &rc.call).and_then(|i| items[i].tool.as_ref()).and_then(|t| t.status);
+        let applied = self.call_applied(&rc.call);
         h_flex()
             .w_full()
             .h(px(receipt_line(m)))
@@ -790,7 +855,7 @@ impl AppView {
             .debug_selector(move || format!("receipt-row {}", d.id))
             // On the call rows' verb column (the finish gate of #18).
             .child(div().pl(px(crate::turns::Geo::of(self.panes.cur.layout, m).verb)).text_color(p.dim_t).child(format!("{kind} · ")))
-            .child(self.receipt_words(rc, rc.answer, false, p))
+            .child(self.receipt_words(rc, rc.answer_for(status, applied), applied == Some(true), false, p))
             .into_any_element()
     }
 
@@ -1302,6 +1367,9 @@ pub(crate) const ALLOW_STYLE: crate::cards::AllowStyle = crate::cards::AllowStyl
 thread_local! {
     /// A test's Allow style (none: [`ALLOW_STYLE`]).
     pub(crate) static TEST_ALLOW: std::cell::Cell<Option<crate::cards::AllowStyle>> = const { std::cell::Cell::new(None) };
+    /// Each receipt drawn, in order: its row, its word, whether it was lit
+    /// (#25).
+    pub(crate) static RECEIPT_LIT: std::cell::RefCell<Vec<(u64, &'static str, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The Allow style this frame draws ([`ALLOW_STYLE`]).
@@ -1363,7 +1431,7 @@ pub(crate) fn receipt_line(m: &Metrics) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, PromptRow, Receipt, asked, call_ix, dash_xs, guard_shape, run_start, status_beside, took, with_prompts};
+    use super::{Answer, PromptRow, Receipt, applied, asked, call_ix, dash_xs, guard_shape, run_start, status_beside, took, with_prompts};
     use crate::turns::{Disp, Gap, Kind, Who};
     use std::time::{Duration, Instant};
 
@@ -1551,14 +1619,51 @@ mod tests {
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Cancelled)), None, "a HALT under the card: one cancelled");
         assert_eq!(status_beside(Some("cancelled"), Some(Answer::Elsewhere)), Some("cancelled"));
         // Shady L4: not ours, and its call cancelled: a cancel, said once.
-        use synaps_client::transcript::ToolStatus;
+        use synaps_client::transcript::{ToolCall, ToolStatus};
         let cancelled = Some(ToolStatus::Cancelled);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(cancelled), Answer::Cancelled, "a HALT from another client");
-        assert_eq!(r(Answer::Resolved, None).answer_for(cancelled), Answer::Cancelled);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(Some(ToolStatus::Done)), Answer::Elsewhere);
-        assert_eq!(r(Answer::Elsewhere, None).answer_for(None), Answer::Elsewhere, "still running");
-        assert_eq!(r(Answer::Allowed, None).answer_for(cancelled), Answer::Allowed, "ours stays ours");
-        assert_eq!(status_beside(Some("cancelled"), Some(r(Answer::Elsewhere, None).answer_for(cancelled))), None);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(cancelled, None), Answer::Cancelled, "a HALT from another client");
+        assert_eq!(r(Answer::Resolved, None).answer_for(cancelled, Some(false)), Answer::Cancelled);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(Some(ToolStatus::Done), Some(true)), Answer::Elsewhere);
+        assert_eq!(r(Answer::Elsewhere, None).answer_for(None, None), Answer::Elsewhere, "still running");
+        // #25: a yes from here whose call shows it was held at its gate
+        // says so; one that got past, or isn't known yet, stays ours.
+        for a in [Answer::Allowed, Answer::AllowedAll, Answer::Provided] {
+            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Denied), Some(false)), Answer::Denied);
+            assert_eq!(r(a, None).answer_for(cancelled, Some(false)), Answer::Cancelled);
+            assert_eq!(r(a, None).answer_for(cancelled, Some(true)), a, "it ran: a cancel after it doesn't demote it");
+            assert_eq!(r(a, None).answer_for(Some(ToolStatus::Running), None), a, "not known yet: what was sent");
+        }
+        assert_eq!(r(Answer::Denied, None).answer_for(Some(ToolStatus::Denied), Some(false)), Answer::Denied);
+        assert_eq!(r(Answer::Denied, None).answer_for(cancelled, Some(false)), Answer::Denied, "a no stays a no");
+        assert_eq!(status_beside(Some("cancelled"), Some(r(Answer::Elsewhere, None).answer_for(cancelled, None))), None);
+        // [`applied`]: the engine's whole forms only, and what the call showed
+        // before (`past`) is never taken back.
+        let call = |status, result: &str| ToolCall { status: Some(status), result: result.into(), ..Default::default() };
+        let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
+        let started = "Canceled by user. It had already started and may have partially applied its effects.";
+        let partial = "running 6 tests\n\n[Canceled by user before the tool finished; the output above is partial.]";
+        use ToolStatus::*;
+        for (c, past, want, why) in [
+            (call(Denied, gate), false, Some(false), "held at the gate"),
+            (call(Cancelled, "Canceled by user"), false, Some(false), "a bare cancel, nothing streamed"),
+            (call(Cancelled, ""), false, Some(false), "the turn ended before it reported, nothing streamed"),
+            (call(Cancelled, started), false, Some(true), "the engine says it had started"),
+            (call(Cancelled, partial), false, Some(true), "its partial output, the engine's note under it"),
+            (call(Cancelled, "Canceled by user"), true, Some(true), "C64-1: it streamed before the HALT's bare cancel"),
+            (call(Cancelled, "running 6 tests\n"), true, Some(true), "C64-1: settled after its output, no result"),
+            (call(Denied, gate), true, Some(true), "C64-2: printed the gate's words after streaming"),
+            (call(Running, ""), false, None, "silent: not known"),
+            (call(Done, "ok"), false, Some(true), "ended on its own"),
+            (call(Failed, "Tool execution failed: Command failed (exit 1):"), false, Some(true), "ended on its own"),
+            // C64-2: a deny quoted inside output, or another block, is not the gate's.
+            (call(Done, &format!("log:\n{gate}\n")), false, Some(true), "quoted mid-output"),
+            (call(Denied, "Tool call blocked by extension: policy says no"), false, None, "another extension's block"),
+            (call(Cancelled, "Canceled by user\nthen more"), false, None, "not the bare phrase"),
+        ] {
+            assert_eq!(applied(Some(&c), past), want, "{why}: {c:?}");
+        }
+        assert_eq!(applied(None, false), None);
+        assert_eq!(applied(None, true), Some(true));
         assert_eq!(status_beside(Some("failed"), Some(Answer::Allowed)), Some("failed"));
         assert_eq!(status_beside(Some("waiting"), Some(Answer::Allowed)), Some("waiting"), "a secret still to come");
         assert_eq!((took(Duration::from_secs(125)), took(Duration::from_secs(3780))), ("2m 05s".into(), "1h 03m".into()));
