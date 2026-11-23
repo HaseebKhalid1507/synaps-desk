@@ -1930,3 +1930,31 @@ async fn set_and_model_options_wire_shapes_and_replies() {
         .await;
     assert_eq!(options(&events).await, (seq, Err(synaps_client::client::OPTIONS_UNSUPPORTED.to_string())));
 }
+
+/// The right panel's cache and keep-warm (synaps-desk #68, SynapsCLI #436):
+/// a `status` query on the attachment, its answer by id as
+/// `Event::SessionStatus` (the value as the daemon sent it); another id's
+/// answer is not it.
+#[tokio::test]
+async fn status_query_wire_shape_and_answer() {
+    let mut fake = Fake::start("status").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    client.on(seq).status().unwrap();
+    let cmd = conn.recv_cmd().await;
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "status", "cache": true}}));
+    let value = json!({"pinned": false, "keepwarm": {"mode": "auto", "session_pings": 0},
+        "cache_ttl": {"setting": "1h", "resolved": "1h"},
+        "cache": {"ttl": "5m", "ttl_secs": 300, "age_secs": 78, "expires_in_secs": 222, "downgraded": true}});
+    conn.event(40, json!({"ev": "query_result", "id": id ^ 1, "value": {"pinned": true}})).await;
+    conn.event(41, json!({"ev": "query_result", "id": id, "value": value})).await;
+    let got = wait(&events, "session status", |e| match e {
+        Event::SessionStatus { attach_seq, value } => Some((*attach_seq, value.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, (seq, value));
+}

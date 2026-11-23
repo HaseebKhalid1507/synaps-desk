@@ -42,6 +42,10 @@ pub const FEATURE_SESSION_PAGE: &str = "session_page";
 /// (the models and thinking levels a session's `Set` takes). An older
 /// daemon answers the query with `Error{unknown variant}`.
 pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
+/// `Welcome.features` entry: the daemon answers `Status{cache: true}` with
+/// when the session's prompt cache expires (`cache`), to the asking client
+/// only. An older daemon is never asked.
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
 pub const CATALOG_PAGE_MAX: u32 = 200;
@@ -382,7 +386,14 @@ impl std::fmt::Debug for SessionCommand {
 pub enum SessionQuery {
     /// Reply value: the session's `api_messages` array.
     Messages,
-    Status,
+    /// Reply value: the session's status object. `cache`: with when the
+    /// prompt cache expires (`cache`), answered to this client only; ask it
+    /// only of a daemon whose `Welcome.features` lists
+    /// [`FEATURE_CACHE_EXPIRY`] (an off flag is not sent: the old bytes).
+    Status {
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        cache: bool,
+    },
     /// Reply value: a [`WatchPage`] of worker `handle_id`'s journal from
     /// `since` (the previous page's `next_seq`; 0 = all), or `{"error":
     /// "no subagent <id> in this session"}`. `tool_queue`: include the
