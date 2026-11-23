@@ -1864,7 +1864,7 @@ async fn status_query_wire_shape_and_answer() {
     let cmd = conn.recv_cmd().await;
     let id = cmd["id"].as_u64().unwrap();
     assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
-    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "status"}}));
+    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "status", "cache": true}}));
     let value = json!({"pinned": false, "keepwarm": {"mode": "auto", "session_pings": 0},
         "cache_ttl": {"setting": "1h", "resolved": "1h"},
         "cache": {"ttl": "5m", "ttl_secs": 300, "age_secs": 78, "expires_in_secs": 222, "downgraded": true}});

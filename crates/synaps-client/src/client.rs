@@ -1100,10 +1100,12 @@ impl SessionRef<'_> {
         self.send(Command::EngineCommand { name: name.into(), arg: arg.into() })
     }
 
-    /// The session's status (`SessionQuery::Status`: cost, keep-warm, the
-    /// cache's TTL and, from newer daemons, when the cache expires) →
-    /// `Event::SessionStatus`. Read-only, any attach mode. Not connected:
-    /// nothing comes back (ask again on the next attach).
+    /// The session's status (`SessionQuery::Status{cache: true}`: cost,
+    /// keep-warm, the cache's TTL and when the cache expires) →
+    /// `Event::SessionStatus`, answered to this client only. Ask only a
+    /// daemon whose `Welcome.features` lists [`crate::protocol::FEATURE_CACHE_EXPIRY`] (an
+    /// older one does not take the opt-in). Read-only, any attach mode. Not
+    /// connected: nothing comes back (ask again on the next attach).
     pub fn status(&self) -> Result<(), ClientClosed> {
         self.send(Command::Status)
     }
@@ -1986,7 +1988,9 @@ async fn session_loop(
                                 statuses.pop_front();
                             }
                             statuses.push_back(id);
-                            SessionCommand::Query { id, query: SessionQuery::Status }
+                            // The app asks only a daemon that lists
+                            // `cache_expiry` (`FEATURE_CACHE_EXPIRY`).
+                            SessionCommand::Query { id, query: SessionQuery::Status { cache: true } }
                         }
                         _ => continue,
                     };
