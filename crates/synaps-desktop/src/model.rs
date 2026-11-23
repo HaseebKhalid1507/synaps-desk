@@ -3095,6 +3095,44 @@ mod tests {
         }
     }
 
+    /// Providers don't share a prompt cache: a switch to another
+    /// provider's model of the same name is a new model, so the countdown
+    /// stops and the daemon is asked again (Shady #68 round 3). Only
+    /// `anthropic/`, the default provider's documented alias, is the same
+    /// model written two ways.
+    #[test]
+    fn another_provider_s_model_of_the_same_name_asks_again() {
+        let asked = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Status(1))).count();
+        let set = |model: &str| {
+            let v = json!({"ev": "setting_changed", "applied": {"id": 0, "setting": "model", "ok": true,
+                "view": {"model": model, "thinking_level": "low", "reasoning_level": "low", "context_window": 200000}}});
+            let e = synaps_client::protocol::decode_event(&v).unwrap();
+            Event::session(1, "s", 0, e, Arc::new(v))
+        };
+        let warm = json!({"keepwarm": {"mode": "off"}, "cache": {"ttl": "1h", "expires_in_secs": 3000}});
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        let v = json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": []},
+            "input_owner": 2, "view": {"model": "anthropic/claude-sonnet-4-6", "thinking_level": "low", "context_window": 200000}});
+        let Ok(synaps_client::protocol::DaemonFrame::Attached(a)) = synaps_client::protocol::decode_frame(&v.to_string()) else { panic!() };
+        m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: false });
+        let counting = |m: &Model| m.lives[LiveId::FIRST].stats.warm.as_ref().and_then(|w| w.expires).is_some();
+        for (model, new) in [
+            ("bedrock/claude-sonnet-4-6", true),
+            ("claude-sonnet-4-6", true),
+            ("anthropic/claude-sonnet-4-6", false),
+            ("ext-a/claude-sonnet-4-6", true),
+            ("ext-b/claude-sonnet-4-6", true),
+            ("ext-b/claude-sonnet-4-6", false),
+        ] {
+            m.apply(Event::SessionStatus { attach_seq: 1, value: warm.clone() });
+            assert!(counting(&m));
+            assert_eq!(asked(&m.apply(set(model))), usize::from(new), "to {model}: asked again");
+            assert_eq!(!counting(&m), new, "to {model}: stopped");
+        }
+    }
+
     fn connected(features: &[&str]) -> Event {
         Event::Status(Status::Connected {
             daemon_version: "0.0.0".into(),

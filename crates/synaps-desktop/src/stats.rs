@@ -97,10 +97,19 @@ impl RuntimeInfo {
     }
 }
 
-/// The same model, with or without a `provider/` prefix.
+/// The same model, with or without a `provider/` prefix. For telling a
+/// side call's usage from the session's, never for the cache.
 fn same_model(a: &str, b: &str) -> bool {
     let bare = |m: &str| m.rsplit_once('/').map_or(m, |(_, m)| m).to_string();
     a == b || bare(a) == bare(b)
+}
+
+/// The same prompt cache: the same provider-qualified model. Providers
+/// don't share a cache, so `bedrock/m` is not `anthropic/m`. The one alias
+/// is the default provider's: `anthropic/m` is `m` (SynapsCLI `models.rs`).
+fn same_cache_model(a: &str, b: &str) -> bool {
+    let id = |m: &str| m.strip_prefix("anthropic/").unwrap_or(m).to_owned();
+    id(a) == id(b)
 }
 
 /// The cost unless it is the serde default of a daemon that sent neither
@@ -238,7 +247,7 @@ impl Stats {
                 if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {
                     // Only an effective change of model: a refused or
                     // same-model `Set`, or a thinking change, keeps it.
-                    new_cache = self.view.as_ref().is_some_and(|o| !same_model(&o.model, &v.model));
+                    new_cache = self.view.as_ref().is_some_and(|o| !same_cache_model(&o.model, &v.model));
                     self.view = Some(v);
                 }
             }
