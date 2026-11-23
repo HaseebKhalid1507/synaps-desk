@@ -21,6 +21,7 @@ use synaps_client::{ModelOptions, Setting};
 use crate::app::AppView;
 use crate::menu::{At, How, Item, Key, Menu, Phase};
 use crate::pane::{PANES_MAX, PaneId};
+use crate::stats::same_model_id;
 use crate::theme::Palette;
 
 /// Which picker.
@@ -104,18 +105,18 @@ fn cut(s: &str) -> String {
     if s.chars().count() <= CUT { s.to_string() } else { format!("{}…", s.chars().take(CUT - 1).collect::<String>()) }
 }
 
-/// The same model, with or without a `provider/` prefix.
-pub(crate) fn same_model(a: &str, b: &str) -> bool {
-    let bare = |m: &str| m.rsplit_once('/').map_or(m, |(_, m)| m).to_string();
-    a == b || bare(a) == bare(b)
-}
-
 impl Target {
-    fn is_current(&self, v: &str) -> bool {
+    /// The same value: a model by its full id (never its name alone:
+    /// another provider's model of the same name is another route).
+    fn same(&self, a: &str, b: &str) -> bool {
         match self.kind {
-            Kind::Model => same_model(v, &self.current),
-            Kind::Thinking => v == self.current,
+            Kind::Model => same_model_id(a, b),
+            Kind::Thinking => a == b,
         }
+    }
+
+    fn is_current(&self, v: &str) -> bool {
+        self.same(v, &self.current)
     }
 
     /// The current value's index.
@@ -125,11 +126,13 @@ impl Target {
 
     /// The values from the daemon's answer (`None`: it has none: an older
     /// daemon, or it could not answer). The current value is always one.
-    /// A model menu shows the current model's provider's models.
+    /// A model menu shows the current model's provider's models, or the
+    /// provider the user went to, while the answer still lists it.
     pub fn fill(&mut self, options: Option<&ModelOptions>) {
         self.loading = false;
         match (self.kind, options) {
             (Kind::Model, Some(o)) => {
+                let browsing = self.shown.clone().filter(|p| self.home() != Some(p.as_str()));
                 let key = |m: &synaps_client::ModelOption| {
                     if m.provider_key.is_empty() { m.provider.clone() } else { m.provider_key.clone() }
                 };
@@ -148,7 +151,8 @@ impl Target {
                 if o.notice.is_some() {
                     self.note = o.notice.clone();
                 }
-                self.show(None);
+                let browsing = browsing.filter(|p| self.all.iter().any(|m| m.2 == *p));
+                self.show(browsing.as_deref());
             }
             (Kind::Thinking, Some(o)) => self.set_values(o.thinking.iter().map(|l| (l.clone(), l.clone())).collect()),
             (Kind::Model, None) => {
@@ -161,7 +165,7 @@ impl Target {
 
     /// The current model's provider.
     fn home(&self) -> Option<&str> {
-        self.all.iter().find(|m| same_model(&m.0, &self.current)).map(|m| m.2.as_str())
+        self.all.iter().find(|m| same_model_id(&m.0, &self.current)).map(|m| m.2.as_str())
     }
 
     /// A model menu shows `provider`'s models (`None`: the current model's,
@@ -274,15 +278,12 @@ impl Target {
         self.provider(act).map(Row::Provider).or_else(|| self.values.get(act).map(|(v, _)| Row::Value(v.clone())))
     }
 
-    /// `row`'s act now: the same id (a model also written with or without
-    /// its provider, as the fallback row is), or the same provider.
+    /// `row`'s act now: the same value (a model by its full id), or the
+    /// same provider. `None` when it is gone: never a lookalike.
     fn act(&self, row: &Row) -> Option<usize> {
         match row {
             Row::Provider(p) => self.providers.iter().position(|(q, _)| q == p).map(|j| PROVIDER + j),
-            Row::Value(v) => {
-                let model = self.kind == Kind::Model;
-                self.values.iter().position(|(w, _)| w == v).or_else(|| self.values.iter().position(|(w, _)| model && same_model(w, v)))
-            }
+            Row::Value(v) => self.values.iter().position(|(w, _)| self.same(w, v)),
         }
     }
 }
@@ -337,14 +338,16 @@ impl Choices {
     /// keyboard, which selects the current value (not the first row).
     pub fn open(&mut self, t: Target, at: At, born: Option<Instant>) {
         let mut m = Menu::new(t.items(), at, born.is_none());
-        // `refresh` places a keyboard menu's selection not on a value yet.
         m.sel = None;
-        if let Some(b) = born {
-            m = m.born(b);
+        match born {
+            Some(b) => m = m.born(b),
+            None => {
+                let cur = t.current_ix();
+                m.sel = m.items.iter().position(|it| Some(it.act) == cur && it.enabled()).or(m.items.iter().position(Item::enabled));
+            }
         }
         self.width.set(0.);
         self.menu = Some((m, t));
-        self.refresh();
     }
 
     /// The open menu's rows again, the selection kept on the same value.
@@ -354,21 +357,15 @@ impl Choices {
 
     /// The open menu's target changed by `f` (the daemon's list, a pick, a
     /// refusal) and its rows again, the selection kept on the same value or
-    /// provider: by what it is, not by its index (finish gate R1).
+    /// provider: by what it is, not by its index (finish gate R1). A value
+    /// that is gone leaves nothing selected, not a guess (Shady #72 r2):
+    /// Enter then sends nothing until the keys pick a row.
     pub fn update(&mut self, f: impl FnOnce(&mut Target)) {
         let Some((m, t)) = self.menu.as_mut() else { return };
         let was = m.sel.and_then(|i| m.items.get(i)).filter(|it| it.act != NOTE).and_then(|it| t.row(it.act));
         f(t);
         m.items = t.items();
-        m.sel = match was {
-            Some(r) => t.act(&r).and_then(|a| m.items.iter().position(|it| it.act == a && it.enabled())),
-            None if m.born.is_none() => {
-                // From the keyboard: on the current value.
-                let cur = t.current_ix();
-                m.items.iter().position(|it| Some(it.act) == cur && it.enabled()).or(m.items.iter().position(Item::enabled))
-            }
-            None => None,
-        };
+        m.sel = was.and_then(|r| t.act(&r)).and_then(|a| m.items.iter().position(|it| it.act == a && it.enabled()));
     }
 }
 
