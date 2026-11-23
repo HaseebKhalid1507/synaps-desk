@@ -820,6 +820,85 @@ mod tests {
         assert_eq!(sel(&c).as_deref(), Some("high"), "fifth of the fallback levels, third of the daemon's");
     }
 
+    /// Google Gemini's and Google AI Studio's models: the same names, two
+    /// providers (two routes, two credentials).
+    fn google() -> ModelOptions {
+        let m = |id: &str, label: &str, key: &str, provider: &str| ModelOption {
+            id: id.into(),
+            label: label.into(),
+            provider: provider.into(),
+            provider_key: key.into(),
+        };
+        ModelOptions {
+            model: "google-gemini/gemini-2.5-pro".into(),
+            models: vec![
+                m("google-gemini/gemini-2.5-pro", "Gemini 2.5 Pro", "google-gemini", "Google Gemini"),
+                m("google-gemini/gemini-2.5-flash", "Gemini 2.5 Flash", "google-gemini", "Google Gemini"),
+                m("google/gemini-2.5-flash", "Gemini 2.5 Flash", "google", "Google AI Studio"),
+                m("google/gemini-2.5-pro", "Gemini 2.5 Pro", "google", "Google AI Studio"),
+            ],
+            ..ModelOptions::default()
+        }
+    }
+
+    /// A model is its full id, never its name alone (Shady #72 round 2): a
+    /// late list keeps the provider being browsed and the model selected
+    /// there; a selected model the list no longer has leaves no selection,
+    /// never another provider's model of the same name; another provider's
+    /// model of the same name is not the current one. The one alias is the
+    /// daemon's: `anthropic/m` is `m`.
+    #[test]
+    fn a_late_list_keeps_the_selected_model_by_its_full_id() {
+        let at = At::Point(point(px(0.), px(0.)));
+        let picked = |c: &Choices| c.menu.as_ref().and_then(|(m, t)| m.sel.and_then(|i| t.values.get(m.items[i].act)).map(|v| v.0.clone()));
+        let without = |ids: &[&str]| {
+            let mut o = google();
+            o.models.retain(|m| !ids.contains(&m.id.as_str()));
+            o
+        };
+        // Google AI Studio's row, then its Flash, as the keys do.
+        let browse = |c: &mut Choices| {
+            let (m, t) = c.menu.as_mut().expect("open");
+            t.show(Some("google"));
+            m.items = t.items();
+            let i = t.values.iter().position(|(v, _)| v == "google/gemini-2.5-flash").expect("listed");
+            m.sel = m.items.iter().position(|it| it.act == i);
+        };
+        let opened = |c: &mut Choices| {
+            let mut t = target(Kind::Model, "google-gemini/gemini-2.5-pro");
+            t.fill(Some(&google()));
+            c.open(t, at, None);
+            assert_eq!(picked(c).as_deref(), Some("google-gemini/gemini-2.5-pro"));
+            browse(c);
+            assert_eq!(picked(c).as_deref(), Some("google/gemini-2.5-flash"));
+        };
+        let mut c = Choices::default();
+        opened(&mut c);
+        c.update(|t| t.fill(Some(&google())));
+        assert_eq!(picked(&c).as_deref(), Some("google/gemini-2.5-flash"), "the same list: still Google AI Studio's");
+        c.update(|t| t.fill(Some(&without(&["google/gemini-2.5-flash"]))));
+        assert_eq!(picked(&c), None, "gone (its provider listed): nothing, not Google Gemini's Flash");
+        c.refresh();
+        assert_eq!(picked(&c), None, "and nothing after");
+        opened(&mut c);
+        c.update(|t| t.fill(Some(&without(&["google/gemini-2.5-flash", "google/gemini-2.5-pro"]))));
+        assert_eq!(picked(&c), None, "gone with its provider: nothing, not Google Gemini's Flash");
+
+        let mut t = target(Kind::Model, "google-gemini/gemini-2.5-pro");
+        t.fill(Some(&google()));
+        assert_eq!(t.home(), Some("google-gemini"));
+        t.show(Some("google"));
+        assert!(!t.is_current("google/gemini-2.5-pro"), "Google AI Studio's Pro is another model");
+        assert!(t.items().iter().all(|i| i.key != Some("current")), "{:?}", t.items());
+
+        let mut t = target(Kind::Model, "claude-opus-5-5");
+        t.fill(None);
+        c.open(t, at, None);
+        assert_eq!(picked(&c).as_deref(), Some("claude-opus-5-5"));
+        c.update(|t| t.fill(Some(&opts())));
+        assert_eq!(picked(&c).as_deref(), Some("anthropic/claude-opus-5-5"), "the bare id is its `anthropic/` row");
+    }
+
     /// The provider head shows only when other providers' rows follow
     /// (one provider's list needs no name), and is never picked.
     #[test]

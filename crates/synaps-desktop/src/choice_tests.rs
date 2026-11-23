@@ -154,6 +154,89 @@ fn the_daemon_s_late_list_keeps_a_keyboard_picker_on_its_model(cx: &mut TestAppC
     assert_eq!(sel(cx).as_deref(), Some("Sonnet 4.6"), "kept on its model through a reordered list");
 }
 
+/// A late list keeps the provider the keys are in and the model selected
+/// there, by its full id: Google AI Studio's Flash is not Google Gemini's
+/// (the same name; another route and credential). A selected model the
+/// list no longer has leaves nothing selected, so Enter sends nothing; a
+/// pick sends the browsed provider's own id (Shady #72 round 2).
+#[gpui_kit::test]
+fn a_late_list_keeps_the_browsed_provider_s_model(cx: &mut TestAppContext) {
+    let (window, view) = open(cx);
+    let m = |id: &str, label: &str, key: &str, provider: &str| ModelOption {
+        id: id.into(),
+        label: label.into(),
+        provider: provider.into(),
+        provider_key: key.into(),
+    };
+    let current = "google-gemini/gemini-2.5-pro";
+    let models = vec![
+        m(current, "Gemini 2.5 Pro", "google-gemini", "Google Gemini"),
+        m("google-gemini/gemini-2.5-flash", "Gemini 2.5 Flash", "google-gemini", "Google Gemini"),
+        m("google/gemini-2.5-flash", "Gemini 2.5 Flash", "google", "Google AI Studio"),
+        m("google/gemini-2.5-pro", "Gemini 2.5 Pro", "google", "Google AI Studio"),
+    ];
+    let seq = view.update(cx, |v, _| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].transcript.apply(&synaps_client::SessionEvent::Idle);
+        let s = &mut v.model.lives[live].stats;
+        let mut info = s.view.clone().unwrap_or_default();
+        info.model = current.into();
+        s.view = Some(info);
+        v.model.lives[live].attachment().expect("attached")
+    });
+    let reply = |cx: &mut TestAppContext, models: Vec<ModelOption>| {
+        view.update(cx, |v, cx| {
+            v.choice_options(seq, Ok(ModelOptions { model: current.into(), models, ..ModelOptions::default() }));
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let key = |cx: &mut TestAppContext, k: &'static str| {
+        let ks = gpui_kit::Keystroke::parse(k).unwrap();
+        cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| v.choice_keydown(&ks, true, window, cx))).unwrap();
+        cx.run_until_parked();
+    };
+    // The selected row: its label, and its model's id if it is one.
+    let sel = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let (m, t) = v.choice.menu.as_ref().expect("a picker is open");
+            assert!(t.off.is_none(), "the demo session takes a pick: {:?}", t.off);
+            let it = m.sel.and_then(|i| m.items.get(i));
+            (it.map(|it| it.label.to_string()), it.and_then(|it| t.values.get(it.act)).map(|v| v.0.clone()))
+        })
+    };
+    // What a pick sent `Set` for.
+    let sent = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.choice.menu.as_ref().and_then(|(_, t)| t.pending.and_then(|i| t.values.get(i)).map(|v| v.0.clone())))
+    };
+
+    cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| v.app_act(AppAct::ChangeModel, window, cx))).unwrap();
+    view.update(cx, |v, _| {
+        let (_, t) = v.choice.menu.as_mut().expect("a picker is open");
+        (t.note, t.loading) = (None, true);
+    });
+    cx.run_until_parked();
+    reply(cx, models.clone());
+    assert_eq!(sel(cx).1.as_deref(), Some(current));
+    key(cx, "down");
+    key(cx, "down");
+    assert_eq!(sel(cx).0.as_deref(), Some("Google AI Studio · 2"));
+    key(cx, "enter");
+    assert_eq!(sel(cx).1.as_deref(), Some("google/gemini-2.5-flash"), "Google AI Studio's models, its first");
+    reply(cx, models.clone());
+    assert_eq!(sel(cx).1.as_deref(), Some("google/gemini-2.5-flash"), "the same list: still Google AI Studio's Flash");
+    reply(cx, models.iter().filter(|m| m.id != "google/gemini-2.5-flash").cloned().collect());
+    assert_eq!(sel(cx), (None, None), "gone: nothing selected, not Google Gemini's Flash");
+    key(cx, "enter");
+    assert_eq!(sent(cx), None, "Enter on nothing sends nothing");
+    reply(cx, models);
+    assert_eq!(sel(cx), (None, None), "nothing stays nothing");
+    key(cx, "down");
+    assert_eq!(sel(cx).1.as_deref(), Some("google/gemini-2.5-flash"), "Google AI Studio's still");
+    key(cx, "enter");
+    assert_eq!(sent(cx).as_deref(), Some("google/gemini-2.5-flash"), "its own id");
+}
+
 /// Frames until the window asks for none (at most 12).
 fn settle(cx: &mut TestAppContext, w: AnyWindowHandle) {
     for _ in 0..12 {
