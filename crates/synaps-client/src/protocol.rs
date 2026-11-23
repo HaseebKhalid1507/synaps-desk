@@ -38,6 +38,10 @@ pub const SAVED_SESSIONS_MAX: u32 = 1000;
 /// watch-sessions replacement of `saved_sessions`). An older daemon
 /// answers the frame with `Error{unknown variant}`.
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
+/// `Welcome.features` entry: the daemon answers `SessionQuery::ModelOptions`
+/// (the models and thinking levels a session's `Set` takes). An older
+/// daemon answers the query with `Error{unknown variant}`.
+pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
 pub const CATALOG_PAGE_MAX: u32 = 200;
@@ -280,6 +284,61 @@ pub enum SessionCommand {
         name: String,
         arg: String,
     },
+    /// Change one of the session's settings (this session only). Reply:
+    /// `SettingChanged{applied: {id, ok, message, view}}`, broadcast to
+    /// every attached client, so pick an id below [`RESERVED_QUERY_ID_BASE`]
+    /// that others won't. Input-owner only: otherwise `Refused{command:
+    /// "set"}`.
+    Set {
+        id: u64,
+        setting: Setting,
+    },
+}
+
+/// `types::SessionSetting`, the variants this client sets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "setting", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Setting {
+    /// `try_set_model`: a runtime id (`anthropic/claude-opus-5-5`).
+    Model { model: String },
+    /// `set_reasoning_level_checked`: `off`, `adaptive`, `low` ... (the
+    /// daemon parses it; one it does not know fails the frame's decode).
+    ReasoningLevel { level: String },
+}
+
+impl Setting {
+    /// The wire name (`SettingApplied.setting`, `Refused.command` is `set`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Setting::Model { .. } => "model",
+            Setting::ReasoningLevel { .. } => "reasoning_level",
+        }
+    }
+}
+
+/// The reply to `SessionQuery::ModelOptions` (`session::model_options`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct ModelOptions {
+    /// The session's model and thinking level as the daemon answered.
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub thinking_level: String,
+    #[serde(default)]
+    pub models: Vec<ModelOption>,
+    /// The levels the session takes for its current model.
+    #[serde(default)]
+    pub thinking: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct ModelOption {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub provider: String,
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -302,6 +361,7 @@ impl std::fmt::Debug for SessionCommand {
             Self::EngineCommand { id, name, arg } => {
                 f.debug_struct("EngineCommand").field("id", id).field("name", name).field("arg", arg).finish()
             }
+            Self::Set { id, setting } => f.debug_struct("Set").field("id", id).field("setting", setting).finish(),
         }
     }
 }
@@ -326,6 +386,9 @@ pub enum SessionQuery {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// Reply value: [`ModelOptions`]. Only to a daemon that lists
+    /// [`FEATURE_MODEL_OPTIONS`].
+    ModelOptions,
 }
 
 /// One page of a worker's watch journal (`runtime::subagent_watch::WatchPage`,

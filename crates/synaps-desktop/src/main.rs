@@ -36,6 +36,7 @@ mod beat;
 mod bench;
 mod cards;
 mod chart;
+mod choice;
 mod chrome;
 mod dash;
 mod demo;

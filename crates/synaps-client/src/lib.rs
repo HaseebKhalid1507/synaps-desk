@@ -111,8 +111,9 @@ pub use client::{
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, FEATURE_SAVED_SESSIONS,
-    FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX,
-    SavedSession, SessionEvent, SessionMeta, WatchEvent, WatchPage, validate_session_name,
+    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, FEATURE_MODEL_OPTIONS,
+    FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, ModelOption, ModelOptions, Rejected,
+    RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage,
+    validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};
