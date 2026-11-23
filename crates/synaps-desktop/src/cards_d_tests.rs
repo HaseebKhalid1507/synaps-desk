@@ -141,18 +141,22 @@ fn paints(cx: &mut TestAppContext, view: &Entity<AppView>) -> Rc<RefCell<Vec<(bo
 
 /// Shady #73 R2-M1: [`idle_frame`] counts the frames drawn, not only the
 /// animation frames queued: a timer's `cx.notify` on a window at rest draws
-/// one with none queued, and it is seen.
+/// one with none queued, and it is seen. The timer is armed before the
+/// frame's clock moves (built here, not in the task, which is first polled
+/// later: Shady #73 R3-M1), so it fires 3 ms into the frame.
 #[gpui_kit::test]
 fn an_idle_frame_sees_a_timer_s_draw(cx: &mut TestAppContext) {
     let (w, view, _events) = idle_cpu(cx, 900.);
     at_rest(cx, w, &view);
     view.update(cx, |_, cx| {
+        let timer = cx.background_executor().timer(Duration::from_millis(3));
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(3)).await;
+            timer.await;
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
     });
+    cx.run_until_parked();
     let (drawn, ran) = idle_frame(cx, w, &view);
     assert!(drawn >= 1 && ran == 0, "a timer's draw: {drawn} drawn, {ran} queued");
 }
@@ -481,6 +485,8 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
         }
         let held = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
         assert!(held(cx).is_some_and(|r| r >= 1.), "used up {used_up}: the fold's room, held");
+        // Every frame from here on, the append's too (R3-L1).
+        let drawn = paints(cx, &view);
         if used_up {
             // Rows grow in under it (a history append): they take the room.
             view.update(cx, |v, cx| {
@@ -496,7 +502,6 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
         }
         // Idle until the room is gone, then for two seconds more: the draws
         // after it are what its release left behind.
-        let drawn = paints(cx, &view);
         let mut n = 0;
         while held(cx).is_some() {
             idle_frame(cx, w, &view);
@@ -511,14 +516,12 @@ fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
             }
         }
         view.update(cx, |v, _| v.on_draw = None);
-        // (Used up, the rows' growth may take it in a frame of their own.)
         let drawn = drawn.take();
         let went = drawn.iter().position(|(room, _)| !room);
-        assert!(used_up || went.is_some(), "released: no frame drew the room gone ({drawn:?})");
-        if let Some(went) = went {
-            assert!(drawn[went..].iter().all(|(room, _)| !room), "used up {used_up}: the room drawn back after it went ({drawn:?})");
-            assert!(used_up || !drawn[went].1, "released: the frame that drew the room gone asked for another ({drawn:?})");
-        }
+        let went = went.unwrap_or_else(|| panic!("used up {used_up}: no frame drew the room gone ({drawn:?})"));
+        assert!(drawn[went..].iter().all(|(room, _)| !room), "used up {used_up}: the room drawn back after it went ({drawn:?})");
+        // (Used up, the rows growing in may still ask for frames of their own.)
+        assert!(used_up || !drawn[went].1, "released: the frame that drew the room gone asked for another ({drawn:?})");
         seen.push((used_up, late));
     }
     // Released: nothing after its sheet lands. Used up: rows that grew in
