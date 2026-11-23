@@ -82,11 +82,13 @@ pub(crate) struct Flight {
     /// until the flight lands (the panels' `PanelFx.freeze` rule: it
     /// rewraps once, at the start as it narrows, at the end as it widens).
     pub wrap: Vec<(PaneId, f32)>,
-    /// The centre's width `wrap` was set at, from the flight's ends
-    /// (Shady #42 L2: set once, not the narrowest drawn so far, which crept
-    /// frame by frame under a panel's flight); `None`: not yet (the wraps
-    /// a flight carries on from are kept where narrower).
-    pub wrap_at: Option<(f32, f32)>,
+    /// The centres `wrap` was set at, the flight's start's and its
+    /// landing's, each with its origin in the window (Shady #42 L2: set
+    /// once, not the narrowest drawn so far, which crept frame by frame
+    /// under a panel's flight; #62 r4 R4-1: the same width at another
+    /// origin is another layout); `None`: not yet (the wraps a flight
+    /// carries on from are kept where narrower).
+    pub wrap_at: Option<(Rect, Rect)>,
     /// A panel yielding on this flight (#51): the layout rides its spring.
     pub ride: Option<Ride>,
 }
@@ -100,11 +102,56 @@ pub(crate) struct Ride {
     /// The centre's width where they start, and where they land.
     pub from: f32,
     pub to: f32,
+    /// The centre's left edge in the window where they start: the
+    /// starting tree's boxes there are its columns' (Shady #62 r4 R4-1:
+    /// read at the landing's edge, a pane 378 wide was 377.8, and its
+    /// column went 346 → 345 → 427).
+    pub from_x: f32,
 }
 
 impl Flight {
+    /// The velocity (px/s of its travel) this flight starts at, taking over
+    /// `was` (its ends and its travel) moving at `v` (px/s of that travel),
+    /// in `area`: each pane edge's velocity carried over as nearly as one
+    /// spring can carry it (least squares over the edges of the panes in
+    /// both). A reversal (a split's close mid-flight) carries it whole: the
+    /// layout turns from where it is with its speed, as a panel does
+    /// ([`crate::chrome::PanelFx::fly`]).
+    pub(crate) fn carried(&self, was: &(Node, Node, f32), v: f32, area: Rect) -> f32 {
+        let (a, b, len) = was;
+        if *len < 1. || self.travel < 1. {
+            return 0.;
+        }
+        let old = b.moves_from(a, area);
+        let (mut uw, mut ww) = (0f32, 0f32);
+        for (id, w) in self.to.moves_from(&self.from, area) {
+            ww += w.iter().map(|d| d * d).sum::<f32>();
+            if let Some((_, u)) = old.iter().find(|(i, _)| *i == id) {
+                uw += u.iter().zip(w).map(|(u, w)| u * w).sum::<f32>();
+            }
+        }
+        if ww < 1. {
+            return 0.;
+        }
+        self.travel * (v / len) * uw / ww
+    }
+
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
         Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
+    }
+
+    /// A frame of its ride `r` (#51), the centre `area`: the panes by how
+    /// far the centre has gone from the ride's `from` toward its `to`.
+    /// Under 0 while a panel turned back carries on its way first (a
+    /// split's close mid-flight: [`crate::pane::Carry::Ride`]), as far as
+    /// it goes: an early close's way back is a few px and the panel's
+    /// overshoot several times that (Shady #62 M1: held at −1, the divider
+    /// stood while the panel moved). Each edge stays between its
+    /// neighbours ([`Node::lerp_px_from`]).
+    pub(crate) fn ride_frame(&self, r: Ride, area: Rect) -> Node {
+        let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
+        let at = |w: f32| Rect { w, ..area };
+        self.to.lerp_px_from(&self.from, t, at(r.from), at(r.to), area)
     }
 
     /// Each pane's wrap (its narrowest width on the way), set from the
@@ -118,12 +165,14 @@ impl Flight {
     }
 
     /// [`Flight::set_wraps`] from its ends each in its own centre: `from`
-    /// where the flight starts, `to` where it lands. A panel yielding on
-    /// this flight (#51) moves on its spring from its start, so the centre
-    /// and the ratios move together: a pane's width, the product of a
-    /// share and the centre moving the other way, is still least at an end.
+    /// where the flight starts, `to` where it lands, each at its own
+    /// origin in the window (`x`, `y`: the panes are rounded on the
+    /// window's pixels, [`Node::rects_in`]). A panel yielding on this
+    /// flight (#51) moves on its spring from its start, so the centre and
+    /// the ratios move together: a pane's width, the product of a share
+    /// and the centre moving the other way, is still least at an end.
     pub(crate) fn set_wraps_at(&mut self, from: Rect, to: Rect) {
-        if self.wrap_at == Some((from.w, to.w)) {
+        if self.wrap_at == Some((from, to)) {
             return;
         }
         let carried = self.wrap_at.is_none();
@@ -141,7 +190,7 @@ impl Flight {
                 None => self.wrap.push((id, w)),
             }
         }
-        self.wrap_at = Some((from.w, to.w));
+        self.wrap_at = Some((from, to));
     }
 }
 
@@ -364,10 +413,34 @@ impl Node {
     }
 
     /// Each pane's rectangle in `area`, the dividers between kids taken
-    /// out, every edge on a whole pixel.
+    /// out, every edge on a whole pixel of `area`'s own coordinates.
     pub(crate) fn rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
         self.place(area, &mut out);
+        out
+    }
+
+    /// [`Node::rects`] in `area` of the centre, the centre's top-left at
+    /// `origin` in the window: every edge on a whole pixel of the window
+    /// (where it is drawn), each rectangle in the centre's own pixels. A
+    /// panel's edge moves the centre by device pixels (half a pixel at 2×);
+    /// rounded from the centre's own edge, a divider could step back half
+    /// a pixel as the panel stepped on (Shady #62 M2: rail 476.5 → 477, the
+    /// first pane 495 → 494). From the window's, each edge is the rounding
+    /// of where it is going, one way.
+    pub(crate) fn rects_in(&self, area: Rect, origin: (f32, f32)) -> Vec<(PaneId, Rect)> {
+        let shifted = Rect { x: area.x + origin.0, y: area.y + origin.1, ..area };
+        self.rects(shifted).into_iter().map(|(id, r)| (id, Rect { x: r.x - origin.0, y: r.y - origin.1, ..r })).collect()
+    }
+
+    /// [`Node::dividers`] as [`Node::rects_in`] lays them out.
+    pub(crate) fn dividers_in(&self, area: Rect, origin: (f32, f32)) -> Vec<Divider> {
+        let shifted = Rect { x: area.x + origin.0, y: area.y + origin.1, ..area };
+        let mut out = self.dividers(shifted);
+        for d in &mut out {
+            d.rect.x -= origin.0;
+            d.rect.y -= origin.1;
+        }
         out
     }
 
@@ -496,18 +569,22 @@ impl Node {
         }
     }
 
-    /// Each kid's rectangle in `area` (as [`Node::rects`] lays them).
+    /// Each kid's rectangle in `area` (as [`Node::rects`] lays them): each
+    /// edge between kids on a whole pixel of `area`'s coordinates (its own
+    /// start may not be on one: [`Node::rects_in`]), as a flight's step
+    /// rounds them ([`Node::lerp_px_from`]).
     fn kid_rects(&self, area: Rect, out: &mut Vec<Rect>) {
         let Node::Split { axis, kids, ratios } = self else { return };
-        let len = match axis {
-            Axis::Row => area.w,
-            Axis::Column => area.h,
+        let (start, len) = match axis {
+            Axis::Row => (area.x, area.w),
+            Axis::Column => (area.y, area.h),
         };
         let room = (len - DIVIDER * (kids.len() - 1) as f32).max(0.);
         let (mut at, mut acc) = (0f32, 0f32);
         for (i, r) in ratios.iter().enumerate() {
             acc += r;
-            let end = if i + 1 == kids.len() { room } else { (room * acc).round() };
+            let base = start + DIVIDER * i as f32;
+            let end = if i + 1 == kids.len() { room } else { ((base + room * acc).round() - base).clamp(at, room) };
             let off = at + DIVIDER * i as f32;
             out.push(match axis {
                 Axis::Row => Rect { x: area.x + off, y: area.y, w: (end - at).max(0.), h: area.h },
@@ -747,7 +824,9 @@ impl Node {
     }
 
     /// Each split's ratios `t` of the way from `from`'s to this tree's
-    /// (`t` 1: this tree itself). Not the same shape: this tree.
+    /// (`t` 1: this tree itself). Not the same shape: this tree. Under 0
+    /// (a flight turning with the velocity of the one it took over: back
+    /// past `from` the way that one went), no share under 0.
     pub(crate) fn lerp_from(&self, from: &Node, t: f32) -> Node {
         if t >= 1. {
             return self.clone();
@@ -758,7 +837,12 @@ impl Node {
                 if axis == a2 && kids.len() == k2.len() =>
             {
                 let kids = kids.iter().zip(k2).map(|(k, f)| k.lerp_from(f, t)).collect();
-                let ratios = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                let mut ratios: Vec<f32> = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                if t < 0. {
+                    ratios.iter_mut().for_each(|r| *r = r.max(0.));
+                    let sum: f32 = ratios.iter().sum();
+                    ratios.iter_mut().for_each(|r| *r /= sum.max(f32::EPSILON));
+                }
                 Node::Split { axis: *axis, kids, ratios }
             }
             _ => self.clone(),
@@ -811,16 +895,19 @@ impl Node {
     /// How far a flight from `from` to this tree moves anything in `area`
     /// (the most any pane's edge travels, px): its spring's length.
     pub(crate) fn travel_from(&self, from: &Node, area: Rect) -> f32 {
+        self.moves_from(from, area).iter().flat_map(|(_, d)| d.iter()).fold(0f32, |m, d| m.max(d.abs()))
+    }
+
+    /// How far each pane in both trees moves its edges in `area` (px: left,
+    /// top, right, bottom), going from `from` to this tree.
+    pub(crate) fn moves_from(&self, from: &Node, area: Rect) -> Vec<(PaneId, [f32; 4])> {
         let (a, b) = (from.rects(area), self.rects(area));
-        let mut most = 0f32;
-        for (id, r) in &b {
-            if let Some((_, f)) = a.iter().find(|(i, _)| i == id) {
-                for d in [r.x - f.x, r.y - f.y, r.x + r.w - f.x - f.w, r.y + r.h - f.y - f.h] {
-                    most = most.max(d.abs());
-                }
-            }
-        }
-        most
+        b.iter()
+            .filter_map(|(id, r)| {
+                let (_, f) = a.iter().find(|(i, _)| i == id)?;
+                Some((*id, [r.x - f.x, r.y - f.y, r.x + r.w - f.x - f.w, r.y + r.h - f.y - f.h]))
+            })
+            .collect()
     }
 
     /// The panes in reading order (split.md §1): top to bottom, then left
@@ -1269,5 +1356,130 @@ mod tests {
         assert_eq!(up, Node::Split { axis: Axis::Row, kids: vec![col, Node::Leaf(p(1))], ratios: vec![0.5, 0.5] });
         assert_eq!(up.reading_order(area()), vec![p(2), p(1), p(0)]);
         assert_eq!(Node::Leaf(p(0)).split(p(0), Side::Left, p(1), (640., 1000.)), Err(Refused::Room), "the minimums hold on the left too");
+    }
+
+    /// Shady #62 M2, as a property: a side panel moving one way moves
+    /// every divider one way, at any panel width, scale, window and split.
+    /// The panels on the device grid (the rail's spring, the right panel
+    /// fixed, or yielding tied to it: `chrome::Tie`), the centre in device
+    /// pixels and laid out from the rail's edge (`AppView::render`: the
+    /// centre at `MARK + rail`, [`Node::rects_in`]). Rounded from the
+    /// centre's own edge (`rects`), 1500 px at 2× with 480/240 panels steps
+    /// back half a pixel: rail 476.5 → 477, the first pane 495 → 494.
+    #[test]
+    fn a_moving_panel_moves_every_divider_one_way() {
+        use crate::{app::STRIP, chrome::MARK};
+        let trees = [vec![0.5, 0.5], vec![0.3, 0.7], vec![0.62, 0.38], vec![1. / 3., 1. / 3., 1. / 3.]];
+        let mut fails = Vec::new();
+        let mut cases = 0;
+        for s in [1., 1.25, 1.5, 1.75, 2.] {
+            let snap = |v: f32| (v * s).round() / s;
+            let dp = |v: f32| (v * s).round();
+            for win in [1280., 1500., 1700., 1920., 2560.] {
+                for rail in (220..=480).step_by(20).chain([221, 333, 479, 481]) {
+                    for right in (240..=520).step_by(40).chain([241, 519]) {
+                        for tied in [false, true] {
+                            for ratios in &trees {
+                                let n = ratios.len();
+                                let kids = (0..n).map(|i| Node::Leaf(p(i as u8))).collect();
+                                let tree = Node::Split { axis: Axis::Row, kids, ratios: ratios.clone() };
+                                let (rail_to, right_from, right_to) =
+                                    (snap(rail as f32), snap(right as f32), if tied { STRIP } else { snap(right as f32) });
+                                // An unfold, frame by frame (any one-way path:
+                                // the spring's ease, sampled at 144 Hz).
+                                let steps = 90;
+                                let mut xs: Vec<Vec<f32>> = Vec::new();
+                                for k in 0..=steps {
+                                    let e = 1. - (1. - k as f32 / steps as f32).powi(3);
+                                    let r = snap(STRIP + (rail_to - STRIP) * e);
+                                    let q = if tied {
+                                        snap(right_from + (right_to - right_from) * (r - STRIP) / (rail_to - STRIP))
+                                    } else {
+                                        right_from
+                                    };
+                                    let centre = ((dp(win) - dp(MARK) - dp(r) - dp(q)) / s).max(0.);
+                                    let origin = (MARK + r, 52.);
+                                    let rects = tree.rects_in(Rect { x: 0., y: 0., w: centre, h: 900. }, origin);
+                                    xs.push(rects.iter().take(n - 1).map(|(_, b)| origin.0 + b.x + b.w).collect());
+                                }
+                                cases += 1;
+                                for d in 0..n - 1 {
+                                    let path: Vec<f32> = xs.iter().map(|x| x[d]).collect();
+                                    let dir = (path[path.len() - 1] - path[0]).signum();
+                                    if let Some(w) = path.windows(2).find(|w| (w[1] - w[0]) * dir < -1e-3)
+                                        && fails.len() < 12
+                                    {
+                                        fails.push(format!(
+                                            "{s}× {win} px, rail {rail} right {right} (tied {tied}) {ratios:?}: divider {d} {} -> {}",
+                                            w[0], w[1]
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 10_000, "{cases} cases");
+        assert!(fails.is_empty(), "{fails:#?}");
+    }
+
+    /// Shady #62 M1: a split's close rides its panel turned back, and the
+    /// panel first goes on past where the close came (its velocity), so
+    /// the ride's progress goes under 0, as far as it overshoots: an early
+    /// close's way back is a few px and the overshoot several times that.
+    /// Held only by each edge's bounds ([`Node::lerp_px_from`]): the new
+    /// pane `d` px wide as drawn when the centre was `from`, closing at
+    /// `from - back`, the centre going on to `from + 400`, with the new
+    /// pane on the right or the left. Every pane at least 0 wide, in its
+    /// room, in order; the closing pane where it was drawn at `from` and
+    /// moving with the centre (it was held while the progress stood at -1).
+    /// Through the ride's frame as the app draws it ([`Flight::ride_frame`],
+    /// where the progress was clamped to −1: Shady #62 r3).
+    #[test]
+    fn a_ride_past_its_start_keeps_every_pane_in_its_room() {
+        let h = 1000.;
+        let at = |w: f32| Rect { x: 0., y: 0., w, h };
+        let mut fails = Vec::new();
+        for left in [false, true] {
+            let kids = if left { vec![Node::Leaf(p(1)), Node::Leaf(p(0))] } else { vec![Node::Leaf(p(0)), Node::Leaf(p(1))] };
+            let shares = |new: f32| if left { vec![new, 1. - new] } else { vec![1. - new, new] };
+            let to = Node::Split { axis: Axis::Row, kids: kids.clone(), ratios: shares(0.) };
+            for (d, back) in [(1., 1.), (3., 3.), (9., 9.), (9., 2.), (40., 10.), (200., 50.)] {
+                let from = 930.;
+                let drawn = Node::Split { axis: Axis::Row, kids: kids.clone(), ratios: shares(d / (from - DIVIDER)) };
+                let flight = Flight::new(drawn, to.clone(), Vec::new(), vec![p(1)]);
+                let ride = Ride { from, to: from - back, from_x: 0. };
+                let mut last: Option<f32> = None;
+                for n in 0..=57 {
+                    let w = from + 7. * n as f32;
+                    let t = (w - from) / (-back);
+                    let step = flight.ride_frame(ride, at(w));
+                    let rects = step.rects(at(w));
+                    let what = format!("{} pane {d} px, back {back}, centre {w} (t {t})", if left { "a left" } else { "a right" });
+                    let new = rects.iter().find(|(id, _)| *id == p(1)).map(|(_, r)| r.w).expect("the closing pane");
+                    if rects.iter().any(|(_, r)| r.w < -0.01 || r.x < -0.01 || r.x + r.w > w + 0.01) {
+                        fails.push(format!("{what}: out of its room: {rects:?}"));
+                    }
+                    if rects.windows(2).any(|k| k[1].1.x + 0.01 < k[0].1.x + k[0].1.w) {
+                        fails.push(format!("{what}: out of order: {rects:?}"));
+                    }
+                    if n == 0 && (new - d).abs() > 1. {
+                        fails.push(format!("{what}: not where it was drawn: {new}"));
+                    }
+                    if let Some(l) = last
+                        && new + 0.01 < l
+                    {
+                        fails.push(format!("{what}: the closing pane turned before its panel: {l} -> {new}"));
+                    }
+                    if n == 8 && last.is_some_and(|l| (new - l).abs() < 0.01) && new + 1. < w - DIVIDER {
+                        fails.push(format!("{what}: held while the centre moved: {new}"));
+                    }
+                    last = Some(new);
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{fails:#?}");
     }
 }

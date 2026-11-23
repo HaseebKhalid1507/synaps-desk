@@ -386,6 +386,33 @@ pub(crate) struct Flight {
     /// Where a width change started (its content is laid out at the wider
     /// of this and the new width, so it is clipped, never short of the box).
     pub(crate) start: f32,
+    /// A yield on the other panel's flight: drawn off that panel's progress
+    /// ([`Tie`]), not on a spring of its own.
+    pub(crate) tie: Option<Tie>,
+}
+
+/// A panel that yields to the split (or comes back from it) on the other
+/// panel's flight (#51), drawn off that panel's progress: its width moves
+/// from where it was to its target as the causing panel's drawn width
+/// moves from where it was to its own (linearly; past its start, as a
+/// reversal's turn goes, as far as its strip or open width). On two
+/// springs of their own the two stepped their device pixels on alternate
+/// frames, and the centre's width between them went back and forth half a
+/// pixel in the tail (#59: 1407.5 / 1408), the dividers with it. One a
+/// function of the other's drawn width, the centre moves one way only:
+/// `w + round(a + k·w)` is monotone in `w` for any `k`. It lands in the
+/// frame the causing panel does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Tie {
+    /// The causing panel's index in [`PanelFx::sides`].
+    pub(crate) by: usize,
+    /// Where each was drawn when the yield changed: this panel, the
+    /// causing one.
+    pub(crate) from: f32,
+    pub(crate) by_from: f32,
+    /// Its width's change per pixel of the causing panel's, as last drawn
+    /// (its velocity is the causing panel's times this: Shady #62 M4).
+    pub(crate) rate: f32,
 }
 
 /// A folded panel's strip in flight (#35: its glyphs cut in as the rail
@@ -413,7 +440,50 @@ pub(crate) struct PanelFx {
     /// The narrowest centre pane of the flight: the column is laid out
     /// for it until every panel is at rest (it rewraps once, at the start
     /// when it narrows, at the end when it widens; fluid.md §3.8).
-    pub(crate) freeze: Option<f32>,
+    pub(crate) freeze: Option<Freeze>,
+}
+
+/// The centres a panels' flight wraps its panes for ([`PanelFx::freeze`]),
+/// each a width and its left edge in the window: a pane's box depends on
+/// both (the panes are rounded on the window's pixels,
+/// [`crate::split::Node::rects_in`]), so equal widths at two origins can
+/// be a pane a fraction apart (Shady #62 R3-1). Each pane wraps at the
+/// narrower of its boxes in the two.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Freeze {
+    /// The centre its column wrapped for in the frame before the flight:
+    /// a widening flight keeps that column until it lands.
+    pub(crate) start: (f32, f32),
+    /// The narrowest centre of the flight so far, its ends included, with
+    /// its own origin: a narrowing flight wraps at once for where it lands.
+    pub(crate) narrowest: (f32, f32),
+}
+
+impl Freeze {
+    /// A flight's first frame: `before`, the centre the column wrapped for
+    /// in the frame before (none yet: `now`'s).
+    pub(crate) fn new(before: Option<(f32, f32)>, now: (f32, f32)) -> Self {
+        Freeze { start: before.unwrap_or(now), narrowest: before.unwrap_or(now) }
+    }
+
+    /// `centres` (this frame's, where it lands) in: the narrower kept, an
+    /// equal one not taken over the one before it.
+    pub(crate) fn with(self, centres: impl IntoIterator<Item = (f32, f32)>) -> Self {
+        let narrowest = centres.into_iter().fold(self.narrowest, |n, c| if c.0 < n.0 { c } else { n });
+        Freeze { narrowest, ..self }
+    }
+
+    /// The narrowest centre's width (one pane: its column's wrap).
+    pub(crate) fn width(&self) -> f32 {
+        self.narrower().0
+    }
+
+    /// The narrower of its centres, with its own origin (a layout flying
+    /// on its own spring under the panels' flight wraps its trees there:
+    /// Shady #62 r4 R4-1).
+    pub(crate) fn narrower(&self) -> (f32, f32) {
+        if self.narrowest.0 < self.start.0 { self.narrowest } else { self.start }
+    }
 }
 
 impl PanelFx {
@@ -423,7 +493,9 @@ impl PanelFx {
         let f = &mut self.sides[usize::from(!rail)];
         // In flight already (a reversal): it turns from where it is, with
         // its velocity (fluid.md §2.1, Shady N2): only the target moves.
-        if !f.moving {
+        // Tied to the other panel ([`Tie`]), its own spring did not move
+        // with it: from where it is drawn.
+        if !f.moving || f.tie.take().is_some() {
             f.from = Some(f.shown);
         }
         f.start = f.shown;
@@ -434,6 +506,27 @@ impl PanelFx {
     pub(crate) fn moving(&self) -> bool {
         self.sides.iter().any(|f| f.moving)
     }
+
+    /// Panel `i` yields (or comes back) on panel `by`'s flight: drawn off
+    /// its progress from here ([`Tie`]).
+    pub(crate) fn tie(&mut self, i: usize, by: usize) {
+        let by_from = self.sides[by].shown;
+        self.sides[i].tie = Some(Tie { by, from: self.sides[i].shown, by_from, rate: 0. });
+    }
+}
+
+/// How fast the centre's width changes at `at` (px/s): each panel on its
+/// spring then, a tied one at its cause's times its rate ([`Tie`]). What a
+/// layout riding them moves at (Shady #62 M4). Off the panels' flights and
+/// their springs, so a caller holding the layout's flight can read it.
+pub(crate) fn centre_velocity(fx: &crate::motion::Motion, panels: &PanelFx, at: std::time::Instant) -> f32 {
+    let sides = panels.sides;
+    let own = |i: usize| if sides[i].moving { fx.spring_velocity_at(PANEL_W[i], at).unwrap_or(0.) } else { 0. };
+    let v = |i: usize| match sides[i].tie {
+        Some(t) => t.rate * own(t.by),
+        None => own(i),
+    };
+    -(v(0) + v(1))
 }
 
 /// A shown value's hash, for its afterglow ([`crate::motion::Motion::glow`]).
@@ -1180,7 +1273,35 @@ impl AppView {
     /// changes at all (`list.rs` prepaint), and its scrollbar with them.
     pub(crate) fn panel_frame(&mut self, rail: Side, right: Side) -> (f32, f32) {
         let dragged = self.drag.filter(|g| g.moved).map(|g| usize::from(!g.rail));
-        for (i, side) in [rail, right].into_iter().enumerate() {
+        let sides = [rail, right];
+        // A tie holds while the causing panel flies, on its own (not
+        // dragged, not tied itself) toward a target it is not already at.
+        for i in 0..2 {
+            if let Some(t) = self.panel_fx.sides[i].tie {
+                let by = self.panel_fx.sides[t.by];
+                let gone = dragged.is_some()
+                    || by.tie.is_some()
+                    || !(by.moving || by.from.is_some())
+                    || (sides[t.by].width() - t.by_from).abs() < 0.5;
+                if gone {
+                    // From rest where it is drawn, on a spring of its own.
+                    let f = &mut self.panel_fx.sides[i];
+                    f.tie = None;
+                    if f.moving {
+                        f.from = Some(f.shown);
+                    }
+                }
+            }
+        }
+        // The causing panel first: a tied one is drawn off its width.
+        let tied = self.panel_fx.sides.map(|f| f.tie.is_some());
+        let order = if tied[0] { [1, 0] } else { [0, 1] };
+        for i in order {
+            let side = sides[i];
+            if let Some(t) = self.panel_fx.sides[i].tie {
+                self.tied_frame(i, t, side, sides[t.by]);
+                continue;
+            }
             let f = &mut self.panel_fx.sides[i];
             let to = side.width();
             if f.response == 0. {
@@ -1212,6 +1333,37 @@ impl AppView {
             }
         }
         (self.panel_fx.sides[0].shown, self.panel_fx.sides[1].shown)
+    }
+
+    /// Panel `i`, tied to the panel that made it yield ([`Tie`]): its width
+    /// this frame off that panel's, drawn already this frame, on the
+    /// device grid; landed in the frame that one lands (its own spring at
+    /// rest there). A tie let go mid-flight flies on from where it is drawn
+    /// (`from`: [`PanelFx::fly`], [`AppView::panel_frame`]).
+    fn tied_frame(&mut self, i: usize, t: Tie, side: Side, by_side: Side) {
+        let by = self.panel_fx.sides[t.by];
+        let to = side.width();
+        let f = &mut self.panel_fx.sides[i];
+        f.from = None;
+        if let Side::Open(ow) = side {
+            f.open = ow;
+        }
+        if f.response == 0. {
+            f.response = crate::motion::SHEET_RESPONSE;
+        }
+        if !by.moving {
+            f.tie = None;
+            (f.shown, f.moving) = (self.fx.snap(to), false);
+            self.fx.spring_jump(PANEL_W[i], to, to, f.response);
+            return;
+        }
+        let k = (by.shown - t.by_from) / (by_side.width() - t.by_from);
+        let (lo, hi) = (t.from.min(to).min(STRIP), t.from.max(to).max(f.open));
+        let at = t.from + (to - t.from) * k;
+        f.shown = self.fx.snap(at.clamp(lo, hi));
+        f.moving = true;
+        let rate = if at > lo && at < hi { (to - t.from) / (by_side.width() - t.by_from) } else { 0. };
+        f.tie = Some(Tie { rate, ..t });
     }
 
     /// A side panel (`rail`, else the right one) as drawn this frame. In

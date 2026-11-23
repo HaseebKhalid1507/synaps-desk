@@ -561,6 +561,23 @@ type FlightEnds = (crate::split::Node, crate::split::Node, Vec<PaneId>, Vec<Pane
 /// event, timer or effect addressed to one runs, that pane is swapped
 /// into `cur` for its length ([`crate::app::AppView::in_pane`]) and back:
 /// code that acts on "the pane" acts on that one, never on another.
+/// A layout flight taken over mid-flight (the panels' rule, fluid.md
+/// §2.1: it turns from where it is with its velocity).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Carry {
+    /// It flew on its own spring (its ends, its travel): the new one
+    /// starts at that velocity ([`crate::split::Flight::carried`]).
+    Spring(crate::split::Node, crate::split::Node, f32),
+    /// It rode a yielding panel (#51): the new one rides on from the width
+    /// the layout was last drawn at, on that panel turned back with its
+    /// own velocity ([`crate::chrome::PanelFx::fly`]: a close), or on the
+    /// same flights (no yield changed: a split down, Equalise; Shady #62
+    /// M4). One that can't ride (a yield changed as another panel flies)
+    /// starts at the velocity the ride had: its ends, its travel, the
+    /// centre's widths it rode between (`app.rs` `ride_velocity`).
+    Ride(crate::split::Node, crate::split::Node, f32, crate::split::Ride),
+}
+
 pub(crate) struct Panes {
     /// The pane acted on (the focused one, between events).
     pub(crate) cur: Pane,
@@ -577,6 +594,9 @@ pub(crate) struct Panes {
     pub(crate) tree: crate::split::Node,
     /// The layout's change in flight, on `sheet` (split.md §10).
     pub(crate) flight: Option<crate::split::Flight>,
+    /// The flight a new one took over: the new one carries its velocity
+    /// on, read on its first frame ([`Carry`]).
+    pub(crate) carry: Option<Carry>,
     /// A divider held down, or dragged (split.md §4).
     pub(crate) grab: Option<crate::split::Grab>,
     /// The window is too narrow (or short) for the split (split.md §5):
@@ -585,6 +605,10 @@ pub(crate) struct Panes {
     /// The layout as last drawn (a flight's step, else the tree): where
     /// the next flight starts (Shady #42 M1).
     pub(crate) drawn: crate::split::Node,
+    /// The frame a flight was last drawn in (its instant), while one flies:
+    /// a flight that takes it over starts from `drawn` as of then, so the
+    /// frame that makes it moves on, not draws `drawn` again.
+    pub(crate) drawn_at: Option<std::time::Instant>,
     /// The last generation handed out ([`Panes::next_gen`]).
     gens: u64,
 }
@@ -599,8 +623,10 @@ impl Panes {
             closing: Vec::new(),
             focused: id,
             drawn: tree.clone(),
+            drawn_at: None,
             tree,
             flight: None,
+            carry: None,
             grab: None,
             folded: false,
             gens: 0,
@@ -611,6 +637,17 @@ impl Panes {
     /// as drawn, and where the flight in the air goes (its closing panes in
     /// it at 0), with its growing and closing panes and its wraps; at rest,
     /// the tree.
+    /// A new flight takes over: the one in the air (measured: it has had a
+    /// frame) is what it turns from.
+    fn hand_over(&mut self) {
+        if let Some(f) = self.flight.as_ref().filter(|f| f.travel > 0.) {
+            self.carry = Some(match f.ride {
+                None => Carry::Spring(f.from.clone(), f.to.clone(), f.travel),
+                Some(r) => Carry::Ride(f.from.clone(), f.to.clone(), f.travel, r),
+            });
+        }
+    }
+
     fn flight_ends(&self) -> FlightEnds {
         use crate::split::Node;
         match &self.flight {
@@ -627,6 +664,7 @@ impl Panes {
     /// pane still growing or closing carries on).
     pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
         use crate::split::Flight;
+        self.hand_over();
         let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
         // A closing pane's id handed out again (all four in use): its share
         // keeps closing under a ghost's id, its ground only (its content
@@ -653,6 +691,7 @@ impl Panes {
     /// A close's flight (split.md §8, §10): `id`'s share to 0, the panes
     /// beside it taking it, every pane from where it is drawn.
     pub(crate) fn fly_close(&mut self, id: PaneId) {
+        self.hand_over();
         let (drawn, to, mut grow, mut ghosts, wrap) = self.flight_ends();
         grow.retain(|g| *g != id);
         ghosts.push(id);
@@ -668,6 +707,7 @@ impl Panes {
     /// Equalise mid-close snapped the closing share away).
     pub(crate) fn fly_to(&mut self, to: crate::split::Node, area: crate::split::Rect) {
         use crate::split::Flight;
+        self.hand_over();
         let (drawn, end, grow, ghosts, wrap) = self.flight_ends();
         let was = std::mem::replace(&mut self.tree, to.clone());
         let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
@@ -2162,7 +2202,9 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// panes across (the panels yield), then the window narrowed to fold.
 /// `filmarrive` (#47's landing): the rail folds and unfolds in one pane,
 /// then a split, and it folds and unfolds again; then the second pane
-/// closes (#54: the right panel comes back with it).
+/// closes (#54: the right panel comes back with it). `filmtails`: the
+/// 2-panel settle (the right panel tied to the rail) and two splits closed
+/// mid-flight (riding the right panel; on their own spring).
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -2249,6 +2291,76 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 sleep(0.1).await;
                 unfocus(cx);
                 sleep(1.4).await;
+                mark("done");
+                film_frames(&mut frames, t0);
+                return;
+            }
+            if how == "filmtails" {
+                // fix/split-motion-tails, every frame logged on the marks'
+                // clock (as `filmarrive`, nothing ambient). Two panes at
+                // 1920, the right panel yielded: the rail folds (the right
+                // panel comes back, drawn off the rail's progress) and
+                // unfolds (it yields again); the second pane closes. Then a
+                // split closed 80 ms into its flight, riding the right
+                // panel, which turns back; and with the right panel folded
+                // (nothing yields) a split closed 80 ms in, on its spring.
+                gpui_kit::profiler::set_trace_enabled(true);
+                let mut frames = gpui_kit::profiler::FrameTimingCollector::new();
+                let _ = FILM_LOG.set(t0);
+                act(cx, &|v, _, _| {
+                    for m in v.model.sessions.iter_mut() {
+                        (m.busy, m.subagents_running) = (false, 0);
+                    }
+                    v.model.rail_gen += 1;
+                    let idle = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+                    v.open_tab(idle, crate::tabs::Place::Current);
+                    let mut p = v.panels;
+                    (p.rail_width, p.right_width) = (Some(crate::theme::RAIL_WIDTHS.1), Some(crate::theme::RIGHT_WIDTHS.1));
+                    v.panels = p;
+                });
+                let unfocus = |cx: &mut AsyncWindowContext| {
+                    mark("unfocus");
+                    act(cx, &|v, w, cx| w.focus(&v.focus, cx));
+                };
+                let close_last = |v: &mut AppView, _: &mut Window, _: &mut Context<AppView>| {
+                    if let Some(last) = v.reading_order().last().copied() {
+                        v.in_pane(last, |v| v.close_pane());
+                    }
+                };
+                sleep(5.0).await;
+                mark("split");
+                act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+                sleep(0.1).await;
+                unfocus(cx);
+                sleep(1.9).await;
+                for what in ["fold", "unfold"] {
+                    mark(&format!("rail-{what}"));
+                    act(cx, &|v, _, cx| v.toggle_panel(true, cx));
+                    sleep(1.5).await;
+                }
+                mark("close");
+                act(cx, &close_last);
+                sleep(0.1).await;
+                unfocus(cx);
+                sleep(1.4).await;
+                for (what, right) in [("ride", false), ("own", true)] {
+                    if right {
+                        mark("right-fold");
+                        act(cx, &|v, _, cx| v.toggle_panel(false, cx));
+                        sleep(1.5).await;
+                    }
+                    mark(&format!("split-{what}"));
+                    act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+                    sleep(0.08).await;
+                    mark(&format!("close-mid-split-{what}"));
+                    act(cx, &close_last);
+                    sleep(0.1).await;
+                    unfocus(cx);
+                    sleep(1.5).await;
+                }
+                mark("right-unfold");
+                act(cx, &|v, _, cx| v.toggle_panel(false, cx));
+                sleep(1.5).await;
                 mark("done");
                 film_frames(&mut frames, t0);
                 return;
