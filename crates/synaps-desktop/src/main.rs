@@ -71,6 +71,8 @@ mod settings_view;
 mod shell;
 mod split;
 #[cfg(all(test, unix))]
+mod split_motion_tests;
+#[cfg(all(test, unix))]
 mod split_tests;
 mod stats;
 mod sticky;
