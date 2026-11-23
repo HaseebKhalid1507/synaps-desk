@@ -103,6 +103,32 @@ pub(crate) struct Ride {
 }
 
 impl Flight {
+    /// The velocity (px/s of its travel) this flight starts at, taking over
+    /// `was` (its ends and its travel) moving at `v` (px/s of that travel),
+    /// in `area`: each pane edge's velocity carried over as nearly as one
+    /// spring can carry it (least squares over the edges of the panes in
+    /// both). A reversal (a split's close mid-flight) carries it whole: the
+    /// layout turns from where it is with its speed, as a panel does
+    /// ([`crate::chrome::PanelFx::fly`]).
+    pub(crate) fn carried(&self, was: &(Node, Node, f32), v: f32, area: Rect) -> f32 {
+        let (a, b, len) = was;
+        if *len < 1. || self.travel < 1. {
+            return 0.;
+        }
+        let old = b.moves_from(a, area);
+        let (mut uw, mut ww) = (0f32, 0f32);
+        for (id, w) in self.to.moves_from(&self.from, area) {
+            ww += w.iter().map(|d| d * d).sum::<f32>();
+            if let Some((_, u)) = old.iter().find(|(i, _)| *i == id) {
+                uw += u.iter().zip(w).map(|(u, w)| u * w).sum::<f32>();
+            }
+        }
+        if ww < 1. {
+            return 0.;
+        }
+        self.travel * (v / len) * uw / ww
+    }
+
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
         Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
     }
@@ -742,7 +768,9 @@ impl Node {
     }
 
     /// Each split's ratios `t` of the way from `from`'s to this tree's
-    /// (`t` 1: this tree itself). Not the same shape: this tree.
+    /// (`t` 1: this tree itself). Not the same shape: this tree. Under 0
+    /// (a flight turning with the velocity of the one it took over: back
+    /// past `from` the way that one went), no share under 0.
     pub(crate) fn lerp_from(&self, from: &Node, t: f32) -> Node {
         if t >= 1. {
             return self.clone();
@@ -753,7 +781,12 @@ impl Node {
                 if axis == a2 && kids.len() == k2.len() =>
             {
                 let kids = kids.iter().zip(k2).map(|(k, f)| k.lerp_from(f, t)).collect();
-                let ratios = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                let mut ratios: Vec<f32> = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                if t < 0. {
+                    ratios.iter_mut().for_each(|r| *r = r.max(0.));
+                    let sum: f32 = ratios.iter().sum();
+                    ratios.iter_mut().for_each(|r| *r /= sum.max(f32::EPSILON));
+                }
                 Node::Split { axis: *axis, kids, ratios }
             }
             _ => self.clone(),
@@ -806,16 +839,19 @@ impl Node {
     /// How far a flight from `from` to this tree moves anything in `area`
     /// (the most any pane's edge travels, px): its spring's length.
     pub(crate) fn travel_from(&self, from: &Node, area: Rect) -> f32 {
+        self.moves_from(from, area).iter().flat_map(|(_, d)| d.iter()).fold(0f32, |m, d| m.max(d.abs()))
+    }
+
+    /// How far each pane in both trees moves its edges in `area` (px: left,
+    /// top, right, bottom), going from `from` to this tree.
+    pub(crate) fn moves_from(&self, from: &Node, area: Rect) -> Vec<(PaneId, [f32; 4])> {
         let (a, b) = (from.rects(area), self.rects(area));
-        let mut most = 0f32;
-        for (id, r) in &b {
-            if let Some((_, f)) = a.iter().find(|(i, _)| i == id) {
-                for d in [r.x - f.x, r.y - f.y, r.x + r.w - f.x - f.w, r.y + r.h - f.y - f.h] {
-                    most = most.max(d.abs());
-                }
-            }
-        }
-        most
+        b.iter()
+            .filter_map(|(id, r)| {
+                let (_, f) = a.iter().find(|(i, _)| i == id)?;
+                Some((*id, [r.x - f.x, r.y - f.y, r.x + r.w - f.x - f.w, r.y + r.h - f.y - f.h]))
+            })
+            .collect()
     }
 
     /// The panes in reading order (split.md §1): top to bottom, then left

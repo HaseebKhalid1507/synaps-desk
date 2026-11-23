@@ -572,6 +572,10 @@ pub(crate) struct Panes {
     pub(crate) tree: crate::split::Node,
     /// The layout's change in flight, on `sheet` (split.md §10).
     pub(crate) flight: Option<crate::split::Flight>,
+    /// The flight a new one took over, on its own spring (its ends and its
+    /// travel): the new one starts at its velocity
+    /// ([`crate::split::Flight::carried`]), read on its first frame.
+    pub(crate) carry: Option<(crate::split::Node, crate::split::Node, f32)>,
     /// A divider held down, or dragged (split.md §4).
     pub(crate) grab: Option<crate::split::Grab>,
     /// The window is too narrow (or short) for the split (split.md §5):
@@ -596,6 +600,7 @@ impl Panes {
             drawn: tree.clone(),
             tree,
             flight: None,
+            carry: None,
             grab: None,
             folded: false,
             gens: 0,
@@ -606,6 +611,14 @@ impl Panes {
     /// as drawn, and where the flight in the air goes (its closing panes in
     /// it at 0), with its growing and closing panes and its wraps; at rest,
     /// the tree.
+    /// A new flight takes over: the one in the air, if it flies on its own
+    /// spring (not riding a panel, measured), is what it turns from.
+    fn hand_over(&mut self) {
+        if let Some(f) = self.flight.as_ref().filter(|f| f.travel > 0. && f.ride.is_none()) {
+            self.carry = Some((f.from.clone(), f.to.clone(), f.travel));
+        }
+    }
+
     fn flight_ends(&self) -> FlightEnds {
         use crate::split::Node;
         match &self.flight {
@@ -622,6 +635,7 @@ impl Panes {
     /// pane still growing or closing carries on).
     pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
         use crate::split::Flight;
+        self.hand_over();
         let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
         // A closing pane's id handed out again (all four in use): its share
         // keeps closing under a ghost's id, its ground only (its content
@@ -648,6 +662,7 @@ impl Panes {
     /// A close's flight (split.md §8, §10): `id`'s share to 0, the panes
     /// beside it taking it, every pane from where it is drawn.
     pub(crate) fn fly_close(&mut self, id: PaneId) {
+        self.hand_over();
         let (drawn, to, mut grow, mut ghosts, wrap) = self.flight_ends();
         grow.retain(|g| *g != id);
         ghosts.push(id);
@@ -663,6 +678,7 @@ impl Panes {
     /// Equalise mid-close snapped the closing share away).
     pub(crate) fn fly_to(&mut self, to: crate::split::Node, area: crate::split::Rect) {
         use crate::split::Flight;
+        self.hand_over();
         let (drawn, end, grow, ghosts, wrap) = self.flight_ends();
         let was = std::mem::replace(&mut self.tree, to.clone());
         let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {

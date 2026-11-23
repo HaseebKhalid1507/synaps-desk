@@ -2119,6 +2119,23 @@ impl Motion {
         self.spring_held(key, at, SNAP_RESPONSE).0 - at
     }
 
+    /// [`Motion::spring_jump`] at `velocity` (px/s): a move that takes
+    /// over another turns from where it is with its speed (fluid.md §2.1).
+    pub(crate) fn spring_jump_moving(&self, key: u64, at: f32, target: f32, velocity: f32, response: f32) {
+        if self.level.get() != Level::Full {
+            return;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: velocity, at: now, frame, response });
+    }
+
+    /// Chrome position `key`'s velocity now (px/s), while it moves on a
+    /// spring.
+    pub(crate) fn spring_velocity(&self, key: u64) -> Option<f32> {
+        let now = self.now();
+        self.springs.borrow().get(&key).filter(|s| !s.settled(now)).map(|s| s.state(now).1)
+    }
+
     /// Where chrome position `key` was drawn last, if it is on a spring.
     pub(crate) fn spring_at(&self, key: u64) -> Option<f32> {
         let now = self.now();

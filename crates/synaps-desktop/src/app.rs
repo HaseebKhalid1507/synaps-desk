@@ -8572,6 +8572,13 @@ impl AppView {
             if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
                 self.panel_fx.fly(i == 0, crate::motion::SHEET_RESPONSE, true);
                 flew = true;
+                // On the other panel's flight: drawn off its progress, so
+                // the centre between them moves one way (#59's wobble).
+                let by = 1 - i;
+                let cause = self.panel_fx.sides[by];
+                if (cause.from.is_some() || cause.moving) && cause.tie.is_none() && was[by] == now[by] {
+                    self.panel_fx.tie(i, by);
+                }
             }
         }
         flew && !panels
@@ -8655,15 +8662,23 @@ impl AppView {
         let Some(f) = self.panes.flight.as_mut() else { return self.panes.tree.clone() };
         if f.travel == 0. {
             f.travel = f.to.travel_from(&f.from, area);
+            let carry = self.panes.carry.take();
             if f.travel < 1. {
                 self.panes.flight = None;
                 return self.panes.tree.clone();
             }
-            // From rest where it is drawn (a flight taking over another's
-            // starts again from there). Riding a panel: parked at rest,
-            // landed; read only if the ride is handed back (Shady #54 M2).
+            // From where it is drawn. A flight taking over another on its
+            // own spring turns with that one's velocity (the panels' rule:
+            // `PanelFx::fly`), as each edge's as one spring can carry it
+            // (`Flight::carried`); else from rest. Riding a panel: parked
+            // at rest, landed; read only if the ride is handed back (Shady
+            // #54 M2).
             let from = if f.ride.is_some() { f.travel } else { 0. };
-            self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
+            let v = carry
+                .filter(|_| f.ride.is_none())
+                .and_then(|was| Some(f.carried(&was, self.fx.spring_velocity(PANE_FLIGHT)?, area)))
+                .unwrap_or(0.);
+            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE);
         }
         // A panel yielding on it (#51): the layout rides the panel's
         // spring, by how far the centre has gone, and lands with it, in the
@@ -8690,7 +8705,8 @@ impl AppView {
             self.panes.flight = None;
             return self.panes.tree.clone();
         }
-        f.to.lerp_from(&f.from, (d / travel).clamp(0., 1.))
+        // Turning (a carried velocity): back past `from` as far as it goes.
+        f.to.lerp_from(&f.from, (d / travel).min(1.))
     }
 
     /// The layout changes to `to` on `sheet` from where it is drawn

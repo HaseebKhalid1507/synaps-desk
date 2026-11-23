@@ -5508,3 +5508,145 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
     let (layout, tabs) = crate::theme::load_restore(&path, &k, true);
     assert!(layout.is_some() && tabs.is_some(), "a launch reads it back");
 }
+
+// ── fix/split-motion-tails ──────────────────────────────────────────────
+
+/// [`on_a`] in a window `w` × `h`.
+#[allow(clippy::type_complexity)]
+fn on_a_at(
+    cx: &mut TestAppContext,
+    name: &str,
+    (w, h): (f32, f32),
+) -> (AnyWindowHandle, Entity<AppView>, Client, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
+    let (window, view) = open_sized(cx, w, h);
+    let (path, attaches) = start(name);
+    let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
+    until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        v.client = Some(client.clone());
+        v.model.tabs.open(A, "a", crate::tabs::Place::Current);
+        v.reconcile(None);
+        cx.notify();
+    });
+    let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
+    a.send(attached(A, None));
+    feed(cx, window, &view, &events, "A attached", |v| v.model.lives[v.panes.cur.live].is_active(A));
+    (window, view, client, a, attaches, events)
+}
+
+/// The divider's wobble on the 2-panel settle (#59's note, #54's
+/// neighbour): two panes at 1920, the rail wide and the right panel
+/// yielded to them. The rail folds and the right panel comes back, then
+/// the rail unfolds and the right panel yields again: both panels fly, the
+/// layout rides neither (the panes are the tree in the centre each frame).
+/// Frame by frame at 144 Hz the divider's x on screen moves one way only.
+/// On two springs of their own the panels stepped their half-pixels on
+/// alternate frames in the tail, so the centre's width (1920 − MARK − both)
+/// went 1407.5 / 1408 / 1407.5 and the divider back half a pixel, four
+/// times; the yielding panel is now drawn off the causing panel's progress
+/// ([`crate::chrome::Tie`]), so their edges step together.
+#[gpui_kit::test]
+fn the_divider_moves_one_way_through_a_two_panel_settle(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "settle", (1920., 1080.));
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_width, p.right_width) = (Some(crate::theme::RAIL_WIDTHS.1), Some(crate::theme::RIGHT_WIDTHS.1));
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    assert_eq!(
+        view.read_with(cx, |v, _| (v.panes.len(), v.pane_yield.map(|y| y.1))),
+        (2, Some(true)),
+        "two panes, the right panel yielded"
+    );
+    level(cx, crate::motion::Level::Full);
+    let mut fails = Vec::new();
+    for (what, yields) in [("fold", false), ("unfold", true)] {
+        view.update(cx, |v, cx| v.toggle_panel(true, cx));
+        let (mut xs, mut rest, mut both) = (Vec::new(), 0, false);
+        for _ in 0..400 {
+            frame_144(cx, window, &view);
+            xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
+            let (moving, sides) = view.read_with(cx, |v, _| {
+                (v.panes.flight.is_some() || v.panel_fx.moving(), v.panel_fx.sides.iter().filter(|f| f.moving).count())
+            });
+            both |= sides == 2;
+            rest = if moving { 0 } else { rest + 1 };
+            if rest >= 5 {
+                break;
+            }
+        }
+        assert!(both, "{what}: both panels flew");
+        assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(yields), "{what}: the right panel's yield");
+        let dir = (xs[xs.len() - 1] - xs[0]).signum();
+        eprintln!("SETTLE {what}: {} frames, {:?}", xs.len(), xs);
+        for (i, w) in xs.windows(2).enumerate() {
+            if (w[1] - w[0]) * dir < -0.01 {
+                fails.push(format!("{what}, frame {}: the divider went back, {} -> {}", i + 1, w[0], w[1]));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// A layout flight taken over mid-flight turns with its velocity (the
+/// panels' rule, `PanelFx::fly`: fluid.md §2.1): Ctrl+\ at 2560 (nothing
+/// yields), and 10 frames into its flight, Ctrl+W on the new pane. The
+/// divider was moving left at speed; the frame after the close it still
+/// moves left at least half as fast (from rest it all but stopped: the
+/// close started a new spring at 0), then turns once and goes right to
+/// the end, one pane left. Off: the close lands in its frame, as before.
+#[gpui_kit::test]
+fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "panes-carry", (2560., 1080.));
+    level(cx, crate::motion::Level::Full);
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    let mut xs = Vec::new();
+    for _ in 0..10 {
+        frame_144(cx, window, &view);
+        xs.extend(drawn(cx, window, "pane-divider Row".into()).map(|b| b[0]));
+    }
+    assert!(view.read_with(cx, |v, _| v.panes.flight.is_some()), "the split still in the air");
+    let k = xs.len();
+    key(cx, window, "ctrl-w");
+    let mut frames = 0;
+    while view.read_with(cx, |v, _| v.panes.flight.is_some()) {
+        frame_144(cx, window, &view);
+        frames += 1;
+        assert!(frames < 300, "the close never landed");
+        if let Some(b) = drawn(cx, window, "pane-divider Row".into()) {
+            xs.push(b[0]);
+        }
+    }
+    eprintln!("CARRY {k} frames of the split, then the close: {xs:?}");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "one pane left");
+    let steps: Vec<f32> = xs.windows(2).map(|w| w[1] - w[0]).collect();
+    let (before, after) = (steps[k - 2], steps[k - 1]);
+    assert!(before < -4., "the split's divider moving left at speed: {before} px a frame");
+    assert!(
+        after < 0. && after <= before * 0.5,
+        "the frame after the close still moves left at least half as fast: {after} px after {before} (from rest it stops)"
+    );
+    // One turn: left while it carries on, then right to the end.
+    let turn = steps[k - 1..].iter().position(|&s| s > 0.).expect("it turns");
+    let back = steps[k - 1 + turn..].iter().filter(|&&s| s < 0.).count();
+    assert_eq!(back, 0, "once turned, right to the end: {:?}", &steps[k - 1..]);
+    // Off: a split and its close land each in its frame.
+    level(cx, crate::motion::Level::Off);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    key(cx, window, "ctrl-w");
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some())), (1, false), "Off: landed in its frame");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
