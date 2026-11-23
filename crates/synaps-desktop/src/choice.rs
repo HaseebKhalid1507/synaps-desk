@@ -268,6 +268,31 @@ impl Target {
     pub fn provider(&self, act: usize) -> Option<String> {
         act.checked_sub(PROVIDER).and_then(|j| self.providers.get(j)).map(|(p, _)| p.clone())
     }
+
+    /// What row `act` stands for, whatever its index.
+    fn row(&self, act: usize) -> Option<Row> {
+        self.provider(act).map(Row::Provider).or_else(|| self.values.get(act).map(|(v, _)| Row::Value(v.clone())))
+    }
+
+    /// `row`'s act now: the same id (a model also written with or without
+    /// its provider, as the fallback row is), or the same provider.
+    fn act(&self, row: &Row) -> Option<usize> {
+        match row {
+            Row::Provider(p) => self.providers.iter().position(|(q, _)| q == p).map(|j| PROVIDER + j),
+            Row::Value(v) => {
+                let model = self.kind == Kind::Model;
+                self.values.iter().position(|(w, _)| w == v).or_else(|| self.values.iter().position(|(w, _)| model && same_model(w, v)))
+            }
+        }
+    }
+}
+
+/// A row by what it is, not where: the daemon's list replaces the values
+/// under an open menu, so an index would land on another model.
+#[derive(Clone, Debug, PartialEq)]
+enum Row {
+    Value(String),
+    Provider(String),
 }
 
 /// The pickers' state on the window: one open at a time, as every menu.
@@ -324,11 +349,19 @@ impl Choices {
 
     /// The open menu's rows again, the selection kept on the same value.
     fn refresh(&mut self) {
+        self.update(|_| {});
+    }
+
+    /// The open menu's target changed by `f` (the daemon's list, a pick, a
+    /// refusal) and its rows again, the selection kept on the same value or
+    /// provider: by what it is, not by its index (finish gate R1).
+    pub fn update(&mut self, f: impl FnOnce(&mut Target)) {
         let Some((m, t)) = self.menu.as_mut() else { return };
-        let was = m.sel.and_then(|i| m.items.get(i)).map(|it| it.act).filter(|a| *a != NOTE);
+        let was = m.sel.and_then(|i| m.items.get(i)).filter(|it| it.act != NOTE).and_then(|it| t.row(it.act));
+        f(t);
         m.items = t.items();
         m.sel = match was {
-            Some(a) => m.items.iter().position(|it| it.act == a && it.enabled()),
+            Some(r) => t.act(&r).and_then(|a| m.items.iter().position(|it| it.act == a && it.enabled())),
             None if m.born.is_none() => {
                 // From the keyboard: on the current value.
                 let cur = t.current_ix();
@@ -494,8 +527,10 @@ impl AppView {
         if let Ok(o) = &reply {
             self.choice.cache = Some((attach_seq, o.clone()));
         }
-        let Some((_, t)) = self.choice.menu.as_mut().filter(|(_, t)| t.attach_seq == attach_seq) else { return };
-        match &reply {
+        if self.choice.menu.as_ref().is_none_or(|(_, t)| t.attach_seq != attach_seq) {
+            return;
+        }
+        self.choice.update(|t| match &reply {
             Ok(o) => t.fill(Some(o)),
             Err(e) => {
                 if t.values.is_empty() || t.kind == Kind::Model {
@@ -503,8 +538,7 @@ impl AppView {
                 }
                 t.note = Some(e.clone());
             }
-        }
-        self.choice.refresh();
+        });
         self.model.view_dirty = true;
     }
 
@@ -764,6 +798,26 @@ mod tests {
         t.fill(Some(&opts()));
         c.open(t, at, None);
         assert_eq!(sel(&c).as_deref(), Some("Opus 5.5"), "past the head and Sonnet");
+    }
+
+    /// The daemon's list replaces the values under an open keyboard menu:
+    /// the selection stays on its value, not on its index (finish gate R1).
+    #[test]
+    fn the_daemon_s_list_keeps_the_selection_on_its_value() {
+        let at = At::Point(point(px(0.), px(0.)));
+        let sel = |c: &Choices| c.menu.as_ref().and_then(|(m, _)| m.sel.map(|i| m.items[i].label.to_string()));
+        let mut c = Choices::default();
+        let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
+        t.fill(None);
+        c.open(t, at, None);
+        c.update(|t| t.fill(Some(&opts())));
+        assert_eq!(sel(&c).as_deref(), Some("Opus 5.5"), "the current model, its provider's second");
+        let mut t = target(Kind::Thinking, "high");
+        t.fill(None);
+        c.open(t, at, None);
+        assert_eq!(sel(&c).as_deref(), Some("high"));
+        c.update(|t| t.fill(Some(&opts())));
+        assert_eq!(sel(&c).as_deref(), Some("high"), "fifth of the fallback levels, third of the daemon's");
     }
 
     /// The provider head shows only when other providers' rows follow

@@ -80,6 +80,80 @@ fn a_keyboard_picker_opens_on_the_current_value(cx: &mut TestAppContext) {
     }
 }
 
+/// The daemon's list arriving after a keyboard open keeps the selection on
+/// the current model, not on whatever row now has its index, so Enter
+/// changes nothing; a selection the keys moved stays on its model through
+/// a reordered list (finish gate R1, Shady #72).
+#[gpui_kit::test]
+fn the_daemon_s_late_list_keeps_a_keyboard_picker_on_its_model(cx: &mut TestAppContext) {
+    let (window, view) = open(cx);
+    let m = |id: &str, label: &str, provider: &str| ModelOption {
+        id: id.into(),
+        label: label.into(),
+        provider: provider.into(),
+        provider_key: provider.to_lowercase(),
+    };
+    let (sonnet, opus, gpt) = (
+        m("anthropic/claude-sonnet-4-6", "Sonnet 4.6", "Anthropic"),
+        m("anthropic/claude-opus-5-5", "Opus 5.5", "Anthropic"),
+        m("openai-codex/gpt-5.5", "GPT-5.5", "OpenAI Codex"),
+    );
+    let list = |models: Vec<ModelOption>| ModelOptions { model: "anthropic/claude-opus-5-5".into(), models, ..ModelOptions::default() };
+    let seq = view.update(cx, |v, _| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].transcript.apply(&synaps_client::SessionEvent::Idle);
+        let s = &mut v.model.lives[live].stats;
+        let mut info = s.view.clone().unwrap_or_default();
+        info.model = "anthropic/claude-opus-5-5".into();
+        s.view = Some(info);
+        v.model.lives[live].attachment().expect("attached")
+    });
+    // From the palette, as a supported daemon with nothing cached opens it:
+    // the current model alone while the list is asked for.
+    let open_picker = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| v.app_act(AppAct::ChangeModel, window, cx))).unwrap();
+        view.update(cx, |v, _| {
+            let (_, t) = v.choice.menu.as_mut().expect("a picker is open");
+            (t.note, t.loading) = (None, true);
+        });
+        cx.run_until_parked();
+    };
+    let reply = |cx: &mut TestAppContext, models: Vec<ModelOption>| {
+        view.update(cx, |v, cx| {
+            v.choice_options(seq, Ok(list(models)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    let key = |cx: &mut TestAppContext, k: &'static str| {
+        let ks = gpui_kit::Keystroke::parse(k).unwrap();
+        cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| v.choice_keydown(&ks, true, window, cx))).unwrap();
+        cx.run_until_parked();
+    };
+    let sel = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let (m, t) = v.choice.menu.as_ref().expect("a picker is open");
+            assert!(t.off.is_none(), "the demo session takes a pick: {:?}", t.off);
+            m.sel.and_then(|i| m.items.get(i)).map(|it| it.label.to_string())
+        })
+    };
+
+    open_picker(cx);
+    assert_eq!(sel(cx).as_deref(), Some("anthropic/claude-opus-5-5"), "the current model, before the list");
+    reply(cx, vec![sonnet.clone(), opus.clone(), gpt.clone()]);
+    assert_eq!(sel(cx).as_deref(), Some("Opus 5.5"), "still the current model, second in the list");
+    key(cx, "enter");
+    let after = view.read_with(cx, |v, _| v.choice.menu.as_ref().map(|(_, t)| t.pending));
+    assert_eq!(after, None, "Enter on the current model closes the picker and sets nothing");
+
+    open_picker(cx);
+    reply(cx, vec![sonnet.clone(), opus.clone(), gpt.clone()]);
+    key(cx, "up");
+    assert_eq!(sel(cx).as_deref(), Some("Sonnet 4.6"), "moved by the keys");
+    reply(cx, vec![gpt, opus, sonnet]);
+    assert_eq!(sel(cx).as_deref(), Some("Sonnet 4.6"), "kept on its model through a reordered list");
+}
+
 /// Frames until the window asks for none (at most 12).
 fn settle(cx: &mut TestAppContext, w: AnyWindowHandle) {
     for _ in 0..12 {
