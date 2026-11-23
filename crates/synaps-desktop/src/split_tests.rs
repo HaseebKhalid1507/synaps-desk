@@ -5531,7 +5531,7 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
     let _ = names(&mut a);
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
-    let (layout, tabs) = crate::theme::load_restore(&path, &k, Some(true));
+    let (layout, tabs) = crate::theme::load_restore(&path, &k, true);
     assert!(layout.is_some() && tabs.is_some(), "a launch reads it back");
 }
 
@@ -5599,7 +5599,7 @@ fn flag_off_a_saved_layout_is_neither_read_nor_written(cx: &mut TestAppContext) 
     let k = format!("test:persist-off-{}", std::process::id());
     let path = crate::theme::settings_path().expect("the tests' settings file");
     crate::theme::save_layout(&path, &k, &two_across(&[A], &[B], 1)).unwrap();
-    let (restore, tabs) = crate::theme::load_restore(&path, &k, Some(false));
+    let (restore, tabs) = crate::theme::load_restore(&path, &k, false);
     assert!(restore.is_none(), "flag off: no layout read");
     let (window, view, client, attaches, _events) = launch_in(cx, "persist-off", restore, tabs, false, (1280., 800.));
     view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
