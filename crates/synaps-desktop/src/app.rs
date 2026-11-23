@@ -9656,10 +9656,15 @@ impl Render for AppView {
                     // Its narrowest of the flight, set at its start, not this
                     // frame's box (it would rewrap as that moved). With a
                     // panel yielding on it, its narrower end (#51): it
-                    // moves linearly between them.
+                    // moves linearly between them. In the panels' flight
+                    // alone, its box at their narrowest centre, where they
+                    // land; not also this frame's box: on the window's
+                    // pixels (M2), at a centre's edge on a half pixel, that
+                    // is a fraction narrower every other frame, and the
+                    // column rewrapped 635/636 as the rail folded.
                     wrap: match ride_from {
                         Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
-                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
                     },
                     pane_to: of(&rects_to),
                     view_pane: pane,
