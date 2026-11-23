@@ -846,7 +846,8 @@ impl AppView {
                 "Jump to what is waiting",
                 k("Ctrl+J", "⌃J"),
                 "the authorize card".into(),
-                (l.transcript.pending_prompts().is_empty() && self.waiting_pane().is_none()).then_some("nothing is waiting on you"),
+                (l.transcript.pending_prompts().is_empty() && self.waiting_pane().is_none() && self.jump_elsewhere().is_none())
+                    .then_some("nothing is waiting on you"),
             ),
             (
                 AppAct::Favourite,
@@ -1048,6 +1049,24 @@ impl AppView {
         }
     }
 
+    /// Why Equalise would do nothing with more than one pane (Shady #44
+    /// n16): folded, the panes are not side by side; or they are even.
+    fn equalise_refusal(&self) -> Option<&'static str> {
+        if self.panes.folded {
+            return Some("no room at this window size");
+        }
+        let (w, h) = self.centre.get();
+        let area = crate::split::Rect { x: 0., y: 0., w, h };
+        let mut to = self.panes.tree.clone();
+        to.equalise_all(area);
+        let even = to
+            .rects(area)
+            .iter()
+            .zip(self.panes.tree.rects(area))
+            .all(|((_, a), (_, b))| (a.w - b.w).abs() < 0.5 && (a.h - b.h).abs() < 0.5);
+        even.then_some("already even")
+    }
+
     /// The palette's pane actions (split.md §2, A19), with split panes on:
     /// each with its key and, when it can't run, why.
     fn pane_entries(&self, mac: bool) -> Vec<AppEntry> {
@@ -1091,7 +1110,7 @@ impl AppView {
             (AppAct::FocusPrevPane, "Focus previous pane", k("Shift+F6", "⇧F6"), "".into(), one),
             (AppAct::MoveTabNext, "Move tab to the next pane", k("Ctrl+Alt+→", "⌘⌥→"), "".into(), mv(false)),
             (AppAct::MoveTabPrev, "Move tab to the previous pane", k("Ctrl+Alt+←", "⌘⌥←"), "".into(), mv(true)),
-            (AppAct::Equalise, "Equalise pane sizes", None, "".into(), one),
+            (AppAct::Equalise, "Equalise pane sizes", None, "".into(), one.or_else(|| self.equalise_refusal())),
             (AppAct::ClosePane, "Close pane", None, "closes its tabs; Ctrl+Shift+T reopens them".into(), one),
             (AppAct::JoinPanes, "Join all panes", None, "every tab into this pane".into(), one),
         ]);

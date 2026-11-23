@@ -120,6 +120,17 @@ impl<A: Copy> Menu<A> {
     /// A key (as GPUI names it; `shift` held; `press`: a new press, not a
     /// held key's repeat) while the menu is open. A repeat of Enter or
     /// Space picks nothing.
+    /// Its items' refusals as things are now (`why_not`, item by item): a
+    /// selected item that can no longer act gives way to the next that can.
+    pub fn reasons(&mut self, why: Vec<Option<SharedString>>) {
+        for (it, w) in self.items.iter_mut().zip(why) {
+            it.why_not = w;
+        }
+        if self.sel.is_some_and(|i| !self.items[i].enabled()) {
+            self.step(true);
+        }
+    }
+
     /// Opened by the pointer at `at` (it enters).
     pub fn born(mut self, at: std::time::Instant) -> Self {
         self.born = Some(at);
