@@ -1873,6 +1873,26 @@ pub struct AppView {
     /// The tabs to reopen once the first session list lands (gone
     /// sessions drop, with a notice).
     pub restore_tabs: Option<Saved>,
+    /// The split layout to restore (`layout.<key>`, split/architecture.md
+    /// §5), built before the first frame draws ([`Self::restore_layout_now`]).
+    pub restore_layout: Option<theme::Layout>,
+    /// Its panes' tabs, for the first session list ([`Self::start_tabs`]).
+    restore_panes: Vec<(PaneId, Saved)>,
+    /// The panes it restored whose tabs still wait for their sessions: one
+    /// whose tabs all close collapses (architecture §5).
+    restored: Vec<PaneId>,
+    /// The layout's ratios are re-clamped to the window when it is next
+    /// laid out ([`Self::pane_yields`]).
+    layout_clamp: bool,
+    /// The layout's generation ([`Self::layout_gen`]) handed to a save,
+    /// and the one written (or meant to stay unwritten); 0: none yet.
+    layout_saved: u64,
+    /// [`Self::layout_gen`]'s last key and what it gave (Shady #55 L4).
+    layout_hash: std::cell::Cell<(u64, u64)>,
+    /// How many times [`Self::layout_gen`] hashed the whole layout.
+    #[cfg(test)]
+    pub(crate) layout_hashes: std::cell::Cell<u32>,
+    layout_written: u64,
     /// Where the tabs are saved in the settings file (per daemon); `None`:
     /// not saved (bench).
     pub tabs_key: Option<String>,
@@ -2504,6 +2524,15 @@ impl AppView {
             start_session: None,
             default_session: None,
             restore_tabs: None,
+            restore_layout: None,
+            restore_panes: Vec::new(),
+            restored: Vec::new(),
+            layout_clamp: false,
+            layout_saved: 0,
+            layout_hash: Default::default(),
+            #[cfg(test)]
+            layout_hashes: Default::default(),
+            layout_written: 0,
             tabs_key: None,
             tabs_saved: 0,
             tabs_saved_pane: PaneId::FIRST,
@@ -3673,30 +3702,83 @@ impl AppView {
             self.model.view_dirty = true;
             self.reconcile(None);
         }
+        // A restored layout's panes (split/architecture.md §5): each its
+        // own tabs, waiting as one pane's do; the focused pane's attach
+        // first, the others' after their gate (§3.3), a session in two
+        // panes on one store (a pane's reconcile finds the store that
+        // has it: `repoint`).
+        if !self.restore_panes.is_empty() {
+            let focused = self.panes.focused;
+            let mut panes = std::mem::take(&mut self.restore_panes);
+            panes.sort_by_key(|(id, _)| *id != focused);
+            for (id, saved) in panes {
+                let ok = self.in_pane(id, |v| {
+                    if v.model.tabs.is_empty() {
+                        v.model.tabs.restore_here(&saved);
+                        v.model.rail_gen += 1;
+                        v.model.view_dirty = true;
+                        v.reconcile(None);
+                    }
+                });
+                if ok.is_some() {
+                    self.restored.push(id);
+                }
+            }
+            let first = self.panes.ids().first().copied().unwrap_or(self.panes.cur.id);
+            self.tabs_saved_pane = first;
+            self.tabs_saved = self.saved_tabs().generation;
+            self.tabs_written = self.tabs_saved;
+            self.layout_saved = self.layout_gen();
+            self.layout_written = self.layout_saved;
+        }
         if self.model.lists != self.lists_seen {
             self.lists_seen = self.model.lists;
-            let quiet = self.model.tabs.generation == self.tabs_saved;
+            let layout_quiet = self.layout_saved != 0 && self.layout_gen() == self.layout_saved;
             let sessions = std::mem::take(&mut self.model.sessions);
-            let shown = self.model.tabs.confirm(&sessions);
+            let (mut dropped, mut early) = (0, false);
+            // Every pane's restored tabs (one pane's, unless a layout was
+            // restored), said in one notice; the focused pane's first (its
+            // attach goes first, and a session another pane shows too is
+            // on that store when that pane's turn comes).
+            let mut ids = self.panes.ids();
+            let focused = self.panes.focused;
+            ids.sort_by_key(|id| *id != focused);
+            for id in ids {
+                self.in_pane(id, |v| {
+                    let first = v.panes.ids().first() == Some(&v.panes.cur.id);
+                    let quiet = first && v.model.tabs.generation == v.tabs_saved;
+                    let shown = v.model.tabs.confirm(&sessions);
+                    let gone = std::mem::take(&mut v.model.tabs.dropped);
+                    early |= std::mem::take(&mut v.model.tabs.dropped_early);
+                    dropped += gone;
+                    if quiet && gone > 0 {
+                        // Not saved without them: the file changes when the user
+                        // changes the tabs (a daemon slower than the lists keeps them).
+                        v.tabs_saved = v.model.tabs.generation;
+                        v.tabs_written = v.tabs_saved;
+                    }
+                    let vis = v.model.tabs.current().map(|t| (t.id, t.session.clone()));
+                    if vis != v.panes.cur.shown_tab {
+                        // A tab followed its session to a new id, or closed.
+                        v.model.rail_gen += 1;
+                        v.model.view_dirty = true;
+                        v.reconcile(None);
+                    } else if shown && let Some((_, Some(s))) = vis {
+                        v.model.rail_gen += 1;
+                        v.model.view_dirty = true;
+                        v.attach_tab(s, None);
+                    }
+                });
+            }
             self.model.sessions = sessions;
-            let dropped = std::mem::take(&mut self.model.tabs.dropped);
-            if quiet && dropped > 0 {
-                // Not saved without them: the file changes when the user
-                // changes the tabs (a daemon slower than the lists keeps them).
-                self.tabs_saved = self.model.tabs.generation;
-                self.tabs_written = self.tabs_saved;
+            self.collapse_restored();
+            if layout_quiet && dropped > 0 {
+                // The same for the layout: a pane collapsed so is not saved
+                // until the user changes the tabs or the panes.
+                self.layout_saved = self.layout_gen();
+                self.layout_written = self.layout_saved;
             }
-            let vis = self.model.tabs.current().map(|t| (t.id, t.session.clone()));
-            if vis != self.panes.cur.shown_tab {
-                // A tab followed its session to a new id, or closed.
-                self.model.rail_gen += 1;
-                self.model.view_dirty = true;
-                self.reconcile(None);
-            } else if shown && let Some((_, Some(s))) = vis {
-                self.model.rail_gen += 1;
-                self.model.view_dirty = true;
-                self.attach_tab(s, None);
-            }
+            self.model.tabs.dropped_early = early;
             self.restore_notice(dropped);
         }
         let start = self.start_session.take().or_else(|| self.default_session.take().filter(|_| self.model.tabs.is_empty()));
@@ -3706,6 +3788,115 @@ impl AppView {
             let fallback = self.model.tab_fallback(&id);
             self.open_tab(Open::Attach { session_id: id, fallback, open: false }, place);
         }
+    }
+
+    /// A restored pane whose tabs have all closed collapses, by the rule
+    /// of a closed last tab (split/architecture.md §5): the tree
+    /// normalises; every pane empty, one empty pane is left. One whose tabs
+    /// no longer wait is let go.
+    fn collapse_restored(&mut self) {
+        for id in std::mem::take(&mut self.restored) {
+            let state = self.in_pane(id, |v| (v.model.tabs.is_empty(), v.model.tabs.iter().any(|t| v.model.tabs.restoring(t.id))));
+            match state {
+                Some((true, _)) if self.panes.len() > 1 => {
+                    self.in_pane(id, |v| v.close_pane());
+                }
+                Some((false, true)) => self.restored.push(id),
+                _ => {}
+            }
+        }
+    }
+
+    /// A saved layout (split/architecture.md §5; split panes on), before
+    /// the first frame draws: its panes, its tree and its focus as they
+    /// were, with no flight (a launch draws its final layout on its first
+    /// frame, #36 R1); each pane's tabs come with the first session list
+    /// ([`Self::start_tabs`]) and its ratios are re-clamped to the window
+    /// as it is first laid out ([`Self::pane_yields`]). One pane: its tabs
+    /// are `tabs.<key>`'s. Split panes off: the tabs alone, as before.
+    fn restore_layout_now(&mut self, layout: theme::Layout, window: &mut Window, cx: &mut Context<Self>) {
+        // Split panes off: no layout (Shady #55 n2), the tabs as they are.
+        if !self.split_on() {
+            return;
+        }
+        // Its panes with no session tabs left out now, so this frame is the
+        // final layout (Shady #55 L2): no pane shows to close on the list.
+        let layout = layout.without_empty_panes();
+        if layout.panes.len() < 2 || self.panes.split() {
+            if self.restore_tabs.is_none() {
+                self.restore_tabs = Some(layout.union());
+            }
+            return;
+        }
+        let mut ids = vec![self.panes.cur.id];
+        for _ in 1..layout.panes.len() {
+            let Some(new) = self.panes.free_id() else { break };
+            let live = self.fresh_live();
+            let (composer, secret, allow_all, subs) = Self::pane_inputs(new, window, cx);
+            let mut pane = Pane::fresh(new, live, composer, secret, allow_all, subs);
+            self.fx.col(new).reset();
+            pane.parked.tabs = crate::tabs::Tabs::numbered_from(self.panes.next_gen() << 32);
+            pane.list_gen = self.panes.next_gen();
+            pane.metrics_gen = self.panes.cur.metrics_gen;
+            pane.full_rebuild = true;
+            self.panes.rest.push(pane);
+            ids.push(new);
+        }
+        self.panes.tree = crate::split::Node::from_saved(&layout.tree, &ids);
+        self.panes.drawn = self.panes.tree.clone();
+        self.panes.flight = None;
+        self.layout_clamp = true;
+        let focused = ids.get(layout.focused).copied().unwrap_or(ids[0]);
+        self.focus_pane(focused, crate::pane::KeysTo::Pane, cx);
+        self.restore_panes = ids.into_iter().zip(layout.panes).collect();
+        self.restore_tabs = None;
+        self.model.rail_gen += 1;
+        self.model.view_dirty = true;
+    }
+
+    /// The layout the settings file keeps now (split panes on;
+    /// split/architecture.md §5): the tree, each pane's tabs in its order,
+    /// the focused pane.
+    pub(crate) fn layout_now(&self) -> theme::Layout {
+        let order = self.panes.tree.leaves();
+        let tabs = |id: PaneId| match self.panes.rest.iter().find(|p| p.id == id) {
+            Some(p) => p.parked.tabs.saved(),
+            None => self.model.tabs.saved(),
+        };
+        theme::Layout {
+            focused: order.iter().position(|id| *id == self.panes.focused).unwrap_or(0),
+            tree: self.panes.tree.to_saved(&order),
+            panes: order.iter().map(|id| tabs(*id)).collect(),
+        }
+    }
+
+    /// The layout's generation: it changes with what [`Self::layout_now`]
+    /// would write (a split, a close, a divider let go, a focus change,
+    /// any pane's tabs), and is the same again when a change is undone.
+    /// Never 0. Each frame asks (Shady #55 L4): a cheap key first (the
+    /// tree, the focus, each pane and its tabs' generation), the whole
+    /// layout hashed again only when the key moved.
+    fn layout_gen(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut k = std::collections::hash_map::DefaultHasher::new();
+        self.panes.tree.hash_shape(&mut k);
+        self.panes.focused.hash(&mut k);
+        (self.panes.cur.id, self.panes.cur.list_gen, self.model.tabs.generation).hash(&mut k);
+        for p in &self.panes.rest {
+            (p.id, p.list_gen, p.parked.tabs.generation).hash(&mut k);
+        }
+        let key = k.finish();
+        let (was, hash) = self.layout_hash.get();
+        if was == key && hash != 0 {
+            return hash;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.layout_now()).hash(&mut h);
+        let hash = h.finish().max(1);
+        self.layout_hash.set((key, hash));
+        #[cfg(test)]
+        self.layout_hashes.set(self.layout_hashes.get() + 1);
+        hash
     }
 
     /// Restored tabs closed (their sessions never came back): said once,
@@ -3827,6 +4018,9 @@ impl AppView {
     }
 
     fn schedule_tabs_save(&mut self, cx: &mut Context<Self>) {
+        if self.split_on() {
+            return self.schedule_layout_save(cx);
+        }
         let first = self.panes.ids().first().copied().unwrap_or(self.panes.cur.id);
         if self.tabs_key.is_none()
             || self.bench.is_some()
@@ -3962,9 +4156,63 @@ impl AppView {
         }
     }
 
+    /// Split panes on (split/architecture.md §5): the layout changed since
+    /// the last save, saved [`SAVE_DELAY`] later off the UI thread with
+    /// `tabs.<key>` as its union ([`theme::save_layout`]). Not while a
+    /// restore waits for its first session list (nothing to lose yet), nor
+    /// while a divider is dragged (its release is the change); a launch's
+    /// own layout is the one the file has.
+    fn schedule_layout_save(&mut self, cx: &mut Context<Self>) {
+        if self.tabs_key.is_none()
+            || self.bench.is_some()
+            || self.restore_tabs.is_some()
+            || self.restore_layout.is_some()
+            || !self.restore_panes.is_empty()
+            || self.panes.grab.as_ref().is_some_and(|g| g.moved)
+        {
+            return;
+        }
+        let generation = self.layout_gen();
+        if self.layout_saved == 0 {
+            (self.layout_saved, self.layout_written) = (generation, generation);
+        }
+        if generation == self.layout_saved {
+            return;
+        }
+        self.layout_saved = generation;
+        self.tabs_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+            let job = this.update(cx, |v, _| (theme::settings_path(), v.tabs_key.clone(), v.layout_now(), v.layout_gen())).ok();
+            let Some((Some(path), Some(key), layout, generation)) = job else { return };
+            let done = cx.background_spawn(async move { theme::save_layout(&path, &key, &layout) }).await;
+            let _ = this.update(cx, |v, cx| match done {
+                Ok(()) => v.layout_written = generation,
+                Err(e) => {
+                    v.model.named.notice = Some(format!("Tabs not saved: {e}"));
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     /// Tabs changed since the last write, written now (the window closes,
-    /// the app quits), whether or not a frame scheduled the save.
-    fn flush_tabs(&mut self) {
+    /// the app quits), whether or not a frame scheduled the save; with
+    /// split panes, the layout and its union.
+    pub(crate) fn flush_tabs(&mut self) {
+        if self.split_on() {
+            self.tabs_save = None;
+            let pending = self.restore_tabs.is_some() || self.restore_layout.is_some() || !self.restore_panes.is_empty();
+            if self.tabs_key.is_none() || self.bench.is_some() || pending || self.layout_gen() == self.layout_written {
+                return;
+            }
+            if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+                match theme::save_layout(&path, key, &self.layout_now()) {
+                    Ok(()) => self.layout_written = self.layout_gen(),
+                    Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+                }
+            }
+            return;
+        }
         self.tabs_save = None;
         if self.tabs_key.is_none() || self.bench.is_some() || self.saved_tabs().generation == self.tabs_written {
             return;
@@ -5107,9 +5355,13 @@ impl AppView {
     /// The session tab is on screen and its card shows the first prompt.
     /// Not over a worker's view: the card is the session's, and Esc there
     /// goes back to it. Not while its pane's rows are held (Shady #48 r2
-    /// L1): its buttons and keys arm from the frame its row first draws.
+    /// L1) or its split's share clips it (#53 R3-L1): its buttons and keys
+    /// arm from the frame they are first drawn whole. Not in a pane the
+    /// fold hides (#53 R3-L2): it waits again when widening shows it.
     fn card_up(&self) -> bool {
         !self.panes.cur.hold_rows
+            && !self.panes.cur.clipped
+            && (!self.panes.folded || self.panes.cur.id == self.panes.focused)
             && self.model.tabs.view().is_none()
             && self.model.lives[self.panes.cur.live].watch.focus().is_none()
             && self.current_card().is_some()
@@ -7800,25 +8052,40 @@ impl AppView {
         // lands: nothing changes after the last frame that moves (#50).
         let (drawn_at, land_at) = (self.panes.cur.rect.get(), self.panes.cur.land.get());
         let left = (land_at.w - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
-        let hold = self.panes.cur.hold_rows
-            && left > crate::pane::HOLD_UNTIL
-            && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        // A new pane laid out at its landed size in a share still more
+        // than that short of it: its card's buttons may be cut off (#53
+        // R3-L1). Within it they are whole: the share clips at most
+        // `HOLD_UNTIL` px off its far side, inside the column's padding and
+        // the card's own, or the composer under it.
+        let clipped = left > crate::pane::HOLD_UNTIL && self.panes.flight.as_ref().is_some_and(|f| f.grow.contains(&self.panes.cur.id));
+        let hold = self.panes.cur.hold_rows && clipped;
         let released = self.panes.cur.hold_rows && !hold;
         if released {
-            // The rows come in: they lift on `quick` (finish gate #48 r2
-            // N2), and the card's buttons and keys wait from this frame, the
-            // first that draws its row (Shady #48 r2 L1), not from the
-            // next frame's sync, a click's width later.
+            // The rows come in: they lift on `quick` (finish gate #48 r2 N2).
             self.panes.cur.rows_in = self.fx.fluid().then(|| self.fx.now());
+        }
+        if clipped {
+            // The card's buttons and keys wait from each frame that clips them.
             if let Some(c) = self.panes.cur.card.as_mut() {
                 c.arm = Arm::new(Instant::now());
-                c._arm = Some(Self::arm_repaint(cx));
             }
             self.panes.cur.keys_live = false;
         }
         self.panes.cur.hold_rows = hold;
-        if released {
-            self.panes.cur.card_was_up = self.card_up();
+        self.panes.cur.clipped = clipped;
+        // On screen now, not at this frame's sync: its buttons drawn whole
+        // (#53 R3-L1; Shady #48 r2 L1: its row's first frame), or a pane the
+        // fold hid shown (#53 R3-L2: the fold is judged after the sync).
+        // They and the keys wait from this frame, not from the next sync's,
+        // a click's width later.
+        if !self.panes.cur.card_was_up && self.card_up() {
+            if let Some(c) = self.panes.cur.card.as_mut() {
+                log::info!(target: "synaps_desktop::card", "card {:?}: drawn whole, waiting", c.key);
+                c.arm = Arm::new(Instant::now());
+                c._arm = Some(Self::arm_repaint(cx));
+            }
+            self.panes.cur.keys_live = false;
+            self.panes.cur.card_was_up = true;
         }
         let (pad_l, pad_r) = lay.padding();
         // Nothing over the list but the tab strip: the first row's own gap
@@ -8190,6 +8457,7 @@ impl AppView {
                 // open pane's now), an empty pane's ground.
                 if self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&id)) {
                     let share = div()
+                        .id(("pane-closing", id.index()))
                         .flex_none()
                         .w(px(r.w))
                         .h(px(r.h))
@@ -8205,7 +8473,12 @@ impl AppView {
                             .into_any_element(),
                     };
                 }
+                // Its own id: what is laid out in it is its own (two panes
+                // on one session draw the same card, and its buttons by one
+                // id shared GPUI's state: a click on the later pane's Allow
+                // was dropped by the other's).
                 self.probe(h_flex(), "pane")
+                    .id(("pane", id.index()))
                     .flex_none()
                     .w(px(r.w))
                     .h(px(r.h))
@@ -8276,6 +8549,33 @@ impl AppView {
         (l, r)
     }
 
+    /// A panel that yields to the split, or comes back from it, moves on
+    /// the flight of what made it (#51): a rail's fold or unfold, a split,
+    /// a close. It springs with it on `sheet` as a fold does, so the panes
+    /// re-wrap once, and land with it. A window resize (the window
+    /// manager's) and anything else not in flight stay a cut, as the
+    /// panels' own widths do then. `was`: the yields of the frame before.
+    /// Whether it flies on the layout's flight alone (the layout then
+    /// rides it: [`crate::split::Flight::ride`]). A panel already flying
+    /// (Ctrl+B, then Ctrl+\ inside its flight) rides nothing: the layout
+    /// flies on its own spring over the moving centre, as before #51.
+    fn yield_on_flight(&mut self, was: Option<(bool, bool, bool)>, resized: bool) -> bool {
+        let panels = self.panel_fx.sides.iter().any(|f| f.from.is_some() || f.moving);
+        if resized || !(panels || self.panes.flight.is_some()) {
+            return false;
+        }
+        let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
+        let (was, now) = (of(was), of(self.pane_yield));
+        let mut flew = false;
+        for i in 0..2 {
+            if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
+                self.panel_fx.fly(i == 0, crate::motion::SHEET_RESPONSE, true);
+                flew = true;
+            }
+        }
+        flew && !panels
+    }
+
     /// [`AppView::pane_sides`], judged now.
     fn pane_yields(&mut self, rail: Side, right: Side) -> (Side, Side) {
         use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
@@ -8286,6 +8586,19 @@ impl AppView {
         // Every pane at its minimum in a centre `w` wide, as laid out.
         let fits = |w: f32| tree.rects(Rect { x: 0., y: 0., w, h }).iter().all(|(_, r)| r.w + 0.5 >= PANE_MIN_W && r.h + 0.5 >= PANE_MIN_H);
         let right = if centre(rail, right) + 0.5 >= wide { right } else { Side::Strip };
+        // A restored layout's ratios, re-clamped to this window first
+        // (split/architecture.md §5): every pane at its minimum if it can be.
+        if std::mem::take(&mut self.layout_clamp) {
+            for (l, r) in [(rail, right), (Side::Strip, right)] {
+                let area = Rect { x: 0., y: 0., w: centre(l, r), h };
+                let c = tree.clamped(area);
+                if c.rects(area).iter().all(|(_, r)| r.w + 0.5 >= PANE_MIN_W && r.h + 0.5 >= PANE_MIN_H) {
+                    self.panes.drawn = c.clone();
+                    self.panes.tree = c;
+                    return (l, r);
+                }
+            }
+        }
         for (l, r) in [(rail, right), (Side::Strip, right)] {
             if fits(centre(l, r)) {
                 return (l, r);
@@ -8343,8 +8656,30 @@ impl AppView {
                 return self.panes.tree.clone();
             }
             // From rest where it is drawn (a flight taking over another's
-            // starts again from there).
-            self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
+            // starts again from there). Riding a panel: parked at rest,
+            // landed; read only if the ride is handed back (Shady #54 M2).
+            let from = if f.ride.is_some() { f.travel } else { 0. };
+            self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
+        }
+        // A panel yielding on it (#51): the layout rides the panel's
+        // spring, by how far the centre has gone, and lands with it (the
+        // frame the panel is drawn at its target, #50).
+        if let Some(r) = f.ride {
+            if self.panel_fx.moving() {
+                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(0., 1.) };
+                let at = |w: f32| crate::split::Rect { w, ..area };
+                return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
+            }
+            let now = self.fx.now();
+            match r.landed {
+                Some(at) if at < now => self.panes.flight = None,
+                Some(_) => {}
+                None => {
+                    f.ride = Some(crate::split::Ride { landed: Some(now), ..r });
+                    self.fx.want_frame();
+                }
+            }
+            return self.panes.tree.clone();
         }
         let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
         if let Some(t0) = crate::pane::FILM_LOG.get() {
@@ -8529,6 +8864,9 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        if let Some(layout) = self.restore_layout.take() {
+            self.restore_layout_now(layout, window, cx);
+        }
         self.apply_keys(window, cx);
         if std::mem::take(&mut self.keys_rearm) {
             let focused = self.panes.focused;
@@ -8678,7 +9016,8 @@ impl Render for AppView {
         // A window resize is the window manager's (fluid.md §3.8, `follow`):
         // the dock and the draft take the heights it gives them at once, as
         // after a switch.
-        if (width, height) != (self.width, self.height) {
+        let resized = (width, height) != (self.width, self.height);
+        if resized {
             for pane in self.panes.iter() {
                 pane.dock_h.set(f32::NAN);
                 pane.composer_h.set(f32::NAN);
@@ -8692,7 +9031,9 @@ impl Render for AppView {
         // drew the old bar).
         self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
+        let yielded = self.pane_yield;
         let (rail, right) = self.pane_sides(rail, right);
+        let with_panes = self.yield_on_flight(yielded, resized);
         if let Side::Open(w) = rail {
             self.rail_width = w;
         }
@@ -8714,6 +9055,30 @@ impl Render for AppView {
         let pane = column_of(&[crate::chrome::MARK, rail_w, right_w]);
         let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
         self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
+        // At Reduced and Off the panel is there at once, the layout too.
+        // Over a view the layout is drawn without the right panel (below:
+        // `view_pane`), so it has nothing to ride: it flies on its own
+        // spring (Shady #54 M1).
+        if with_panes
+            && self.panel_fx.moving()
+            && !(view.is_some() && !self.panes.split())
+            && let Some(f) = self.panes.flight.as_mut()
+        {
+            f.ride = Some(crate::split::Ride { from: pane, to: pane_to, landed: None });
+        }
+        // Its ends moved under it (a fold or unfold, an edge drag, a width
+        // reset, a resize): the layout flies on from where it is drawn on
+        // its own spring, from rest, as on main (Shady #54 M2). Its wraps
+        // carry on, the narrower kept (`wrap_at`: none yet).
+        if let Some(f) = self.panes.flight.as_mut()
+            && let Some(r) = f.ride.filter(|r| r.landed.is_none())
+            && (resized || (r.to - pane_to).abs() >= 0.5)
+        {
+            f.from = self.panes.drawn.clone();
+            f.ride = None;
+            f.travel = 0.;
+            f.wrap_at = None;
+        }
         let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
@@ -8772,6 +9137,8 @@ impl Render for AppView {
             // measured the list again).
             let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            // A panel yielding on the layout's flight (#51): its own ends.
+            let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
             // The tree itself drawn (the pixel landing, before the spring
             // rests): each column at its landed wrap in this frame, the
@@ -8781,7 +9148,10 @@ impl Render for AppView {
             // Each pane's wrap in the flight, from its ends at the panels'
             // narrowest centre (Shady #42 L2).
             if let Some(f) = self.panes.flight.as_mut() {
-                f.set_wraps(area(wrap));
+                match ride_from {
+                    Some(from) => f.set_wraps_at(area(from), area(pane_to)),
+                    None => f.set_wraps(area(wrap)),
+                }
             }
             // Where each closing share goes (its rectangle at 0).
             let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
@@ -8818,15 +9188,24 @@ impl Render for AppView {
                         r.w.min(l.w)
                     }
                 });
-                let pane = if grows { l.w } else { r.w };
+                let pane = match (grows, ride_from) {
+                    (true, Some(_)) => of(&rects_to),
+                    (true, None) => l.w,
+                    _ => r.w,
+                };
                 // One pane left (a close's flight to it): its height read
                 // as one pane's is (under the full bar), as it lands.
                 let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
                     pane,
                     // Its narrowest of the flight, set at its start, not this
-                    // frame's box (it would rewrap as that moved).
-                    wrap: of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                    // frame's box (it would rewrap as that moved). With a
+                    // panel yielding on it, its narrower end (#51): it
+                    // moves linearly between them.
+                    wrap: match ride_from {
+                        Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
+                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                    },
                     pane_to: of(&rects_to),
                     view_pane: pane,
                     win_h,
@@ -8838,7 +9217,7 @@ impl Render for AppView {
                     v.panes.cur.land.set(l);
                     v.pane_main(g, window, cx)
                 }) {
-                    let el = if grows { div().flex_none().w(px(l.w)).h(px(l.h)).child(el) } else { el };
+                    let el = if grows { div().flex_none().w(px(pane)).h(px(l.h)).child(el) } else { el };
                     mains.push((*id, el));
                 }
             }

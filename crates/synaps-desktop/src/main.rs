@@ -301,7 +301,15 @@ fn main() {
     };
 
     let load = |k: Option<&str>| k.and_then(|k| settings.as_deref().and_then(|p| theme::load_tabs(p, k)));
-    let restore_tabs = load(tabs_key.as_deref()).or_else(|| load(legacy_key.as_deref()));
+    // The split layout first (split panes step 5): whole and still the
+    // tabs' union, else the tabs as one pane (an older file, or one an
+    // older build wrote since).
+    // Split panes off, the layout is never read (Shady #55 n2); the file
+    // is read once for both (n3).
+    let split_env = settings_view::split_env();
+    let (restore_layout, tabs) =
+        tabs_key.as_deref().zip(settings.as_deref()).map(|(k, p)| theme::load_restore(p, k, split_env)).unwrap_or_default();
+    let restore_tabs = tabs.or_else(|| load(legacy_key.as_deref()));
     // The favourites, under the same key (a bench has none).
     let favs = tabs_key.as_deref().zip(settings.as_deref()).map(|(k, p)| theme::load_favourites(p, k)).unwrap_or_default();
     if let (Some(k), Some(p)) = (tabs_key.as_deref(), settings.as_deref()) {
@@ -349,6 +357,7 @@ fn main() {
                 v.start_session = start_session;
                 v.tabs_key = tabs_key;
                 v.restore_tabs = restore_tabs;
+                v.restore_layout = restore_layout;
                 v.model.favs = favourites::Favourites::new(favs);
                 v.picker_open = open_picker;
                 if let Some(mode) = open_palette {
