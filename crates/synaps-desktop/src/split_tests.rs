@@ -5967,25 +5967,36 @@ fn a_tabs_menu_leads_with_the_pane_items(cx: &mut TestAppContext) {
 
 /// Split panes step 6 (architecture §7, split.md §10): at Reduced and at
 /// Off a split, an equalise and a close each land in the frame that makes
-/// them, the panels with them: every frame drawn, recorded at its paint
-/// (#61's [`draws`]), is landed, the move's own first. With the window's
-/// focus on its root (no caret) and a Reduced fade's `quick` over, a second
-/// at 144 Hz drawing only the frames the app asks for ([`idle_step`])
-/// draws none: no spring is left armed at rest.
+/// them, the panels with them. Every frame drawn is recorded at its paint
+/// (#61's [`draws`]; the equalise's uneven start set up before): the first
+/// is the move's, landed (nothing flying, the drawn layout the tree), with
+/// its panes (2, 2, 1) and, for the equalise, even ratios; so is every one
+/// after. At Off the move draws its frame alone (a split one more: its new
+/// pane's keys follow at the next frame). With the window's focus on its
+/// root (no caret) and a Reduced fade's `quick` over, a second at 144 Hz
+/// drawing only the frames the app asks for ([`idle_step`]) runs no frame
+/// callback and paints nothing: no spring is left armed at rest (Shady #59
+/// r2 L5.3).
 #[gpui_kit::test]
 fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_armed(cx: &mut TestAppContext) {
     use crate::palette::AppAct;
+    // The frames an Off split, equalise and close draw, all told: the
+    // move's, and a split's one more (its new pane's keys follow at the
+    // next frame: `apply_keys`).
+    const OFF_DRAWS: (usize, usize, usize) = (2, 1, 1);
     let (window, view, client, _a, _attaches, _events) = on_a(cx, "step6-levels", None);
     let _ = cx.update_window(window, |_, window, _| window.activate_window());
     for l in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
         level(cx, l);
-        type Step<'a> = (&'a str, Box<dyn Fn(&mut TestAppContext) + 'a>);
+        // Each step: its setup (not observed), its act, and the panes it
+        // leaves.
+        type Step<'a> = (&'a str, Box<dyn Fn(&mut TestAppContext) + 'a>, Box<dyn Fn(&mut TestAppContext) + 'a>, usize);
         let steps: [Step; 3] = [
-            ("split", Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-\\"))),
+            ("split", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-\\")), 2),
             (
                 "equalise",
+                // Off even first, as a divider's drag leaves it, drawn so.
                 Box::new(|cx: &mut TestAppContext| {
-                    // Off even first, as a divider's drag leaves it.
                     view.update(cx, |v, cx| {
                         if let crate::split::Node::Split { ratios, .. } = &mut v.panes.tree {
                             *ratios = vec![0.3, 0.7];
@@ -5994,34 +6005,81 @@ fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_arm
                         cx.notify();
                     });
                     frame(cx, window);
-                    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::Equalise, w, cx)));
+                    idle_step(cx, window, &view, Duration::from_millis(300));
                 }),
+                Box::new(|cx: &mut TestAppContext| {
+                    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::Equalise, w, cx)));
+                    frame(cx, window);
+                }),
+                2,
             ),
-            ("close", Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-w"))),
+            ("close", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-w")), 1),
         ];
-        for (what, act) in steps.iter() {
+        for (what, setup, act, panes) in steps.iter() {
+            setup(cx);
             // Every frame drawn from here (#61's per-draw probe, Shady #59
-            // L5.3: a check after `frame` helpers that drain the executor
-            // could miss a draw between them).
-            let seen = draws(cx, &view, |v| (v.panes.flight.is_some() || v.panel_fx.moving(), v.panes.len()));
+            // L5.3): whether anything moved, the panes, the drawn layout's
+            // ratios, and whether the drawn layout is the tree.
+            let seen = draws(cx, &view, |v| {
+                let ratios = match &v.panes.drawn {
+                    crate::split::Node::Split { ratios, .. } => ratios.clone(),
+                    crate::split::Node::Leaf(_) => vec![1.],
+                };
+                (v.panes.flight.is_some() || v.panel_fx.moving(), v.panes.len(), ratios, v.panes.drawn == v.panes.tree)
+            });
+            let was = view.read_with(cx, |v, _| {
+                let ratios = match &v.panes.drawn {
+                    crate::split::Node::Split { ratios, .. } => ratios.clone(),
+                    crate::split::Node::Leaf(_) => vec![1.],
+                };
+                (v.panes.len(), ratios)
+            });
             act(cx);
-            // The move's own frame (a key's: `key` draws it), and one more
-            // only if the app asks for it.
+            // The move's own frame (`key` and the equalise's `frame` draw
+            // it), then one more only if the app asks for it.
             asked_frame(cx, window, &view);
             let drawn = seen.borrow().clone();
-            assert!(!drawn.is_empty(), "{l:?}, {what}: drawn");
-            assert!(drawn.iter().all(|d| !d.0), "{l:?}, {what}: every frame drawn landed, the first too: {drawn:?}");
+            // A key's own frame can come before the move it defers to the
+            // next frame's top: the same picture as before, nothing moved.
+            // The first frame that differs is the move's, landed: its panes,
+            // its layout the tree's, an equalise's ratios even; so is every
+            // frame after it.
+            let first = drawn.iter().position(|d| (d.1, &d.2) != (was.0, &was.1));
+            let Some(first) = first else { panic!("{l:?}, {what}: no frame drawn shows the move: {drawn:?}") };
+            assert!(drawn[..first].iter().all(|d| !d.0 && d.3), "{l:?}, {what}: a frame before the move's is still: {drawn:?}");
+            let moved = &drawn[first..];
+            assert!(
+                moved.iter().all(|d| !d.0 && d.3 && d.1 == *panes),
+                "{l:?}, {what}: from the move's frame on, landed with {panes} pane(s): {drawn:?}"
+            );
+            if *what == "equalise" {
+                assert!(
+                    moved.iter().all(|d| d.2.iter().all(|r| (r - 0.5).abs() < 1e-4)),
+                    "{l:?}, {what}: even from its frame on: {drawn:?}"
+                );
+            }
+            // Off: OFF_DRAWS frames for the move, all told.
+            if l == crate::motion::Level::Off {
+                let expected = match *what {
+                    "split" => OFF_DRAWS.0,
+                    "equalise" => OFF_DRAWS.1,
+                    _ => OFF_DRAWS.2,
+                };
+                assert_eq!(drawn.len(), expected, "{l:?}, {what}: frames drawn for the move: {drawn:?}");
+            }
             // Off the composer (its caret blinks a frame every 500 ms), a
             // Reduced fade's frames over (`quick`), then a second at 144
-            // Hz drawing only what the app asks for: nothing.
+            // Hz drawing only what the app asks for: no frame callback and
+            // no paint.
             let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
             idle_step(cx, window, &view, Duration::from_millis(300));
             let at_rest = seen.borrow().len();
             let ran: usize = (0..144).map(|_| idle_step(cx, window, &view, Duration::from_micros(6944))).sum();
-            assert_eq!(ran, 0, "{l:?}, {what}: frames at rest: {:?}", &seen.borrow()[at_rest..]);
+            assert_eq!(ran, 0, "{l:?}, {what}: frame callbacks at rest: {:?}", &seen.borrow()[at_rest..]);
+            assert_eq!(seen.borrow().len(), at_rest, "{l:?}, {what}: paints at rest: {:?}", &seen.borrow()[at_rest..]);
             assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "{l:?}, {what}: a frame asked for at rest");
+            view.update(cx, |v, _| v.on_draw = None);
         }
-        view.update(cx, |v, _| v.on_draw = None);
         assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{l:?}: one pane again");
     }
     view.update(cx, |v, _| v.client = None);
@@ -6293,6 +6351,83 @@ fn a_delayed_layout_write_under_way_never_lands_after_the_quit_flush(cx: &mut Te
     let _ = names(&mut a);
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+/// Shady #59 r2 L1: a delayed layout write that finished while the quit
+/// came does not fool the flush. G0 (the new pane focused) is saved; G1
+/// (the focus to the first pane) is written; the focus goes back (G0
+/// again: the layout's generation is its content's) and the window's
+/// flush runs. The file must end on G0. Two orderings: (a) the app's own
+/// delayed write has finished, its continuation (which notes what it
+/// wrote) not yet run; (b) a write of G1 holds the slot's lock as the flush
+/// comes (a thread in [`crate::app::SaveJob::write`], as the delayed save's
+/// background task is, held at a barrier): the flush waits for it, then
+/// writes G0 after it. Before, the flush trusted `layout_written` (G0) and
+/// wrote nothing: the file kept G1.
+#[gpui_kit::test]
+fn a_delayed_layout_write_that_finished_as_the_quit_came_is_written_over(cx: &mut TestAppContext) {
+    use crate::app::{SaveJob, SaveKind};
+    for held in [false, true] {
+        let what = if held { "(b) a write holding the lock" } else { "(a) a write finished, its continuation not run" };
+        let name = if held { "persist-held" } else { "persist-done" };
+        let (window, view, client, mut a, _attaches, _events) = on_a(cx, name, None);
+        let k = format!("test:{name}-{}", std::process::id());
+        let path = crate::theme::settings_path().expect("the tests' settings file");
+        view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+        frame(cx, window);
+        key(cx, window, "ctrl-\\");
+        wait_saved(cx, window);
+        let focused = |_: &mut TestAppContext| crate::theme::load_layout(&path, &k).map(|l| l.focused);
+        assert_eq!(focused(cx), Some(1), "{what}: G0, the new pane focused, saved");
+        let order = view.read_with(cx, |v, _| v.reading_order());
+        let writes = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writes)
+        };
+        view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
+        frame(cx, window);
+        if !held {
+            // Task by task until G1's write is done (a write counted), its
+            // continuation still queued.
+            let before = writes(cx);
+            let mut n = 0;
+            while writes(cx) == before {
+                if !cx.dispatcher.tick(false) {
+                    assert!(cx.dispatcher.advance_clock_to_next_timer(), "{what}: no timer left: G1's save never came");
+                }
+                n += 1;
+                assert!(n < 100_000, "{what}: G1's delayed save never wrote");
+            }
+            assert_eq!(focused(cx), Some(0), "{what}: G1 in the file");
+            view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+            view.update(cx, |v, _| v.flush_tabs());
+        } else {
+            let (slot, g1, l1) = view.read_with(cx, |v, _| (v.save_job.clone(), v.layout_gen(), v.layout_now()));
+            let (holding_tx, holding) = mpsc::channel();
+            let (go, go_rx) = mpsc::channel::<()>();
+            let (p, key1) = (path.clone(), k.clone());
+            let writer = std::thread::spawn(move || {
+                SaveJob::write(&slot, SaveKind::Layout, g1, || {
+                    holding_tx.send(()).expect("the test");
+                    go_rx.recv().expect("the test");
+                    // The flush is waiting for the lock by now.
+                    std::thread::sleep(Duration::from_millis(150));
+                    crate::theme::save_layout(&p, &key1, &l1)
+                })
+            });
+            holding.recv_timeout(T).expect("the writer holds the lock");
+            view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+            go.send(()).expect("the writer");
+            // Waits for the writer's lock, then writes.
+            view.update(cx, |v, _| v.flush_tabs());
+            assert!(writer.join().expect("the writer").expect("G1 written"), "{what}: G1 was written");
+        }
+        assert_eq!(focused(cx), Some(1), "{what}: the flush wrote G0 after G1");
+        cx.run_until_parked();
+        assert_eq!(focused(cx), Some(1), "{what}: G0 last");
+        let _ = names(&mut a);
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
 }
 
 /// Shady #59 L5.1 (#55 n1): what a pane draws keeps its element state
