@@ -5632,6 +5632,7 @@ impl AppView {
             items[turn..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
         });
         let mine = self.sent.take().filter(|s| s.key == c.key);
+        let sent = mine.is_some();
         let (answer, at, took) = match mine {
             Some(s) => (s.answer, s.at, Some(s.took)),
             None => (self.resolved_by(&c, &sid), crate::authorize::hhmm_now(), None),
@@ -5643,7 +5644,18 @@ impl AppView {
             // What the daemon applied (SynapsCLI #437): the transcript took
             // the `PromptResolved` that resolved this card.
             let outcome = self.model.lives[self.panes.cur.live].transcript.resolved_outcome(c.key.1);
-            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now, outcome });
+            receipts.push(crate::authorize::Receipt {
+                call,
+                own,
+                row: c.row,
+                secret: c.secret,
+                answer,
+                sent,
+                at,
+                took,
+                landed: fx_now,
+                outcome,
+            });
             if receipts.len() > crate::authorize::RECEIPTS {
                 receipts.remove(0);
             }

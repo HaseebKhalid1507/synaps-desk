@@ -374,6 +374,11 @@ impl std::error::Error for TranscriptError {}
 /// Ids (and revs) of rows about to be rebuilt, for reuse by kind.
 type Reuse = VecDeque<(ItemKind, u64, u64)>;
 
+/// How many prompts' outcomes [`Transcript::resolved_outcome`] remembers:
+/// far more than a window could hold back unrendered (a minimised window
+/// resolves its card frames later), 16 bytes each.
+pub const OUTCOMES_KEPT: usize = 1024;
+
 /// How many calls [`Transcript::past_gate`] holds before it lets go of
 /// those no longer in the transcript (it never lets go of one that is).
 pub const PAST_GATE_KEPT: usize = 256;
@@ -399,9 +404,11 @@ pub struct Transcript {
     title: Option<String>,
     pending_prompts: Vec<PromptRequest>,
     /// The last prompts resolved, each with whether a turn ran as it did
-    /// ([`Transcript::resolved_busy`]) and what the daemon applied
-    /// ([`Transcript::resolved_outcome`]).
-    resolved: VecDeque<(u64, bool, Option<crate::protocol::PromptOutcome>)>,
+    /// ([`Transcript::resolved_busy`]).
+    resolved: VecDeque<(u64, bool)>,
+    /// What the daemon applied to the last [`OUTCOMES_KEPT`] prompts this
+    /// attachment raised ([`Transcript::resolved_outcome`]), newest last.
+    outcomes: VecDeque<(u64, crate::protocol::PromptOutcome)>,
     /// The calls that showed they got past their gate
     /// ([`Transcript::past_gate`]), and the size past which those no longer
     /// in the transcript are let go.
@@ -485,20 +492,32 @@ impl Transcript {
         self.resolved.iter().rev().find(|r| r.0 == id).map(|r| r.1)
     }
 
-    /// What the daemon applied when prompt `id` resolved (SynapsCLI #437).
-    /// `None`: a daemon that does not say, an outcome this build does not
-    /// know, or not among the last few resolved here.
-    /// What the daemon applied when prompt `id` resolved, from its raw
-    /// event ([`crate::protocol::PromptOutcome::of_event`]), right after
-    /// [`Transcript::apply`] took the event.
-    pub fn note_outcome(&mut self, id: u64, outcome: crate::protocol::PromptOutcome) {
-        if let Some(r) = self.resolved.iter_mut().rev().find(|r| r.0 == id) {
-            r.2 = Some(outcome);
-        }
+    /// What the daemon applied when prompt `id` resolved (SynapsCLI #437),
+    /// taken with its event ([`Transcript::apply_with`]). Kept for the
+    /// last [`OUTCOMES_KEPT`] prompts this attachment raised and resolved,
+    /// until the next attach (a restarted daemon numbers its prompts from 1
+    /// again), so a card a window resolves frames later still has it
+    /// however many resolved meanwhile (Shady #70 C70-3). `None`: a daemon
+    /// that does not say, an outcome this build does not know.
+    pub fn resolved_outcome(&self, id: u64) -> Option<crate::protocol::PromptOutcome> {
+        self.outcomes.iter().rev().find(|o| o.0 == id).map(|o| o.1).filter(|o| *o != crate::protocol::PromptOutcome::Unknown)
     }
 
-    pub fn resolved_outcome(&self, id: u64) -> Option<crate::protocol::PromptOutcome> {
-        self.resolved.iter().rev().find(|r| r.0 == id).and_then(|r| r.2).filter(|o| *o != crate::protocol::PromptOutcome::Unknown)
+    /// [`Transcript::apply_at`] with what the event says beyond its typed
+    /// form ([`crate::protocol::EventMeta`]), in one step: a resolution's
+    /// outcome is the prompt's as it leaves the pending set.
+    pub fn apply_with(&mut self, ev: &SessionEvent, ts: &str, meta: &crate::protocol::EventMeta) {
+        let raised = match ev {
+            SessionEvent::PromptResolved { prompt_id } => self.pending_prompts.iter().any(|p| p.id == *prompt_id).then_some(*prompt_id),
+            _ => None,
+        };
+        self.apply_at(ev, ts);
+        if let (Some(id), Some(o)) = (raised, meta.prompt_outcome) {
+            if self.outcomes.len() == OUTCOMES_KEPT {
+                self.outcomes.pop_front();
+            }
+            self.outcomes.push_back((id, o));
+        }
     }
 
     /// Whether call `tool_id` showed it got past its gate: output streamed
@@ -810,7 +829,7 @@ impl Transcript {
         self.replaying = true;
         for env in &a.replay {
             if let Ok(ev) = env.decode() {
-                self.apply_at(&ev, &env.ts);
+                self.apply_with(&ev, &env.ts, &crate::protocol::EventMeta::of(&env.event));
             }
         }
         self.replaying = false;
@@ -1378,7 +1397,7 @@ impl Transcript {
                 if self.resolved.len() == 16 {
                     self.resolved.pop_front();
                 }
-                self.resolved.push_back((*prompt_id, self.busy, None));
+                self.resolved.push_back((*prompt_id, self.busy));
             }
             SessionEvent::External { event } => self.live_event(event),
             // The input owner's own steer, whatever it looks like: events
@@ -2000,26 +2019,58 @@ mod outcome_tests {
         assert_eq!((t.resolved_busy(3), t.resolved_busy(4), t.resolved_busy(5)), (Some(true), Some(false), None));
     }
 
-    /// SynapsCLI #437: a prompt remembers what the daemon applied, read
-    /// from the raw event; an older daemon's (no `outcome`) and one this
-    /// build does not know read as nothing said.
+    /// SynapsCLI #437: a prompt remembers what the daemon applied, taken
+    /// with its event ([`Transcript::apply_with`]); an older daemon's (no
+    /// `outcome`) and one this build does not know read as nothing said.
+    /// A resolution of a prompt this attachment never raised records
+    /// nothing.
     #[test]
     fn a_resolved_prompt_remembers_what_the_daemon_applied() {
-        use crate::protocol::{PromptOutcome, decode_event};
+        use crate::protocol::{EventMeta, PromptOutcome, decode_event};
         let mut t = Transcript::new();
-        let mut resolve = |raw: serde_json::Value| {
+        let raise = |t: &mut Transcript, id: u64| {
+            let raw = serde_json::json!({"ev": "prompt", "request": {"id": id, "kind": "confirm", "title": "t", "prompt": "p"}});
             t.apply(&decode_event(&raw).unwrap());
-            if let (Some(o), Some(id)) = (PromptOutcome::of_event(&raw), raw["prompt_id"].as_u64()) {
-                t.note_outcome(id, o);
-            }
         };
+        let resolve = |t: &mut Transcript, raw: serde_json::Value| t.apply_with(&decode_event(&raw).unwrap(), "", &EventMeta::of(&raw));
         for (id, outcome) in [(1, "allowed"), (2, "denied"), (3, "answered"), (4, "cancelled"), (5, "timed_out"), (6, "vetoed")] {
-            resolve(serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": outcome}));
+            raise(&mut t, id);
+            resolve(&mut t, serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": outcome}));
         }
-        resolve(serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7}));
-        let got: Vec<_> = (1..=8).map(|id| t.resolved_outcome(id)).collect();
+        raise(&mut t, 7);
+        resolve(&mut t, serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7}));
+        resolve(&mut t, serde_json::json!({"ev": "prompt_resolved", "prompt_id": 9, "outcome": "allowed"}));
+        let got: Vec<_> = (1..=9).map(|id| t.resolved_outcome(id)).collect();
         use PromptOutcome::*;
-        assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None]);
-        assert_eq!(PromptOutcome::of_event(&serde_json::json!({"ev": "idle", "outcome": "allowed"})), None, "only prompt_resolved");
+        assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None, None]);
+        assert_eq!(EventMeta::of(&serde_json::json!({"ev": "idle", "outcome": "allowed"})), EventMeta::default(), "only prompt_resolved");
+    }
+
+    /// Shady #70 C70-3: a prompt's outcome is kept until the next attach,
+    /// however many prompts resolve after it before a window reads it (a
+    /// minimised window resolves its card frames later).
+    #[test]
+    fn a_resolved_prompts_outcome_outlives_later_resolutions() {
+        use crate::protocol::{EventMeta, PromptOutcome, decode_event};
+        let mut t = Transcript::new();
+        let raise = |t: &mut Transcript, id: u64| {
+            let raw = serde_json::json!({"ev": "prompt", "request": {"id": id, "kind": "confirm", "title": "t", "prompt": "p"}});
+            t.apply(&decode_event(&raw).unwrap());
+        };
+        let resolve = |t: &mut Transcript, id: u64, o: &str| {
+            let raw = serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": o});
+            t.apply_with(&decode_event(&raw).unwrap(), "", &EventMeta::of(&raw));
+        };
+        raise(&mut t, 1);
+        resolve(&mut t, 1, "allowed");
+        for id in 2..40 {
+            raise(&mut t, id);
+            resolve(&mut t, id, "denied");
+        }
+        assert_eq!(t.resolved_outcome(1), Some(PromptOutcome::Allowed), "38 resolutions later");
+        let a = json!({"type": "attached", "client": 2, "meta": {"id": "s"}, "conversation": {"api_messages": []}, "input_owner": 2});
+        let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+        t.load_attached(&a).unwrap();
+        assert_eq!(t.resolved_outcome(1), None, "an attach starts over (prompt ids may start over)");
     }
 }

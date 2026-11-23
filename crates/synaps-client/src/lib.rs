@@ -27,8 +27,10 @@
 //!                 client.resync()?;
 //!             }
 //!         }
-//!         Event::Session { event, ts, raw, .. } => {
-//!             transcript.apply_at(&event, &ts); // `raw` has every field the mirror drops
+//!         Event::Session { event, ts, meta, raw, .. } => {
+//!             // `meta`: what the typed event leaves out (a prompt's outcome);
+//!             // `raw` has every field the mirror drops.
+//!             transcript.apply_with(&event, &ts, &meta);
 //!         }
 //!         Event::Error { error, .. } => eprintln!("{error}"), // typed: Refused, Daemon, ...
 //!         Event::Detached { reason, .. } => eprintln!("detached: {reason}"),
@@ -111,9 +113,9 @@ pub use client::{
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, FEATURE_MODEL_OPTIONS,
-    FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, ModelOption, ModelOptions,
-    PromptOutcome, Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting,
-    WatchEvent, WatchPage, validate_session_name,
+    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, EventMeta, FEATURE_MODEL_OPTIONS,
+    FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, ModelOption, ModelOptions, PromptOutcome,
+    Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage,
+    validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

@@ -1332,6 +1332,27 @@ impl PromptOutcome {
     }
 }
 
+/// What a session event says beyond its typed [`SessionEvent`]: fields a
+/// variant leaves out so that code building it (struct literals) stays as
+/// it is. Decoded with the event ([`EventMeta::of`]); every
+/// [`crate::Event::Session`] carries it, and [`crate::Transcript::apply_with`]
+/// takes the two together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventMeta {
+    /// A `prompt_resolved`'s `outcome`: what the daemon applied (SynapsCLI
+    /// #437). `None` from a daemon before it, and for any other event.
+    pub prompt_outcome: Option<PromptOutcome>,
+}
+
+impl EventMeta {
+    /// The metadata of the raw session event `raw` (its envelope's `ev` and
+    /// fields).
+    pub fn of(raw: &Value) -> Self {
+        Self { prompt_outcome: PromptOutcome::of_event(raw) }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
@@ -1518,9 +1539,9 @@ pub enum SessionEvent {
     Prompt {
         request: PromptRequest,
     },
-    /// What the daemon applied (`outcome`, SynapsCLI #437) is read from the
-    /// raw event, [`PromptOutcome::of_event`]: this variant keeps its one
-    /// field, so code that builds it (the desktop's tests) is unchanged.
+    /// What the daemon applied (`outcome`, SynapsCLI #437) is the event's
+    /// [`EventMeta`]: this variant keeps its one field, so code that builds
+    /// it (the desktop's tests) is unchanged.
     PromptResolved {
         prompt_id: u64,
     },

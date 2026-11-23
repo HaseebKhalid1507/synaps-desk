@@ -287,7 +287,13 @@ pub(crate) struct Receipt {
     pub(crate) own: bool,
     pub(crate) row: u64,
     pub(crate) secret: bool,
+    /// What this window sent (`sent`), or what resolved it without an
+    /// answer from here ([`Answer::Elsewhere`], [`Answer::Resolved`], a
+    /// cancel read from a HALT here or the turn being over).
     pub(crate) answer: Answer,
+    /// This window sent `answer` (a secret's dismissal included), as
+    /// opposed to a label for another client's or none (Shady #70 C70-1).
+    pub(crate) sent: bool,
     /// Local `HH:MM` of the answer.
     pub(crate) at: SharedString,
     /// How long the card waited for it here.
@@ -331,6 +337,8 @@ impl Receipt {
     /// the daemon's word: the answer sent stays in [`Receipt::answer`].
     /// Read when drawn: no race.
     pub(crate) fn answer_for(&self, call: Option<ToolStatus>, applied: Option<bool>) -> Answer {
+        // The daemon's word, when it gave one, before any reading of the
+        // call (Shady #70 C70-1).
         if let Some(a) = self.reported() {
             return a;
         }
@@ -362,27 +370,31 @@ impl Receipt {
 }
 
 impl Receipt {
-    /// The answer the daemon's outcome gives this receipt (SynapsCLI #437).
-    /// A cancel, or no answer by the deadline, is `cancelled` whoever was
-    /// asked: the call never passed its gate. An answer sent from here says
-    /// what applied instead of what was sent (another client's came first):
-    /// `allowed` (`allowed all` if that was ours), `denied` (a secret's
-    /// dismissal: `cancelled`), `provided`. Another client's answer keeps
-    /// `answered elsewhere`/`resolved` (it names no answer). `None`: no
+    /// The answer the daemon's outcome gives this receipt (SynapsCLI #437),
+    /// whatever its call does after (Shady #70 C70-1). A cancel, or no
+    /// answer by the deadline, is `cancelled` whoever was asked: the call
+    /// never passed its gate. An answer sent from here (a secret's
+    /// dismissal too) says what applied, not what was sent: `allowed`,
+    /// `denied` (a secret's dismissal: `cancelled`), `provided`. Never
+    /// `allowed all`: `allowed` is an ordinary Allow's outcome too, and an
+    /// Allow all that came after another client's Allow changed nothing
+    /// (C70-2). Applied with no answer from here: `answered elsewhere` if
+    /// another client had the input, else `resolved` (it names no answer),
+    /// not a cancel read from a HALT here or a reload (C70-1). `None`: no
     /// outcome, or one this build does not know: the call decides.
     pub(crate) fn reported(&self) -> Option<Answer> {
         use PromptOutcome as O;
-        let ours = matches!(self.answer, Answer::Allowed | Answer::AllowedAll | Answer::Denied | Answer::Provided);
-        match self.outcome? {
-            O::Cancelled | O::TimedOut => Some(Answer::Cancelled),
-            O::Unknown => None,
-            _ if !ours => None,
-            O::Allowed if self.answer == Answer::AllowedAll => Some(Answer::AllowedAll),
-            O::Allowed => Some(Answer::Allowed),
-            O::Denied if self.secret => Some(Answer::Cancelled),
-            O::Denied => Some(Answer::Denied),
-            O::Answered => Some(Answer::Provided),
-        }
+        let o = self.outcome.filter(|o| *o != O::Unknown)?;
+        Some(match o {
+            O::Cancelled | O::TimedOut => Answer::Cancelled,
+            _ if !self.sent && self.answer == Answer::Elsewhere => Answer::Elsewhere,
+            _ if !self.sent => Answer::Resolved,
+            O::Allowed => Answer::Allowed,
+            O::Denied if self.secret => Answer::Cancelled,
+            O::Denied => Answer::Denied,
+            O::Answered => Answer::Provided,
+            O::Unknown => return None,
+        })
     }
 
     /// Whether a yes was applied, which lights the receipt: the daemon's
@@ -1627,6 +1639,7 @@ mod tests {
             row: 1,
             secret,
             answer,
+            sent: !matches!(answer, Answer::Elsewhere | Answer::Resolved),
             at: "14:21".into(),
             took: None,
             landed: Instant::now(),
@@ -1644,7 +1657,9 @@ mod tests {
         assert_eq!(ours(O::Cancelled).answer_for(denied, held), Answer::Cancelled, "a cancel at the gate reads as a denial in the call");
         assert_eq!(ours(O::TimedOut).answer_for(denied, held), Answer::Cancelled);
         assert!(!ours(O::Cancelled).applied_yes(held));
-        assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, unknown), Answer::AllowedAll);
+        // `allowed` doesn't say whose Allow: an Allow all from here may have
+        // come after another client's Allow and changed nothing (C70-2).
+        assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, unknown), Answer::Allowed);
         assert_eq!(
             r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, unknown),
             Answer::Allowed,
@@ -1654,10 +1669,23 @@ mod tests {
         assert_eq!(r(Answer::Provided, true, Some(O::Answered)).answer_for(cancelled, held), Answer::Provided);
         assert_eq!(r(Answer::Provided, true, Some(O::Denied)).answer_for(running, unknown), Answer::Cancelled, "dismissed elsewhere first");
         assert!(r(Answer::Provided, true, Some(O::Answered)).applied_yes(unknown));
-        // Not answered from here: a cancel says so; an answer stays elsewhere's.
+        // A secret dismissed here that lost to another client's value:
+        // what applied (C70-1).
+        assert_eq!(r(Answer::Cancelled, true, Some(O::Answered)).answer_for(cancelled, held), Answer::Provided);
+        // Not answered from here: a cancel says so; an answer stays
+        // elsewhere's, whatever the call does after (C70-1: a HALT's bare
+        // cancel, a deny's text).
         assert_eq!(r(Answer::Elsewhere, false, Some(O::Cancelled)).answer_for(running, unknown), Answer::Cancelled);
         assert_eq!(r(Answer::Elsewhere, false, Some(O::Allowed)).answer_for(running, unknown), Answer::Elsewhere);
+        assert_eq!(r(Answer::Elsewhere, false, Some(O::Allowed)).answer_for(cancelled, held), Answer::Elsewhere);
+        assert_eq!(r(Answer::Resolved, false, Some(O::Allowed)).answer_for(cancelled, held), Answer::Resolved);
         assert_eq!(r(Answer::Resolved, false, Some(O::Denied)).answer_for(denied, held), Answer::Resolved);
+        // A cancel read from a HALT here or a reload (no answer from here)
+        // is no match for an applied outcome (C70-1).
+        let seeded = |o| Receipt { sent: false, ..r(Answer::Cancelled, false, Some(o)) };
+        assert_eq!(seeded(O::Allowed).answer_for(cancelled, held), Answer::Resolved);
+        assert_eq!(seeded(O::Answered).answer_for(running, unknown), Answer::Resolved);
+        assert_eq!(seeded(O::Cancelled).answer_for(running, unknown), Answer::Cancelled);
         // No word, or one this build does not know: the call decides (#25).
         for outcome in [None, Some(O::Unknown)] {
             let fallback = r(Answer::Allowed, false, outcome);
@@ -1678,6 +1706,7 @@ mod tests {
             row: 1,
             secret: false,
             answer,
+            sent: true,
             at: "14:21".into(),
             took,
             landed: Instant::now(),
