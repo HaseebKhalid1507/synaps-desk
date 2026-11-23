@@ -867,6 +867,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             // - a new turn's call streams into the held room
                             //   while the reader scrolls up 0.5 px a frame
                             //   (a touchpad) for 3 s, and after.
+                            // `SYNAPS_BENCH_FOLDS=wrap`: the streamed lines
+                            // are long, each wrapping (#26 L6).
                             let t0 = Instant::now();
                             let mark = |what: &str| eprintln!("FOLDS {what} {:.3}", t0.elapsed().as_secs_f64());
                             let run = |v: &AppView| v.panes.cur.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
@@ -941,19 +943,27 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log")), started("z9")]);
                             sleep(1.).await;
                             mark("slow-scroll");
+                            let wrap = std::env::var("SYNAPS_BENCH_FOLDS").is_ok_and(|v| v == "wrap");
+                            let line = |k: usize| {
+                                if wrap {
+                                    format!("relay: refresh {k} ok, {}\n", "token rotated, cache warmed, upstream answered 200 in 41 ms; ".repeat(3))
+                                } else {
+                                    format!("relay: refresh {k} ok\n")
+                                }
+                            };
                             for k in 0..430 {
                                 let _ = upd(cx, &|v, _| {
                                     v.panes.cur.scroller.touch();
                                     v.panes.cur.list.scroll_by(gpui::px(-0.5));
                                 });
                                 if k % 40 == 0 {
-                                    apply(cx, vec![delta("z9", &format!("relay: refresh {k} ok\n"))]);
+                                    apply(cx, vec![delta("z9", &line(k))]);
                                 }
                                 sleep(0.007).await;
                             }
                             mark("scroll-stopped");
                             for k in 0..8 {
-                                apply(cx, vec![delta("z9", &format!("relay: refresh {} ok\n", 500 + k))]);
+                                apply(cx, vec![delta("z9", &line(500 + k))]);
                                 sleep(0.3).await;
                             }
                             mark("done");
@@ -1220,6 +1230,88 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     out["link_back_3s"] = stats(cx, t0, Instant::now(), c0, f0);
                     out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
                     println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
+                // `SYNAPS_BENCH_WARM=S`: only the right panel's cache countdown
+                // (`crate::warm`), 10 s at rest each: a session whose cache
+                // expires in S s with the panel open (one frame a second under
+                // ten minutes), the same with the panel folded (none), one
+                // expiring in 52 minutes (one a minute), and none known.
+                if let Some(secs) = std::env::var("SYNAPS_BENCH_WARM").ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let warm = |secs: Option<u64>| {
+                        move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.model.lives[v.panes.cur.live].stats.warm = secs.map(|s| {
+                                let st = json!({"keepwarm": {"mode": "auto"}, "cache": {"ttl": "5m", "expires_in_secs": s}});
+                                crate::warm::Warm::from_status(&st, crate::warm::Moment::now())
+                            });
+                        }
+                    };
+                    let fold = |folded: bool| {
+                        move |v: &mut AppView, cx: &mut Context<AppView>| {
+                            let mut p = v.panels;
+                            p.right_collapsed = folded;
+                            v.set_panels_pub(p, cx);
+                        }
+                    };
+                    let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
+                    let _ = upd(cx, &warm(Some(secs)));
+                    sleep(1.5).await;
+                    for (name, step) in [
+                        ("warm_open_10s", None),
+                        ("warm_folded_10s", Some(fold(true))),
+                        ("warm_reopened_10s", Some(fold(false))),
+                    ] {
+                        if let Some(step) = step {
+                            let _ = upd(cx, &step);
+                            sleep(1.5).await;
+                        }
+                        let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                        sleep(10.0).await;
+                        out[name] = stats(cx, t0, Instant::now(), c0, f0);
+                    }
+                    for (name, secs) in [("warm_52m_open_10s", Some(3125)), ("no_warm_open_10s", None)] {
+                        let _ = upd(cx, &warm(secs));
+                        sleep(1.5).await;
+                        let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                        sleep(10.0).await;
+                        out[name] = stats(cx, t0, Instant::now(), c0, f0);
+                    }
+                    out["total_s"] = json!(round(t_main.elapsed().as_secs_f64(), 2));
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
+                // `SYNAPS_BENCH_WARM_STATES=S`: the right panel's cache section
+                // in each state it shows, S s apiece, each announced on stdout
+                // (`warm-state <name>`) for a still: under a minute, at zero,
+                // unknown (`—`: a status without `cache`), an older daemon's
+                // (no section), a downgraded 1h.
+                if let Some(hold) = std::env::var("SYNAPS_BENCH_WARM_STATES").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
+                    let kw = json!({"mode": "off", "session_pings": 0, "session_keepwarm_usd": 0.0});
+                    let states = [
+                        ("under-a-minute", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 42}}))),
+                        ("cold", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 0}}))),
+                        ("unknown", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw}))),
+                        ("older-daemon", None),
+                        (
+                            "downgraded",
+                            Some(json!({"cache_ttl": {"setting": "1h"}, "pinned": true,
+                                "keepwarm": {"mode": "auto", "session_pings": 3, "session_keepwarm_usd": 0.0123, "period": {"next_ping_in_secs": 240}},
+                                "cache": {"ttl": "5m", "expires_in_secs": 268, "downgraded": true}})),
+                        ),
+                    ];
+                    for (name, st) in states {
+                        let set = move |v: &mut AppView, _: &mut Context<AppView>| {
+                            v.model.lives[v.panes.cur.live].stats.warm =
+                                st.as_ref().map(|s| crate::warm::Warm::from_status(s, crate::warm::Moment::now()));
+                        };
+                        let _ = upd(cx, &set);
+                        sleep(0.8).await;
+                        println!("warm-state {name}");
+                        sleep(hold).await;
+                    }
                     let _ = cx.update(|_, cx| cx.quit());
                     return;
                 }

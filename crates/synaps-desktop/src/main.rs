@@ -71,6 +71,8 @@ mod settings_view;
 mod shell;
 mod split;
 #[cfg(all(test, unix))]
+mod split_motion_tests;
+#[cfg(all(test, unix))]
 mod split_tests;
 mod stats;
 mod sticky;
@@ -81,6 +83,8 @@ mod tabs;
 mod tabstrip;
 #[cfg(test)]
 mod test_kit;
+#[cfg(all(test, unix))]
+mod test_waits;
 mod theme;
 mod times;
 mod tray;
@@ -90,6 +94,7 @@ mod ui_tests;
 mod usage;
 mod usage_view;
 mod views;
+mod warm;
 mod watch;
 mod wtabs;
 

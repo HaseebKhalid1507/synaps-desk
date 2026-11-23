@@ -422,7 +422,9 @@ impl Reveal {
 struct Streamed {
     n: usize,
     frame: u64,
-    born: Vec<(usize, Instant)>,
+    /// Each line streaming in: when, and its measured height (a long line
+    /// wraps: its clip grows to all of it, #26 L6).
+    born: Vec<(usize, Instant, Rc<Cell<f32>>)>,
 }
 
 /// The wrapper a growing row is drawn in: `g.shown` tall, its body laid
@@ -2119,6 +2121,27 @@ impl Motion {
         self.spring_held(key, at, SNAP_RESPONSE).0 - at
     }
 
+    /// [`Motion::spring_jump`] at `velocity` (px/s), from `at` as it was
+    /// drawn at `since` (no later than now): a move that takes over another
+    /// turns from where it is with its speed (fluid.md §2.1), and the
+    /// frame that makes it is already that far on.
+    pub(crate) fn spring_jump_moving(&self, key: u64, at: f32, target: f32, velocity: f32, response: f32, since: Instant) {
+        if self.level.get() != Level::Full {
+            return;
+        }
+        let (frame, now) = (self.frame.get(), self.now());
+        let since = since.min(now);
+        self.springs.borrow_mut().insert(key, Sprung { target, x0: at - target, v0: velocity, at: since, frame, response });
+    }
+
+    /// Chrome position `key`'s velocity at `at` (px/s), while it moves on a
+    /// spring then: a spring taking over from a frame drawn before `now`
+    /// starts with the position and the velocity of that frame (Shady #62
+    /// M3).
+    pub(crate) fn spring_velocity_at(&self, key: u64, at: Instant) -> Option<f32> {
+        self.springs.borrow().get(&key).filter(|s| !s.settled(at)).map(|s| s.state(at).1)
+    }
+
     /// Where chrome position `key` was drawn last, if it is on a spring.
     pub(crate) fn spring_at(&self, key: u64) -> Option<f32> {
         let now = self.now();
@@ -2889,11 +2912,12 @@ impl PaneFx<'_> {
 
     /// Lines streaming into a body (cards4/proposal.md §8 #4): of the `n`
     /// it holds now, those that came while watched, as `(line, clip,
-    /// strength)`: each line's clip 0 → 1 of its height on `flick`, its
+    /// strength, height)`: each line's clip 0 → 1 of its height on `flick`
+    /// (`height`: the line as laid out, all its wraps; NaN until measured), its
     /// text from 70 % on [`STREAM_FADE`] ([`stream_curve`]), in arrival
     /// order, lines that came in one frame [`STREAM_STAGGER`] apart. Empty
     /// at rest: history, a body seen for the first time, Reduced, Off.
-    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32)> {
+    pub(crate) fn streamed(&self, key: u64, n: usize) -> Vec<(usize, f32, f32, Rc<Cell<f32>>)> {
         let (frame, now) = (self.frame.get(), self.now());
         let fluid = self.fluid();
         let mut streams = self.col.streams.borrow_mut();
@@ -2902,14 +2926,21 @@ impl PaneFx<'_> {
             s.born.clear();
         } else if n > s.n {
             let first = s.born.last().map_or(now, |b| b.1.max(now));
-            s.born.extend((s.n..n).enumerate().map(|(k, i)| (i, first + STREAM_STAGGER * k.min(12) as u32)));
+            s.born.extend((s.n..n).enumerate().map(|(k, i)| (i, first + STREAM_STAGGER * k.min(12) as u32, Rc::new(Cell::new(f32::NAN)))));
         }
         (s.n, s.frame) = (n, frame);
         let curve = stream_curve();
-        s.born.retain(|(_, at)| {
-            now < *at
-                || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01
-                || now.saturating_duration_since(*at) < STREAM_FADE
+        // A line retires (drawn whole, unclipped) once what its clip has
+        // left is under half a pixel of its measured height: a tall wrapped
+        // line never steps when it does (Shady #73 M2). Unmeasured (not
+        // painted yet, so nothing to step): on the spring alone, as
+        // `Reveal` does.
+        s.born.retain(|(_, at, h)| {
+            let t = now.saturating_duration_since(*at);
+            let left = Spring::from_rest(1., FLICK_RESPONSE, t.as_secs_f32());
+            let h = h.get();
+            let moving = if h.is_nan() { left > 0.01 } else { left * h >= FLUID_EPSILON };
+            now < *at || moving || t < STREAM_FADE
         });
         if s.born.is_empty() {
             return Vec::new();
@@ -2917,13 +2948,13 @@ impl PaneFx<'_> {
         self.want_frame();
         s.born
             .iter()
-            .map(|&(i, at)| {
-                let t = now.checked_duration_since(at).map_or(-1., |d| d.as_secs_f32());
+            .map(|(i, at, h)| {
+                let t = now.checked_duration_since(*at).map_or(-1., |d| d.as_secs_f32());
                 if t < 0. {
-                    return (i, 0., LIFT);
+                    return (*i, 0., LIFT, h.clone());
                 }
                 let clip = 1. - Spring::from_rest(1., FLICK_RESPONSE, t);
-                (i, clip, curve.sample((t / STREAM_FADE.as_secs_f32()).min(1.)))
+                (*i, clip, curve.sample((t / STREAM_FADE.as_secs_f32()).min(1.)), h.clone())
             })
             .collect()
     }

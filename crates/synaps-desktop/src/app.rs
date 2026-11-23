@@ -251,7 +251,7 @@ const DOCK_H: u64 = 0x7AF1 << 48;
 const COMPOSER_H: u64 = 0x7AF2 << 48;
 /// The split panes' layout in flight (split.md §10): one spring, its
 /// travel in px ([`crate::split::Flight`]).
-const PANE_FLIGHT: u64 = 0x7AF5 << 48;
+pub(crate) const PANE_FLIGHT: u64 = 0x7AF5 << 48;
 /// Each pane's composer inset from its foot, on `sheet` (+ the pane's
 /// index).
 const FOOT_INSET: u64 = 0x7AF6 << 48;
@@ -1259,7 +1259,22 @@ pub(crate) struct Slack {
     /// have neither the card's row nor, at the list's end, the room the row
     /// drew under it. Its number: the frame it landed in.
     fresh: Option<u64>,
+    /// A fold's or a closed body's: the row clicked (its id, a summary?).
+    /// Its room holds while the header can be clicked again (N3), then goes
+    /// on `sheet` (the design gate of #23 r4, S6): once the pointer has
+    /// left that row, or [`RELEASE_AFTER`] from its landing with the
+    /// pointer never over it. Chrome's tab strip keeps its widths the same
+    /// way while the pointer is in it.
+    row: Option<(u64, bool)>,
+    /// When it was held.
+    since: Instant,
+    /// The pointer has been over `row` since.
+    over: bool,
 }
+
+/// A held room whose row the pointer never came over goes this long after
+/// it landed ([`Slack::row`]).
+const RELEASE_AFTER: Duration = Duration::from_secs(1);
 
 impl Slack {
     /// What it drew at its last frame (px).
@@ -1357,6 +1372,9 @@ pub(crate) struct FoldGap {
     /// The first row's top under the room's top (≤ 0: cut by the view).
     inner: f32,
     from: f32,
+    /// Its room as its spring (since `at`) began: `from`, or what was left
+    /// when a second fold started (the two then close on one spring, #26).
+    start: f32,
     /// What was under the view once its rows went (the run's rows past the
     /// view's bottom go with the splice, not with the room).
     below: f32,
@@ -1365,6 +1383,9 @@ pub(crate) struct FoldGap {
     response: f32,
     /// The clock at its last frame (a late frame pauses the spring).
     seen: Instant,
+    /// Its last few frames' intervals: the display's pace, which a frame
+    /// must be well past to be late (#26 L5).
+    pace: [Duration; 4],
     /// The list's viewport height as it began.
     vh: f32,
 }
@@ -1379,14 +1400,24 @@ impl FoldGap {
     /// critically damped spring's peak speed is `h · 2π / (e · r)`: at
     /// `h / 700`, 1617 px/s, 27 px a 60 Hz frame and 34 px over three
     /// 144 Hz frames (what a 60 Hz capture can see at once; the gate's bar
-    /// is about 40), up to a 1050 px room.
+    /// is about 40), up to a 1050 px room. Past that the response stays
+    /// 1.5 s (a fold never takes much longer than that to land), and
+    /// a taller room goes faster: 1617 px/s × h / 1050 (#26 n4).
     fn response(h: f32) -> f32 {
         (h / 700.).clamp(crate::motion::SHEET_RESPONSE, 1.5)
     }
 
     /// Its room at `now`, whole pixels.
     fn h(&self, now: Instant) -> f32 {
-        (self.from * crate::motion::Spring::from_rest(1., self.response, now.saturating_duration_since(self.at).as_secs_f32())).round()
+        (self.start * crate::motion::Spring::from_rest(1., self.response, now.saturating_duration_since(self.at).as_secs_f32())).round()
+    }
+
+    /// Whether a frame `dt` after its last is late: well past the display's
+    /// pace (a hitch, a busy machine), never a slow display's every frame
+    /// (30 Hz: VNC, a throttled window, #26 L5).
+    fn late(&self, dt: Duration) -> Duration {
+        let pace = self.pace.iter().copied().filter(|d| !d.is_zero()).min().unwrap_or_default();
+        dt.saturating_sub(Duration::from_micros(16_700).max(pace * 3 / 2))
     }
 
     /// The room held at the list's end at `now` (what closed past what was
@@ -1571,6 +1602,19 @@ pub(crate) fn above_list(lay: Layout, naming: bool) -> f32 {
     let naming = if naming { crate::fit::naming_h(lay.form()) } else { 0. };
     crate::chrome::top_h(lay.short) + naming
 }
+
+/// A ride's velocity as a flight's (px/s of its travel `len`): the layout
+/// went `(w - from) / (to - from)` of its way as the centre went to `w`
+/// ([`AppView::pane_flight_step`]), so as fast as the centre moves
+/// (`centre` px/s) over the centre's way `r` (Shady #62 M4).
+fn ride_velocity(len: f32, r: crate::split::Ride, centre: f32) -> f32 {
+    if (r.to - r.from).abs() < 0.5 { 0. } else { len * centre / (r.to - r.from) }
+}
+
+/// Tests: the centre's top-left in the window and each pane's rectangle in
+/// it, as a frame drew them ([`AppView::rects_drawn`]).
+#[cfg(test)]
+pub(crate) type RectsDrawn = ((f32, f32), Vec<(crate::pane::PaneId, crate::split::Rect)>);
 
 /// Tests: what [`AppView::on_draw`] calls each frame drawn.
 #[cfg(test)]
@@ -1961,6 +2005,11 @@ pub struct AppView {
     /// Tests: the dividers' handles were drawn this frame.
     #[cfg(test)]
     pub(crate) handles_drawn: Cell<bool>,
+    /// Tests: the centre's top-left in the window and each pane's
+    /// rectangle in it, as the last frame drew them (Shady #62 M2: a
+    /// divider's place on screen, each draw).
+    #[cfg(test)]
+    pub(crate) rects_drawn: RefCell<RectsDrawn>,
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
@@ -1982,6 +2031,9 @@ pub struct AppView {
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
+    /// Its scale at the last frame, unclamped (a card's edge holds a device
+    /// pixel at any: `cards::slab`).
+    pub(crate) scale: f32,
     /// Its height (the picker fits under it).
     pub(crate) height: f32,
     pub picker_open: bool,
@@ -2105,6 +2157,10 @@ pub struct AppView {
     /// The centre's top-left in the window, as last drawn (a divider's
     /// drag is in the centre's pixels).
     pub(crate) centre_at: Cell<(f32, f32)>,
+    /// The centre the panes' columns wrapped for in the last frame drawn
+    /// with no panel moving: its width and its left in the window (where
+    /// a panels' flight starts, [`crate::chrome::Freeze::start`]).
+    wrap_centre: Option<(f32, f32)>,
     /// The top bar's form, the window's (its height under the full bar):
     /// never a pane's, so focus never moves the window (finish gate #36
     /// M1). With one pane it is that pane's `Layout::short`.
@@ -2165,6 +2221,9 @@ pub struct AppView {
     pub(crate) window_active: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
+    /// The right panel's cache countdown: its next redraw (or status ask),
+    /// armed only while the panel shows a countdown ([`crate::warm`]).
+    warm_tick: Option<(Instant, Task<()>)>,
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
     /// not wholly covered, not minimized). Nothing polls while it is not.
     visible: bool,
@@ -2685,6 +2744,8 @@ impl AppView {
             on_draw: None,
             #[cfg(test)]
             handles_drawn: Cell::new(false),
+            #[cfg(test)]
+            rects_drawn: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
             panels_writing: Default::default(),
@@ -2694,6 +2755,7 @@ impl AppView {
             panel_fx: crate::chrome::PanelFx::default(),
             fold_keys: FoldKeys::default(),
             width: 0.,
+            scale: 1.,
             height: 0.,
             picker_open: false,
             picker_note: None,
@@ -2753,6 +2815,7 @@ impl AppView {
             app_settings: crate::settings_view::AppSettings { split: cfg!(all(test, feature = "split-on-tests")), ..Default::default() },
             centre: Cell::new((0., 0.)),
             centre_at: Cell::new((0., 0.)),
+            wrap_centre: None,
             top_short: false,
             split_note: None,
             pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
@@ -2788,6 +2851,7 @@ impl AppView {
             view_seen: None,
             window_active: true,
             watch_poll: None,
+            warm_tick: None,
             visible: i.visible,
             fx: Rc::default(),
             receipts: HashMap::new(),
@@ -3011,6 +3075,11 @@ impl AppView {
             }
             Effect::Setting { attach_seq, setting, reply } => self.choice_answered(attach_seq, &setting, reply),
             Effect::Options { attach_seq, reply } => self.choice_options(attach_seq, reply),
+            Effect::Status(seq) => {
+                if let Some(c) = &self.client {
+                    let _ = c.on(seq).status();
+                }
+            }
         }
     }
 
@@ -4739,6 +4808,58 @@ impl AppView {
         self.watch_poll = Some((due, task));
     }
 
+    /// The right panel's countdown redraws when what it says changes (each
+    /// second under ten minutes, each minute above), and the status is asked
+    /// again a little after a keep-warm ping is due: only while the panel
+    /// shows (`shown`) in a visible window. Cold, or nothing counting:
+    /// nothing armed (an idle window draws no frame for it).
+    fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
+        let now = crate::warm::Moment::now();
+        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
+        let seq = self.model.lives[self.panes.cur.live].attachment();
+        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
+        // Woken from a sleep: read again at once (the callback rebases).
+        let slept = warm.is_some_and(|w| w.slept(now)).then_some(now.mono);
+        let due = [warm.and_then(|w| w.next_change(now)), refresh, slept].into_iter().flatten().min();
+        let Some(due) = due else {
+            self.warm_tick = None;
+            return;
+        };
+        if self.warm_tick.as_ref().is_some_and(|(at, _)| *at == due) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let left = due.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                cx.background_executor().timer(left).await;
+            }
+            let _ = this.update(cx, |v, cx| {
+                v.warm_tick = None;
+                // The machine slept since the answer: what it said is aged
+                // by the sleep, and asked again.
+                let now = crate::warm::Moment::now();
+                let slept = v.model.lives[v.panes.cur.live].stats.warm.as_mut().is_some_and(|w| {
+                    let slept = w.slept(now);
+                    if slept {
+                        w.rebase(now);
+                    }
+                    slept
+                });
+                // A due ping moved the cache's anchor: ask once.
+                if (slept || refresh.is_some_and(|r| now.mono >= r))
+                    && let (Some(c), Some(seq)) = (&v.client, seq)
+                {
+                    let _ = c.on(seq).status();
+                    if let Some(w) = v.model.lives[v.panes.cur.live].stats.warm.as_mut() {
+                        w.next_ping = None;
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.warm_tick = Some((due, task));
+    }
+
     fn watch_poll_now(&mut self, cx: &mut Context<Self>) {
         self.watch_poll = None;
         let now = Instant::now();
@@ -4760,6 +4881,10 @@ impl AppView {
     fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         self.arm_watch_poll(cx);
+        // Hidden: the cache countdown's timer goes now, not at its wake.
+        if !visible {
+            self.warm_tick = None;
+        }
         // Hidden, the heartbeat stops; shown again, the next frame re-arms it.
         self.fx.set_visible(visible);
         if visible {
@@ -4958,19 +5083,22 @@ impl AppView {
                 && self.panes.cur.disp.iter().any(|d| d.id == g.id && matches!(d.kind, Kind::Summary { open: false, .. }))
         };
         // A late frame (a hitch, a busy machine) pauses the folds past a
-        // 60 Hz frame's time, their held room's spring with them: the
-        // column goes on from where it was, never skips (N1: ~40 px a frame).
+        // 60 Hz frame's time, or half again the display's pace if that is
+        // slower, their held room's spring with them: the column goes on
+        // from where it was, never skips (N1: ~40 px a frame).
         let mut late = Duration::ZERO;
         let gaps: Vec<FoldGap> = gaps
             .into_iter()
             .filter(here)
             .map(|g| {
-                let l = now.saturating_duration_since(g.seen).saturating_sub(Duration::from_micros(16_700));
+                let dt = now.saturating_duration_since(g.seen);
+                let l = g.late(dt);
+                let pace = if dt.is_zero() { g.pace } else { [g.pace[1], g.pace[2], g.pace[3], dt] };
                 if l > Duration::ZERO && g.seen > g.at {
                     late = late.max(l);
-                    FoldGap { at: g.at + l, seen: now, ..g }
+                    FoldGap { at: g.at + l, seen: now, pace, ..g }
                 } else {
-                    FoldGap { seen: now, ..g }
+                    FoldGap { seen: now, pace, ..g }
                 }
             })
             .collect();
@@ -4987,7 +5115,7 @@ impl AppView {
             if h >= 1. {
                 out.push((g, h));
             } else {
-                self.land(g.held(now), g.vh);
+                self.land(g.held(now), g.vh, Some((g.id, true)));
             }
         }
         *self.panes.cur.fold_gap.borrow_mut() = out.iter().map(|(g, _)| g.clone()).collect();
@@ -5004,7 +5132,9 @@ impl AppView {
     /// the list's viewport height as it began; what the view lost since
     /// (the composer, the dock, a resize) is not a scroll (Shady #23 r4
     /// H1): [`AppView::tail_slack`] lifts the list by it.
-    fn land(&self, held: f32, vh: f32) {
+    /// `row`: the row clicked (a run's summary, or a call's row), which
+    /// holds the room while the pointer is over it ([`Slack::row`]).
+    fn land(&self, held: f32, vh: f32, row: Option<(u64, bool)>) {
         if held < 1. {
             return;
         }
@@ -5030,6 +5160,9 @@ impl AppView {
             input: prev.is_some_and(|s| s.input),
             vh: if left { view } else { vh },
             fresh: None,
+            row,
+            since: self.fx.clock(),
+            over: false,
         }));
     }
 
@@ -5117,7 +5250,7 @@ impl AppView {
         let head = match (summary.and_then(|ix| self.panes.cur.disp.get(ix)), self.panes.cur.metrics_last.get()) {
             (Some(d), Some(m)) => {
                 let g = crate::cards::Geo::of(&m);
-                turns::gap_of(d.gap, &m) + g.inset + 1. + g.row
+                turns::gap_of(d.gap, &m) + g.edge + g.inset + g.row
             }
             _ => 41.,
         };
@@ -5163,7 +5296,12 @@ impl AppView {
         let inner = rows.first().map_or(0., |r| (r.1 - gap_top).min(0.));
         let now = self.fx.clock();
         let slack = if f.following { self.panes.cur.fold_slack.get().map_or(0., |s| s.last) } else { 0. };
-        let response = FoldGap::response(from + slack);
+        // Folds in flight in this list: this one and theirs close on one
+        // spring from here (#26): the rows under them move as one fold of
+        // their sum would, never by two springs' at once.
+        let list_gen = self.panes.cur.list_gen;
+        let others: f32 = self.panes.cur.fold_gap.borrow().iter().filter(|g| g.list == list_gen && !g.is(f.id)).map(|g| g.h(now)).sum();
+        let response = FoldGap::response(from + slack + others);
         if f.following
             && let Some(mut s) = self.panes.cur.fold_slack.get()
         {
@@ -5173,6 +5311,11 @@ impl AppView {
         let rows: Rc<[Disp]> = rows.into_iter().map(|r| r.0).collect();
         let mut gaps = self.panes.cur.fold_gap.borrow_mut();
         gaps.retain(|g| !g.is(f.id));
+        let mut pace = [Duration::ZERO; 4];
+        for g in gaps.iter_mut().filter(|g| g.list == list_gen) {
+            (g.start, g.at, g.seen, g.response) = (g.h(now), now, now, response);
+            pace = g.pace;
+        }
         // Folds in flight share what is under the view (Shady #23 r3 M2):
         // one already holding keeps its count; one that isn't yet takes
         // what it may still close of it, first come; this one the rest.
@@ -5189,11 +5332,13 @@ impl AppView {
             rows,
             inner,
             from,
+            start: from,
             below,
             hold: !f.following,
             at: now,
             response,
             seen: now,
+            pace,
             vh,
         });
         self.fx.want_frame();
@@ -5206,7 +5351,9 @@ impl AppView {
     /// once landed, it goes on `sheet`. A run folding with its header held,
     /// and a body the user closed, keep theirs the same way (N1, S1). The
     /// rooms are on the clock the folds close on. Not fluid: none.
-    pub(crate) fn tail_slack(&self) -> f32 {
+    /// `over`: the pointer is over the row a held room's fold or body was
+    /// clicked on ([`Slack::row`]).
+    pub(crate) fn tail_slack(&self, over: bool) -> f32 {
         // The user's own scroll since the last frame (the wheel, a finger,
         // their glide or coast, a jump, the bar): nothing else leaves the
         // end (Shady #23 r3 H2, M1).
@@ -5251,7 +5398,7 @@ impl AppView {
                 }
                 Some((o, _, h, true)) if o == opens && !opens => {
                     self.panes.cur.body_hold.set(None);
-                    self.land((h - below).max(0.).round(), vh);
+                    self.land((h - below).max(0.).round(), vh, Some((id, false)));
                 }
                 _ => self.panes.cur.body_hold.set(None),
             }
@@ -5343,13 +5490,30 @@ impl AppView {
             s.last = room.clamp(0., s.given).round();
         }
         // The turn ended (its run folds, the column moves anyway): what is
-        // left goes on `sheet` with it. A fold the user made stays.
-        if !self.panes.cur.synced_busy && !s.held && s.gone.is_none() {
+        // left goes on `sheet` with it. A fold the user made stays while
+        // its row can be clicked again (S6): until the pointer leaves it,
+        // or a while from landing with the pointer never over it.
+        s.over |= over;
+        // Not once the user has scrolled since it was held: a room left in
+        // sight is theirs, as content (`left`).
+        let release =
+            s.held && s.row.is_some() && !s.input && !over && (s.over || clock.saturating_duration_since(s.since) >= RELEASE_AFTER);
+        if s.gone.is_none() && (!self.panes.cur.synced_busy && !s.held || release) {
             s.gone = Some((s.last, clock, crate::motion::SHEET_RESPONSE));
         }
         if let Some((from, at, response)) = s.gone {
             s.last = (from * crate::motion::Spring::from_rest(1., response, clock.saturating_duration_since(at).as_secs_f32())).round();
-            self.fx.want_frame();
+        }
+        // Only a room that is still there asks for anything: the frame its
+        // sheet lands on, or rows growing in took the rest, asks for no
+        // next frame and no release timer (nothing after a landing, #58;
+        // Shady #73 M1).
+        if s.last >= 1. {
+            if s.gone.is_some() {
+                self.fx.want_frame();
+            } else if s.held && s.row.is_some() && !s.input && !over && !s.over {
+                self.fx.want_at(s.since + RELEASE_AFTER);
+            }
         }
         if s.last < 1. {
             self.panes.cur.fold_slack.set(None);
@@ -5372,6 +5536,22 @@ impl AppView {
         }
         self.panes.cur.fold_slack.set(Some(s));
         s.last + folding
+    }
+
+    /// The pointer is over the row a held room was clicked on
+    /// ([`Slack::row`]), as the last layout placed it.
+    fn over_held_row(&self, window: &Window) -> bool {
+        let Some((id, summary)) = self.panes.cur.fold_slack.get().and_then(|s| s.row) else { return false };
+        let Some(ix) = self
+            .panes
+            .cur
+            .disp
+            .iter()
+            .position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == summary && d.kind != Kind::Prompt)
+        else {
+            return false;
+        };
+        self.panes.cur.list.bounds_for_item(ix).is_some_and(|b| b.contains(&window.mouse_position()))
     }
 
     /// Row `ix` as it arrives or grows (fluid.md §3.3, §3.4): a row that
@@ -5837,6 +6017,7 @@ impl AppView {
             items[turn..=at].iter().rev().find_map(|i| i.tool.as_ref()).map(|t| SharedString::from(t.tool_id.clone()))
         });
         let mine = self.sent.take().filter(|s| s.key == c.key);
+        let sent = mine.is_some();
         let (answer, at, took) = match mine {
             Some(s) => (s.answer, s.at, Some(s.took)),
             None => (self.resolved_by(&c, &sid), crate::authorize::hhmm_now(), None),
@@ -5845,7 +6026,21 @@ impl AppView {
         let line = call.is_some();
         if let Some(call) = call {
             let receipts = self.receipts.entry(sid.clone()).or_default();
-            receipts.push(crate::authorize::Receipt { call, own, row: c.row, secret: c.secret, answer, at, took, landed: fx_now });
+            // What the daemon applied (SynapsCLI #437): the transcript took
+            // the `PromptResolved` that resolved this card.
+            let outcome = self.model.lives[self.panes.cur.live].transcript.resolved_outcome(c.key.1);
+            receipts.push(crate::authorize::Receipt {
+                call,
+                own,
+                row: c.row,
+                secret: c.secret,
+                answer,
+                sent,
+                at,
+                took,
+                landed: fx_now,
+                outcome,
+            });
             if receipts.len() > crate::authorize::RECEIPTS {
                 receipts.remove(0);
             }
@@ -5943,6 +6138,9 @@ impl AppView {
                     input: !self.panes.cur.list.is_following_tail(),
                     vh: f32::from(self.panes.cur.list.viewport_bounds().size.height),
                     fresh: Some(self.fx.frame()),
+                    row: None,
+                    since: fx_now,
+                    over: false,
                 }));
                 self.panes.cur.card_exit = None;
             }
@@ -8457,7 +8655,7 @@ impl AppView {
         let (pad_t, pad_b) = (0., list_pad_b(&m));
         // Read here: the list's own state is borrowed while it lays out.
         let gaps = self.fold_gap_now();
-        let slack = self.tail_slack();
+        let slack = self.tail_slack(self.over_held_row(window));
         let geo = crate::cards::Geo::of(&m);
         self.panes.cur.metrics_last.set(Some(m));
         let id = self.panes.cur.id;
@@ -8705,7 +8903,9 @@ impl AppView {
             let rows = this.fold_rows(&g.rows, cx);
             let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
             let p = theme::palette(cx);
-            let room = crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.inset + 1.)).debug_selector(|| "fold-gap".into());
+            let room = crate::cards::slab(false, true, inner, &p, geo, this.scale)
+                .h(px(*h + geo.edge + geo.inset))
+                .debug_selector(|| "fold-gap".into());
             el = div().w_full().child(el).child(room).into_any_element();
         }
         // The room an answered card gave up, under the last row.
@@ -8956,6 +9156,15 @@ impl AppView {
         }
         let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
         let (was, now) = (of(was), of(self.pane_yield));
+        // Taking over a flight that rode a yielding panel: a split's close
+        // mid-flight turns that panel back with its velocity, and the
+        // layout rides it on, if no other panel flies. A takeover that
+        // changes no yield (a split down, Equalise: Shady #62 M4) rides on
+        // the same flights it rode, from where it was drawn (below:
+        // `Carry::Ride`): the ride is linear in the centre's width, so an
+        // edge both layouts share goes on along the same line.
+        let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride(..)));
+        let others = (0..2).any(|i| was[i] == now[i] && (self.panel_fx.sides[i].from.is_some() || self.panel_fx.sides[i].moving));
         // On the spring of the panel whose flight made it, if one did
         // (Shady #54 n2: a drag let go onto a detent flies on `snap`; a
         // yield on `sheet` beside it made the centre non-monotone, and the
@@ -8967,9 +9176,16 @@ impl AppView {
             if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
                 self.panel_fx.fly(i == 0, response, true);
                 flew = true;
+                // On the other panel's flight: drawn off its progress, so
+                // the centre between them moves one way (#59's wobble).
+                let by = 1 - i;
+                let cause = self.panel_fx.sides[by];
+                if (cause.from.is_some() || cause.moving) && cause.tie.is_none() && was[by] == now[by] {
+                    self.panel_fx.tie(i, by);
+                }
             }
         }
-        flew && !panels
+        (flew && (!panels || (rode && !others))) || (!flew && rode && panels)
     }
 
     /// [`AppView::pane_sides`], judged now.
@@ -9047,8 +9263,9 @@ impl AppView {
     /// ([`crate::motion::Motion::spring_jump`] starts nothing).
     pub(crate) fn pane_flight_frame(&mut self, area: crate::split::Rect) -> crate::split::Node {
         let drawn = self.pane_flight_step(area);
-        // Where the next flight starts (Shady #42 M1).
+        // Where the next flight starts (Shady #42 M1), and when.
         self.panes.drawn = drawn.clone();
+        self.panes.drawn_at = self.panes.flight.is_some().then(|| self.fx.now());
         drawn
     }
 
@@ -9056,24 +9273,49 @@ impl AppView {
         let Some(f) = self.panes.flight.as_mut() else { return self.panes.tree.clone() };
         if f.travel == 0. {
             f.travel = f.to.travel_from(&f.from, area);
+            let carry = self.panes.carry.take();
             if f.travel < 1. {
                 self.panes.flight = None;
                 return self.panes.tree.clone();
             }
-            // From rest where it is drawn (a flight taking over another's
-            // starts again from there). Riding a panel: parked at rest,
-            // landed; read only if the ride is handed back (Shady #54 M2).
+            // From where it is drawn. A flight taking over another on its
+            // own spring turns with that one's velocity (the panels' rule:
+            // `PanelFx::fly`), as each edge's as one spring can carry it
+            // (`Flight::carried`); else from rest. Riding a panel: parked
+            // at rest, landed; read only if the ride is handed back (Shady
+            // #54 M2).
             let from = if f.ride.is_some() { f.travel } else { 0. };
-            self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
+            // Carried, it starts from `drawn` as of the frame that drew it
+            // (a frame of the old flight's time is not held: the 1920 film
+            // drew the layout twice, 14 ms, at the turn), at the velocity
+            // the old one had then: position, velocity and instant of one
+            // frame (Shady #62 M3: the velocity read now, a frame on, was
+            // planted at the frame before).
+            let now = self.fx.now();
+            let at = self.panes.drawn_at.filter(|t| now.saturating_duration_since(*t) < Duration::from_millis(100)).unwrap_or(now);
+            let v = match carry {
+                Some(crate::pane::Carry::Spring(a, b, len)) if f.ride.is_none() => {
+                    self.fx.spring_velocity_at(PANE_FLIGHT, at).map_or(0., |v| f.carried(&(a, b, len), v, area))
+                }
+                // A ride it can't carry on (a yield changed as another panel
+                // flies, or over a view): at the ride's velocity, projected
+                // (Shady #62 M4).
+                Some(crate::pane::Carry::Ride(a, b, len, r)) if f.ride.is_none() => {
+                    let v = ride_velocity(len, r, crate::chrome::centre_velocity(&self.fx, &self.panel_fx, at));
+                    if v == 0. { 0. } else { f.carried(&(a, b, len), v, area) }
+                }
+                _ => 0.,
+            };
+            self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE, if v != 0. { at } else { now });
         }
         // A panel yielding on it (#51): the layout rides the panel's
         // spring, by how far the centre has gone, and lands with it, in the
         // frame the panel is drawn at its target (#50, #52).
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
-                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(0., 1.) };
-                let at = |w: f32| crate::split::Rect { w, ..area };
-                return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
+                // Under 0 while a panel turned back carries on its way first
+                // (Shady #62 M1: [`crate::split::Flight::ride_frame`]).
+                return f.ride_frame(r, area);
             }
             self.panes.flight = None;
             return self.panes.tree.clone();
@@ -9091,7 +9333,8 @@ impl AppView {
             self.panes.flight = None;
             return self.panes.tree.clone();
         }
-        f.to.lerp_from(&f.from, (d / travel).clamp(0., 1.))
+        // Turning (a carried velocity): back past `from` as far as it goes.
+        f.to.lerp_from(&f.from, (d / travel).min(1.))
     }
 
     /// The layout changes to `to` on `sheet` from where it is drawn
@@ -9116,7 +9359,7 @@ impl AppView {
         let held = self.panes.grab.as_ref().filter(|g| g.moved).map(|g| (g.divider.path.clone(), g.divider.i));
         let (edge, dim) = (p.edge, p.dim_ch);
         let origin = self.centre_at.get();
-        tree.dividers(area)
+        tree.dividers_in(area, origin)
             .into_iter()
             .enumerate()
             .map(|(n, d)| {
@@ -9204,7 +9447,7 @@ impl AppView {
         let found = self
             .panes
             .tree
-            .dividers(crate::split::Rect { x: 0., y: 0., w, h })
+            .dividers_in(crate::split::Rect { x: 0., y: 0., w, h }, self.centre_at.get())
             .into_iter()
             .find(|d| (&d.path, d.i, d.axis) == (&g.divider.path, g.divider.i, g.divider.axis) && d.rect.w > 0. && d.rect.h > 0.);
         if found.is_none() {
@@ -9265,6 +9508,7 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);
         }
@@ -9455,7 +9699,15 @@ impl Render for AppView {
         let column_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
         let pane = column_of(&[crate::chrome::MARK, rail_w, right_w]);
         let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
-        self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
+        // Each with its left edge in the window: this frame's, and where
+        // the panels land (Shady #62 R3-1: a pane's box is rounded on the
+        // window's pixels, so the same width at another origin can wrap a
+        // pixel apart).
+        let (at_now, at_to) = (crate::chrome::MARK + rail_w, crate::chrome::MARK + dp(rail.width()) / s);
+        self.panel_fx.freeze = self.panel_fx.moving().then(|| {
+            let f = self.panel_fx.freeze.unwrap_or_else(|| crate::chrome::Freeze::new(self.wrap_centre, (pane, at_now)));
+            f.with([(pane, at_now), (pane_to, at_to)])
+        });
         // At Reduced and Off the panel is there at once, the layout too.
         // Over a view the layout is drawn without the right panel (below:
         // `view_pane`), so it has nothing to ride: it flies on its own
@@ -9466,7 +9718,14 @@ impl Render for AppView {
             && !lone_view
             && let Some(f) = self.panes.flight.as_mut()
         {
-            f.ride = Some(crate::split::Ride { from: pane, to: pane_to });
+            // Riding on (`Carry::Ride`): from the width its `from` was drawn
+            // at, the last frame's, so this frame carries on as that ride
+            // would have.
+            // Each with its left edge (Shady #62 r4 R4-1): the last
+            // frame's, riding on; this frame's, from rest.
+            let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride(..)));
+            let (from, from_x) = if rode { (self.centre.get().0, self.centre_at.get().0) } else { (pane, at_now) };
+            f.ride = Some(crate::split::Ride { from, to: pane_to, from_x });
         }
         // Its ends moved under it (a fold or unfold, an edge drag, a width
         // reset, a resize), or a view came on screen in the pane a close
@@ -9483,7 +9742,11 @@ impl Render for AppView {
             f.travel = 0.;
             f.wrap_at = None;
         }
-        let wrap = self.panel_fx.freeze.unwrap_or(pane);
+        let wrap = self.panel_fx.freeze.map_or(pane, |f| f.width());
+        // At rest, the centre the columns wrap for (`origin_to` below).
+        if self.panel_fx.freeze.is_none() {
+            self.wrap_centre = Some((pane, at_to));
+        }
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
         let view_pane = column_of(&[crate::chrome::MARK, rail_w]);
@@ -9525,13 +9788,21 @@ impl Render for AppView {
         }
         let main = if self.panes.shown_split() || (self.panes.flight.is_some() && !self.panes.folded) {
             let area = |w: f32| crate::split::Rect { x: 0., y: 0., w, h: centre_h };
+            // On the window's pixels (Shady #62 M2: [`crate::split::Node::rects_in`]):
+            // the centre's top-left as drawn now, and as the panels land
+            // (where a landed pane's width and a flight's wraps are read).
+            let origin = self.centre_at.get();
+            let origin_to = (crate::chrome::MARK + dp(rail.width()) / s, origin.1);
+            let placed = |w: f32, o: (f32, f32)| crate::split::Rect { x: o.0, y: o.1, w, h: centre_h };
             // The layout as drawn this frame: the tree, or its flight's
             // step (split.md §10).
-            let drawn = self.pane_flight_frame(area(centre));
+            let drawn = self.pane_flight_frame(placed(centre, origin));
             // The panes whose close has landed go (finish gate #42 F2).
             self.reap_closing();
-            let rects = drawn.rects(area(centre));
-            let land = self.panes.tree.rects(area(centre));
+            let rects = drawn.rects_in(area(centre), origin);
+            #[cfg(test)]
+            self.rects_drawn.replace((origin, rects.clone()));
+            let land = self.panes.tree.rects_in(area(centre), origin);
             // Each pane's width as the panels' flight lands, and the width
             // its column wraps at while they fly: its rectangle in the
             // centre at `pane_to`, and at the flight's narrowest (`wrap`).
@@ -9540,26 +9811,41 @@ impl Render for AppView {
             // centre's, `r.w * wrap / pane` went a pixel either way as its
             // rounded width and the centre's fraction moved, and each step
             // measured the list again).
-            let at = |w: f32| self.panes.tree.rects(area(w));
-            let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            let at = |w: f32| self.panes.tree.rects_in(area(w), origin_to);
+            // In the panels' flight, each pane's box in the centre it
+            // started from and in the narrowest, each at its own origin:
+            // the narrower is its wrap (Shady #62 R3-1). At rest, the
+            // centre at `origin_to`, as before.
+            let wraps = self.panel_fx.freeze.map_or([(pane, origin_to.0); 2], |f| [f.start, f.narrowest]);
+            let (rects_to, rects_wrap) = (at(pane_to), wraps.map(|(w, x)| self.panes.tree.rects_in(area(w), (x, origin.1))));
             // A panel yielding on the layout's flight (#51): its own ends.
-            let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
+            let ride = self.panes.flight.as_ref().and_then(|f| f.ride);
+            let ride_from = ride.map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
             // The tree itself drawn (the pixel landing, before the spring
             // rests): each column at its landed wrap in this frame, the
             // last that moves, never after it (finish gate #42 F1).
             let landed = drawn == self.panes.tree;
             let mut mains = Vec::new();
-            // Each pane's wrap in the flight, from its ends at the panels'
-            // narrowest centre (Shady #42 L2).
+            // Each pane's wrap in the flight, from its ends (Shady #42 L2),
+            // each tree in a centre at that centre's own origin (Shady #62
+            // r4 R4-1: at the landing's, a ride's starting pane of 378 was
+            // 377.8, and its column went 346 → 345 → 427). Riding: the
+            // start where the ride starts, the end where it lands. On its
+            // own spring: both at the panels' narrowest centre, at rest
+            // this frame's.
             if let Some(f) = self.panes.flight.as_mut() {
-                match ride_from {
-                    Some(from) => f.set_wraps_at(area(from), area(pane_to)),
-                    None => f.set_wraps(area(wrap)),
+                match ride {
+                    Some(r) => f.set_wraps_at(placed(r.from, (r.from_x, origin.1)), placed(pane_to, origin_to)),
+                    None => {
+                        let (w, x) = self.panel_fx.freeze.map_or((pane, origin_to.0), |z| z.narrower());
+                        f.set_wraps(placed(w, (x, origin.1)));
+                    }
                 }
             }
             // Where each closing share goes (its rectangle at 0).
-            let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
+            let to_rects =
+                self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects_in(area(centre), origin)).unwrap_or_default();
             for (id, r) in &rects {
                 if ghosts.contains(id) {
                     // A closing pane (finish gate #42 F2): laid out where it
@@ -9606,10 +9892,17 @@ impl Render for AppView {
                     // Its narrowest of the flight, set at its start, not this
                     // frame's box (it would rewrap as that moved). With a
                     // panel yielding on it, its narrower end (#51): it
-                    // moves linearly between them.
+                    // moves linearly between them. In the panels' flight
+                    // alone, its box at their narrowest centre, where they
+                    // land; not also this frame's box: on the window's
+                    // pixels (M2), at a centre's edge on a half pixel, that
+                    // is a fraction narrower every other frame, and the
+                    // column rewrapped 635/636 as the rail folded.
                     wrap: match ride_from {
                         Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
-                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                        None => {
+                            of(&rects_wrap[0]).min(of(&rects_wrap[1])).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY))
+                        }
                     },
                     pane_to: of(&rects_to),
                     view_pane: pane,
@@ -9649,6 +9942,8 @@ impl Render for AppView {
         } else {
             #[cfg(test)]
             self.handles_drawn.set(false);
+            #[cfg(test)]
+            self.rects_drawn.replace(((0., 0.), Vec::new()));
             // The last close's pane goes, if a frame of it is left.
             self.reap_closing();
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
@@ -9664,6 +9959,7 @@ impl Render for AppView {
         self.schedule_tabs_save(cx);
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
+        self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
         h_flex()
