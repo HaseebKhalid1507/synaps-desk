@@ -23,7 +23,6 @@ use crate::app::AppView;
 
 const A: &str = "20261121-020000-aaaa";
 const B: &str = "20261121-020000-bbbb";
-const T: Duration = Duration::from_secs(10);
 
 struct Conn {
     r: BufReader<UnixStream>,
@@ -94,16 +93,7 @@ fn start(name: &str) -> (PathBuf, mpsc::Receiver<Conn>) {
 /// The client's events until one matches `done` (the test holds them: the
 /// view under test is driven by the `--offline` demo's, as `ui_tests`').
 fn until(events: &async_channel::Receiver<Event>, what: &str, done: impl Fn(&Event) -> bool) {
-    let deadline = Instant::now() + T;
-    loop {
-        while let Ok(ev) = events.try_recv() {
-            if done(&ev) {
-                return;
-            }
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_waits::until(events, what, done)
 }
 
 /// The `--offline` demo's window at 1280×800, text step 16 (`ui_tests`'
@@ -170,21 +160,7 @@ fn feed(
     what: &str,
     done: impl Fn(&AppView) -> bool,
 ) {
-    let deadline = Instant::now() + T;
-    loop {
-        let batch: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-        if !batch.is_empty() {
-            view.update(cx, |v, cx| v.apply_batch(batch, cx));
-        }
-        cx.run_until_parked();
-        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
-        cx.run_until_parked();
-        if view.read_with(cx, |v, _| done(v)) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_waits::feed(cx, window, view, events, what, done)
 }
 
 /// Shady #32 H1: the last tab closed detaches from its session, as on main
@@ -207,7 +183,7 @@ fn closing_the_last_tab_detaches_its_attachment(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let seq = seq.expect("A's attach asked for");
     assert_eq!(view.read_with(cx, |v, _| v.model.tabs.iter().count()), 1, "one tab");
-    let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
+    let mut a = crate::test_waits::recv(&attaches).expect("A's attach at the daemon");
     a.send(attached(A, None));
     until(&events, "A attached", |e| matches!(e, Event::Attached { attach_seq, .. } if *attach_seq == seq));
     // Ctrl+W on it.
@@ -246,7 +222,7 @@ fn the_views_allow_halt_and_message_reach_only_the_shown_stores_session(cx: &mut
         v.reconcile(None);
         cx.notify();
     });
-    let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
+    let mut a = crate::test_waits::recv(&attaches).expect("A's attach at the daemon");
     a.send(attached(A, Some(1)));
     // The other store, on B: its prompt is #1 too.
     let b = view.update(cx, |v, _| {
@@ -256,7 +232,7 @@ fn the_views_allow_halt_and_message_reach_only_the_shown_stores_session(cx: &mut
         v.model.asked_for(b, B);
         b
     });
-    let mut on_b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut on_b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     on_b.send(attached(B, Some(1)));
     // Its buttons act once it has been up `ARM` (wall time).
     feed(cx, window, &view, &events, "both attached, A's card up and armed", |v| {
@@ -354,7 +330,7 @@ fn on_a_in(
         v.reconcile(None);
         cx.notify();
     });
-    let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
+    let mut a = crate::test_waits::recv(&attaches).expect("A's attach at the daemon");
     a.send(attached_a);
     feed(cx, window, &view, &events, "A attached", |v| v.model.lives[v.panes.cur.live].is_active(A));
     (window, view, client, a, attaches, events)
@@ -418,7 +394,7 @@ fn input_goes_only_to_the_focused_panes_own_attachment(cx: &mut TestAppContext) 
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon, on its own connection");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon, on its own connection");
     b.send(attached(B, Some(1)));
     feed(cx, window, &view, &events, "B attached in the second pane, its card armed", |v| {
         v.model.lives[v.panes.cur.live].is_active(B) && v.panes.cur.card.as_ref().is_some_and(|c| c.armed())
@@ -876,7 +852,7 @@ fn typing_after_a_focus_change_goes_to_the_marked_pane(cx: &mut TestAppContext) 
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
@@ -996,7 +972,7 @@ fn another_panes_attach_leaves_the_open_menu(cx: &mut TestAppContext) {
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     key(cx, window, "alt-1");
     view.update(cx, |v, cx| {
         // A worker's menu, opened with the mouse (it stays until closed).
@@ -1438,7 +1414,7 @@ fn a_refused_message_from_a_pane_that_left_goes_back_to_the_pane_on_its_session(
                 v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
                 cx.notify();
             });
-            let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+            let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
             b.send(attached(B, None));
             feed(cx, window, &view, &events, "B attached in the second pane", |v| {
                 v.panes.get(p1).is_some_and(|p| v.model.lives[p.live].is_active(B))
@@ -2211,7 +2187,7 @@ fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestApp
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
@@ -2222,6 +2198,9 @@ fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestApp
         cmds.iter().find(|e| matches!(e.act, crate::palette::Act::App(crate::palette::AppAct::JumpWaiting))).map(|e| e.off.is_none())
     });
     assert_eq!(offered, Some(true), "the palette offers the jump: A's pane waits");
+    // The card's arm on the test's clock (`pin_arm_clock`): its keys read
+    // at the jump's instant, however long two frames take to draw.
+    crate::app::pin_arm_clock(Some(Instant::now()));
     key(cx, window, "ctrl-j");
     frame(cx, window);
     frame(cx, window);
@@ -2229,6 +2208,7 @@ fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestApp
     assert!(root_has_keys(cx, window, &view), "the card's keys (the window's root) have the focus");
     // The press that jumped answers nothing: the card waits its arm.
     view.update(cx, |v, _| v.in_pane(pa, |v| assert!(!v.panes.cur.card.as_ref().expect("A's card").keys_armed(), "its keys wait again")));
+    crate::app::pin_arm_clock(None);
     assert!(!names(&mut a).iter().any(|n| n == "answer"), "nothing answered");
     // Again, with the card's pane focused: Ctrl+J stays (its own card).
     key(cx, window, "ctrl-j");
@@ -2250,7 +2230,7 @@ fn a_card_in_an_unfocused_pane_fires_its_cues_there(cx: &mut TestAppContext) {
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
@@ -2334,7 +2314,7 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     act(cx, AppAct::SplitDown);
@@ -2455,7 +2435,7 @@ fn open_to_the_side_follows_its_order(cx: &mut TestAppContext) {
         frame(cx, window);
     };
     let attach = |cx: &mut TestAppContext, s: &'static str| {
-        let mut c = attaches.recv_timeout(T).expect("an attach at the daemon");
+        let mut c = crate::test_waits::recv(&attaches).expect("an attach at the daemon");
         c.send(attached(s, None));
         feed(cx, window, &view, &events, "attached", |v| v.model.lives.iter().any(|l| l.is_active(s)));
         let _ = names(&mut c);
@@ -2777,7 +2757,7 @@ fn open_to_the_side_never_splits_for_a_session_on_screen(cx: &mut TestAppContext
         frame(cx, window);
     };
     side(cx, B);
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached", |v| v.model.lives.iter().any(|l| l.is_active(B)));
     let _ = (names(&mut a), names(&mut b));
@@ -2935,7 +2915,7 @@ fn a_card_key_right_after_a_ctrl_j_waits_its_arm(cx: &mut TestAppContext) {
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let _ = names(&mut b);
@@ -3375,7 +3355,7 @@ fn join_closing_two_panes_on_one_store_keeps_their_unsent_text(cx: &mut TestAppC
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the first pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let _ = (names(&mut a), names(&mut b));
@@ -3392,9 +3372,9 @@ fn join_closing_two_panes_on_one_store_keeps_their_unsent_text(cx: &mut TestAppC
     assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused)), (1, p0), "joined into the first pane");
     a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t",
         "event": {"ev": "refused", "client": 2, "command": "submit", "reason": "busy"}}));
-    let deadline = Instant::now() + T;
+    let stop = crate::test_waits::Backstop::start();
     let back = loop {
-        let batch: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let batch = crate::test_waits::batch(&events);
         if !batch.is_empty() {
             view.update(cx, |v, cx| v.apply_batch(batch, cx));
         }
@@ -3403,9 +3383,15 @@ fn join_closing_two_panes_on_one_store_keeps_their_unsent_text(cx: &mut TestAppC
             let shown = (v.panes.cur.restore.clone(), v.panes.cur.composer.read(cx).value().to_string());
             v.drafts.take(A).map(|d| d.text).or(shown.0).or((shown.1 == text).then_some(shown.1))
         });
-        if got.is_some() || Instant::now() > deadline {
+        if got.is_some() {
             break got;
         }
+        // A closed client fails at once (Shady #74 P2); a live one that
+        // never brings it back, at the backstop.
+        if events.is_closed() && events.is_empty() {
+            panic!("the client closed before the unsent text came back");
+        }
+        stop.check("the unsent text back in the pane", || "no draft or restore yet".into());
         std::thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(back.as_deref(), Some(text), "the unsent text back in the pane kept, as A's draft");
@@ -4503,16 +4489,7 @@ fn in_body(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane::Pa
 /// for the attach gate ([`crate::tabs::AttachGate`]): its timer runs on
 /// the test's clock, so frames are drawn and the clock moved meanwhile.
 fn next_attach(cx: &mut TestAppContext, window: AnyWindowHandle, attaches: &mpsc::Receiver<Conn>, what: &str) -> Conn {
-    let deadline = Instant::now() + T;
-    loop {
-        if let Ok(c) = attaches.try_recv() {
-            return c;
-        }
-        assert!(Instant::now() < deadline, "{what}: timed out");
-        cx.executor().advance_clock(Duration::from_millis(50));
-        frame(cx, window);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_waits::next_attach(cx, window, attaches, what)
 }
 
 /// B opened as a new tab of the focused pane, attached.
@@ -5022,8 +4999,11 @@ fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_f
     feed(cx, window, &view, &events, "B's card in the new pane", |v| v.panes.get(new).is_some_and(|p| p.card.is_some()));
     assert!(view.read_with(cx, |v, _| v.panes.get(new).is_some_and(|p| p.hold_rows)), "its rows still held");
     let _ = names(&mut b);
-    // Past the arm the card's first frame would have started (real time).
-    std::thread::sleep(Duration::from_millis(600));
+    // Past the arm the card's first frame would have started: 600 ms on,
+    // the card's arm on the test's clock (`pin_arm_clock`, as in
+    // `arm_from_whole`), then 6.944 ms a frame, the click at its frame's
+    // instant, however long the machine takes to draw it.
+    let mut t = Instant::now() + Duration::from_millis(600);
     // A frame: how far from landing, held, its rows' boxes, sticky layers
     // painted (the first pane's is one), its column, its rows' strength.
     #[derive(Clone, Debug, PartialEq)]
@@ -5069,7 +5049,9 @@ fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_f
     let mut fails = Vec::new();
     let (mut first, mut rest) = (None, 0);
     while rest < 12 {
-        let before = Instant::now();
+        t += Duration::from_micros(6944);
+        crate::app::pin_arm_clock(Some(t));
+        let before = t;
         frame_144(cx, window, &view);
         let thumb = bar.thumbs().last().and_then(|t| t.2);
         let s = snap(cx, thumb);
@@ -5144,12 +5126,15 @@ fn a_dropped_rows_pane_holds_its_rows_lifts_them_in_its_tail_and_arms_its_card_f
         "{fails:#?}\n{:#?}",
         seen.iter().map(|s| (s.left, s.held, s.rows.len(), s.sticky, s.k, s.thumb.is_some())).collect::<Vec<_>>()
     );
-    // The arm run out: Allow answers, once.
-    std::thread::sleep(Duration::from_millis(600));
+    // The arm run out: Allow answers, once (its repaint on the test's
+    // clock too, as in `arm_from_whole`).
+    crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
+    cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     let allow = in_pane_at(cx, window, "allow-fill", new);
     click_at(cx, window, allow);
     assert_eq!(names(&mut b), ["answer"], "armed, the click answers");
+    crate::app::pin_arm_clock(None);
     drop(attaches);
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
@@ -5172,12 +5157,17 @@ fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
 
 /// #53 R3-L1, the rest of a growing pane's flight at Full, frame by frame
 /// at 144 Hz, its card up (its arm, if counted from the pane's first
-/// frame, run out in the real time slept before): the card's buttons as
-/// drawn against the pane's share. A click on Allow while it shows but the
+/// frame, run out in the 600 ms before): the card's buttons as drawn
+/// against the pane's share. A click on Allow while it shows but the
 /// buttons are cut off, and on the first frame they are whole a click and
 /// a Ctrl+Enter (the root has the keys after the click), answer nothing;
 /// the arm counts from that frame. Then, 600 ms on, Allow answers. What
 /// failed, by `what`.
+///
+/// The card's arm is on the test's clock (`pin_arm_clock`): those 600 ms,
+/// then 6.944 ms a frame, the clicks at their frame's instant. On wall
+/// time a loaded runner's frame and click took longer than the arm itself
+/// (#69: CI's ubuntu runner, the side case's first whole frame).
 fn arm_from_whole(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -5187,13 +5177,15 @@ fn arm_from_whole(
     what: &str,
 ) -> Vec<String> {
     let mut fails = Vec::new();
-    std::thread::sleep(Duration::from_millis(600));
+    let mut t = Instant::now() + Duration::from_millis(600);
     let card_at =
         |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(new).and_then(|p| p.card.as_ref().map(|c| c.arm.shown_at())));
     let allow = |b: [f32; 4]| gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
     let (mut whole_at, mut cut_clicked, mut rest, mut i) = (None, false, 0, 0);
     while rest < 12 {
-        let before = Instant::now();
+        t += Duration::from_micros(6944);
+        crate::app::pin_arm_clock(Some(t));
+        let before = t;
         frame_144(cx, window, view);
         let share = drawn(cx, window, format!("pane {}", new.index()));
         let buttons = drawn(cx, window, format!("card-buttons {}", new.index()));
@@ -5234,10 +5226,11 @@ fn arm_from_whole(
         assert!(i < 400, "{what}: never landed");
     }
     if whole_at.is_none() {
+        crate::app::pin_arm_clock(None);
         fails.push(format!("{what}: its buttons never drawn whole"));
         return fails;
     }
-    std::thread::sleep(Duration::from_millis(600));
+    crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
     cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     match drawn(cx, window, format!("card-buttons {}", new.index())) {
@@ -5250,6 +5243,7 @@ fn arm_from_whole(
         }
         None => fails.push(format!("{what}: no card left to answer")),
     }
+    crate::app::pin_arm_clock(None);
     fails
 }
 
@@ -5337,7 +5331,9 @@ fn a_growing_panes_card_arms_from_the_first_frame_its_buttons_are_whole(cx: &mut
 /// #53 R3-L2: a card in a pane the fold hides waits again when widening
 /// shows it: a click on its Allow on the first frame it is drawn again
 /// answers nothing (it had been up for longer than its arm); 600 ms on,
-/// one answers.
+/// one answers. The card's arm on the test's clock (`pin_arm_clock`), as
+/// in `arm_from_whole`: the click at its frame's instant, however long the
+/// machine takes to draw it.
 #[gpui_kit::test]
 fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let (window, view, client, mut a, _attaches, events) = on_a(cx, "arm-fold", Some(1));
@@ -5347,13 +5343,15 @@ fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let p1 = view.read_with(cx, |v, _| v.panes.focused);
     assert_ne!(p1, p0);
     // Armed in both panes, then the first one hidden by the fold.
-    std::thread::sleep(Duration::from_millis(600));
+    let mut t = Instant::now() + Duration::from_millis(600);
+    crate::app::pin_arm_clock(Some(t));
     frame(cx, window);
     let _ = names(&mut a);
     resize(cx, window, 700., 800.);
     assert!(view.read_with(cx, |v, _| v.panes.folded && v.panes.focused == p1), "folded on the second pane");
     assert!(drawn(cx, window, format!("pane {}", p0.index())).is_none(), "the first pane not drawn");
-    std::thread::sleep(Duration::from_millis(600));
+    t += Duration::from_millis(600);
+    crate::app::pin_arm_clock(Some(t));
     frame(cx, window);
     // Widened: its first frame shows the first pane's card, armed or not.
     VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(800.)));
@@ -5363,11 +5361,12 @@ fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let allow = gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
     click_at(cx, window, allow);
     assert_eq!(names(&mut a), Vec::<String>::new(), "a click on its first frame back answers nothing");
-    // Its arm runs out (real time; its repaint on the test's clock).
-    std::thread::sleep(Duration::from_millis(600));
+    // Its arm runs out (its repaint on the test's clock too).
+    crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
     cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     click_at(cx, window, allow);
+    crate::app::pin_arm_clock(None);
     assert_eq!(names(&mut a), ["answer"], "armed, the click answers");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
@@ -6406,13 +6405,13 @@ fn a_delayed_layout_write_that_finished_as_the_quit_came_is_written_over(cx: &mu
             let writer = std::thread::spawn(move || {
                 SaveJob::write(&slot, SaveKind::Layout, g1, || {
                     holding_tx.send(()).expect("the test");
-                    go_rx.recv().expect("the test");
+                    crate::test_waits::recv(&go_rx).expect("the test");
                     // The flush is waiting for the lock by now.
                     std::thread::sleep(Duration::from_millis(150));
                     crate::theme::save_layout(&p, &key1, &l1)
                 })
             });
-            holding.recv_timeout(T).expect("the writer holds the lock");
+            crate::test_waits::recv(&holding).expect("the writer holds the lock");
             view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
             go.send(()).expect("the writer");
             // Waits for the writer's lock, then writes.
@@ -6442,7 +6441,7 @@ fn a_press_held_through_the_last_close_is_still_a_click(cx: &mut TestAppContext)
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = attaches.recv_timeout(T).expect("B's attach");
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));

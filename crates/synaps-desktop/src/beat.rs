@@ -27,6 +27,14 @@ pub(crate) struct Shell {
     beat: Entity<BeatLayer>,
 }
 
+#[cfg(test)]
+impl Shell {
+    /// The app's view (`test_waits`: a test's window to its view).
+    pub(crate) fn app(&self) -> Entity<AppView> {
+        self.app.clone()
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().relative().size_full().child(self.app.clone().cached(StyleRefinement::default().size_full())).child(self.beat.clone())

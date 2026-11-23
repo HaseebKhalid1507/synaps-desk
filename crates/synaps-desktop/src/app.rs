@@ -1624,6 +1624,38 @@ pub(crate) struct Arm {
     keys: Instant,
 }
 
+/// The time on the card's arm ([`Arm`]): every wait it starts and every
+/// check of it read this. The time; a test may pin it ([`pin_arm_clock`]),
+/// so a card drawn frame by frame on the test's clock is judged on that
+/// clock, not on how long the machine took to draw the frames (#69: a
+/// click on the frame its buttons came whole answered on a loaded CI
+/// runner, the frame and the click 930 ms of wall time).
+pub(crate) fn arm_now() -> Instant {
+    arm_at(Instant::now())
+}
+
+/// `now` on the card's arm ([`arm_now`]): `now` itself, unless a test
+/// pinned the arm's clock.
+pub(crate) fn arm_at(now: Instant) -> Instant {
+    #[cfg(test)]
+    if let Some(at) = ARM_PIN.with(Cell::get) {
+        return at;
+    }
+    now
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARM_PIN: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Tests: the card's arm reads `at` until pinned again (`None`: the time).
+/// A GPUI test runs the view on its own thread, so the pin is that test's.
+#[cfg(test)]
+pub(crate) fn pin_arm_clock(at: Option<Instant>) {
+    ARM_PIN.with(|p| p.set(at));
+}
+
 impl Arm {
     pub(crate) fn new(now: Instant) -> Self {
         Arm { shown: now, keys: now }
@@ -5832,7 +5864,7 @@ impl AppView {
     pub(crate) fn restart_card_keys(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.panes.cur.card.as_mut() {
             log::info!(target: "synaps_desktop::card", "card {:?}: keys live, waiting", c.key);
-            c.arm.restart(Instant::now());
+            c.arm.restart(arm_now());
             c._arm = Some(Self::arm_repaint(cx));
         }
     }
@@ -5844,7 +5876,7 @@ impl AppView {
         let press = self.panes.cur.chord_press;
         let fresh = !std::mem::replace(&mut self.panes.cur.keys_live, true);
         let Some(c) = self.panes.cur.card.as_mut() else { return false };
-        let now = Instant::now();
+        let now = arm_now();
         if fresh {
             c.arm.restart(now);
         }
@@ -6148,7 +6180,7 @@ impl AppView {
         if up && !self.panes.cur.card_was_up && !new {
             if let Some(c) = self.panes.cur.card.as_mut() {
                 log::info!(target: "synaps_desktop::card", "card {:?}: back on screen, waiting", c.key);
-                c.arm = Arm::new(now);
+                c.arm = Arm::new(arm_at(now));
                 c._arm = Some(Self::arm_repaint(cx));
             }
             self.panes.cur.keys_live = false;
@@ -8568,7 +8600,7 @@ impl AppView {
         if clipped {
             // The card's buttons and keys wait from each frame that clips them.
             if let Some(c) = self.panes.cur.card.as_mut() {
-                c.arm = Arm::new(Instant::now());
+                c.arm = Arm::new(arm_now());
             }
             self.panes.cur.keys_live = false;
         }
@@ -8582,7 +8614,7 @@ impl AppView {
         if !self.panes.cur.card_was_up && self.card_up() {
             if let Some(c) = self.panes.cur.card.as_mut() {
                 log::info!(target: "synaps_desktop::card", "card {:?}: drawn whole, waiting", c.key);
-                c.arm = Arm::new(Instant::now());
+                c.arm = Arm::new(arm_now());
                 c._arm = Some(Self::arm_repaint(cx));
             }
             self.panes.cur.keys_live = false;
