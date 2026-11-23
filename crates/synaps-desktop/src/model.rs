@@ -1816,7 +1816,7 @@ impl Model {
                     self.view_dirty = true;
                 }
             }
-            Event::Session { attach_seq, ts, event, raw, .. } if self.lives[lid].current(attach_seq) => {
+            Event::Session { attach_seq, ts, event, meta, raw, .. } if self.lives[lid].current(attach_seq) => {
                 // The engine's note of a worker steer in the main conversation.
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
                     self.lives[lid].watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
@@ -1841,7 +1841,9 @@ impl Model {
                     }
                     _ => {}
                 }
-                self.lives[lid].transcript.apply_at(&event, &ts);
+                // With what it says beyond its typed form (a prompt's
+                // outcome, SynapsCLI #437: the receipt takes its word).
+                self.lives[lid].transcript.apply_with(&event, &ts, &meta);
                 let l = &mut self.lives[lid];
                 if !l.answered.is_empty() {
                     let pending = l.transcript.pending_prompts();

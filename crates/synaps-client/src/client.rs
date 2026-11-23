@@ -508,6 +508,9 @@ pub enum Event {
         /// ([`crate::transcript::Transcript::apply_at`]).
         ts: String,
         event: SessionEvent,
+        /// What the event says beyond its typed form (an outcome, …),
+        /// decoded from `raw` with it.
+        meta: crate::protocol::EventMeta,
         raw: Arc<Value>,
     },
     /// The history changed (`Full` mode).
@@ -665,7 +668,8 @@ pub enum WatchReply {
 impl Event {
     /// An [`Event::Session`] sent at no known time (`ts` empty).
     pub fn session(attach_seq: u64, session_id: impl Into<String>, seq: u64, event: SessionEvent, raw: Arc<Value>) -> Self {
-        Event::Session { attach_seq, session_id: session_id.into(), seq, ts: String::new(), event, raw }
+        let meta = crate::protocol::EventMeta::of(&raw);
+        Event::Session { attach_seq, session_id: session_id.into(), seq, ts: String::new(), event, meta, raw }
     }
 
     /// This [`Event::Session`] sent at `ts` (its envelope's, RFC 3339). Any
@@ -2200,7 +2204,8 @@ async fn session_loop(
                             _ => {}
                         }
                         let ended = matches!(event, SessionEvent::Ended { .. });
-                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, raw });
+                        let meta = crate::protocol::EventMeta::of(&raw);
+                        emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, meta, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered");
                             unset(&events, attach_seq, &mut sets, &mut options, "the session ended before the daemon answered");
