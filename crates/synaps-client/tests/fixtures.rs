@@ -999,3 +999,80 @@ fn a_prompts_raised_at_and_scope_are_read_leniently() {
         serde_json::from_value(serde_json::json!({"id": 3, "kind": "secret", "confirm_scope": {"extensions": ["guard"]}})).unwrap();
     assert!(secret.allow_all().is_none());
 }
+
+/// #14: a compaction's two messages are drawn as nothing, as the TUI and
+/// the daemon's display projection draw them (SynapsCLI dev
+/// `session/display.rs` `items_of`: any string content holding
+/// `<context-summary>`; no string-content assistant message). The daemon
+/// writes the summary inside a sentence (`compaction_context_messages`),
+/// so a `starts_with` drew it as a YOU row and the acknowledgement as an
+/// AGENT row. On every path a history comes by: an attach (with its
+/// replay), the mirror's append and its replacement (a compaction's
+/// re-query), a `MessageHistory` while a turn runs, a digest-less replay.
+#[test]
+fn a_compaction_summary_is_drawn_as_nothing() {
+    use serde_json::json;
+    const SUMMARY: &str = "The conversation history before this point was compacted into the following summary:\n\n\
+        <context-summary>\nwhat came before\n</context-summary>\n\n\
+        Continue from where we left off. The summary and the system prompt contain all the context you need.";
+    const ACK: &str = "I've loaded the conversation summary. Ready to continue.";
+    let compacted = vec![
+        json!({"role": "user", "content": SUMMARY}),
+        json!({"role": "assistant", "content": ACK}),
+        json!({"role": "user", "content": "after the compaction"}),
+        json!({"role": "assistant", "content": [{"type": "text", "text": "carrying on"}]}),
+    ];
+    let drawn = |t: &Transcript| {
+        let rows = texts(t);
+        assert!(!rows.iter().any(|(_, s)| s.contains("<context-summary>") || s == ACK), "{rows:?}");
+        rows.into_iter().filter(|(k, _)| *k != ItemKind::Notice).collect::<Vec<_>>()
+    };
+    let after = vec![(ItemKind::User, "after the compaction".to_string()), (ItemKind::Assistant, "carrying on".to_string())];
+    // An attach (`load_attached`).
+    let mut a = attached("attached_history.json");
+    a.conversation.api_messages = compacted.clone();
+    a.conversation.messages_len = compacted.len();
+    let mut t = Transcript::new();
+    t.load_attached(&a).unwrap();
+    assert_eq!(drawn(&t), after, "an attach");
+    // The mirror: the compaction's re-query replaces the history; a later
+    // round appends after it.
+    let mut t = Transcript::new();
+    t.apply_update(&HistoryUpdate::Replace { messages: vec![json!({"role": "user", "content": "before"})] }).unwrap();
+    t.apply_update(&HistoryUpdate::Replace { messages: compacted.clone() }).unwrap();
+    assert_eq!(drawn(&t), after, "a replacement");
+    let more = vec![json!({"role": "user", "content": "more"})];
+    t.apply_update(&HistoryUpdate::Append { base_len: compacted.len(), messages: more }).unwrap();
+    assert_eq!(drawn(&t).len(), 3, "an append after it: {:?}", texts(&t));
+    // An append that ends on the summary, its acknowledgement in the next.
+    let mut t = Transcript::new();
+    t.apply_update(&HistoryUpdate::Replace { messages: vec![json!({"role": "user", "content": "before"})] }).unwrap();
+    t.apply_update(&HistoryUpdate::Append { base_len: 1, messages: compacted[..1].to_vec() }).unwrap();
+    t.apply_update(&HistoryUpdate::Append { base_len: 2, messages: compacted[1..].to_vec() }).unwrap();
+    assert_eq!(drawn(&t)[1..], after[..], "split across appends: {:?}", texts(&t));
+    // A `MessageHistory` while a turn runs, and a digest-less replay.
+    let mut t = Transcript::new();
+    t.apply(&SessionEvent::Stream { event: StreamEvent::Session(SessionStreamEvent::MessageHistory { messages: compacted.clone() }) });
+    assert_eq!(drawn(&t), after, "a MessageHistory");
+    let mut t = Transcript::new();
+    t.apply_history(&compacted);
+    assert_eq!(drawn(&t), after, "a replay");
+    // An older daemon's summary, at the start: nothing either.
+    let mut t = Transcript::new();
+    t.apply_history(&[
+        json!({"role": "user", "content": "<context-summary>old</context-summary>"}),
+        json!({"role": "user", "content": "next"}),
+    ]);
+    assert_eq!(drawn(&t), [(ItemKind::User, "next".to_string())]);
+    // Only the acknowledgement right after a summary goes: another
+    // string-content assistant message is a row, as before; and a user's
+    // own words that mention the tag inside a block are theirs.
+    let mut t = Transcript::new();
+    t.apply_history(&[
+        json!({"role": "assistant", "content": ACK}),
+        json!({"role": "user", "content": [{"type": "text", "text": "what is <context-summary>?"}]}),
+    ]);
+    assert_eq!(texts(&t), [(ItemKind::Assistant, ACK.to_string()), (ItemKind::User, "what is <context-summary>?".to_string())]);
+    assert!(synaps_client::transcript::is_compaction_summary(&compacted[0]));
+    assert!(!synaps_client::transcript::is_compaction_summary(&compacted[1]));
+}

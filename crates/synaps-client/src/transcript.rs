@@ -374,6 +374,10 @@ pub struct Transcript {
     /// An attach's replay is applied: the one time a frame can come after
     /// its own history row ([`same_event`]).
     replaying: bool,
+    /// The message folded last was a compaction summary
+    /// ([`is_compaction_summary`]): the next, if the acknowledgement the
+    /// daemon writes after it, is not drawn either.
+    after_summary: bool,
 }
 
 impl Transcript {
@@ -779,6 +783,7 @@ impl Transcript {
     /// Fold a whole history from empty, interleaving `notes` by anchor.
     /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
+        self.after_summary = false;
         let notes = self.hold_events(notes, messages);
         let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.sort_by_key(|n| n.anchor);
@@ -983,11 +988,22 @@ impl Transcript {
     fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
+        // A compaction's two messages (#14), drawn as nothing, as the TUI
+        // and the daemon's display projection do: the summary, and the
+        // acknowledgement right after it (the projection draws no
+        // string-content assistant message; this one only).
+        let after_summary = std::mem::take(&mut self.after_summary);
+        if is_compaction_summary(m) {
+            self.after_summary = true;
+            return;
+        }
+        if after_summary && role == "assistant" && content.is_string() {
+            return;
+        }
         match (role, content) {
             ("user", Value::String(s)) if is_event_form(role, s) => self.fold_event(s, reuse),
             ("user", Value::String(s)) => {
-                let kind = if s.starts_with("<context-summary>") { ItemKind::Notice } else { ItemKind::User };
-                self.push(kind, s.clone(), None, false, reuse);
+                self.push(ItemKind::User, s.clone(), None, false, reuse);
             }
             ("assistant", Value::String(s)) => {
                 self.push(ItemKind::Assistant, s.clone(), None, false, reuse);
@@ -1403,6 +1419,19 @@ fn steered_event(text: &str) -> Option<ExternalEvent> {
 /// Whether a history message's text (its content, or a text block of it)
 /// from `role` is an event's agent form: the one test the fold and
 /// [`Transcript::hold_events`] share. One that does not parse is a notice.
+/// A compaction summary in a history (#14): a message whose content is a
+/// string holding `<context-summary>`, any role. The daemon's own rule
+/// (SynapsCLI dev `agent-engine` `session/display.rs` `items_of`, and
+/// `runtime/compaction.rs`): it writes the summary inside a sentence
+/// (`agent-core` `compaction_context_messages`: "The conversation history
+/// before this point was compacted into the following summary:\n\n
+/// <context-summary>…"), with no structural marker; older daemons wrote it
+/// at the start. Not a block's text (the daemon's rule reads only string
+/// content).
+pub fn is_compaction_summary(m: &Value) -> bool {
+    m.get("content").and_then(Value::as_str).is_some_and(|s| s.contains("<context-summary>"))
+}
+
 fn is_event_form(role: &str, text: &str) -> bool {
     role == "user" && ExternalEvent::is_payload(text)
 }
