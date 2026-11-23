@@ -5696,7 +5696,8 @@ fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_arm
     let _ = cx.update_window(window, |_, window, _| window.activate_window());
     for l in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
         level(cx, l);
-        let steps: [(&str, Box<dyn Fn(&mut TestAppContext)>); 3] = [
+        type Step<'a> = (&'a str, Box<dyn Fn(&mut TestAppContext) + 'a>);
+        let steps: [Step; 3] = [
             ("split", Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-\\"))),
             (
                 "equalise",

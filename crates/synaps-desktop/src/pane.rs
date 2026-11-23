@@ -2078,6 +2078,56 @@ async fn film3b2(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCon
     mark("done");
 }
 
+/// Step 6's film (`SYNAPS_DESK_PANES=film6`): the tab menu's pane items,
+/// each opened by its tab and picked from it: a second tab moved to a new
+/// pane, the new pane's tab split down, then Close pane, twice.
+async fn film6(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+    use crate::app::{SessionAct, SessionAt};
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    // The focused pane's shown tab's menu, opened under it (as a
+    // right-click on it puts it), then `act` picked from it.
+    let menu = |cx: &mut AsyncWindowContext| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            let Some(id) = v.model.tabs.current().map(|t| t.id) else { return };
+            // Under its pane's tab strip, near its start.
+            let (o, r) = (v.centre_at.get(), v.panes.cur.rect.get());
+            let at = point(px(o.0 + r.x + 80.), px(o.1 + r.y + crate::tabstrip::TAB_H - 4.));
+            v.open_session_menu(SessionAt::Tab(id), at, window, cx);
+            cx.notify();
+        });
+    };
+    let pick = |cx: &mut AsyncWindowContext, act: SessionAct| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            v.session_menu_pick(act, crate::menu::How::Key { press: true }, window, cx);
+            cx.notify();
+        });
+    };
+    mark("second-tab");
+    let _ = view.update_in(cx, |v, _, cx| {
+        v.open_tab(
+            crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false },
+            crate::tabs::Place::New,
+        );
+        cx.notify();
+    });
+    sleep(1.6).await;
+    for (what, act) in [
+        ("move-to-new-pane", SessionAct::MoveToNewPane),
+        ("split-down", SessionAct::SplitDown),
+        ("close-pane", SessionAct::ClosePane),
+        ("close-pane-2", SessionAct::ClosePane),
+    ] {
+        mark(&format!("menu {what}"));
+        menu(cx);
+        sleep(1.4).await;
+        mark(what);
+        pick(cx, act);
+        sleep(1.8).await;
+    }
+    mark("done");
+}
+
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
 /// across, 4 as 2×2. Each: the pane to focus first (reading order), and
 /// the side (`None`: right, or down if narrow).
@@ -2135,6 +2185,11 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             if how == "film3b2" {
                 sleep(5.0).await;
                 film3b2(&view, cx, &ex, t0).await;
+                return;
+            }
+            if how == "film6" {
+                sleep(5.0).await;
+                film6(&view, cx, &ex, t0).await;
                 return;
             }
             if how == "film4" || how == "film4b" {
