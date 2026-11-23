@@ -440,7 +440,43 @@ pub(crate) struct PanelFx {
     /// The narrowest centre pane of the flight: the column is laid out
     /// for it until every panel is at rest (it rewraps once, at the start
     /// when it narrows, at the end when it widens; fluid.md §3.8).
-    pub(crate) freeze: Option<f32>,
+    pub(crate) freeze: Option<Freeze>,
+}
+
+/// The centres a panels' flight wraps its panes for ([`PanelFx::freeze`]),
+/// each a width and its left edge in the window: a pane's box depends on
+/// both (the panes are rounded on the window's pixels,
+/// [`crate::split::Node::rects_in`]), so equal widths at two origins can
+/// be a pane a fraction apart (Shady #62 R3-1). Each pane wraps at the
+/// narrower of its boxes in the two.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Freeze {
+    /// The centre its column wrapped for in the frame before the flight:
+    /// a widening flight keeps that column until it lands.
+    pub(crate) start: (f32, f32),
+    /// The narrowest centre of the flight so far, its ends included, with
+    /// its own origin: a narrowing flight wraps at once for where it lands.
+    pub(crate) narrowest: (f32, f32),
+}
+
+impl Freeze {
+    /// A flight's first frame: `before`, the centre the column wrapped for
+    /// in the frame before (none yet: `now`'s).
+    pub(crate) fn new(before: Option<(f32, f32)>, now: (f32, f32)) -> Self {
+        Freeze { start: before.unwrap_or(now), narrowest: before.unwrap_or(now) }
+    }
+
+    /// `centres` (this frame's, where it lands) in: the narrower kept, an
+    /// equal one not taken over the one before it.
+    pub(crate) fn with(self, centres: impl IntoIterator<Item = (f32, f32)>) -> Self {
+        let narrowest = centres.into_iter().fold(self.narrowest, |n, c| if c.0 < n.0 { c } else { n });
+        Freeze { narrowest, ..self }
+    }
+
+    /// The narrowest centre's width (one pane: its column's wrap).
+    pub(crate) fn width(&self) -> f32 {
+        self.start.0.min(self.narrowest.0)
+    }
 }
 
 impl PanelFx {

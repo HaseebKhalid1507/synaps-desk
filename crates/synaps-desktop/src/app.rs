@@ -2094,6 +2094,10 @@ pub struct AppView {
     /// The centre's top-left in the window, as last drawn (a divider's
     /// drag is in the centre's pixels).
     pub(crate) centre_at: Cell<(f32, f32)>,
+    /// The centre the panes' columns wrapped for in the last frame drawn
+    /// with no panel moving: its width and its left in the window (where
+    /// a panels' flight starts, [`crate::chrome::Freeze::start`]).
+    wrap_centre: Option<(f32, f32)>,
     /// The top bar's form, the window's (its height under the full bar):
     /// never a pane's, so focus never moves the window (finish gate #36
     /// M1). With one pane it is that pane's `Layout::short`.
@@ -2746,6 +2750,7 @@ impl AppView {
             app_settings: Default::default(),
             centre: Cell::new((0., 0.)),
             centre_at: Cell::new((0., 0.)),
+            wrap_centre: None,
             top_short: false,
             split_note: None,
             pane_script: std::env::var("SYNAPS_DESK_PANES").ok(),
@@ -9186,15 +9191,8 @@ impl AppView {
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
                 // Under 0 while a panel turned back carries on its way first
-                // (a split's close mid-flight: [`crate::pane::Carry::Ride`]),
-                // as far as it goes: an early close's way back is a few px
-                // and the panel's overshoot several times that (Shady #62
-                // M1: held at −1, the divider stood while the panel moved).
-                // Each edge stays between its neighbours
-                // ([`crate::split::Node::lerp_px_from`]).
-                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
-                let at = |w: f32| crate::split::Rect { w, ..area };
-                return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
+                // (Shady #62 M1: [`crate::split::Flight::ride_frame`]).
+                return f.ride_frame(r, area);
             }
             self.panes.flight = None;
             return self.panes.tree.clone();
@@ -9578,7 +9576,15 @@ impl Render for AppView {
         let column_of = |less: &[f32]| ((dp(self.width) - less.iter().map(|&v| dp(v)).sum::<f32>()) / s).max(0.);
         let pane = column_of(&[crate::chrome::MARK, rail_w, right_w]);
         let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
-        self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
+        // Each with its left edge in the window: this frame's, and where
+        // the panels land (Shady #62 R3-1: a pane's box is rounded on the
+        // window's pixels, so the same width at another origin can wrap a
+        // pixel apart).
+        let (at_now, at_to) = (crate::chrome::MARK + rail_w, crate::chrome::MARK + dp(rail.width()) / s);
+        self.panel_fx.freeze = self.panel_fx.moving().then(|| {
+            let f = self.panel_fx.freeze.unwrap_or_else(|| crate::chrome::Freeze::new(self.wrap_centre, (pane, at_now)));
+            f.with([(pane, at_now), (pane_to, at_to)])
+        });
         // At Reduced and Off the panel is there at once, the layout too.
         // Over a view the layout is drawn without the right panel (below:
         // `view_pane`), so it has nothing to ride: it flies on its own
@@ -9611,7 +9617,11 @@ impl Render for AppView {
             f.travel = 0.;
             f.wrap_at = None;
         }
-        let wrap = self.panel_fx.freeze.unwrap_or(pane);
+        let wrap = self.panel_fx.freeze.map_or(pane, |f| f.width());
+        // At rest, the centre the columns wrap for (`origin_to` below).
+        if self.panel_fx.freeze.is_none() {
+            self.wrap_centre = Some((pane, at_to));
+        }
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
         let view_pane = column_of(&[crate::chrome::MARK, rail_w]);
@@ -9677,7 +9687,12 @@ impl Render for AppView {
             // rounded width and the centre's fraction moved, and each step
             // measured the list again).
             let at = |w: f32| self.panes.tree.rects_in(area(w), origin_to);
-            let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            // In the panels' flight, each pane's box in the centre it
+            // started from and in the narrowest, each at its own origin:
+            // the narrower is its wrap (Shady #62 R3-1). At rest, the
+            // centre at `origin_to`, as before.
+            let wraps = self.panel_fx.freeze.map_or([(pane, origin_to.0); 2], |f| [f.start, f.narrowest]);
+            let (rects_to, rects_wrap) = (at(pane_to), wraps.map(|(w, x)| self.panes.tree.rects_in(area(w), (x, origin.1))));
             // A panel yielding on the layout's flight (#51): its own ends.
             let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
@@ -9751,7 +9766,9 @@ impl Render for AppView {
                     // column rewrapped 635/636 as the rail folded.
                     wrap: match ride_from {
                         Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
-                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
+                        None => {
+                            of(&rects_wrap[0]).min(of(&rects_wrap[1])).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY))
+                        }
                     },
                     pane_to: of(&rects_to),
                     view_pane: pane,

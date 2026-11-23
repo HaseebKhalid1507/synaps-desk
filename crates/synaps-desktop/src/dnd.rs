@@ -236,11 +236,14 @@ impl AppView {
     /// centre: one, the whole centre, when not shown split (one pane, or
     /// folded: split.md §5). The landed tree's: during a split's or a
     /// close's flight (about 300 ms) a drag previews against where the
-    /// panes land, not where they are drawn (Shady #48 n5).
-    fn drop_bodies(&self) -> Vec<(PaneId, Rect)> {
+    /// panes land, not where they are drawn (Shady #48 n5). On the
+    /// window's pixels, as the panes are drawn
+    /// ([`crate::split::Node::rects_in`]; Shady #62 R3-3).
+    pub(crate) fn drop_bodies(&self) -> Vec<(PaneId, Rect)> {
         let (w, h) = self.centre.get();
         let all = Rect { x: 0., y: 0., w, h };
-        let rects = if self.panes.shown_split() { self.panes.tree.rects(all) } else { vec![(self.panes.focused, all)] };
+        let rects =
+            if self.panes.shown_split() { self.panes.tree.rects_in(all, self.centre_at.get()) } else { vec![(self.panes.focused, all)] };
         let strip = crate::tabstrip::TAB_H;
         rects.into_iter().map(|(id, r)| (id, Rect { y: r.y + strip, h: (r.h - strip).max(0.), ..r })).collect()
     }

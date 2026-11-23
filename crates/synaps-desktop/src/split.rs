@@ -133,6 +133,20 @@ impl Flight {
         Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
     }
 
+    /// A frame of its ride `r` (#51), the centre `area`: the panes by how
+    /// far the centre has gone from the ride's `from` toward its `to`.
+    /// Under 0 while a panel turned back carries on its way first (a
+    /// split's close mid-flight: [`crate::pane::Carry::Ride`]), as far as
+    /// it goes: an early close's way back is a few px and the panel's
+    /// overshoot several times that (Shady #62 M1: held at −1, the divider
+    /// stood while the panel moved). Each edge stays between its
+    /// neighbours ([`Node::lerp_px_from`]).
+    pub(crate) fn ride_frame(&self, r: Ride, area: Rect) -> Node {
+        let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
+        let at = |w: f32| Rect { w, ..area };
+        self.to.lerp_px_from(&self.from, t, at(r.from), at(r.to), area)
+    }
+
     /// Each pane's wrap (its narrowest width on the way), set from the
     /// flight's ends laid out in `area` (the centre at the panels'
     /// narrowest): a pane's width is a product of ratios lerped linearly,
@@ -1412,6 +1426,8 @@ mod tests {
     /// pane on the right or the left. Every pane at least 0 wide, in its
     /// room, in order; the closing pane where it was drawn at `from` and
     /// moving with the centre (it was held while the progress stood at -1).
+    /// Through the ride's frame as the app draws it ([`Flight::ride_frame`],
+    /// where the progress was clamped to −1: Shady #62 r3).
     #[test]
     fn a_ride_past_its_start_keeps_every_pane_in_its_room() {
         let h = 1000.;
@@ -1424,11 +1440,13 @@ mod tests {
             for (d, back) in [(1., 1.), (3., 3.), (9., 9.), (9., 2.), (40., 10.), (200., 50.)] {
                 let from = 930.;
                 let drawn = Node::Split { axis: Axis::Row, kids: kids.clone(), ratios: shares(d / (from - DIVIDER)) };
+                let flight = Flight::new(drawn, to.clone(), Vec::new(), vec![p(1)]);
+                let ride = Ride { from, to: from - back };
                 let mut last: Option<f32> = None;
                 for n in 0..=57 {
                     let w = from + 7. * n as f32;
                     let t = (w - from) / (-back);
-                    let step = to.lerp_px_from(&drawn, t, at(from), at(from - back), at(w));
+                    let step = flight.ride_frame(ride, at(w));
                     let rects = step.rects(at(w));
                     let what = format!("{} pane {d} px, back {back}, centre {w} (t {t})", if left { "a left" } else { "a right" });
                     let new = rects.iter().find(|(id, _)| *id == p(1)).map(|(_, r)| r.w).expect("the closing pane");
