@@ -779,7 +779,10 @@ fn catalog_pages_decode() {
     assert_eq!(again, "{\"type\":\"catalog_page\",\"req\":12,\"before\":\"v2:opaque-cursor/2026-11-12\",\"limit\":50}\n");
 }
 
-/// `CatalogPage` requests, byte for byte as PR 4's `wire.rs` pins them.
+/// `CatalogPage` requests: the same frames as PR 4's `wire.rs` pins, byte
+/// for byte but the cursor, which is relayed as a JSON value (its key
+/// order is serde_json's: sorted in a build without `preserve_order`,
+/// insertion order in the desktop's, #28).
 #[test]
 fn catalog_page_requests_encode_as_the_daemon_expects() {
     let first = encode_frame(&ClientFrame::CatalogPage { req: 7, before: None, limit: 50, named_only: false }).unwrap();
@@ -796,6 +799,21 @@ fn catalog_page_requests_encode_as_the_daemon_expects() {
     );
     let named = encode_frame(&ClientFrame::CatalogPage { req: 1, before: None, limit: 200, named_only: true }).unwrap();
     assert_eq!(named, "{\"type\":\"catalog_page\",\"req\":1,\"limit\":200,\"named_only\":true}\n");
+    // The cursor as the daemon sends it (`wire.rs`: `updated_at` first),
+    // decoded from its reply and sent back (Shady #27 L2): the same JSON
+    // value goes out, in either build (value equality ignores key order;
+    // the bytes do not: `{"updated_at",…}` with `preserve_order`, sorted
+    // without), and the frame's other fields as above.
+    let reply = r#"{"type":"catalog_page","req":8,"sessions":[],"next":{"updated_at":"2026-11-12T04:00:00.123456789Z","id":"20261110-202033-64fb"}}"#;
+    let DaemonFrame::CatalogPage { next: Some(cursor), .. } = decode_frame(reply).unwrap() else { panic!("{reply}") };
+    let sent = encode_frame(&ClientFrame::CatalogPage { req: 9, before: Some(cursor), limit: 50, named_only: false }).unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+    let theirs: serde_json::Value = serde_json::from_str(reply).unwrap();
+    assert_eq!(sent["before"], theirs["next"], "the daemon's cursor goes back as the same value");
+    assert_eq!(sent["before"]["updated_at"], "2026-11-12T04:00:00.123456789Z", "its time untouched, nanoseconds and all");
+    let mut rest = sent.as_object().unwrap().clone();
+    rest.remove("before");
+    assert_eq!(serde_json::Value::Object(rest), serde_json::json!({"type": "catalog_page", "req": 9, "limit": 50}));
 }
 
 /// `Renamed` / `RenameFailed` (`wire.rs`): every refusal, `taken_by`,
