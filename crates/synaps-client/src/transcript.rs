@@ -190,9 +190,10 @@ const CONFIRM_DENIED: &str = "Tool call blocked by extension: Tool call confirma
 /// included. A tool whose whole output is byte for byte one of these forms
 /// reads as it; only the daemon saying what it applied can tell them apart.
 pub fn gate_note(result: &str, tail: &str) -> Option<GateNote> {
-    if result.starts_with(CONFIRM_DENIED)
-        || result.strip_prefix(ACTIVATION_DENIED).is_some_and(|why| why.trim_start().starts_with(ACTIVATION_REFUSED))
-    {
+    // The confirm's deny ends with its extension's reason (any text); the
+    // activation refusal is one fixed text, matched whole (Shady #64 r2,
+    // C64-2): a prefix of it, or it followed by more, is output.
+    if result.starts_with(CONFIRM_DENIED) || result.strip_prefix(ACTIVATION_DENIED) == Some(ACTIVATION_REFUSED_WHOLE) {
         return Some(GateNote::Denied);
     }
     if CANCEL_PHRASES.contains(&result) {
@@ -217,8 +218,12 @@ pub fn gate_note(result: &str, tail: &str) -> Option<GateNote> {
 const ACTIVATION_DENIED: &str = "Tool execution failed: tool activation denied:";
 /// The one `HostActivationError` that is a refusal, `ConfirmationRequired`
 /// (`tools/activation.rs`): the user denied the prompt, the policy is
-/// `deny`, or nothing could show a prompt.
-const ACTIVATION_REFUSED: &str = "tool activation requires host confirmation authority";
+/// `deny`, or nothing could show a prompt. Its whole text after
+/// [`ACTIVATION_DENIED`] (wrapped by `activation_denied` and
+/// `RuntimeError::Tool`, SynapsCLI `dev`), matched whole (Shady #64 r2,
+/// C64-2): a prefix of it, or it followed by more, is a failure's text.
+const ACTIVATION_REFUSED_WHOLE: &str =
+    " tool activation requires host confirmation authority; model-initiated activation was not confirmed";
 
 /// The last line of a `bash` result whose output passed the daemon's limit
 /// (agent-engine `tools/bash.rs`): `[output truncated at 262144]` (v0.11)
@@ -246,7 +251,7 @@ pub fn tool_outcome(result: &str, is_error: bool) -> ToolOutcome {
     // are failures.
     const DENIED: [&str; 2] = ["Tool call blocked by extension", "Tool call denied:"];
     if let Some(why) = result.strip_prefix(ACTIVATION_DENIED) {
-        return if why.trim_start().starts_with(ACTIVATION_REFUSED) { ToolOutcome::Denied } else { ToolOutcome::Failed };
+        return if why == ACTIVATION_REFUSED_WHOLE { ToolOutcome::Denied } else { ToolOutcome::Failed };
     }
     if DENIED.iter().any(|p| result.starts_with(p)) {
         return ToolOutcome::Denied;
@@ -369,7 +374,8 @@ impl std::error::Error for TranscriptError {}
 /// Ids (and revs) of rows about to be rebuilt, for reuse by kind.
 type Reuse = VecDeque<(ItemKind, u64, u64)>;
 
-/// How many calls [`Transcript::past_gate`] remembers.
+/// How many calls [`Transcript::past_gate`] holds before it lets go of
+/// those no longer in the transcript (it never lets go of one that is).
 pub const PAST_GATE_KEPT: usize = 256;
 
 #[derive(Clone, Debug, Default)]
@@ -396,9 +402,11 @@ pub struct Transcript {
     /// ([`Transcript::resolved_busy`]) and what the daemon applied
     /// ([`Transcript::resolved_outcome`]).
     resolved: VecDeque<(u64, bool, Option<crate::protocol::PromptOutcome>)>,
-    /// The last calls that showed they got past their gate
-    /// ([`Transcript::past_gate`]), newest last.
-    past_gate: VecDeque<String>,
+    /// The calls that showed they got past their gate
+    /// ([`Transcript::past_gate`]), and the size past which those no longer
+    /// in the transcript are let go.
+    past_gate: std::collections::HashSet<String>,
+    past_gate_cap: usize,
     subagents: Vec<Value>,
     cost_usd: f64,
     /// The conversation was swapped (clear, resume, compaction): the next
@@ -433,6 +441,11 @@ pub struct Transcript {
     /// An attach's replay is applied: the one time a frame can come after
     /// its own history row ([`same_event`]).
     replaying: bool,
+    /// The message folded last was a compaction summary
+    /// ([`is_compaction_summary`]): the next, if it is the acknowledgement
+    /// the daemon writes after one ([`COMPACTION_ACKS`]), is not drawn
+    /// either.
+    after_summary: bool,
 }
 
 impl Transcript {
@@ -495,19 +508,27 @@ impl Transcript {
     /// bare phrase even after output, the history's says it started), a
     /// settle or a refold does not take it back (synaps-desk #64, C64-1).
     /// `ToolStarted` is not evidence: the daemon sends it before the gate.
-    /// The last [`PAST_GATE_KEPT`] calls.
+    /// Kept as long as the call is in the transcript, however many calls
+    /// come after it, and across a re-attach to the same session (Shady
+    /// #64 r2, C64-1): a receipt reads it for as long as its call is there.
     pub fn past_gate(&self, tool_id: &str) -> bool {
-        self.past_gate.iter().rev().any(|t| t == tool_id)
+        self.past_gate.contains(tool_id)
     }
 
     fn note_past_gate(&mut self, tool_id: &str) {
-        if tool_id.is_empty() || self.past_gate(tool_id) {
+        if tool_id.is_empty() || !self.past_gate.insert(tool_id.to_string()) {
             return;
         }
-        if self.past_gate.len() == PAST_GATE_KEPT {
-            self.past_gate.pop_front();
+        if self.past_gate.len() > self.past_gate_cap.max(PAST_GATE_KEPT) {
+            // Let go of calls no longer in the transcript (a bounded
+            // worker's dropped rows, another session's): only theirs.
+            let held: std::collections::HashSet<&str> =
+                self.items.iter().filter_map(|i| i.tool.as_ref()).map(|t| t.tool_id.as_str()).collect();
+            let mut kept = std::mem::take(&mut self.past_gate);
+            kept.retain(|id| held.contains(id.as_str()) || id == tool_id);
+            self.past_gate = kept;
+            self.past_gate_cap = 2 * self.past_gate.len();
         }
-        self.past_gate.push_back(tool_id.to_string());
     }
 
     /// A result for `tool_id`: evidence it got past its gate, if it is.
@@ -764,6 +785,9 @@ impl Transcript {
         let no_subagent_notices = self.no_subagent_notices;
         let pending = if same { std::mem::take(&mut self.pending) } else { Vec::new() };
         let stuck = if same { std::mem::take(&mut self.stuck) } else { Vec::new() };
+        // Which calls ran: the same session's calls still are what they were.
+        let (past_gate, past_gate_cap) =
+            if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
         *self = Transcript {
             next_id,
             clean_len,
@@ -771,6 +795,8 @@ impl Transcript {
             no_subagent_notices,
             pending,
             stuck,
+            past_gate,
+            past_gate_cap,
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
@@ -885,6 +911,7 @@ impl Transcript {
     /// Fold a whole history from empty, interleaving `notes` by anchor.
     /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
+        self.after_summary = false;
         let notes = self.hold_events(notes, messages);
         let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.sort_by_key(|n| n.anchor);
@@ -1089,11 +1116,24 @@ impl Transcript {
     fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         let content = m.get("content").unwrap_or(&Value::Null);
+        // A compaction's two messages (#14), drawn as nothing, as the TUI
+        // and the daemon's display projection do: the summary, and right
+        // after it the daemon's acknowledgement, word for word (Shady
+        // C63-1: not whatever the assistant said next; the projection draws
+        // no string-content assistant message, this client draws all but
+        // this one).
+        let after_summary = std::mem::take(&mut self.after_summary);
+        if is_compaction_summary(m) {
+            self.after_summary = true;
+            return;
+        }
+        if after_summary && role == "assistant" && content.as_str().is_some_and(|s| COMPACTION_ACKS.contains(&s)) {
+            return;
+        }
         match (role, content) {
             ("user", Value::String(s)) if is_event_form(role, s) => self.fold_event(s, reuse),
             ("user", Value::String(s)) => {
-                let kind = if s.starts_with("<context-summary>") { ItemKind::Notice } else { ItemKind::User };
-                self.push(kind, s.clone(), None, false, reuse);
+                self.push(ItemKind::User, s.clone(), None, false, reuse);
             }
             ("assistant", Value::String(s)) => {
                 self.push(ItemKind::Assistant, s.clone(), None, false, reuse);
@@ -1513,6 +1553,33 @@ fn steered_event(text: &str) -> Option<ExternalEvent> {
     ExternalEvent::is_payload(text).then(|| ExternalEvent::from_payload(text)).flatten()
 }
 
+/// The assistant message the daemon writes right after a compaction
+/// summary (SynapsCLI `agent-core` `core/compaction.rs`
+/// `compaction_context_messages`), and the one it wrote before T30.
+pub const COMPACTION_ACKS: [&str; 2] = [
+    "I've loaded the conversation summary. Ready to continue.",
+    "I've loaded the conversation summary and system prompt. Ready to continue.",
+];
+
+/// A compaction summary in a history (#14): a message whose content is a
+/// string holding `<context-summary>`, any role. The daemon's own rule
+/// (SynapsCLI dev `agent-engine` `session/display.rs` `items_of`, and
+/// `runtime/compaction.rs`): it writes the summary inside a sentence
+/// (`agent-core` `compaction_context_messages`: "The conversation history
+/// before this point was compacted into the following summary:\n\n
+/// <context-summary>…"), with no structural marker; older daemons wrote it
+/// at the start. Not a block's text (the daemon's rule reads only string
+/// content). Parity holds for plain messages: the daemon reads
+/// `user_content(msg)`, which turns a hooked one-text-block body back into
+/// a string first; this reads the raw content only. Shared with the
+/// daemon, and known: a plain string message that only quotes the tag (a
+/// user asking about it, an assistant naming it) is not drawn either; the
+/// message after it is, unless it is one of [`COMPACTION_ACKS`]. A
+/// structural marker upstream would end that.
+pub fn is_compaction_summary(m: &Value) -> bool {
+    m.get("content").and_then(Value::as_str).is_some_and(|s| s.contains("<context-summary>"))
+}
+
 /// Whether a history message's text (its content, or a text block of it)
 /// from `role` is an event's agent form: the one test the fold and
 /// [`Transcript::hold_events`] share. One that does not parse is a notice.
@@ -1639,6 +1706,12 @@ mod outcome_tests {
                 "Tool execution failed: tool activation denied: tool activation requires host confirmation authority; model-initiated activation was not confirmed",
                 Denied,
             ),
+            // Not that text whole (Shady #64 r2 C64-2): a failure's.
+            ("Tool execution failed: tool activation denied: tool activation requires host confirmation authority", Failed),
+            (
+                "Tool execution failed: tool activation denied: tool activation requires host confirmation authority — example from a manual",
+                Failed,
+            ),
             (
                 "Tool execution failed: tool activation denied: unknown tool id 'x:y'; nothing was activated. activate_tools needs exact ids (namespace:name) as search_tools returns them: search for the tool instead of guessing its id.",
                 Failed,
@@ -1754,7 +1827,9 @@ mod outcome_tests {
     #[test]
     fn gate_notes_are_the_engines_whole_forms() {
         let gate = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this";
-        let activation = "Tool execution failed: tool activation denied: tool activation requires host confirmation authority";
+        let activation = "Tool execution failed: tool activation denied: tool activation requires host confirmation authority; \
+                          model-initiated activation was not confirmed";
+        let activation_cut = "Tool execution failed: tool activation denied: tool activation requires host confirmation authority";
         let started = "Canceled (session stopped by the host). It had already started and may have partially applied its effects.";
         let partial = "a\nb\n\n[Canceled by user before the tool finished; the output above is partial.]";
         let partial_fx = "a\n\n[Canceled by user before the tool finished; the output above is partial. It had already started and may have \
@@ -1776,6 +1851,13 @@ mod outcome_tests {
             ("Tool call blocked by extension: policy says no", None),
             ("Tool call denied: x", None),
             ("ok", None),
+            // The activation refusal, whole only: shortened, followed by
+            // more, or spaced otherwise, it is output (Shady #64 r2 C64-2).
+            (activation_cut, None),
+            (&format!("{activation} — example from a manual, not a denial"), None),
+            (&format!("{activation}\n"), None),
+            (&activation.replacen("denied: tool", "denied:  tool", 1), None),
+            ("Tool execution failed: tool activation denied: tool activation requires host confirmation authority — example", None),
         ] {
             assert_eq!(gate_note(r, ""), want, "{r:?}");
         }
@@ -1841,6 +1923,42 @@ mod outcome_tests {
         start(&mut t, "e");
         t.apply(&result("e", "Tool call blocked by extension: Tool call confirmation denied: guard"));
         assert!(t.past_gate("d") && !t.past_gate("e"));
+    }
+
+    /// Shady #64 r2 C64-1: a call's evidence that it ran lives as long as
+    /// the call: 300 ordinary calls after it don't push it out (a receipt
+    /// still on screen reads it), nor does a re-attach to the same session.
+    /// Another session's calls are not kept.
+    #[test]
+    fn evidence_a_call_ran_lives_as_long_as_the_call() {
+        let ev = |v: Value| crate::protocol::decode_event(&v).unwrap();
+        let llm = |v: Value| ev(json!({"ev": "stream", "event": v}));
+        let call = |t: &mut Transcript, id: &str| {
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "bash", "tool_id": id, "input": {}})));
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})));
+        };
+        let attach = |id: &str| {
+            let a = json!({"type": "attached", "client": 2, "meta": {"id": id}, "conversation": {"api_messages": []}, "input_owner": 2});
+            let crate::protocol::DaemonFrame::Attached(a) = crate::protocol::decode_frame(&a.to_string()).unwrap() else { panic!() };
+            a
+        };
+        let mut t = Transcript::new();
+        t.load_attached(&attach("s")).unwrap();
+        t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
+        call(&mut t, "a");
+        t.apply(&llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": "a", "delta": "removed 3 files\n"})));
+        t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "a", "result": "Canceled by user"})));
+        for k in 0..300 {
+            let id = format!("o{k}");
+            call(&mut t, &id);
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "ok"})));
+        }
+        assert!(t.past_gate("a"), "300 calls later, `a` still ran");
+        assert!(t.past_gate("o0") && t.past_gate("o299"));
+        t.load_attached(&attach("s")).unwrap();
+        assert!(t.past_gate("a"), "a re-attach to the same session keeps it");
+        t.load_attached(&attach("other")).unwrap();
+        assert!(!t.past_gate("a"), "another session's calls are not this one's");
     }
 
     /// Subagent notices are on by default; off, they stay off across an

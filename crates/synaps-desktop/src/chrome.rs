@@ -1777,7 +1777,7 @@ impl AppView {
     fn render_row2(&self, row: &rail::Row, p: &Palette, cx: &Context<Self>) -> AnyElement {
         // No readout under an open menu (a right-click's pointer rests on
         // the row it opened from).
-        let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
+        let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some();
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
         let on = meta.is_some_and(|s| self.model.is_active(&s.id));
@@ -1987,7 +1987,7 @@ impl AppView {
     fn render_hist(&self, row: &rail::Row, p: &Palette, cx: &Context<Self>) -> AnyElement {
         // No readout under an open menu (a right-click's pointer rests on
         // the row it opened from).
-        let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some();
+        let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some();
         let key = row.key;
         let title_color = match row.state {
             State::Unread => p.ink,

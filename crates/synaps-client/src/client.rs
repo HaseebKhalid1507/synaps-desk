@@ -303,6 +303,12 @@ pub enum Command {
         name: String,
         arg: String,
     },
+    /// `Set` one of the session's settings → `Event::SettingReply`. See
+    /// [`SessionRef::set`].
+    Set(Setting),
+    /// `SessionQuery::ModelOptions` → `Event::ModelOptions`. See
+    /// [`SessionRef::model_options`].
+    ModelOptions,
 }
 
 impl Command {
@@ -326,6 +332,8 @@ impl Command {
             Command::SubagentWatch { .. } => "subagent_watch",
             Command::SubagentSteer { .. } => "subagent_steer",
             Command::CancelWorker { .. } | Command::EngineCommand { .. } => "engine_command",
+            Command::Set(_) => "set",
+            Command::ModelOptions => "model_options",
         }
     }
 }
@@ -374,7 +382,9 @@ impl std::fmt::Debug for Command {
             }
             Command::CancelWorker { handle_id } => f.debug_struct("CancelWorker").field("handle_id", handle_id).finish(),
             Command::EngineCommand { name, .. } => f.debug_struct("EngineCommand").field("name", name).finish(),
+            Command::Set(setting) => f.debug_tuple("Set").field(setting).finish(),
             other => f.write_str(match other {
+                Command::ModelOptions => "ModelOptions",
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
                 Command::Resync => "Resync",
@@ -598,6 +608,24 @@ pub enum Event {
         name: String,
         reply: CommandReply,
     },
+    /// What became of [`SessionRef::set`] (`setting`: its wire name):
+    /// `Ok` with the daemon's note, if any (the new view comes as the
+    /// `setting_changed` session event every client gets), or `Err` with why
+    /// not: the daemon's refusal (`ok: false`, not this client's input), or
+    /// this client's (not connected; the link dropped before the answer: it
+    /// may have applied, the next view says).
+    SettingReply {
+        attach_seq: u64,
+        setting: String,
+        reply: Result<Option<String>, String>,
+    },
+    /// The answer to [`SessionRef::model_options`]: the choices, or why
+    /// none (the daemon predates the query, not connected, the reply did
+    /// not decode).
+    ModelOptions {
+        attach_seq: u64,
+        reply: Result<ModelOptions, String>,
+    },
 }
 
 /// What became of a slash command ([`Event::EngineReply`]).
@@ -661,6 +689,8 @@ impl Event {
             | Event::SubagentWatch { attach_seq, .. }
             | Event::WorkerCancel { attach_seq, .. }
             | Event::EngineReply { attach_seq, .. }
+            | Event::SettingReply { attach_seq, .. }
+            | Event::ModelOptions { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -1085,6 +1115,23 @@ impl SessionRef<'_> {
     /// Run a slash command ([`Client::engine_command`]).
     pub fn engine_command(&self, name: impl Into<String>, arg: impl Into<String>) -> Result<(), ClientClosed> {
         self.send(Command::EngineCommand { name: name.into(), arg: arg.into() })
+    }
+
+    /// Change this session's model or thinking level (`Set`, this session
+    /// only, owner-only like `steer`). The answer is `Event::SettingReply`;
+    /// the label to show is the `setting_changed` event's view, never the
+    /// value asked for.
+    pub fn set(&self, setting: Setting) -> Result<(), ClientClosed> {
+        self.send(Command::Set(setting))
+    }
+
+    /// The models and thinking levels this session takes now
+    /// (`SessionQuery::ModelOptions`) → `Event::ModelOptions`. Only a daemon
+    /// whose `Welcome.features` lists [`crate::FEATURE_MODEL_OPTIONS`] knows
+    /// it; check [`Client::supports`] first (an older one is answered
+    /// `Err` here too).
+    pub fn model_options(&self) -> Result<(), ClientClosed> {
+        self.send(Command::ModelOptions)
     }
 
     /// Leave this attachment only (`Detach` + `Bye`); the others stay. Its
@@ -1648,6 +1695,15 @@ async fn without_session<F: Future>(
                     name,
                     reply: CommandReply::NotRun("not connected to the session (attaching or reconnecting)".into()),
                 }),
+                Some(Command::Set(setting)) => emit(events, Event::SettingReply {
+                    attach_seq,
+                    setting: setting.name().into(),
+                    reply: Err("not connected to the session (attaching or reconnecting): not changed".into()),
+                }),
+                Some(Command::ModelOptions) => emit(events, Event::ModelOptions {
+                    attach_seq,
+                    reply: Err("not connected to the session (attaching or reconnecting)".into()),
+                }),
                 Some(c) => emit_error(events, Some(attach_seq), Error::Refused {
                     command: Some(c.name().into()),
                     reason: "not connected to the session (attaching or reconnecting)".into(),
@@ -1689,6 +1745,20 @@ fn answer(events: &Events, attach_seq: u64, asked: Asked, reply: CommandReply) {
             emit(events, Event::WorkerCancel { attach_seq, handle_id, result })
         }
         Asked::Run(name, _) => emit(events, Event::EngineReply { attach_seq, name, reply }),
+    }
+}
+
+/// What an [`Event::ModelOptions`] says when the daemon predates the query.
+pub const OPTIONS_UNSUPPORTED: &str = "this daemon does not list models (it predates model_options)";
+
+/// The `Set`s and model-option queries still in flight as the connection
+/// or the attachment ends: each answered `Err(why)`, never left waiting.
+fn unset(events: &Events, attach_seq: u64, sets: &mut VecDeque<(u64, &'static str)>, options: &mut VecDeque<u64>, why: &str) {
+    for (_, name) in sets.drain(..) {
+        emit(events, Event::SettingReply { attach_seq, setting: name.into(), reply: Err(why.to_string()) });
+    }
+    for _ in options.drain(..) {
+        emit(events, Event::ModelOptions { attach_seq, reply: Err(why.to_string()) });
     }
 }
 
@@ -1856,6 +1926,10 @@ async fn session_loop(
         let mut watches: VecDeque<(u64, String, u64)> = VecDeque::new();
         // Engine commands in flight: `(query id, what)`, oldest first.
         let mut cancels: VecDeque<(u64, Asked)> = VecDeque::new();
+        // `Set`s in flight: `(id, setting name)`, oldest first (a refusal
+        // carries no id: it is the oldest's). `ModelOptions` queries: ids.
+        let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
+        let mut options: VecDeque<u64> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1877,6 +1951,7 @@ async fn session_loop(
                             let _ = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: SessionCommand::Detach { client: me } }).await;
                             conn.bye().await;
                             unanswered(&events, attach_seq, &mut cancels, "detached before the daemon answered");
+                            unset(&events, attach_seq, &mut sets, &mut options, "detached before the daemon answered");
                             return detached(session_id);
                         }
                         Some(c) => c,
@@ -1952,6 +2027,34 @@ async fn session_loop(
                             cancels.push_back((id, Asked::Run(name.clone(), arg.clone())));
                             SessionCommand::EngineCommand { id, name, arg }
                         }
+                        Command::Set(setting) => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) {
+                                    break id;
+                                }
+                            };
+                            if sets.len() == CANCELS_MAX
+                                && let Some((_, name)) = sets.pop_front()
+                            {
+                                emit(&events, Event::SettingReply { attach_seq, setting: name.into(), reply: Err("no answer from the daemon".into()) });
+                            }
+                            sets.push_back((id, setting.name()));
+                            SessionCommand::Set { id, setting }
+                        }
+                        Command::ModelOptions => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) {
+                                    break id;
+                                }
+                            };
+                            if options.len() == WATCHES_MAX {
+                                options.pop_front();
+                            }
+                            options.push_back(id);
+                            SessionCommand::Query { id, query: SessionQuery::ModelOptions }
+                        }
                         _ => continue,
                     };
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
@@ -1997,6 +2100,33 @@ async fn session_loop(
                             answer(&events, attach_seq, asked, reply);
                             continue;
                         }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| options.iter().position(|o| *o == q))
+                        {
+                            options.remove(k);
+                            let value = v.get_mut("value").map(Value::take).unwrap_or_default();
+                            let reply = match value.get("error").and_then(Value::as_str) {
+                                Some(e) => Err(e.to_string()),
+                                None => serde_json::from_value::<ModelOptions>(value).map_err(|e| format!("the daemon's model options did not decode: {e}")),
+                            };
+                            emit(&events, Event::ModelOptions { attach_seq, reply });
+                            continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("setting_changed")
+                            && let Some(k) = v.pointer("/applied/id").and_then(Value::as_u64).and_then(|q| sets.iter().position(|s| s.0 == q))
+                        {
+                            // Ours: answered here; the event still goes on (its
+                            // view is the session's, for every client).
+                            let (_, name) = sets.remove(k).expect("present");
+                            let a = &v["applied"];
+                            let setting = a.get("setting").and_then(Value::as_str).unwrap_or(name).to_string();
+                            let message = a.get("message").and_then(Value::as_str).map(str::to_string);
+                            let reply = match a.get("ok").and_then(Value::as_bool) {
+                                Some(true) => Ok(message),
+                                _ => Err(message.unwrap_or_else(|| "not applied".into())),
+                            };
+                            emit(&events, Event::SettingReply { attach_seq, setting, reply });
+                        }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
                             // Only our own resync is ours. Another client's
                             // result (broadcast: a co-attached TUI's resync is
@@ -2041,6 +2171,10 @@ async fn session_loop(
                                 let (_, asked) = cancels.pop_front().expect("not empty");
                                 answer(&events, attach_seq, asked, CommandReply::NotRun(format!("refused: {reason}")));
                             }
+                            SessionEvent::Refused { client, command, reason } if *client == me && command == "set" && !sets.is_empty() => {
+                                let (_, name) = sets.pop_front().expect("not empty");
+                                emit(&events, Event::SettingReply { attach_seq, setting: name.into(), reply: Err(format!("refused: {reason}")) });
+                            }
                             SessionEvent::Refused { client, command, reason } if *client == me => {
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
                             }
@@ -2069,6 +2203,7 @@ async fn session_loop(
                         emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered");
+                            unset(&events, attach_seq, &mut sets, &mut options, "the session ended before the daemon answered");
                             return Exit { session_id, reason: "session ended".into() };
                         }
                         if send_query && let Err(e) = conn.send(&query(&sid)).await {
@@ -2081,6 +2216,7 @@ async fn session_loop(
                     }
                     Ok(Some(DaemonFrame::Bye(reason))) => {
                         unanswered(&events, attach_seq, &mut cancels, "the daemon said bye before it answered");
+                        unset(&events, attach_seq, &mut sets, &mut options, "the daemon said bye before it answered");
                         return Exit { session_id, reason: format!("daemon said bye ({reason:?})") };
                     }
                     Ok(Some(DaemonFrame::Error { session_id: esid, message })) => {
@@ -2098,6 +2234,12 @@ async fn session_loop(
                                     command: Some("subagent_steer".into()),
                                     reason: STEER_UNSUPPORTED.into(),
                                 });
+                                continue;
+                            }
+                            Some("model_options") => {
+                                for _ in options.drain(..) {
+                                    emit(&events, Event::ModelOptions { attach_seq, reply: Err(OPTIONS_UNSUPPORTED.into()) });
+                                }
                                 continue;
                             }
                             _ => {}
@@ -2122,6 +2264,7 @@ async fn session_loop(
             }
         };
         unanswered(&events, attach_seq, &mut cancels, "the link dropped before the daemon answered");
+        unset(&events, attach_seq, &mut sets, &mut options, "the link dropped before the daemon answered (it may have applied)");
         let reload = why == RELOADING;
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });
