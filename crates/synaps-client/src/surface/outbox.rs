@@ -11,11 +11,15 @@
 //! - `accepted` / `duplicate`, or a state whose `actions` (or answer)
 //!   holds our id: done.
 //! - `pending`: keep, "saving…" after 2 s; never re-sent on this
-//!   connection, only after a reattach.
-//! - `reloading`, `rate_limited`, `busy`: re-send the same id after 1, 2,
-//!   4 … 30 s, while connected.
+//!   connection, only after a reattach. Also when it comes for an action
+//!   held on this connection (after the 3-send cap, say): the daemon has
+//!   it, so the user's Retry sends nothing there (Shady #75 M1).
+//! - `reloading`, `rate_limited`, `busy` with `retry: true` (§3.3 gives
+//!   them that): re-send the same id after 1, 2, 4 … 30 s, while
+//!   connected. Without it (`false`, or a daemon that sent none): "Not
+//!   sent · Retry", never re-sent by the clock (Shady #75 O2).
 //! - `storage`, `unavailable` (with its `detail`): "Not sent: … · Retry";
-//!   Retry re-sends the same id.
+//!   Retry re-sends the same id, on the connection it is held on.
 //! - `conflict`, `resolved`, `stale`, `stopped`, `gone`: the values become
 //!   a recovered draft (§6.1.6), the entry goes.
 //! - No reply in 5 s: re-send the same id; after 3 sends on one connection
@@ -68,8 +72,13 @@ pub enum Step {
     /// on `connection` at `due`, `delay` after the refusal.
     Backoff { connection: u64, due: Instant, delay: Duration, reason: SurfaceRefusal },
     /// Not sent: the card shows "Not sent: … · Retry". Re-sent by the
-    /// user's Retry, or by a reattach whose snapshot allows it.
-    Held(NotSent),
+    /// user's Retry on `connection`, or by a reattach whose snapshot
+    /// allows it; never by the clock. `connection`: the live one its last
+    /// send went on, where the daemon may still answer it (a `pending`
+    /// there makes it [`Step::Pending`]). `None` once that connection is
+    /// gone: then only a new connection's snapshot moves it
+    /// ([`Entry::on_snapshot`]).
+    Held { connection: Option<u64>, why: NotSent },
     /// Its connection is gone: nothing is sent until a new connection's
     /// snapshot reconciles it ([`Entry::on_snapshot`]).
     Detached,
@@ -87,6 +96,10 @@ pub enum NotSent {
     Unanswered,
     /// A refusal reason this build doesn't know.
     Unknown,
+    /// `reloading`, `rate_limited` or `busy` in a result that didn't say
+    /// `retry: true` (Shady #75 O2): §3.3 says they do, so this daemon is
+    /// off the spec, and the outbox doesn't re-send against its word.
+    NoAutoRetry(SurfaceRefusal),
 }
 
 /// What to do with an entry.
@@ -133,11 +146,13 @@ impl Entry {
         }
     }
 
-    /// The connection a send in this step goes on, if it has one.
+    /// The live connection the entry is on: the one its last send went on,
+    /// held there or not. `None` once that connection is gone.
     pub fn connection(&self) -> Option<u64> {
         match self.step {
             Step::Sent { connection, .. } | Step::Pending { connection, .. } | Step::Backoff { connection, .. } => Some(connection),
-            Step::Held(_) | Step::Detached => None,
+            Step::Held { connection, .. } => connection,
+            Step::Detached => None,
         }
     }
 
@@ -148,9 +163,11 @@ impl Entry {
         }
         match r.outcome {
             SurfaceOutcome::Accepted | SurfaceOutcome::Duplicate => Next::Done,
+            // On its live connection, held there too (Shady #75 M1): the
+            // daemon has the action, so the final result follows there.
             SurfaceOutcome::Pending => match self.connection() {
                 Some(connection) => Next::Stay(Step::Pending { connection, since: now }),
-                // Held or detached: a reattach or the user decides.
+                // Detached: the new connection's snapshot decides.
                 None => Next::Stay(self.step),
             },
             SurfaceOutcome::Refused => self.refused(r, now),
@@ -161,23 +178,25 @@ impl Entry {
 
     fn refused(&self, r: &SurfaceResult, now: Instant) -> Next {
         let reason = r.reason.unwrap_or(SurfaceRefusal::Unknown);
+        let held = |why| Next::Stay(Step::Held { connection: self.connection(), why });
         match reason {
             SurfaceRefusal::Reloading | SurfaceRefusal::RateLimited | SurfaceRefusal::Busy => {
-                let last = match self.step {
-                    Step::Sent { backoff, .. } => backoff,
-                    Step::Backoff { delay, .. } => Some(delay),
-                    _ => None,
+                let (connection, last) = match self.step {
+                    Step::Sent { connection, backoff, .. } => (connection, backoff),
+                    Step::Backoff { connection, delay, .. } => (connection, Some(delay)),
+                    Step::Pending { connection, .. } => (connection, None),
+                    // Held: only the user or a reattach re-sends it.
+                    // Detached: the new connection's snapshot decides.
+                    Step::Held { .. } | Step::Detached => return Next::Stay(self.step),
                 };
-                match self.connection() {
-                    Some(connection) => {
-                        let delay = last.map_or(BACKOFF_FIRST, |d| (d * 2).min(BACKOFF_MAX));
-                        Next::Stay(Step::Backoff { connection, due: now + delay, delay, reason })
-                    }
-                    None => Next::Stay(self.step),
+                if r.retry != Some(true) {
+                    return held(NotSent::NoAutoRetry(reason));
                 }
+                let delay = last.map_or(BACKOFF_FIRST, |d| (d * 2).min(BACKOFF_MAX));
+                Next::Stay(Step::Backoff { connection, due: now + delay, delay, reason })
             }
-            SurfaceRefusal::Storage => Next::Stay(Step::Held(NotSent::Storage)),
-            SurfaceRefusal::Unavailable => Next::Stay(Step::Held(NotSent::Unavailable(r.detail))),
+            SurfaceRefusal::Storage => held(NotSent::Storage),
+            SurfaceRefusal::Unavailable => held(NotSent::Unavailable(r.detail)),
             SurfaceRefusal::Conflict
             | SurfaceRefusal::Resolved
             | SurfaceRefusal::Stale
@@ -185,7 +204,7 @@ impl Entry {
             | SurfaceRefusal::Gone
             | SurfaceRefusal::Forbidden
             | SurfaceRefusal::Invalid => Next::Recover(reason),
-            _ => Next::Stay(Step::Held(NotSent::Unknown)),
+            _ => held(NotSent::Unknown),
         }
     }
 
@@ -204,10 +223,11 @@ impl Entry {
     }
 
     /// The connection is gone. Nothing is sent until a new one's snapshot
-    /// reconciles the entry; a held one keeps its "Not sent · Retry".
+    /// reconciles the entry; a held one keeps its "Not sent · Retry", but
+    /// no longer on a connection.
     pub fn on_disconnect(&self) -> Next {
         match self.step {
-            Step::Held(_) => Next::Stay(self.step),
+            Step::Held { why, .. } => Next::Stay(Step::Held { connection: None, why }),
             _ => Next::Stay(Step::Detached),
         }
     }
@@ -249,7 +269,7 @@ impl Entry {
                 if sends < SENDS_MAX {
                     Next::Send(Step::Sent { connection, sends: sends + 1, at: now, backoff })
                 } else {
-                    Next::Stay(Step::Held(NotSent::Unanswered))
+                    Next::Stay(Step::Held { connection: Some(connection), why: NotSent::Unanswered })
                 }
             }
             Step::Backoff { connection, due, delay, .. } if now >= due => {
@@ -260,10 +280,17 @@ impl Entry {
     }
 
     /// The user's Retry on a held action: the same id, on `connection` (the
-    /// one the card is drawn from now). Anything else has nothing to retry.
+    /// one the card is drawn from now), when that is the live connection
+    /// it is held on. Held across a disconnect, it waits for the new
+    /// connection's snapshot, which re-sends it if the card still takes it
+    /// (an entry is only ever sent on a connection it was reconciled
+    /// against, §3.8). Anything else has nothing to retry: a pending
+    /// action waits for its final result (§3.8; Shady #75 M1).
     pub fn retry(&self, connection: u64, now: Instant) -> Next {
         match self.step {
-            Step::Held(_) => Next::Send(Step::Sent { connection, sends: 1, at: now, backoff: None }),
+            Step::Held { connection: Some(on), .. } if on == connection => {
+                Next::Send(Step::Sent { connection, sends: 1, at: now, backoff: None })
+            }
             step => Next::Stay(step),
         }
     }
@@ -281,7 +308,7 @@ impl Entry {
             Step::Sent { at, .. } => Some(at + REPLY_TIMEOUT),
             Step::Backoff { due, .. } => Some(due),
             Step::Pending { since, .. } => Some(since + SAVING_AFTER).filter(|t| *t > now),
-            Step::Held(_) | Step::Detached => None,
+            Step::Held { .. } | Step::Detached => None,
         }
     }
 }

@@ -56,8 +56,13 @@ fn result(outcome: SurfaceOutcome, reason: Option<SurfaceRefusal>) -> SurfaceRes
     SurfaceResult { client: 1, action_id: OURS.into(), outcome, reason, retry: None, answer_rev: None, detail: None }
 }
 
+/// A refusal as §3.3 has the daemon send it: `retry: true` for the
+/// reasons a retry may get past (`rate_limited`, `reloading`, `busy`,
+/// `unavailable`), `false` otherwise.
 fn refused(reason: SurfaceRefusal) -> SurfaceResult {
-    result(SurfaceOutcome::Refused, Some(reason))
+    let retry =
+        matches!(reason, SurfaceRefusal::RateLimited | SurfaceRefusal::Reloading | SurfaceRefusal::Busy | SurfaceRefusal::Unavailable);
+    SurfaceResult { retry: Some(retry), ..result(SurfaceOutcome::Refused, Some(reason)) }
 }
 
 fn sent(t: Instant) -> Entry {
@@ -75,10 +80,12 @@ fn every_step(t: Instant) -> Vec<Step> {
         Step::Sent { connection: CONN, sends: 3, at: t, backoff: Some(s(4)) },
         Step::Pending { connection: CONN, since: t },
         Step::Backoff { connection: CONN, due: t + s(2), delay: s(2), reason: SurfaceRefusal::Busy },
-        Step::Held(NotSent::Storage),
-        Step::Held(NotSent::Unavailable(Some(SurfaceUnavailable::QueueFull))),
-        Step::Held(NotSent::Unanswered),
-        Step::Held(NotSent::Unknown),
+        Step::Held { connection: Some(CONN), why: NotSent::Storage },
+        Step::Held { connection: Some(CONN), why: NotSent::Unavailable(Some(SurfaceUnavailable::QueueFull)) },
+        Step::Held { connection: Some(CONN), why: NotSent::Unanswered },
+        Step::Held { connection: Some(CONN), why: NotSent::Unknown },
+        Step::Held { connection: Some(CONN), why: NotSent::NoAutoRetry(SurfaceRefusal::Busy) },
+        Step::Held { connection: None, why: NotSent::Unanswered },
         Step::Detached,
     ]
 }
@@ -143,7 +150,8 @@ fn pending_waits_for_its_final_result_and_is_not_resent() {
         assert_eq!(e.tick(t + later), Next::Stay(e.step), "no re-send at +{later:?}");
     }
     assert_eq!(e.on_result(&result(SurfaceOutcome::Accepted, None), t + s(9)), Next::Done);
-    assert_eq!(e.on_result(&refused(SurfaceRefusal::Storage), t + s(9)), Next::Stay(Step::Held(NotSent::Storage)));
+    let storage = Next::Stay(Step::Held { connection: Some(CONN), why: NotSent::Storage });
+    assert_eq!(e.on_result(&refused(SurfaceRefusal::Storage), t + s(9)), storage);
 }
 
 /// Row 3: `reloading`, `rate_limited`, `busy` re-send the same id after
@@ -169,6 +177,10 @@ fn retryable_refusals_back_off_1_2_4_to_30_seconds() {
             assert_eq!(e.action.action_id, OURS, "the same id");
         }
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30], "{reason:?}");
+        // Without `retry: true`, held for the user on its connection (O2).
+        let off = SurfaceResult { retry: None, ..refused(reason) };
+        let held = Next::Stay(Step::Held { connection: Some(CONN), why: NotSent::NoAutoRetry(reason) });
+        assert_eq!(e.on_result(&off, now), held, "{reason:?}");
         // A new connection starts the schedule again.
         let fresh = e.on_snapshot(Some(&card(None)), CONN + 1, now);
         let e = e.apply(fresh).unwrap();
@@ -229,14 +241,17 @@ fn storage_and_unavailable_wait_for_retry() {
     cases.push((stray, NotSent::Storage));
     for (r, why) in cases {
         let next = sent(t).on_result(&r, t);
-        assert_eq!(next, Next::Stay(Step::Held(why)), "{r:?}");
+        assert_eq!(next, Next::Stay(Step::Held { connection: Some(CONN), why }), "{r:?}");
         let e = sent(t).apply(next).unwrap();
         assert_eq!(e.due(t), None);
         assert_eq!(e.tick(t + s(3600)), Next::Stay(e.step), "held: never re-sent by the clock");
-        assert_eq!(e.retry(CONN + 1, t + s(9)), Next::Send(Step::Sent { connection: CONN + 1, sends: 1, at: t + s(9), backoff: None }));
+        assert_eq!(e.retry(CONN, t + s(9)), Next::Send(Step::Sent { connection: CONN, sends: 1, at: t + s(9), backoff: None }));
+        // Only on the connection it is held on (§3.8: another connection
+        // reconciles it first, with its snapshot).
+        assert_eq!(e.retry(CONN + 1, t + s(9)), Next::Stay(e.step), "{r:?}");
     }
     // Retry has nothing to do on an action that isn't held.
-    for step in every_step(t).into_iter().filter(|s| !matches!(s, Step::Held(_))) {
+    for step in every_step(t).into_iter().filter(|s| !matches!(s, Step::Held { .. })) {
         assert_eq!(at(step).retry(CONN, t), Next::Stay(step), "{step:?}");
     }
 }
@@ -267,7 +282,7 @@ fn refusals_that_cannot_be_sent_recover_the_values() {
 fn a_newer_daemons_reason_holds_and_its_outcome_is_no_reply() {
     let t = Instant::now();
     for r in [refused(SurfaceRefusal::Unknown), result(SurfaceOutcome::Refused, None)] {
-        assert_eq!(sent(t).on_result(&r, t), Next::Stay(Step::Held(NotSent::Unknown)), "{r:?}");
+        assert_eq!(sent(t).on_result(&r, t), Next::Stay(Step::Held { connection: Some(CONN), why: NotSent::Unknown }), "{r:?}");
     }
     let e = sent(t);
     assert_eq!(e.on_result(&result(SurfaceOutcome::Unknown, None), t + s(1)), Next::Stay(e.step));
@@ -279,8 +294,9 @@ fn a_newer_daemons_reason_holds_and_its_outcome_is_no_reply() {
 }
 
 /// Row 6 and v3.4 #7: no reply in 5 s re-sends the same id; the third
-/// send unanswered holds it ("Not sent · Retry"). Any reply starts the
-/// count again.
+/// send unanswered holds it ("Not sent · Retry"), on its connection. A
+/// reply the outbox acts on starts the count again; an outcome this build
+/// doesn't know doesn't (it is as if no reply came).
 #[test]
 fn no_reply_resends_until_three_sends_then_holds() {
     let t = Instant::now();
@@ -293,7 +309,7 @@ fn no_reply_resends_until_three_sends_then_holds() {
     let third = e.tick(t + s(10));
     assert_eq!(third, Next::Send(Step::Sent { connection: CONN, sends: 3, at: t + s(10), backoff: None }));
     e = e.apply(third).unwrap();
-    assert_eq!(e.tick(t + s(15)), Next::Stay(Step::Held(NotSent::Unanswered)));
+    assert_eq!(e.tick(t + s(15)), Next::Stay(Step::Held { connection: Some(CONN), why: NotSent::Unanswered }));
     // A late tick (the timer fired late) still counts one send, not three.
     assert_eq!(sent(t).tick(t + s(60)), Next::Send(Step::Sent { connection: CONN, sends: 2, at: t + s(60), backoff: None }));
     // A reply (here `busy`) resets the count: its re-send is a first again.
@@ -303,7 +319,7 @@ fn no_reply_resends_until_three_sends_then_holds() {
     let resend = e.tick(t + s(7));
     assert!(matches!(resend, Next::Send(Step::Sent { sends: 1, .. })), "{resend:?}");
     // The user's Retry after "Not sent" is a first send again.
-    let held = at(Step::Held(NotSent::Unanswered));
+    let held = at(Step::Held { connection: Some(CONN), why: NotSent::Unanswered });
     let retry = held.retry(CONN, t + s(20));
     let retried = held.apply(retry).unwrap();
     assert_eq!(retried.tick(t + s(25)), Next::Send(Step::Sent { connection: CONN, sends: 2, at: t + s(25), backoff: None }));
@@ -377,7 +393,10 @@ fn a_late_pending_after_the_cap_waits_for_the_final_result() {
 fn a_lost_connection_waits_for_the_snapshot() {
     let t = Instant::now();
     for step in every_step(t) {
-        let want = if matches!(step, Step::Held(_)) { step } else { Step::Detached };
+        let want = match step {
+            Step::Held { why, .. } => Step::Held { connection: None, why },
+            _ => Step::Detached,
+        };
         assert_eq!(at(step).on_disconnect(), Next::Stay(want), "{step:?}");
     }
     let e = at(Step::Detached);
@@ -425,14 +444,16 @@ fn reattach_reconciles_every_entry_against_the_snapshot() {
     assert_eq!(revise.on_snapshot(Some(&card(Some((2, THEIRS)))), new, t), Next::Recover(SurfaceRefusal::Conflict));
     assert_eq!(revise.on_snapshot(Some(&card(None)), new, t), Next::Recover(SurfaceRefusal::Resolved), "revise not offered");
     // A skip, like an answer.
-    let skip = Entry { action: action(Verb::Skip, 0), step: Step::Held(NotSent::Unanswered) };
+    let skip = Entry { action: action(Verb::Skip, 0), step: Step::Held { connection: None, why: NotSent::Unanswered } };
     assert!(matches!(skip.on_snapshot(Some(&card(None)), new, t), Next::Send(_)));
 }
 
 /// §6.1.6: a committed value is never dropped by an event. Over every
 /// step and every input, an entry leaves only as `Done` (the daemon has
 /// it: accepted, duplicate, or a state that lists it) or `Recover` (its
-/// values go to a draft); everything else keeps it.
+/// values go to a draft); everything else keeps it. A `pending` on the
+/// entry's live connection always makes it pending there (Shady #75 M1),
+/// and nothing is sent on a connection but its own or a reconciled one.
 #[test]
 fn a_committed_value_is_never_dropped_by_an_event() {
     let t = Instant::now();
@@ -441,13 +462,22 @@ fn a_committed_value_is_never_dropped_by_an_event() {
         let e = at(step);
         for reason in EVERY_REFUSAL {
             for detail in [None, Some(SurfaceUnavailable::QueueFull)] {
-                let r = SurfaceResult { detail, ..refused(reason) };
-                assert_ne!(e.on_result(&r, t), Next::Done, "{step:?} {reason:?}");
+                for retry in [None, Some(false), Some(true)] {
+                    let r = SurfaceResult { detail, retry, ..refused(reason) };
+                    let next = e.on_result(&r, t);
+                    assert_ne!(next, Next::Done, "{step:?} {reason:?}");
+                    if let Next::Stay(Step::Backoff { connection, .. }) = next {
+                        assert_eq!((Some(connection), retry), (e.connection(), Some(true)), "{step:?} {reason:?}");
+                    }
+                }
             }
         }
-        for outcome in [SurfaceOutcome::Pending, SurfaceOutcome::Unknown] {
-            assert!(matches!(e.on_result(&result(outcome, None), t), Next::Stay(_)), "{step:?} {outcome:?}");
-        }
+        let pending = match e.connection() {
+            Some(connection) => Step::Pending { connection, since: t },
+            None => step,
+        };
+        assert_eq!(e.on_result(&result(SurfaceOutcome::Pending, None), t), Next::Stay(pending), "{step:?}");
+        assert_eq!(e.on_result(&result(SurfaceOutcome::Unknown, None), t), Next::Stay(step), "{step:?}");
         for c in &others {
             assert!(matches!(e.on_state(c), Next::Stay(_)), "{step:?}");
             assert_ne!(e.on_snapshot(Some(c), CONN + 1, t), Next::Done, "{step:?}");
@@ -456,7 +486,12 @@ fn a_committed_value_is_never_dropped_by_an_event() {
             assert!(matches!(e.tick(t + later), Next::Stay(_) | Next::Send(_)), "{step:?}");
         }
         assert!(matches!(e.on_disconnect(), Next::Stay(_)));
-        assert!(matches!(e.retry(CONN, t), Next::Stay(_) | Next::Send(_)));
+        for c in [CONN, CONN + 1] {
+            match e.retry(c, t) {
+                Next::Send(Step::Sent { connection, .. }) => assert_eq!(Some(connection), e.connection(), "{step:?}"),
+                next => assert_eq!(next, Next::Stay(step), "{step:?}"),
+            }
+        }
         // Whatever is sent is the action as committed.
         for next in [e.tick(t + s(60)), e.retry(CONN, t), e.on_snapshot(Some(&card(None)), CONN + 1, t)] {
             if let Next::Send(step) = next {
