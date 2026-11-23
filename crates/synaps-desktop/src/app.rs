@@ -8188,25 +8188,17 @@ impl AppView {
         // A re-wrap: this frame's bar reads the rows GPUI didn't draw at
         // the hint the next frame gives them (`rehint`, below, which only
         // reads; #46: the thumbs land with the panes, not a frame after).
-        // The next frame gives it ([`AppView::hint_rows`]) when there is
-        // one to give: after the list's layout, rows left without a height.
-        // The bar read it ahead this frame (`rehint`): it is given after
-        // this frame, with no frame of its own, which would draw what this
-        // one did (#60 L2: a frame after every widening landing, and every
-        // move at Off). Else one more frame, at every level, gives it.
-        let ahead = drawn.is_some() && !hold;
+        // One more frame, at every level, gives it ([`AppView::hint_rows`]),
+        // when there is one to give: after the list's layout, rows left
+        // without a height (#60 L2: else it drew what this one did, a frame
+        // after every widening landing at Full and every move at Off). Not
+        // given without a frame: set between frames, the drawn rows would
+        // lose their bounds until the next layout (`hint_ahead`).
         let rewrap_frame = rewrap.then(|| {
-            let (l, n, v) = (self.panes.cur.list.clone(), self.panes.cur.disp.len(), cx.weak_entity());
+            let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
             canvas(
-                move |_, window, cx| {
-                    if !wants_hint(&l, n) {
-                        return;
-                    }
-                    if ahead {
-                        window.defer(cx, move |_, cx| {
-                            let _ = v.update(cx, |this, _| this.in_drawn(id, |this| this.hint_rows(&m)));
-                        });
-                    } else {
+                move |_, window, _| {
+                    if wants_hint(&l, n) {
                         window.request_animation_frame();
                     }
                 },
@@ -8215,7 +8207,7 @@ impl AppView {
             .absolute()
             .size_0()
         });
-        let hint_frame = (self.panes.cur.list.is_scrolled_to_end().is_none() && !(rewrap && ahead)).then(|| {
+        let hint_frame = self.panes.cur.list.is_scrolled_to_end().is_none().then(|| {
             let (l, n) = (self.panes.cur.list.clone(), self.panes.cur.disp.len());
             canvas(
                 move |_, window, _| {
