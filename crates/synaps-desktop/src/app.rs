@@ -1804,6 +1804,13 @@ impl FavsJob {
 pub(crate) struct SaveJob {
     /// The window's last flush has run: a job not begun writes nothing.
     closed: bool,
+    /// What the last delayed write of each kind wrote (its generation),
+    /// recorded under this lock as it finishes, until the view takes it:
+    /// the job's continuation, or the flush before it trusts
+    /// `tabs_written` / `layout_written` (Shady #59 r2 L1: a write that
+    /// finished while the flush waited for the lock, its continuation not
+    /// yet run, left those stale, and a change undone since read as saved).
+    done: [Option<u64>; 2],
     /// Tests: the generation the last job read (its write is next).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) taken: u64,
@@ -1813,16 +1820,37 @@ pub(crate) struct SaveJob {
     pub(crate) writes: u32,
 }
 
+/// What a [`SaveJob`] writes: `tabs.<key>` alone (split panes off), or the
+/// layout and its union.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SaveKind {
+    Tabs = 0,
+    Layout = 1,
+}
+
 impl SaveJob {
-    /// `write` unless the window's last flush came first; whether it wrote.
-    fn write(slot: &std::sync::Mutex<SaveJob>, write: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<bool> {
+    /// `write` (generation `generation` of `kind`) unless the window's last
+    /// flush came first; whether it wrote. What it wrote is recorded before
+    /// the lock is let go ([`SaveJob::take_done`]).
+    pub(crate) fn write(
+        slot: &std::sync::Mutex<SaveJob>,
+        kind: SaveKind,
+        generation: u64,
+        write: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
         let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if job.closed {
             return Ok(false);
         }
         write()?;
         job.writes += 1;
+        job.done[kind as usize] = Some(generation);
         Ok(true)
+    }
+
+    /// The generation a finished write of `kind` wrote, once.
+    fn take_done(&mut self, kind: SaveKind) -> Option<u64> {
+        self.done[kind as usize].take()
     }
 }
 
@@ -4018,7 +4046,7 @@ impl AppView {
     /// Never 0. Each frame asks (Shady #55 L4): a cheap key first (the
     /// tree, the focus, each pane and its tabs' generation), the whole
     /// layout hashed again only when the key moved.
-    fn layout_gen(&self) -> u64 {
+    pub(crate) fn layout_gen(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut k = std::collections::hash_map::DefaultHasher::new();
         self.panes.tree.hash_shape(&mut k);
@@ -4182,11 +4210,16 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), saved, generation, slot)) = job else { return };
-            let done = cx.background_spawn(async move { SaveJob::write(&slot, || theme::save_tabs(&path, &key, &saved)) }).await;
+            let done = cx
+                .background_spawn(
+                    async move { SaveJob::write(&slot, SaveKind::Tabs, generation, || theme::save_tabs(&path, &key, &saved)) },
+                )
+                .await;
             let _ = this.update(cx, |v, cx| match done {
-                Ok(wrote) => {
-                    if wrote {
-                        v.tabs_written = v.tabs_written.max(generation);
+                Ok(_) => {
+                    // What it wrote, unless the flush took it first.
+                    if let Some(g) = v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_done(SaveKind::Tabs) {
+                        v.tabs_written = v.tabs_written.max(g);
                     }
                 }
                 Err(e) => {
@@ -4340,11 +4373,16 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), layout, generation, slot)) = job else { return };
-            let done = cx.background_spawn(async move { SaveJob::write(&slot, || theme::save_layout(&path, &key, &layout)) }).await;
+            let done = cx
+                .background_spawn(async move {
+                    SaveJob::write(&slot, SaveKind::Layout, generation, || theme::save_layout(&path, &key, &layout))
+                })
+                .await;
             let _ = this.update(cx, |v, cx| match done {
-                Ok(wrote) => {
-                    if wrote {
-                        v.layout_written = generation;
+                Ok(_) => {
+                    // What it wrote, unless the flush took it first.
+                    if let Some(g) = v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_done(SaveKind::Layout) {
+                        v.layout_written = g;
                     }
                 }
                 Err(e) => {
@@ -4365,6 +4403,14 @@ impl AppView {
         let slot = self.save_job.clone();
         let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         job.closed = true;
+        // A delayed write that finished while this waited (its continuation
+        // not yet run): what the file holds now, before trusting `written`.
+        if let Some(g) = job.take_done(SaveKind::Layout) {
+            self.layout_written = g;
+        }
+        if let Some(g) = job.take_done(SaveKind::Tabs) {
+            self.tabs_written = self.tabs_written.max(g);
+        }
         if self.split_on() {
             self.tabs_save = None;
             let pending = self.restore_tabs.is_some() || self.restore_layout.is_some() || !self.restore_panes.is_empty();
