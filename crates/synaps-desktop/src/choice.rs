@@ -56,7 +56,11 @@ impl Kind {
 
 /// An item that only says something (a note, the refusal): never picked.
 pub(crate) const NOTE: usize = usize::MAX;
-/// Models listed at most (the menu does not scroll); the rest by `/model`.
+/// A provider's row (`PROVIDER + j`: `Target::providers[j]`): picking it
+/// shows that provider's models in place of the ones shown.
+const PROVIDER: usize = usize::MAX / 2;
+/// One provider's models listed at most (the menu does not scroll); the
+/// rest by `/model`.
 const SHOWN: usize = 14;
 /// A row's text at most, in characters (the menu is 360 px at most).
 const CUT: usize = 44;
@@ -85,6 +89,11 @@ pub(crate) struct Target {
     pub off: Option<String>,
     /// More models than shown.
     pub more: usize,
+    /// A model menu: every model the daemon listed (id, label, provider).
+    /// One provider's are the values; the others are rows of their own.
+    pub all: Vec<(String, String, String)>,
+    /// The providers whose models are not shown, with how many each has.
+    pub providers: Vec<(String, usize)>,
 }
 
 fn cut(s: &str) -> String {
@@ -112,20 +121,58 @@ impl Target {
 
     /// The values from the daemon's answer (`None`: it has none: an older
     /// daemon, or it could not answer). The current value is always one.
+    /// A model menu shows the current model's provider's models.
     pub fn fill(&mut self, options: Option<&ModelOptions>) {
         self.loading = false;
-        let mut values: Vec<(String, String)> = match (self.kind, options) {
+        match (self.kind, options) {
             (Kind::Model, Some(o)) => {
-                // The current model's provider first, then the daemon's order.
-                let prov = o.models.iter().find(|m| same_model(&m.id, &self.current)).map(|m| m.provider.clone());
-                let mut ms: Vec<_> = o.models.iter().collect();
-                ms.sort_by_key(|m| Some(&m.provider) != prov.as_ref());
-                ms.into_iter().map(|m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() })).collect()
+                self.all = o
+                    .models
+                    .iter()
+                    .map(|m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() }, m.provider.clone()))
+                    .collect();
+                self.show(None);
             }
-            (Kind::Thinking, Some(o)) => o.thinking.iter().map(|l| (l.clone(), l.clone())).collect(),
-            (Kind::Model, None) => Vec::new(),
-            (Kind::Thinking, None) => crate::settings::THINKING.iter().map(|l| (l.to_string(), l.to_string())).collect(),
-        };
+            (Kind::Thinking, Some(o)) => self.set_values(o.thinking.iter().map(|l| (l.clone(), l.clone())).collect()),
+            (Kind::Model, None) => {
+                self.all.clear();
+                self.show(None);
+            }
+            (Kind::Thinking, None) => self.set_values(crate::settings::THINKING.iter().map(|l| (l.to_string(), l.to_string())).collect()),
+        }
+    }
+
+    /// The current model's provider.
+    fn home(&self) -> Option<&str> {
+        self.all.iter().find(|m| same_model(&m.0, &self.current)).map(|m| m.2.as_str())
+    }
+
+    /// A model menu shows `provider`'s models (`None`: the current model's,
+    /// with the current model), the other providers as rows.
+    pub fn show(&mut self, provider: Option<&str>) {
+        let home = self.home().map(str::to_string);
+        let shown = provider.map(str::to_string).or(home.clone()).or_else(|| self.all.first().map(|m| m.2.clone()));
+        let mut providers: Vec<(String, usize)> = Vec::new();
+        for (_, _, p) in &self.all {
+            match providers.iter_mut().find(|(q, _)| q == p) {
+                Some(e) => e.1 += 1,
+                None => providers.push((p.clone(), 1)),
+            }
+        }
+        providers.retain(|(p, _)| Some(p) != shown.as_ref());
+        self.providers = providers;
+        let values = self.all.iter().filter(|m| Some(&m.2) == shown.as_ref()).map(|m| (m.0.clone(), m.1.clone())).collect();
+        if shown == home || home.is_none() && provider.is_none() {
+            self.set_values(values);
+        } else {
+            // Another provider's: the current model stays where it is.
+            let current = std::mem::take(&mut self.current);
+            self.set_values(values);
+            self.current = current;
+        }
+    }
+
+    fn set_values(&mut self, mut values: Vec<(String, String)>) {
         if !self.current.is_empty() && !values.iter().any(|(v, _)| self.is_current(v)) {
             values.insert(0, (self.current.clone(), self.current.clone()));
         }
@@ -175,7 +222,22 @@ impl Target {
             let more = format!("+{} more: /model provider/id", self.more);
             out.push(Item::new(NOTE, more.clone()).off(more));
         }
+        let home = self.home();
+        for (j, (p, n)) in self.providers.iter().enumerate() {
+            let name = if p.is_empty() { "other" } else { p.as_str() };
+            let mut it =
+                Item::new(PROVIDER + j, cut(&format!("{name} · {n}"))).key(if home == Some(p.as_str()) { "current ▸" } else { "▸" });
+            if self.pending.is_some() {
+                it = it.off("waiting for the daemon's answer");
+            }
+            out.push(it);
+        }
         out
+    }
+
+    /// A provider's row: its provider.
+    pub fn provider(&self, act: usize) -> Option<String> {
+        act.checked_sub(PROVIDER).and_then(|j| self.providers.get(j)).map(|(p, _)| p.clone())
     }
 }
 
@@ -267,11 +329,18 @@ pub(crate) fn label(
         Kind::Model => "Change model (this session)",
         Kind::Thinking => "Change thinking (this session)",
     };
+    // No tooltip while a picker is open (it would sit on the menu's foot).
+    let open = cx.entity().downgrade();
     el.id(("choice-label", slot * 2 + kind as usize))
         .debug_selector(move || format!("choice-{} {slot}", kind.noun()))
         .cursor_pointer()
         .hover(move |s| s.text_color(ink))
-        .tooltip(move |window, cx| crate::overlay::tip(tip, window, cx))
+        .tooltip(move |window, cx| {
+            if open.upgrade().is_some_and(|v| v.read(cx).choice.menu.is_some()) {
+                return cx.new(|_| gpui::Empty).into();
+            }
+            crate::overlay::tip(tip, window, cx)
+        })
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             cx.stop_propagation();
             this.open_choice(kind, Some(ev.position()), window, cx);
@@ -321,6 +390,8 @@ impl AppView {
             refused: None,
             off,
             more: 0,
+            all: Vec::new(),
+            providers: Vec::new(),
         };
         let cached = self.choice.cache.as_ref().filter(|c| c.0 == attach_seq).map(|c| c.1.clone());
         if supported {
@@ -427,8 +498,20 @@ impl AppView {
         if !how.is_press() || i == NOTE {
             return;
         }
-        let Some((_, t)) = self.choice.menu.as_ref() else { return };
-        if t.off.is_some() || t.pending.is_some() {
+        let Some((m, t)) = self.choice.menu.as_mut() else { return };
+        if t.pending.is_some() {
+            return;
+        }
+        // A provider: its models in place of the ones shown (read-only too:
+        // the list is worth reading).
+        if let Some(p) = t.provider(i) {
+            t.show(Some(&p));
+            m.items = t.items();
+            m.sel = matches!(how, How::Key { .. }).then(|| m.items.iter().position(|it| it.act < PROVIDER && it.act != NOTE)).flatten();
+            cx.notify();
+            return;
+        }
+        if t.off.is_some() {
             return;
         }
         let Some((value, _)) = t.values.get(i).cloned() else { return };
@@ -496,7 +579,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, NOTE, SHOWN, Target};
+    use super::{Kind, NOTE, PROVIDER, SHOWN, Target};
     use crate::pane::PaneId;
     use synaps_client::{ModelOption, ModelOptions};
 
@@ -513,6 +596,8 @@ mod tests {
             refused: None,
             off: None,
             more: 0,
+            all: Vec::new(),
+            providers: Vec::new(),
         }
     }
 
@@ -536,10 +621,19 @@ mod tests {
         let mut t = target(Kind::Model, "claude-opus-5-5");
         t.fill(Some(&opts()));
         let ids: Vec<&str> = t.values.iter().map(|v| v.0.as_str()).collect();
-        assert_eq!(ids, ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-5-5", "openai-codex/gpt-5.5"], "its provider first");
+        assert_eq!(ids, ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-5-5"], "its provider's models");
         let items = t.items();
         assert_eq!(items[1].key, Some("current"));
         assert!(items.iter().all(|i| i.enabled()));
+        // The other providers are rows: one opens its models in place.
+        assert_eq!((items[2].act, items[2].label.as_ref(), items[2].key), (PROVIDER, "OpenAI Codex · 1", Some("▸")));
+        t.show(t.provider(items[2].act).as_deref());
+        let items = t.items();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
+        assert_eq!(labels, ["GPT-5.5", "Anthropic · 2"]);
+        assert_eq!((items[0].key, items[1].key), (None, Some("current ▸")), "the current model is the other provider's");
+        t.show(t.provider(items[1].act).as_deref());
+        assert_eq!(t.current_ix(), Some(1), "back on the current one");
         let mut t = target(Kind::Thinking, "high");
         t.fill(Some(&opts()));
         assert_eq!(t.items().iter().filter(|i| i.key == Some("current")).map(|i| i.act).collect::<Vec<_>>(), [2]);
