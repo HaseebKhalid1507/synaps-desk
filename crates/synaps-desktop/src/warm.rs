@@ -175,7 +175,8 @@ pub(crate) fn mode_line(w: &Warm) -> String {
 }
 
 /// The TTL as honoured, and what was asked when it differs, short enough
-/// for the panel's half column (at most [`TTL_CHARS`]): `5m ↓ 1h` (a 1h
+/// for the panel's half column (at most 15 mono characters: about 124 px at
+/// the default 296 px panel, 7.8 px a character at mono 13): `5m ↓ 1h` (a 1h
 /// request the server kept for 5m), `5m of 1h` (asked 1h, not proved yet).
 pub(crate) fn ttl_line(w: &Warm) -> Option<String> {
     let ttl = w.ttl.as_deref()?;
@@ -185,10 +186,6 @@ pub(crate) fn ttl_line(w: &Warm) -> Option<String> {
         _ => ttl.to_string(),
     })
 }
-
-/// The TTL line's longest, in mono characters: the half column of a
-/// 296 px panel holds about 124 px (7.8 px a character at mono 13).
-pub(crate) const TTL_CHARS: usize = 15;
 
 /// What a short TTL line means, in words (its tooltip); `None`: it says it.
 pub(crate) fn ttl_tip(w: &Warm) -> Option<String> {
@@ -354,7 +351,7 @@ mod tests {
             st["cache_ttl"]["setting"] = json!(setting);
             let w = Warm::from_status(&st, t0);
             let line = ttl_line(&w).unwrap();
-            assert!(line.chars().count() <= TTL_CHARS, "{line:?}");
+            assert!(line.chars().count() <= 15, "{line:?}");
         }
     }
 }
