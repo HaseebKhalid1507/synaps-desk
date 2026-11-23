@@ -66,7 +66,9 @@ fn settle(cx: &mut TestAppContext, w: AnyWindowHandle, max: usize) -> usize {
     max
 }
 
-fn set_motion(cx: &mut TestAppContext, view: &Entity<AppView>, level: Level) {
+/// The motion level (`ui_tests`' `set_motion`, renamed as `test_kit`'s:
+/// `one_stream_fade_policy` reads that name as a text motion policy).
+fn motion_level(cx: &mut TestAppContext, view: &Entity<AppView>, level: Level) {
     cx.update(|cx| {
         cx.set_global(crate::motion::Setting { level: Some(level), lock: None });
         crate::motion::Level::apply(cx);
@@ -94,7 +96,7 @@ fn allow_then(
     end: impl FnOnce(&mut TestAppContext, &Entity<AppView>, &str),
 ) -> (Vec<(u64, &'static str, bool)>, u64, AnyWindowHandle) {
     let (w, view, _events) = open(cx);
-    set_motion(cx, &view, level);
+    motion_level(cx, &view, level);
     settle(cx, w, 8);
     let key = view.read_with(cx, |v, _| v.current_card().expect("the demo's card").key);
     // The card's arm ([`crate::app::Arm`], real time).
