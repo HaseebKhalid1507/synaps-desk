@@ -670,6 +670,17 @@ impl AppView {
             if let Some(id) = self.waiting_pane() {
                 self.focus_pane(id, crate::pane::KeysTo::Follow, cx);
                 self.reveal_card(window, cx);
+            } else if let Some(s) = self.jump_elsewhere() {
+                // Nothing waits on screen: the waiting session opens in
+                // the focused pane (split.md §7's third clause, Shady #44
+                // L7), in its visible tab's place as Jump → opens a row, or
+                // its tab there if it has one. Not the rail's cross-pane
+                // focus (Shady #59 L3: a background tab of it in another
+                // pane took the focus there): that pane's tab, and its
+                // draft, stay as they are; the two share the session's store.
+                let fallback = self.model.journal_of(&s);
+                self.open_tab(crate::app::Open::Attach { session_id: s, fallback, open: false }, crate::tabs::Place::Current);
+                cx.notify();
             }
             return;
         }
@@ -683,6 +694,12 @@ impl AppView {
             return;
         }
         self.reveal_card(window, cx);
+    }
+
+    /// Split panes on, nothing waiting on screen: the waiting session Ctrl+J
+    /// opens in the focused pane (the top bar's Jump → target), if any.
+    pub(crate) fn jump_elsewhere(&self) -> Option<String> {
+        self.split_on().then(|| self.model.jump_target().map(str::to_string)).flatten()
     }
 
     /// The card's row in view and the keys to it (after a frame has built
