@@ -2,6 +2,16 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since d6f8f68
+
+Agent cards, D1 of agent-ui (`agent-ui/architecture.md` v3.4 §7): the protocol mirror and the model, **inert**. This client declares no card catalog (`capabilities.surfaces` 0, omitted: the `Hello` is unchanged), so a daemon sends it no card, no `surface_result` and no `Attached.surfaces`; nothing in the desktop draws a card (D2) or answers one (D3). Additive apart from new fields on two structs (below).
+
+- `protocol` mirrors SynapsCLI #444 (C3) at `6e895d27`: `FEATURE_AGENT_SURFACES` (`"agent_surfaces"`), `SURFACES_CATALOG` (0), `Capabilities::surfaces`; `SessionCommand::SurfaceAction(SurfaceAction)` (`Debug` redacts `values`; `SurfaceAction::mint_id()`, 32 hex); `SessionEvent::Surface { surface: Option<Box<SurfaceState>> }` and `SessionEvent::SurfaceResult(SurfaceResult)` with `SurfaceOutcome`, `SurfaceRefusal`, `SurfaceUnavailable` (`detail`, v3.4 #2), each reading a newer daemon's value as `Unknown`; `SessionMeta::{surfaces_waiting, surfaces_open}`; `Attached::surfaces`, read card by card, and `Rejected::surfaces`. A card this build can't read (an unknown field or phase, a doc that doesn't revalidate) is dropped and counted, never a frame error; a verb it doesn't know leaves `offers` and the card stays (v3.4 #4).
+- New `Client::surface_action_on(connection, action)` / `SessionRef::surface_action_on` and `Command::SurfaceActionOn`, the twin of `answer_on`: sent only on the connection the card came on, and only to a daemon that lists `agent_surfaces`; otherwise `Error::Refused { command: "surface_action" }` and nothing is sent.
+- New `surface` module, a hand mirror of C1/C2's card model at `6e895d27`: the types (`CardDoc`, `Answer`, `UiMark`, `SurfaceState`, `AnswerState`, …), `ui_sanitize`, `parse_input`, `revalidate`, `parse_answer`, `parse_answer_message`, `decode_json`, the history fold by host marks (`fold_history`, `fold_answer`), and `surface::outbox`: one committed action's §3.8 transitions as pure functions (`Entry`, `Step`, `Next`).
+- `tests/fixtures/ui/` is C1's corpus, copied unchanged; `surface::parity_tests` runs the mirror over all of it. `tests/surfaces.rs`: the wire, as #444's tests read it.
+- **Breaking** for code that builds `SessionMeta { .. }` or `Capabilities { .. }` without `..`: add `surfaces_waiting` and `surfaces_open`, or `surfaces`. `Rejected::total()` now counts cards too.
+
 ## Since c89cc05
 
 Saved sessions as catalog pages (SynapsCLI watch-sessions PR 4, `session_page`), the replacement of #408's `saved_sessions`. Additive apart from one new `SessionMeta` field (below); `saved_sessions` / `SavedSessionList` stay for daemons that still speak them.

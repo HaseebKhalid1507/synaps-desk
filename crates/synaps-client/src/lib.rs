@@ -95,8 +95,8 @@
 //! - [`history`]: the digest-checked history mirror ([`HistoryUpdate`])
 //! - [`transcript`]: history + live events folded into display rows
 //! - [`surface`]: agent cards' model (agent-ui D1: inert, this client
-//!   declares no catalog): the card types, `ui_sanitize`, validation and
-//!   the history fold by host marks
+//!   declares no catalog): the card types, `ui_sanitize`, validation, the
+//!   history fold by host marks, the outbox's transitions
 //! - [`synthetic`]: deterministic load for benches
 
 pub mod client;

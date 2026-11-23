@@ -14,6 +14,7 @@
 //! - [`doc`]: [`parse_input`] and [`revalidate`] (§5.1).
 //! - [`answer`]: [`parse_answer`] (§3.3 #11), [`parse_answer_message`] (§3.6).
 //! - [`fold`]: history folded by host marks, never by text (§2.5).
+//! - [`outbox`]: one committed action's §3.8 transitions, as pure functions.
 //!
 //! What only the host does is not mirrored: the contract digest (a client
 //! echoes `SurfaceState.contract`), building the `<ui_answer>` message and
@@ -34,6 +35,7 @@
 pub mod answer;
 pub mod doc;
 pub mod fold;
+pub mod outbox;
 pub mod sanitize;
 pub mod types;
 
