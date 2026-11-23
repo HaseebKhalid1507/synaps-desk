@@ -3,8 +3,10 @@
 //! window's pixels, a takeover's carry, a ride past its start, a panels'
 //! flight's wraps, the drop targets. Moved out of `split_tests.rs`, which
 //! is protected and stays as on main (Shady #62 r3 R3-2); its helpers
-//! these tests use are copied here as they are there, the waits'
-//! deadline [`T`] a backstop (#74: a slow runner never fails for it).
+//! these tests use are copied here as they are there, but for the waits:
+//! those are `test_waits`' (#74), shared with `split_tests`, never a copy
+//! (Shady #62 r5 R5-1: a copy kept the busy channel's way past the
+//! backstop that #74 closed).
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -22,12 +24,10 @@ use serde_json::{Value, json};
 use synaps_client::{Client, ClientOptions, Endpoint, Event, Identity};
 
 use crate::app::AppView;
+use crate::test_waits;
 
 const A: &str = "20261121-020000-aaaa";
 const B: &str = "20261121-020000-bbbb";
-/// A wait's wall-clock backstop: never the 10 s deadline a loaded runner
-/// went past (#71, #74), only what turns a hang into a failure.
-const T: Duration = Duration::from_secs(300);
 
 struct Conn {
     r: BufReader<UnixStream>,
@@ -82,21 +82,6 @@ fn start(name: &str) -> (PathBuf, mpsc::Receiver<Conn>) {
     (path, rx)
 }
 
-/// The client's events until one matches `done` (the test holds them: the
-/// view under test is driven by the `--offline` demo's, as `ui_tests`').
-fn until(events: &async_channel::Receiver<Event>, what: &str, done: impl Fn(&Event) -> bool) {
-    let deadline = Instant::now() + T;
-    loop {
-        while let Ok(ev) = events.try_recv() {
-            if done(&ev) {
-                return;
-            }
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
 /// [`open`] at `w`×`h`.
 fn open_sized(cx: &mut TestAppContext, w: f32, h: f32) -> (AnyWindowHandle, Entity<AppView>) {
     let wv = cx.update(|cx| {
@@ -143,33 +128,6 @@ fn attached(sid: &str, prompt: Option<u64>) -> Value {
 fn conversation() -> Value {
     let messages = synaps_client::synthetic::history(4, 7);
     json!({"api_messages": messages, "messages_len": messages.len()})
-}
-
-/// The client's events into the view, as its pump hands them
-/// (`apply_batch`), frames drawn, until `done`.
-fn feed(
-    cx: &mut TestAppContext,
-    window: AnyWindowHandle,
-    view: &Entity<AppView>,
-    events: &async_channel::Receiver<Event>,
-    what: &str,
-    done: impl Fn(&AppView) -> bool,
-) {
-    let deadline = Instant::now() + T;
-    loop {
-        let batch: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-        if !batch.is_empty() {
-            view.update(cx, |v, cx| v.apply_batch(batch, cx));
-        }
-        cx.run_until_parked();
-        let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
-        cx.run_until_parked();
-        if view.read_with(cx, |v, _| done(v)) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
@@ -244,6 +202,32 @@ fn level(cx: &mut TestAppContext, l: crate::motion::Level) {
     });
 }
 
+/// The waits this module calls are `test_waits`' (Shady #62 r5 R5-1).
+/// Its own tests take `until` and `recv` through a closed channel and a
+/// busy one; this one takes `feed` through a view: a backlog past the
+/// pump's batch is taken one batch a look, so each look draws and
+/// checks (the copy it replaces drained the channel first, so a channel
+/// that never emptied never let it look), and a closed channel fails at
+/// once, named (the copy spun to its deadline).
+#[gpui_kit::test]
+fn the_feed_this_module_waits_with_looks_a_batch_at_a_time_and_fails_at_once_when_closed(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 1280., 800.);
+    let (tx, rx) = async_channel::unbounded::<Event>();
+    let backlog = 2 * crate::model::MAX_BATCH + 5;
+    for _ in 0..backlog {
+        tx.try_send(Event::Status(synaps_client::Status::Connecting)).expect("queued");
+    }
+    test_waits::feed(cx, window, &view, &rx, "its first look", |_| true);
+    assert_eq!(rx.len(), backlog - crate::model::MAX_BATCH, "one look, one batch");
+    drop(tx);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        test_waits::feed(cx, window, &view, &rx, "an event that never comes", |_| false);
+    }));
+    let said = failed.expect_err("a closed channel fails").downcast::<String>().map(|s| *s).unwrap_or_default();
+    assert!(said.contains("the client closed before an event that never comes"), "{said}");
+    assert!(rx.is_empty(), "the backlog applied before it failed");
+}
+
 // ── fix/split-motion-tails ──────────────────────────────────────────────
 
 /// `split_tests`' `on_a` in a window `w` × `h`.
@@ -256,7 +240,7 @@ fn on_a_at(
     let (window, view) = open_sized(cx, w, h);
     let (path, attaches) = start(name);
     let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
-    until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
+    test_waits::until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
     view.update(cx, |v, cx| {
         v.app_settings.split = true;
         v.client = Some(client.clone());
@@ -264,9 +248,9 @@ fn on_a_at(
         v.reconcile(None);
         cx.notify();
     });
-    let mut a = attaches.recv_timeout(T).expect("A's attach at the daemon");
+    let mut a = test_waits::recv(&attaches).expect("A's attach at the daemon");
     a.send(attached(A, None));
-    feed(cx, window, &view, &events, "A attached", |v| v.model.lives[v.panes.cur.live].is_active(A));
+    test_waits::feed(cx, window, &view, &events, "A attached", |v| v.model.lives[v.panes.cur.live].is_active(A));
     (window, view, client, a, attaches, events)
 }
 
@@ -831,10 +815,9 @@ fn the_drop_targets_are_the_panes_as_drawn_at_a_fractional_origin(cx: &mut TestA
     let _ = client.shutdown();
 }
 
-// ── #62 round 5 (Shady #62 r4: R4-1) ────────────────────────────────────
+// ── #62 rounds 5 and 6 (Shady #62 r4 R4-1; r5 R5-2, R5-3) ───────────────
 
-/// A row of [`every_flight_rewraps_each_pane_at_most_once`]: what starts
-/// its flight.
+/// An action in a row of [`every_flight_rewraps_each_pane_at_most_once`].
 #[derive(Clone, Copy, Debug)]
 enum Step {
     /// Ctrl-\ on the focused pane.
@@ -844,32 +827,185 @@ enum Step {
     CloseLast,
     /// The rail folds or unfolds.
     Rail,
-    /// A split, taken over six frames in by an equalise: two flights.
-    SplitThenEqualise,
-}
-
-fn equalise(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
-    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(crate::palette::AppAct::Equalise, w, cx))).expect("the window");
 }
 
 fn take_step(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, step: Step) {
     match step {
         Step::Split => key(cx, window, "ctrl-\\"),
-        Step::Equalise => equalise(cx, window, view),
+        Step::Equalise => {
+            cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(crate::palette::AppAct::Equalise, w, cx)))
+                .expect("the window");
+        }
         Step::CloseLast => view.update(cx, |v, cx| {
             let last = *v.reading_order().last().expect("a pane");
             v.in_pane(last, |v| v.close_pane());
             cx.notify();
         }),
         Step::Rail => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
-        Step::SplitThenEqualise => {
-            key(cx, window, "ctrl-\\");
-            for _ in 0..6 {
-                frame_144(cx, window, view);
+    }
+}
+
+/// What a row lands on (Shady #62 r5 R5-2: its landing is checked, never
+/// its last frame taken for one): its panes, an equalised tree, the
+/// rail folded or open (`None`: either).
+#[derive(Clone, Copy, Debug)]
+struct Lands {
+    panes: usize,
+    equal: bool,
+    rail_folded: Option<bool>,
+}
+
+/// One draw (#61's hook, every frame drawn): the layout's flight, by its
+/// target (`None`: none), whether a panel flies, each pane's column.
+#[derive(Clone, Debug)]
+struct Draw<P> {
+    flight: Option<String>,
+    panels: bool,
+    cols: Vec<(P, f32)>,
+}
+
+impl<P> Draw<P> {
+    fn moving(&self) -> bool {
+        self.flight.is_some() || self.panels
+    }
+}
+
+/// The 144 Hz frames a row's last flight has to land in, and the resting
+/// frames after it that count as landed.
+const CAP: usize = 400;
+const RESTING: usize = 5;
+
+/// A row's verdict on its draws (Shady #62 r5 R5-2, R5-3): what fails,
+/// each named with `row`. `starts[i]` is the last draw before phase `i`'s
+/// action, with the columns it comes in with; the phase runs to the next
+/// one's or to the row's end, on `rest` resting frames.
+/// - The draw before the first action is at rest, and each phase flies
+///   after its action (not before it: a flight that never landed is the
+///   last row's).
+/// - A phase after the first takes over: the flight it comes in on is
+///   under way, and its action starts another (a target of its own; an
+///   action that changes nothing fails).
+/// - In each phase, each pane in it from its first draw to its last
+///   rewraps at most once.
+/// - The row lands: [`RESTING`] frames at rest within [`CAP`].
+fn judge<P: PartialEq + std::fmt::Debug>(row: &str, draws: &[Draw<P>], starts: &[usize], rest: usize) -> Vec<String> {
+    let mut fails = Vec::new();
+    let Some(&first) = starts.first() else { return vec![format!("{row}: no action")] };
+    if draws[first].moving() {
+        fails.push(format!("{row}: the frame before its action was still moving: {:?}", draws[first]));
+    }
+    for (n, &s) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(draws.len() - 1);
+        let after = &draws[s + 1..=end];
+        if !after.iter().any(Draw::moving) {
+            fails.push(format!("{row}, phase {n}: nothing flew after its action"));
+        }
+        if n > 0 {
+            let was = &draws[s].flight;
+            if was.is_none() {
+                fails.push(format!("{row}, phase {n}: no flight under way to take over"));
             }
-            equalise(cx, window, view);
+            if !after.iter().any(|d| d.flight.is_some() && d.flight != *was) {
+                fails.push(format!("{row}, phase {n}: its action started no flight of its own"));
+            }
+        }
+        let phase = &draws[s..=end];
+        let (incoming, out) = (&phase[0].cols, &phase[phase.len() - 1].cols);
+        for (id, _) in incoming.iter().filter(|(id, _)| out.iter().any(|(o, _)| o == id)) {
+            let mut columns: Vec<f32> = phase.iter().filter_map(|d| d.cols.iter().find(|(i, _)| i == id).map(|c| c.1)).collect();
+            columns.dedup();
+            if columns.len() > 2 {
+                fails.push(format!("{row}, phase {n}: pane {id:?}'s column rewrapped {} times: {columns:?}", columns.len() - 1));
+            }
         }
     }
+    let last = &draws[draws.len() - 1];
+    if rest < RESTING || last.moving() {
+        fails.push(format!(
+            "{row}: never landed: {rest} resting frames of {RESTING} within {CAP}; the last draw's flight {:?}, panels moving {}, columns {:?}",
+            last.flight, last.panels, last.cols
+        ));
+    }
+    fails
+}
+
+/// [`judge`] on made-up draws (Shady #62 r5: each loophole, one row): a
+/// flight frozen mid-way with its column still, a takeover rewrapping
+/// twice in one phase (0 + 2, 2 + 0) though once in each flight on
+/// average, an action that changes nothing taken for a takeover, a row
+/// that starts mid-flight. Each fails; a row that rewraps once a phase
+/// and lands holds.
+#[test]
+fn the_tables_verdict_fails_each_loophole() {
+    let d = |flight: Option<&str>, panels: bool, c: f32| Draw { flight: flight.map(str::to_owned), panels, cols: vec![(0_u8, c)] };
+    let rest = |c: f32| d(None, false, c);
+    let fly = |t: &str, c: f32| d(Some(t), false, c);
+    let frozen: Vec<Draw<u8>> = std::iter::once(rest(672.)).chain(std::iter::repeat_n(fly("a", 445.), CAP)).collect();
+    // Each: its draws, its phases' starts, its resting frames, and the
+    // failures it must give, in order (none: it holds).
+    type Case = (&'static str, Vec<Draw<u8>>, Vec<usize>, usize, Vec<&'static str>);
+    let cases: Vec<Case> = vec![
+        ("one rewrap, landed", vec![rest(672.), fly("a", 445.), fly("a", 445.), rest(445.)], vec![0], RESTING, vec![]),
+        (
+            "a takeover, one rewrap a phase",
+            vec![rest(672.), fly("a", 445.), fly("a", 445.), fly("b", 445.), fly("b", 589.), rest(589.)],
+            vec![0, 2],
+            RESTING,
+            vec![],
+        ),
+        ("a panel's flight", vec![rest(672.), d(None, true, 520.), rest(520.)], vec![0], RESTING, vec![]),
+        ("frozen mid-flight, its column still", frozen, vec![0], 0, vec!["never landed"]),
+        (
+            "at rest, short of five frames",
+            vec![rest(672.), fly("a", 445.), fly("a", 445.), rest(445.)],
+            vec![0],
+            RESTING - 1,
+            vec!["never landed"],
+        ),
+        (
+            "a takeover, 2 + 0",
+            vec![rest(672.), fly("a", 600.), fly("a", 445.), fly("b", 445.), rest(445.)],
+            vec![0, 2],
+            RESTING,
+            vec!["phase 0: pane 0's column rewrapped 2 times"],
+        ),
+        (
+            "a takeover, 0 + 2",
+            vec![rest(672.), fly("a", 672.), fly("a", 672.), fly("b", 600.), fly("b", 589.), rest(589.)],
+            vec![0, 2],
+            RESTING,
+            vec!["phase 1: pane 0's column rewrapped 2 times"],
+        ),
+        (
+            "a second action that changes nothing",
+            vec![rest(672.), fly("a", 445.), fly("a", 445.), fly("a", 445.), rest(589.)],
+            vec![0, 2],
+            RESTING,
+            vec!["started no flight of its own"],
+        ),
+        (
+            "a takeover of a flight that has landed",
+            vec![rest(672.), fly("a", 445.), rest(445.), fly("b", 589.), rest(589.)],
+            vec![0, 2],
+            RESTING,
+            vec!["no flight under way to take over"],
+        ),
+        (
+            "a row that starts mid-flight, its own action doing nothing",
+            vec![fly("a", 445.), rest(445.), rest(445.)],
+            vec![0],
+            RESTING,
+            vec!["still moving", "nothing flew after its action"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, draws, starts, rested, want) in &cases {
+        let got = judge(name, draws, starts, *rested);
+        if got.len() != want.len() || !got.iter().zip(want).all(|(g, w)| g.contains(w)) {
+            wrong.push(format!("{name}: wanted {want:?}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Shady #62 r4 R4-1: every flight, the panels', the layout's or both at
@@ -882,29 +1018,37 @@ fn take_step(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<App
 /// the rightmost closing brings the rail back, and pane 0, 378 wide, was
 /// read 377.8: its column went 346 → 345 → 427. A table, at 100, 125 and
 /// 150 %: in a window 2400 px wide, a split to two and to three, an
-/// equalise, a close to two, and a split to three taken over by an
-/// equalise (two flights: two rewraps at most), which leaves three equal
-/// panes; then at 1200 and at 1500 px (a resize: a cut), a close to two
-/// (at 1200 px, 125 %: the rail's return), the rail's fold and unfold, a
-/// split (down, where a column has no room) and a close. Every draw
-/// (#61's hook) from the frame before each flight to its rest, each pane
-/// drawn in both.
+/// equalise, a close to two, and a split to three taken over six frames
+/// in by an equalise (two phases), which leaves three equal panes; then
+/// at 1200 and at 1500 px (a resize: a cut), a close to two (at 1200 px,
+/// 125 %: the rail's return), the rail's fold and unfold, a split (down,
+/// where a column has no room: no column moves) and a close. Every draw
+/// (#61's hook), each row from the draw before its action, judged by
+/// [`judge`] (Shady #62 r5 R5-2, R5-3): it starts at rest, flies after
+/// each action, rewraps each pane at most once a phase and lands, on the
+/// panes, the equalised tree or the rail it was for. The panes judged
+/// are those in a phase from its first draw to its last: a split's new
+/// pane and a closing one are not. The takeover is two layout flights on
+/// their own springs (2400 px: nothing yields); a takeover of a ride
+/// (`Ride.from_x` carried) is not a row.
 #[gpui_kit::test]
 fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
     use Step::*;
-    let wide = [
-        (Split, "split to 2", 1),
-        (Split, "split to 3", 1),
-        (Equalise, "equalise", 1),
-        (CloseLast, "close to 2", 1),
-        (SplitThenEqualise, "split to 3 taken over by an equalise", 2),
+    let lands = |panes: usize| Lands { panes, equal: false, rail_folded: None };
+    let equal = Lands { equal: true, ..lands(3) };
+    let wide: [(&[Step], &str, Lands); 5] = [
+        (&[Split], "split to 2", lands(2)),
+        (&[Split], "split to 3", lands(3)),
+        (&[Equalise], "equalise", equal),
+        (&[CloseLast], "close to 2", lands(2)),
+        (&[Split, Equalise], "split to 3 taken over by an equalise", equal),
     ];
-    let steps = [
-        (CloseLast, "close to 2", 1),
-        (Rail, "fold", 1),
-        (Rail, "unfold", 1),
-        (Split, "split to 3", 1),
-        (CloseLast, "close to 2 again", 1),
+    let narrow: [(&[Step], &str, Lands); 5] = [
+        (&[CloseLast], "close to 2", lands(2)),
+        (&[Rail], "fold", Lands { rail_folded: Some(true), ..lands(2) }),
+        (&[Rail], "unfold", Lands { rail_folded: Some(false), ..lands(2) }),
+        (&[Split], "split to 3", lands(3)),
+        (&[CloseLast], "close to 2 again", lands(2)),
     ];
     let mut fails = Vec::new();
     for (n, (w, s)) in [(1200., 1.25), (1200., 1.), (1200., 1.5), (1500., 1.), (1500., 1.25), (1500., 1.5)].into_iter().enumerate() {
@@ -918,12 +1062,12 @@ fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
         });
         frame(cx, window);
         level(cx, crate::motion::Level::Full);
-        let seen = draws(cx, &view, |v: &AppView| {
-            let cols: Vec<(crate::pane::PaneId, f32)> =
-                v.reading_order().iter().filter_map(|id| v.panes.get(*id).map(|p| (*id, p.layout.column))).collect();
-            (v.panes.flight.is_some() || v.panel_fx.moving(), cols)
+        let seen = draws(cx, &view, |v: &AppView| Draw {
+            flight: v.panes.flight.as_ref().map(|f| format!("{:?}", f.to)),
+            panels: v.panel_fx.moving(),
+            cols: v.reading_order().iter().filter_map(|id| v.panes.get(*id).map(|p| (*id, p.layout.column))).collect(),
         });
-        for (k, (step, name, flights)) in wide.into_iter().chain(steps).enumerate() {
+        for (k, (row_steps, name, to)) in wide.into_iter().chain(narrow).enumerate() {
             if k == wide.len() {
                 assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "{w} px, {s}: three panes");
                 VisualTestContext::from_window(window, cx).simulate_resize(size(px(w), px(1080.)));
@@ -932,41 +1076,54 @@ fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
                 }
             }
             let row = format!("{} px, {}%, {name}", if k < wide.len() { 2400. } else { w }, s * 100.);
-            // The frame before the flight, drawn.
-            frame_144(cx, window, &view);
-            let at = seen.borrow().len() - 1;
             let rail_was = view.read_with(cx, |v, _| v.pane_yield.is_some_and(|y| y.0));
-            take_step(cx, window, &view, step);
+            // Each action after the draw before it; a takeover six frames
+            // into the flight before (about 42 ms: well inside it).
+            let mut starts = Vec::new();
+            for (i, &step) in row_steps.iter().enumerate() {
+                for _ in 0..if i == 0 { 1 } else { 6 } {
+                    frame_144(cx, window, &view);
+                }
+                starts.push(seen.borrow().len() - 1);
+                take_step(cx, window, &view, step);
+            }
             let mut rest = 0;
-            for _ in 0..400 {
+            for _ in 0..CAP {
                 frame_144(cx, window, &view);
                 let moving = view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving());
                 rest = if moving { 0 } else { rest + 1 };
-                if rest >= 5 {
+                if rest >= RESTING {
                     break;
                 }
             }
-            let rail_now = view.read_with(cx, |v, _| v.pane_yield.is_some_and(|y| y.0));
-            let got: Vec<(bool, Vec<(crate::pane::PaneId, f32)>)> = seen.borrow()[at..].to_vec();
-            eprintln!("WRAPS {row}: flew {}, the rail yielded {rail_was} -> {rail_now}", got.iter().any(|d| d.0));
-            if !got.iter().any(|d| d.0) {
-                fails.push(format!("{row}: nothing flew"));
+            let at = starts[0];
+            let starts: Vec<usize> = starts.iter().map(|s| s - at).collect();
+            let got: Vec<Draw<crate::pane::PaneId>> = seen.borrow()[at..].to_vec();
+            let row_fails = judge(&row, &got, &starts, rest);
+            let (rail_now, panes, equalised, rail_folded) = view.read_with(cx, |v, _| {
+                let (w, h) = v.centre.get();
+                let mut even = v.panes.tree.clone();
+                even.equalise_all(crate::split::Rect { x: 0., y: 0., w, h });
+                (v.pane_yield.is_some_and(|y| y.0), v.panes.len(), even == v.panes.tree, v.panels.rail_collapsed)
+            });
+            eprintln!("WRAPS {row}: {} draws, phases from {starts:?}, the rail yielded {rail_was} -> {rail_now}", got.len());
+            for (id, _) in &got[0].cols {
+                let mut columns: Vec<f32> = got.iter().filter_map(|d| d.cols.iter().find(|(i, _)| i == id).map(|c| c.1)).collect();
+                columns.dedup();
+                eprintln!("WRAPS {row}, pane {id:?}: {columns:?}");
+            }
+            fails.extend(row_fails);
+            if panes != to.panes {
+                fails.push(format!("{row}: landed on {panes} panes, not {}", to.panes));
+            }
+            if to.equal && !equalised {
+                fails.push(format!("{row}: landed on a tree that is not equalised"));
+            }
+            if to.rail_folded.is_some_and(|f| f != rail_folded) {
+                fails.push(format!("{row}: the rail folded {rail_folded}, not {:?}", to.rail_folded));
             }
             if n == 0 && k == wide.len() && !(rail_was && !rail_now) {
                 fails.push(format!("{row}: the rail comes back from its strip (yielded {rail_was} -> {rail_now})"));
-            }
-            let (first, last) = (&got[0].1, &got[got.len() - 1].1);
-            for (id, _) in first.iter().filter(|(id, _)| last.iter().any(|(l, _)| l == id)) {
-                let path: Vec<f32> = got.iter().filter_map(|(_, cols)| cols.iter().find(|(i, _)| i == id).map(|c| c.1)).collect();
-                let mut columns = path.clone();
-                columns.dedup();
-                eprintln!("WRAPS {row}, pane {id:?}: {columns:?} over {} draws", path.len());
-                if columns.len() > flights + 1 {
-                    fails.push(format!(
-                        "{row}: pane {id:?}'s column rewrapped {} times in {flights} flight(s): {columns:?}",
-                        columns.len() - 1
-                    ));
-                }
             }
         }
         view.update(cx, |v, _| {
