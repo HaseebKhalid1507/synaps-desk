@@ -332,7 +332,18 @@ fn on_a_as(
     name: &str,
     attached_a: Value,
 ) -> (AnyWindowHandle, Entity<AppView>, Client, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
-    let (window, view) = open(cx);
+    on_a_in(cx, name, attached_a, (1280., 800.))
+}
+
+/// [`on_a_as`] in a window `w`×`h`.
+#[allow(clippy::type_complexity)]
+fn on_a_in(
+    cx: &mut TestAppContext,
+    name: &str,
+    attached_a: Value,
+    (w, h): (f32, f32),
+) -> (AnyWindowHandle, Entity<AppView>, Client, Conn, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
+    let (window, view) = open_sized(cx, w, h);
     let (path, attaches) = start(name);
     let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
     until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
@@ -2330,7 +2341,13 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
     let _ = (names(&mut a), names(&mut b));
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "three panes");
     let three = entries(cx);
-    assert_eq!(find(&three, AppAct::Equalise).3, None, "split: Equalise runs");
+    // A third row is the layout's cap, not the window (design gate #59 M1:
+    // "no room at this window size" in a maximised window).
+    assert_eq!(find(&three, AppAct::SplitDown).3.as_deref(), Some("2 rows is the most"), "a third row: the cap named");
+    let menu_says = view.read_with(cx, |v, _| v.split_refusal(Some(crate::split::Side::Down)));
+    assert_eq!(menu_says, Some("2 rows is the most"), "the pane menu's reason, the same words");
+    // Even as split: greyed (Shady #44 n16); uneven, it runs (below).
+    assert_eq!(find(&three, AppAct::Equalise).3.as_deref(), Some("already even"), "split even: Equalise greyed");
     assert_eq!(find(&three, AppAct::FocusPane(3)).3.as_deref(), Some("no such pane"), "a fourth pane isn't there");
     // Uneven, then Equalise: every split even on its flight's landing.
     view.update(cx, |v, cx| {
@@ -2341,6 +2358,7 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
         cx.notify();
     });
     frame(cx, window);
+    assert_eq!(find(&entries(cx), AppAct::Equalise).3, None, "uneven: Equalise runs");
     act(cx, AppAct::Equalise);
     let even = |n: &crate::split::Node| -> bool {
         fn all(n: &crate::split::Node) -> bool {
@@ -3044,7 +3062,7 @@ fn a_refused_send_from_a_pane_join_closed_comes_back(cx: &mut TestAppContext) {
     let _ = client.shutdown();
 }
 
-/// Shady #44 L12: a tab still being created in a pane Join closes stays
+/// Shady #44 L12: a tab still being created in a pane Join closes goes
 /// with its pane (its create is its store's, detached as the pane goes):
 /// the pane that stays has no tab nothing would ever fill, and no store
 /// is left behind.
@@ -3191,7 +3209,8 @@ fn a_closing_pane_slides_out_with_its_rows(cx: &mut TestAppContext) {
 /// Shady #42 r2-L1: four panes, one closes, and a split within its flight
 /// is handed the closing pane's id (the only one free): no pane jumps
 /// (its share keeps closing, a ghost's ground), and every frame steps by
-/// at most one frame's spring.
+/// at most one frame's spring. The new pane and the closing share draw
+/// under different element ids (Shady #59 L5.1).
 #[gpui_kit::test]
 fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppContext) {
     let (window, view, client, _a, _attaches, _events) = on_a(cx, "panes-reuse", None);
@@ -3224,6 +3243,16 @@ fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppC
     key(cx, window, "ctrl-shift-\\");
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "the split took the id");
     assert!(view.read_with(cx, |v, _| v.panes.get(closing).is_some()), "the closing pane's id is the new pane's");
+    // Shady #59 L5.1 (#55 n1), the id's reuse: in the same frame the new
+    // pane draws under its own `("pane", n)` and the closing share under a
+    // ghost's, past `PANES_MAX` (never an open pane's: their element state
+    // stays apart).
+    let ghosts = view.read_with(cx, |v, _| v.panes.flight.as_ref().map(|f| f.ghosts.clone()).unwrap_or_default());
+    assert_eq!(ghosts.len(), 1, "the closing share, a ghost now: {ghosts:?}");
+    assert!(ghosts[0].index() >= crate::pane::PANES_MAX, "a ghost's id is past the open panes': {ghosts:?}");
+    assert!(drawn(cx, window, format!("pane {}", closing.index())).is_some(), "the new pane drawn under its id");
+    assert!(drawn(cx, window, format!("pane-closing {}", ghosts[0].index())).is_some(), "the closing share drawn under the ghost's");
+    assert!(drawn(cx, window, format!("pane-closing {}", closing.index())).is_none(), "no closing share under the open pane's id");
     let mut frames = 0;
     loop {
         bound = bound.max(step(cx));
@@ -5358,12 +5387,25 @@ fn launch_with(
     layout: Option<crate::theme::Layout>,
     tabs: Option<crate::tabs::Saved>,
 ) -> (AnyWindowHandle, Entity<AppView>, Client, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
-    let (window, view) = open(cx);
+    launch_in(cx, name, layout, tabs, true, (1280., 800.))
+}
+
+/// [`launch_with`], split panes on or off, in a window `w`×`h`.
+#[allow(clippy::type_complexity)]
+fn launch_in(
+    cx: &mut TestAppContext,
+    name: &str,
+    layout: Option<crate::theme::Layout>,
+    tabs: Option<crate::tabs::Saved>,
+    split: bool,
+    (w, h): (f32, f32),
+) -> (AnyWindowHandle, Entity<AppView>, Client, mpsc::Receiver<Conn>, async_channel::Receiver<Event>) {
+    let (window, view) = open_sized(cx, w, h);
     let (path, attaches) = start(name);
     let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
     until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
     view.update(cx, |v, cx| {
-        v.app_settings.split = true;
+        v.app_settings.split = split;
         v.client = Some(client.clone());
         // Nothing open, as a launch on a daemon (not the demo's tab).
         v.model.tabs = crate::tabs::Tabs::default();
@@ -5547,6 +5589,501 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
     assert!(layout.is_some() && tabs.is_some(), "a launch reads it back");
 }
 
+/// This key's entries in the tests' settings file, `layout.<k>` and
+/// `tabs.<k>` (the file is shared by the tests that run at once).
+fn file_keys(path: &std::path::Path, k: &str) -> (Value, Value) {
+    let v: Value = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    (v["layout"][k].clone(), v["tabs"][k].clone())
+}
+
+/// The labels of pane `id`'s tabs.
+fn labels_of(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId) -> Vec<String> {
+    view.update(cx, |v, _| v.in_pane(id, |v| v.model.tabs.iter().map(|t| t.label.clone()).collect()).unwrap_or_default())
+}
+
+/// The delayed save's wait, its frame and its write.
+fn wait_saved(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.executor().advance_clock(crate::app::SAVE_DELAY + Duration::from_millis(50));
+    frame(cx, window);
+    cx.run_until_parked();
+}
+
+/// Shady #55 n5 (a launch writes nothing of its own) and r2 n7: a layout
+/// restored, its lists in and the save's delay over, `layout.<k>` and
+/// `tabs.<k>` are as they were. Then B, renamed at the daemon, is named
+/// so in its tab in the pane not acted on, and that is saved.
+#[gpui_kit::test]
+fn a_launch_writes_nothing_of_its_own_and_a_daemon_rename_is_saved_from_any_pane(cx: &mut TestAppContext) {
+    let k = format!("test:persist-quiet-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    let layout = two_across(&[A], &[B], 0);
+    crate::theme::save_layout(&path, &k, &layout).unwrap();
+    let before = file_keys(&path, &k);
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-quiet", Some(layout), None);
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    for _ in 0..=crate::tabs::RESTORE_LISTS {
+        list(cx, window, &view, &[A, B]);
+        wait_saved(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "both panes");
+    assert_eq!(file_keys(&path, &k), before, "the launch wrote nothing");
+    // Seen, not inferred (Shady #59 L5: an identical rewrite passes the above).
+    assert_eq!(writes(cx, &view), 0, "no write at all");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), order[0]);
+    // B renamed at the daemon: that is written (once).
+    let metas: Vec<synaps_client::protocol::SessionMeta> = [(A, None), (B, Some("Relay v2"))]
+        .iter()
+        .map(|(id, name)| serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live", "name": name})).expect("a session"))
+        .collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+    assert_eq!(labels_of(cx, &view, order[1]), ["Relay v2"], "its tab, in the other pane");
+    wait_saved(cx, window);
+    let saved = crate::theme::load_layout(&path, &k).expect("the layout");
+    assert_eq!(saved.panes[1].labels, ["Relay v2"], "saved");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #55 n5: split panes off, a layout in the file. The launch is one
+/// pane from `tabs.<k>` (the layout never read), and a change of its tabs
+/// is saved there, `layout.<k>` left as it was.
+#[gpui_kit::test]
+fn flag_off_a_saved_layout_is_neither_read_nor_written(cx: &mut TestAppContext) {
+    let k = format!("test:persist-off-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    crate::theme::save_layout(&path, &k, &two_across(&[A], &[B], 1)).unwrap();
+    let (restore, tabs) = crate::theme::load_restore(&path, &k, false);
+    assert!(restore.is_none(), "flag off: no layout read");
+    let (window, view, client, attaches, _events) = launch_in(cx, "persist-off", restore, tabs, false, (1280., 800.));
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    list(cx, window, &view, &[A, B]);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "one pane");
+    assert_eq!(tabs_of(cx, &view, p0), [A, B], "the union, as one pane");
+    let layout_before = file_keys(&path, &k).0;
+    key(cx, window, "ctrl-w");
+    wait_saved(cx, window);
+    let (layout, tabs) = file_keys(&path, &k);
+    assert_eq!(layout, layout_before, "layout.<k> untouched");
+    assert_eq!(tabs["sessions"], json!([A]), "the change saved to tabs.<k>");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #55 n5, L3: a restored layout's ratios (0.1 / 0.9) are clamped to
+/// the window on frame 1, the first pane at its minimum, no flight. In a
+/// window too small for two panes at launch it folds, and once the window
+/// widens it is clamped to fit, not left folded under the saved ratios.
+#[gpui_kit::test]
+fn a_restored_layout_is_clamped_on_frame_1_and_again_once_a_small_window_widens(cx: &mut TestAppContext) {
+    use crate::split::PANE_MIN_W;
+    let mut layout = two_across(&[A], &[B], 0);
+    if let crate::theme::LayoutNode::Split { ratios, .. } = &mut layout.tree {
+        *ratios = vec![0.1, 0.9];
+    }
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-clamp", Some(layout.clone()), None);
+    let (order, flight, folded) = view.read_with(cx, |v, _| (v.reading_order(), v.panes.flight.is_some(), v.panes.folded));
+    assert!(!flight && !folded, "frame 1: laid out, no flight");
+    let b0 = pane_box(cx, window, order[0]);
+    assert!((b0[2] - PANE_MIN_W).abs() <= 1., "frame 1: the first pane at its minimum: {b0:?}");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+    // Too small for two panes: folded; widened, clamped.
+    let (window, view, client, attaches, _events) = launch_in(cx, "persist-clamp-small", Some(layout), None, true, (700., 800.));
+    assert!(view.read_with(cx, |v, _| v.panes.folded), "700 px: folded");
+    resize(cx, window, 1280., 800.);
+    frame(cx, window);
+    let (order, folded) = view.read_with(cx, |v, _| (v.reading_order(), v.panes.folded));
+    assert!(!folded, "widened to 1280: the layout clamped to fit, unfolded");
+    let b0 = pane_box(cx, window, order[0]);
+    assert!((b0[2] - PANE_MIN_W).abs() <= 1., "widened: the first pane at its minimum: {b0:?}");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #55 n4: a restored pane closed while its tabs still wait leaves
+/// no id behind for a restore to act on: the next pane takes the id, and
+/// the lists that come leave it as made.
+#[gpui_kit::test]
+fn a_restored_pane_closed_while_it_waits_leaves_its_id_to_the_next_pane(cx: &mut TestAppContext) {
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-reuse", Some(two_across(&[A], &[GONE], 0)), None);
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    view.update(cx, |v, cx| {
+        v.in_pane(order[1], |v| v.close_pane());
+        cx.notify();
+    });
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    let left = view.read_with(cx, |v, _| (v.restored.contains(&order[1]), v.restore_panes.iter().any(|(p, _)| *p == order[1])));
+    assert_eq!(left, (false, false), "its id in no restore");
+    key(cx, window, "ctrl-\\");
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    assert!(view.read_with(cx, |v, _| v.panes.ids().contains(&order[1])), "the id reused");
+    for _ in 0..crate::tabs::RESTORE_LISTS {
+        list(cx, window, &view, &[A, B]);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "the new pane stays");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #55 r2 L5: Ctrl+\ at Full, the right panel yielding to the
+/// split (#51: the layout rides it, the centre growing under the flight;
+/// the new pane laid out at its width in the centre it lands in). Every
+/// frame its share is not counted as clipping it, the share is within
+/// [`crate::pane::HOLD_UNTIL`] px of what is laid out in it; and its card
+/// arms from the first frame its buttons are whole.
+#[gpui_kit::test]
+fn a_riding_grow_panes_clip_is_measured_against_what_is_laid_out_in_it(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, events) = on_a(cx, "arm-yield", Some(1));
+    feed(cx, window, &view, &events, "A's card", |v| v.panes.cur.card.is_some());
+    let _ = names(&mut a);
+    level(cx, crate::motion::Level::Full);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let new = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(new, p0, "a new pane");
+    let mut fails = Vec::new();
+    let mut rode = false;
+    for i in 0..400 {
+        frame_144(cx, window, &view);
+        let (flight, ride, clipped, laid, drawn) = view.read_with(cx, |v, _| {
+            let p = v.panes.get(new).expect("the new pane");
+            (v.panes.flight.is_some(), v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()), p.clipped, p.laid_w.get(), p.rect.get().w)
+        });
+        rode |= ride;
+        if !flight {
+            break;
+        }
+        if !clipped && laid - drawn > crate::pane::HOLD_UNTIL + 0.5 {
+            fails.push(format!("frame {i}: not clipped, but its share is {} px short of what is laid out in it", laid - drawn));
+        }
+    }
+    assert!(rode, "the layout rode the right panel's yield");
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #44 L7, split.md §7's third clause: nothing waits on screen and
+/// B waits off it. The palette's Jump is not greyed, and Ctrl+J opens B
+/// in the focused pane (no new pane).
+#[gpui_kit::test]
+fn ctrl_j_with_nothing_waiting_on_screen_opens_the_waiting_session_in_the_focused_pane(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, _events) = on_a(cx, "jump-open", None);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let metas: Vec<synaps_client::protocol::SessionMeta> = [(A, 0), (B, 1)]
+        .iter()
+        .map(|(id, n)| {
+            serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live", "awaiting_input": n})).expect("a session")
+        })
+        .collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+    let (focused, n) = view.read_with(cx, |v, _| (v.panes.focused, v.panes.len()));
+    assert_eq!(view.read_with(cx, |v, _| v.jump_elsewhere()), Some(B.to_string()), "B is the jump's");
+    key(cx, window, "ctrl-j");
+    let b = next_attach(cx, window, &attaches, "B's attach");
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.focused, v.panes.len())), (focused, n), "the focused pane, no new pane");
+    assert!(tabs_of(cx, &view, focused).contains(&B.to_string()), "B opened in it");
+    assert_eq!(jump_off(cx, &view), Some(None), "the palette's Jump offered while B still waits");
+    drop(b);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// #53 nit: Open to the side (Alt+click on a rail row) holds its new
+/// pane's rows while its split flies, as a rail row dropped on an edge
+/// does, and lets them in before it lands.
+#[gpui_kit::test]
+fn open_to_the_side_holds_its_rows_until_its_split_lands(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, _events) = on_a(cx, "side-hold", None);
+    level(cx, crate::motion::Level::Full);
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let key_b = view.read_with(cx, |v, _| {
+        v.rail.rail.rows.iter().find(|r| r.action == crate::named::RowAction::Attach(B.into())).map(|r| r.key).expect("B's row")
+    });
+    let row = mid(cx, window, format!("rail-row {key_b}"));
+    click_m(cx, window, row, gpui_kit::Modifiers { alt: true, ..Default::default() });
+    let new = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(new, p0, "a new pane");
+    frame_144(cx, window, &view);
+    assert!(view.read_with(cx, |v, _| v.panes.get(new).is_some_and(|p| p.hold_rows)), "its rows held as it flies");
+    for _ in 0..400 {
+        if view.read_with(cx, |v, _| v.panes.flight.is_none()) {
+            break;
+        }
+        frame_144(cx, window, &view);
+    }
+    assert!(view.read_with(cx, |v, _| v.panes.flight.is_none() && v.panes.get(new).is_some_and(|p| !p.hold_rows)), "landed, its rows in");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #54 n2: the rail let go onto a width at `snap` (as a drag's
+/// detent is), the right panel yielding to the panes because of it: the
+/// yield flies on the rail's `snap`, not on `sheet` beside it.
+#[gpui_kit::test]
+fn a_yield_flies_on_the_spring_of_the_panel_that_made_it(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "yield-snap", attached(A, None), (1600., 900.));
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.pane_yield.map(|y| y.1)), Some(false), "two panes, the right panel open");
+    level(cx, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        p.rail_width = Some(crate::theme::RAIL_WIDTHS.1);
+        v.fly_to(p, crate::motion::SNAP_RESPONSE);
+        v.panels = p;
+        cx.notify();
+    });
+    frame_144(cx, window, &view);
+    let (yielded, response) = view.read_with(cx, |v, _| (v.pane_yield.map(|y| y.1), v.panel_fx.sides[1].response));
+    assert_eq!(yielded, Some(true), "the wider rail: the right panel yields");
+    assert_eq!(response, crate::motion::SNAP_RESPONSE, "on the rail's spring");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The session menu's items now: each label, and why it can't run.
+fn menu_items(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<(String, Option<String>)> {
+    view.read_with(cx, |v, _| {
+        v.smenu
+            .as_ref()
+            .map(|(m, _)| m.items.iter().map(|i| (i.label.to_string(), i.why_not.as_ref().map(|w| w.to_string()))).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Pane `id`'s tab of `session`: its menu opened, `act` picked.
+fn tab_menu_pick(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    tab: u64,
+    act: Option<crate::app::SessionAct>,
+) -> Vec<(String, Option<String>)> {
+    cx.update_window(window, |_, w, cx| {
+        view.update(cx, |v, cx| v.open_session_menu(crate::app::SessionAt::Tab(tab), Default::default(), w, cx));
+    })
+    .expect("the window");
+    let items = menu_items(cx, view);
+    if let Some(act) = act {
+        cx.update_window(window, |_, w, cx| {
+            view.update(cx, |v, cx| v.session_menu_pick(act, crate::menu::How::Key { press: true }, w, cx));
+        })
+        .expect("the window");
+    }
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    items
+}
+
+/// Split panes step 6 (split.md §2, the pane menu): a tab's menu leads
+/// with Open to the side, Split right, Split down, Move to new pane and
+/// Close pane, each greyed with why when it can't run, then today's
+/// three. Move to new pane takes the tab into a new pane, out of its own;
+/// Close pane, from the new pane's tab, closes it again. Split panes off:
+/// today's three alone.
+#[gpui_kit::test]
+fn a_tabs_menu_leads_with_the_pane_items(cx: &mut TestAppContext) {
+    let (window, view, client, _a, attaches, _events) = on_a(cx, "pane-menu", None);
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+    });
+    let mut b = next_attach(cx, window, &attaches, "B's attach");
+    b.send(attached(B, None));
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    let tab_b = tab_id(cx, &view, p0, B);
+    let labels = |items: &[(String, Option<String>)]| items.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+    let items = tab_menu_pick(cx, window, &view, tab_b, None);
+    assert_eq!(
+        labels(&items)[..5],
+        ["Open to the side", "Split right", "Split down", "Move to new pane", "Close pane"].map(String::from),
+        "{items:?}"
+    );
+    assert_eq!(labels(&items)[5..].first().map(String::as_str), Some("Rename…"), "then today's");
+    assert_eq!(items[4].1.as_deref(), Some("one pane"), "Close pane greyed");
+    assert!(items[..4].iter().all(|(_, off)| off.is_none()), "the others run: {items:?}");
+    view.update(cx, |v, cx| {
+        v.close_menu();
+        cx.notify();
+    });
+    let _ = tab_menu_pick(cx, window, &view, tab_b, Some(crate::app::SessionAct::MoveToNewPane));
+    let (n, focused) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused));
+    assert_eq!(n, 2, "a new pane");
+    assert_ne!(focused, p0);
+    assert_eq!((tabs_of(cx, &view, p0), tabs_of(cx, &view, focused)), (vec![A.to_string()], vec![B.to_string()]), "B moved");
+    let tab_b = tab_id(cx, &view, focused, B);
+    let items = tab_menu_pick(cx, window, &view, tab_b, None);
+    assert_eq!(items[3].1.as_deref(), Some("its pane's only tab"), "{items:?}");
+    assert_eq!(items[4].1, None, "Close pane runs");
+    view.update(cx, |v, cx| {
+        v.close_menu();
+        cx.notify();
+    });
+    let _ = tab_menu_pick(cx, window, &view, tab_b, Some(crate::app::SessionAct::ClosePane));
+    for _ in 0..40 {
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "Close pane closed it");
+    // Split panes off: today's three.
+    view.update(cx, |v, cx| {
+        v.app_settings.split = false;
+        cx.notify();
+    });
+    let tab_a = tab_id(cx, &view, p0, A);
+    let items = tab_menu_pick(cx, window, &view, tab_a, None);
+    assert_eq!(labels(&items), ["Rename…", "Favourite", "Close tab"].map(String::from), "{items:?}");
+    drop(b);
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Split panes step 6 (architecture §7, split.md §10): at Reduced and at
+/// Off a split, an equalise and a close each land in the frame that makes
+/// them, the panels with them. Every frame drawn is recorded at its paint
+/// (#61's [`draws`]; the equalise's uneven start set up before): the first
+/// is the move's, landed (nothing flying, the drawn layout the tree), with
+/// its panes (2, 2, 1) and, for the equalise, even ratios; so is every one
+/// after. At Off the move draws its frame alone (a split one more: its new
+/// pane's keys follow at the next frame). With the window's focus on its
+/// root (no caret) and a Reduced fade's `quick` over, a second at 144 Hz
+/// drawing only the frames the app asks for ([`idle_step`]) runs no frame
+/// callback and paints nothing: no spring is left armed at rest (Shady #59
+/// r2 L5.3).
+#[gpui_kit::test]
+fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_armed(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    // The frames an Off split, equalise and close draw, all told: the
+    // move's, and a split's one more (its new pane's keys follow at the
+    // next frame: `apply_keys`).
+    const OFF_DRAWS: (usize, usize, usize) = (2, 1, 1);
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "step6-levels", None);
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    for l in [crate::motion::Level::Reduced, crate::motion::Level::Off] {
+        level(cx, l);
+        // Each step: its setup (not observed), its act, and the panes it
+        // leaves.
+        type Step<'a> = (&'a str, Box<dyn Fn(&mut TestAppContext) + 'a>, Box<dyn Fn(&mut TestAppContext) + 'a>, usize);
+        let steps: [Step; 3] = [
+            ("split", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-\\")), 2),
+            (
+                "equalise",
+                // Off even first, as a divider's drag leaves it, drawn so.
+                Box::new(|cx: &mut TestAppContext| {
+                    view.update(cx, |v, cx| {
+                        if let crate::split::Node::Split { ratios, .. } = &mut v.panes.tree {
+                            *ratios = vec![0.3, 0.7];
+                        }
+                        v.panes.drawn = v.panes.tree.clone();
+                        cx.notify();
+                    });
+                    frame(cx, window);
+                    idle_step(cx, window, &view, Duration::from_millis(300));
+                }),
+                Box::new(|cx: &mut TestAppContext| {
+                    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::Equalise, w, cx)));
+                    frame(cx, window);
+                }),
+                2,
+            ),
+            ("close", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-w")), 1),
+        ];
+        for (what, setup, act, panes) in steps.iter() {
+            setup(cx);
+            // Every frame drawn from here (#61's per-draw probe, Shady #59
+            // L5.3): whether anything moved, the panes, the drawn layout's
+            // ratios, and whether the drawn layout is the tree.
+            let seen = draws(cx, &view, |v| {
+                let ratios = match &v.panes.drawn {
+                    crate::split::Node::Split { ratios, .. } => ratios.clone(),
+                    crate::split::Node::Leaf(_) => vec![1.],
+                };
+                (v.panes.flight.is_some() || v.panel_fx.moving(), v.panes.len(), ratios, v.panes.drawn == v.panes.tree)
+            });
+            let was = view.read_with(cx, |v, _| {
+                let ratios = match &v.panes.drawn {
+                    crate::split::Node::Split { ratios, .. } => ratios.clone(),
+                    crate::split::Node::Leaf(_) => vec![1.],
+                };
+                (v.panes.len(), ratios)
+            });
+            act(cx);
+            // The move's own frame (`key` and the equalise's `frame` draw
+            // it), then one more only if the app asks for it.
+            asked_frame(cx, window, &view);
+            let drawn = seen.borrow().clone();
+            // A key's own frame can come before the move it defers to the
+            // next frame's top: the same picture as before, nothing moved.
+            // The first frame that differs is the move's, landed: its panes,
+            // its layout the tree's, an equalise's ratios even; so is every
+            // frame after it.
+            let first = drawn.iter().position(|d| (d.1, &d.2) != (was.0, &was.1));
+            let Some(first) = first else { panic!("{l:?}, {what}: no frame drawn shows the move: {drawn:?}") };
+            assert!(drawn[..first].iter().all(|d| !d.0 && d.3), "{l:?}, {what}: a frame before the move's is still: {drawn:?}");
+            let moved = &drawn[first..];
+            assert!(
+                moved.iter().all(|d| !d.0 && d.3 && d.1 == *panes),
+                "{l:?}, {what}: from the move's frame on, landed with {panes} pane(s): {drawn:?}"
+            );
+            if *what == "equalise" {
+                assert!(
+                    moved.iter().all(|d| d.2.iter().all(|r| (r - 0.5).abs() < 1e-4)),
+                    "{l:?}, {what}: even from its frame on: {drawn:?}"
+                );
+            }
+            // Off: OFF_DRAWS frames for the move, all told.
+            if l == crate::motion::Level::Off {
+                let expected = match *what {
+                    "split" => OFF_DRAWS.0,
+                    "equalise" => OFF_DRAWS.1,
+                    _ => OFF_DRAWS.2,
+                };
+                assert_eq!(drawn.len(), expected, "{l:?}, {what}: frames drawn for the move: {drawn:?}");
+            }
+            // Off the composer (its caret blinks a frame every 500 ms), a
+            // Reduced fade's frames over (`quick`), then a second at 144
+            // Hz drawing only what the app asks for: no frame callback and
+            // no paint.
+            let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
+            idle_step(cx, window, &view, Duration::from_millis(300));
+            let at_rest = seen.borrow().len();
+            let ran: usize = (0..144).map(|_| idle_step(cx, window, &view, Duration::from_micros(6944))).sum();
+            assert_eq!(ran, 0, "{l:?}, {what}: frame callbacks at rest: {:?}", &seen.borrow()[at_rest..]);
+            assert_eq!(seen.borrow().len(), at_rest, "{l:?}, {what}: paints at rest: {:?}", &seen.borrow()[at_rest..]);
+            assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "{l:?}, {what}: a frame asked for at rest");
+            view.update(cx, |v, _| v.on_draw = None);
+        }
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "{l:?}: one pane again");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
 // ── fix/split-motion-tails ──────────────────────────────────────────────
 
 /// [`on_a`] in a window `w` × `h`.
@@ -5710,6 +6247,375 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
     key(cx, window, "ctrl-w");
     frame(cx, window);
     assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some())), (1, false), "Off: landed in its frame");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+// ── #59 round 2 (Shady L1–L5, the design gate's M1) ─────────────────────
+
+/// The writes this window made to `tabs.<k>` / `layout.<k>` ([`crate::app::SaveJob`]).
+fn writes(cx: &mut TestAppContext, view: &Entity<AppView>) -> u32 {
+    view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writes)
+}
+
+/// The palette's "Jump to what is waiting": `Some(None)` offered, `Some(Some(why))` greyed.
+fn jump_off(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<Option<String>> {
+    use crate::palette::{Act, AppAct};
+    view.read_with(cx, |v, cx| {
+        v.palette_entries(cx).1.into_iter().find(|e| matches!(e.act, Act::App(AppAct::JumpWaiting))).map(|e| e.off.map(|o| o.to_string()))
+    })
+}
+
+/// The session menu opened at `at` (a right-click's), its items' acts.
+fn menu_acts(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<AppView>,
+    at: crate::app::SessionAt,
+) -> Vec<crate::app::SessionAct> {
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.open_session_menu(at, gpui_kit::point(px(400.), px(300.)), w, cx)))
+        .unwrap();
+    view.read_with(cx, |v, _| v.smenu.as_ref().map(|(m, _)| m.items.iter().map(|i| i.act).collect()).unwrap_or_default())
+}
+
+/// Shady #59 L2: a rail row's menu has Open to the side and no tab items
+/// (Split right/down, Move to new pane, Close pane), whether or not its
+/// session has a tab in the focused pane; a tab's menu has all five.
+#[gpui_kit::test]
+fn a_rail_rows_menu_has_open_to_the_side_and_no_tab_items(cx: &mut TestAppContext) {
+    use crate::app::{SessionAct, SessionAt};
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "row-menu", None);
+    list(cx, window, &view, &[A, B]);
+    let row_of = |cx: &mut TestAppContext, s: &str| {
+        view.read_with(cx, |v, _| {
+            v.rail.rail.rows.iter().find(|r| matches!(&r.action, crate::named::RowAction::Attach(id) if id == s)).map(|r| r.key)
+        })
+        .unwrap_or_else(|| panic!("{s}'s row"))
+    };
+    let tab_items = [SessionAct::SplitRight, SessionAct::SplitDown, SessionAct::MoveToNewPane, SessionAct::ClosePane];
+    for (what, s) in [("a row whose session has a tab here", A), ("a row with no tab", B)] {
+        let at = SessionAt::Row(row_of(cx, s));
+        let got = menu_acts(cx, window, &view, at);
+        view.update(cx, |v, _| v.close_menu());
+        assert_eq!(got.first(), Some(&SessionAct::OpenSide), "{what}: Open to the side first: {got:?}");
+        assert!(!got.iter().any(|a| tab_items.contains(a)), "{what}: no tab items: {got:?}");
+    }
+    let tab = view.read_with(cx, |v, _| v.model.tabs.iter().find(|t| t.session.as_deref() == Some(A)).map(|t| t.id)).expect("A's tab");
+    let got = menu_acts(cx, window, &view, SessionAt::Tab(tab));
+    assert!(tab_items.iter().all(|a| got.contains(a)) && got.contains(&SessionAct::OpenSide), "a tab's menu: all five: {got:?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #59 L4: the pane menu's refusals follow the window while it is
+/// open. A tab's menu at 1920 × 1080, the keyboard on Split down; the
+/// window 500 px tall: Split down greyed with why (no room for two rows),
+/// the selection moved on to an item that can act; tall again: offered
+/// again, and the keyboard's Enter on it splits down.
+#[gpui_kit::test]
+fn the_pane_menus_refusals_follow_the_window_while_it_is_open(cx: &mut TestAppContext) {
+    use crate::app::{SessionAct, SessionAt};
+    let (window, view, client, _a, _attaches, _events) = on_a(cx, "menu-resize", None);
+    let resize = |cx: &mut TestAppContext, h: f32| {
+        VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(h)));
+        frame(cx, window);
+        frame(cx, window);
+    };
+    resize(cx, 1080.);
+    let tab = view.read_with(cx, |v, _| v.model.tabs.iter().find(|t| t.session.as_deref() == Some(A)).map(|t| t.id)).expect("A's tab");
+    menu_acts(cx, window, &view, SessionAt::Tab(tab));
+    let state = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let (m, _) = v.smenu.as_ref().expect("the menu open");
+            let i = m.items.iter().position(|it| it.act == SessionAct::SplitDown).expect("Split down");
+            (i, m.items[i].why_not.as_ref().map(|s| s.to_string()), m.sel, m.sel.is_some_and(|s| m.items[s].enabled()))
+        })
+    };
+    let (down, why, _, _) = state(cx);
+    assert_eq!(why, None, "1080: Split down offered");
+    for _ in 0..3 {
+        key(cx, window, "down");
+    }
+    assert_eq!(state(cx).2, Some(down), "the keyboard on Split down");
+    resize(cx, 500.);
+    let (_, why, sel, ok) = state(cx);
+    assert_eq!(why.as_deref(), Some("no room to split this pane"), "500 tall: greyed, with why");
+    assert!(sel != Some(down) && ok, "the selection moved on to an item that can act: {sel:?}");
+    resize(cx, 1080.);
+    assert_eq!(state(cx).1, None, "tall again: offered again");
+    key(cx, window, "home");
+    key(cx, window, "down");
+    key(cx, window, "down");
+    assert_eq!(state(cx).2, Some(down), "the keyboard back on Split down");
+    key(cx, window, "enter");
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let split = view.read_with(cx, |v, _| {
+        (v.panes.len(), matches!(&v.panes.tree, crate::split::Node::Split { axis, .. } if *axis == crate::split::Axis::Column))
+    });
+    assert_eq!(split, (2, true), "Enter split down");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #59 L3, split.md §7's third clause: pane P shows A with B a
+/// background tab; the focused pane Q shows A; nothing waits on screen
+/// and B waits. The palette offers Jump, and picking it opens B in Q (the
+/// focused pane), not by focusing P's background tab; P keeps its tabs.
+#[gpui_kit::test]
+fn jump_opens_a_session_waiting_as_a_background_tab_elsewhere_in_the_focused_pane(cx: &mut TestAppContext) {
+    use crate::palette::AppAct;
+    let (window, view, client, _a, attaches, _events) = on_a(cx, "jump-background", None);
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+    });
+    let mut b = next_attach(cx, window, &attaches, "B's attach");
+    b.send(attached(B, None));
+    frame(cx, window);
+    view.update(cx, |v, cx| {
+        let ix = v.model.tabs.find(A).expect("A's tab");
+        v.focus_tab(ix);
+        v.reconcile(None);
+        cx.notify();
+    });
+    frame(cx, window);
+    let p = view.read_with(cx, |v, _| v.panes.focused);
+    assert_eq!(tabs_of(cx, &view, p), [A, B], "P: A, then B");
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let q = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(p, q, "Q, the new pane, focused");
+    let metas: Vec<synaps_client::protocol::SessionMeta> = [(A, 0), (B, 1)]
+        .iter()
+        .map(|(id, n)| {
+            serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live", "awaiting_input": n})).expect("a session")
+        })
+        .collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.jump_elsewhere()), Some(B.to_string()), "B is the jump's");
+    assert_eq!(jump_off(cx, &view), Some(None), "the palette offers Jump");
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(AppAct::JumpWaiting, w, cx))).unwrap();
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    while attaches.try_recv().is_ok() {}
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.focused, v.panes.len())), (q, 2), "Q still focused, no new pane");
+    assert!(tabs_of(cx, &view, q).contains(&B.to_string()), "B opened in Q: {:?}", tabs_of(cx, &view, q));
+    assert_eq!(tabs_of(cx, &view, p), [A, B], "P's tabs as they were");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #59 L1 (#55 n6): a delayed layout write under way at quit never
+/// lands after the quit's flush. G1 (the focus to the first pane): its
+/// delayed save has read its layout, its write not yet run; then G2 (the
+/// focus back) is flushed, as the window closes; then G1's write runs. The
+/// file has G2's focus, not G1's ([`crate::app::SaveJob`]: the flush closes
+/// the slot, the job finds it closed).
+#[gpui_kit::test]
+fn a_delayed_layout_write_under_way_never_lands_after_the_quit_flush(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, _attaches, _events) = on_a(cx, "persist-race", None);
+    let k = format!("test:persist-race-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    wait_saved(cx, window);
+    let focused = |_: &mut TestAppContext| crate::theme::load_layout(&path, &k).map(|l| l.focused);
+    assert_eq!(focused(cx), Some(1), "G0: the new pane focused, saved");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let taken =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).taken);
+    view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    let before = taken(cx);
+    // Timer by timer, one task at a time (the executor's `advance_clock`
+    // runs every task it wakes): stopped as G1's job has read its layout.
+    let mut n = 0;
+    while taken(cx) == before {
+        if !cx.dispatcher.tick(false) {
+            assert!(cx.dispatcher.advance_clock_to_next_timer(), "no timer left: G1's save never came");
+        }
+        n += 1;
+        assert!(n < 100_000, "G1's delayed save never read its layout");
+    }
+    assert_eq!(focused(cx), Some(1), "G1's write is still to come");
+    view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+    view.update(cx, |v, _| v.flush_tabs());
+    assert_eq!(focused(cx), Some(1), "G2 flushed");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(1), "G2's layout last: G1's write found the slot closed");
+    let _ = names(&mut a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #59 r2 L1: a delayed layout write that finished while the quit
+/// came does not fool the flush. G0 (the new pane focused) is saved; G1
+/// (the focus to the first pane) is written; the focus goes back (G0
+/// again: the layout's generation is its content's) and the window's
+/// flush runs. The file must end on G0. Two orderings: (a) the app's own
+/// delayed write has finished, its continuation (which notes what it
+/// wrote) not yet run; (b) a write of G1 holds the slot's lock as the flush
+/// comes (a thread in [`crate::app::SaveJob::write`], as the delayed save's
+/// background task is, held at a barrier): the flush waits for it, then
+/// writes G0 after it. Before, the flush trusted `layout_written` (G0) and
+/// wrote nothing: the file kept G1.
+#[gpui_kit::test]
+fn a_delayed_layout_write_that_finished_as_the_quit_came_is_written_over(cx: &mut TestAppContext) {
+    use crate::app::{SaveJob, SaveKind};
+    for held in [false, true] {
+        let what = if held { "(b) a write holding the lock" } else { "(a) a write finished, its continuation not run" };
+        let name = if held { "persist-held" } else { "persist-done" };
+        let (window, view, client, mut a, _attaches, _events) = on_a(cx, name, None);
+        let k = format!("test:{name}-{}", std::process::id());
+        let path = crate::theme::settings_path().expect("the tests' settings file");
+        view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+        frame(cx, window);
+        key(cx, window, "ctrl-\\");
+        wait_saved(cx, window);
+        let focused = |_: &mut TestAppContext| crate::theme::load_layout(&path, &k).map(|l| l.focused);
+        assert_eq!(focused(cx), Some(1), "{what}: G0, the new pane focused, saved");
+        let order = view.read_with(cx, |v, _| v.reading_order());
+        let writes = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.save_job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writes)
+        };
+        view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
+        frame(cx, window);
+        if !held {
+            // Task by task until G1's write is done (a write counted), its
+            // continuation still queued.
+            let before = writes(cx);
+            let mut n = 0;
+            while writes(cx) == before {
+                if !cx.dispatcher.tick(false) {
+                    assert!(cx.dispatcher.advance_clock_to_next_timer(), "{what}: no timer left: G1's save never came");
+                }
+                n += 1;
+                assert!(n < 100_000, "{what}: G1's delayed save never wrote");
+            }
+            assert_eq!(focused(cx), Some(0), "{what}: G1 in the file");
+            view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+            view.update(cx, |v, _| v.flush_tabs());
+        } else {
+            let (slot, g1, l1) = view.read_with(cx, |v, _| (v.save_job.clone(), v.layout_gen(), v.layout_now()));
+            let (holding_tx, holding) = mpsc::channel();
+            let (go, go_rx) = mpsc::channel::<()>();
+            let (p, key1) = (path.clone(), k.clone());
+            let writer = std::thread::spawn(move || {
+                SaveJob::write(&slot, SaveKind::Layout, g1, || {
+                    holding_tx.send(()).expect("the test");
+                    go_rx.recv().expect("the test");
+                    // The flush is waiting for the lock by now.
+                    std::thread::sleep(Duration::from_millis(150));
+                    crate::theme::save_layout(&p, &key1, &l1)
+                })
+            });
+            holding.recv_timeout(T).expect("the writer holds the lock");
+            view.update(cx, |v, cx| v.focus_pane(order[1], crate::pane::KeysTo::Pane, cx));
+            go.send(()).expect("the writer");
+            // Waits for the writer's lock, then writes.
+            view.update(cx, |v, _| v.flush_tabs());
+            assert!(writer.join().expect("the writer").expect("G1 written"), "{what}: G1 was written");
+        }
+        assert_eq!(focused(cx), Some(1), "{what}: the flush wrote G0 after G1");
+        cx.run_until_parked();
+        assert_eq!(focused(cx), Some(1), "{what}: G0 last");
+        let _ = names(&mut a);
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+}
+
+/// Shady #59 L5.1 (#55 n1): what a pane draws keeps its element state
+/// through split → one pane. A press held on pane A's Allow while the other
+/// pane closes (Off: in its frame, the layout one pane now), let go on it
+/// after, is a click: A's prompt is answered. The one-pane path draws the
+/// pane under its `("pane", n)` as the split does; without it the press
+/// was forgotten at the landing.
+#[gpui_kit::test]
+fn a_press_held_through_the_last_close_is_still_a_click(cx: &mut TestAppContext) {
+    let (window, view, client, mut a, attaches, events) = on_a(cx, "n1-press", Some(1));
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach");
+    b.send(attached(B, None));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    level(cx, crate::motion::Level::Off);
+    // A's card armed (its buttons act `ARM` after it is shown: a press
+    // before then is refused, whatever the layout does).
+    let armed =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(pa).is_some_and(|p| p.card.as_ref().is_some_and(|c| c.armed())));
+    for _ in 0..100 {
+        if armed(cx) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        frame(cx, window);
+    }
+    assert!(armed(cx), "A's card armed");
+    let at = in_pane_at(cx, window, "allow-fill", pa);
+    VisualTestContext::from_window(window, cx).simulate_mouse_move(at, None, Default::default());
+    mouse(cx, window, at, "down", 1);
+    assert!(names(&mut a).is_empty(), "a press alone answers nothing");
+    view.update(cx, |v, cx| {
+        v.in_pane(pb, |v| v.close_pane());
+        cx.notify();
+    });
+    frame(cx, window);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some())), (1, false), "one pane, landed");
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    let now = vcx.debug_bounds("allow-fill").or_else(|| vcx.debug_bounds("allow-outline")).expect("A's Allow").center();
+    // The pointer, held, to where Allow is now; let go there.
+    mouse(cx, window, now, "move", 1);
+    frame(cx, window);
+    mouse(cx, window, now, "up", 1);
+    // The answer goes out on the client's thread: waited for (the tests
+    // run at once, each 400 ms read can come up short).
+    let mut sent = Vec::new();
+    for _ in 0..10 {
+        frame(cx, window);
+        sent.extend(names(&mut a));
+        if !sent.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(sent, ["answer"], "the press held through the landing, let go on Allow: a click");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// #55 n5's second half, seen (Shady #59 L5.2): a restored layout whose
+/// second pane's session is gone collapses after the restore's lists, and
+/// that collapse is not written back: no write at all, the file as it was.
+#[gpui_kit::test]
+fn a_quiet_collapse_is_not_written_back(cx: &mut TestAppContext) {
+    let k = format!("test:persist-collapse-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    let layout = two_across(&[A], &[GONE], 0);
+    crate::theme::save_layout(&path, &k, &layout).unwrap();
+    let before = file_keys(&path, &k);
+    let (window, view, client, attaches, _events) = launch_with(cx, "persist-collapse", Some(layout), None);
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    for _ in 0..=crate::tabs::RESTORE_LISTS {
+        list(cx, window, &view, &[A]);
+        wait_saved(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "collapsed to one pane");
+    assert_eq!(writes(cx, &view), 0, "no write at all");
+    assert_eq!(file_keys(&path, &k), before, "the file as it was");
+    while attaches.try_recv().is_ok() {}
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

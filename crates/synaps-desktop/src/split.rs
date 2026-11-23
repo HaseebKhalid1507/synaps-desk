@@ -187,8 +187,11 @@ pub(crate) struct Grab {
 pub(crate) enum Refused {
     /// [`PANES_MAX`] panes already.
     Most,
-    /// No room: the pane would go under its minimum, or a 4th column or a
-    /// 3rd row.
+    /// A 4th column (`across`) or a 3rd row: the layout's cap, not the
+    /// window's size (the design gate #59 M1: "no room" blamed a maximised
+    /// window for the 2-row cap).
+    Cap { across: bool },
+    /// No room: a pane would go under its minimum.
     Room,
 }
 
@@ -196,6 +199,8 @@ impl Refused {
     pub(crate) const fn note(self) -> &'static str {
         match self {
             Refused::Most => "4 panes is the most",
+            Refused::Cap { across: true } => "3 columns is the most",
+            Refused::Cap { across: false } => "2 rows is the most",
             Refused::Room => "no room to split this pane",
         }
     }
@@ -343,7 +348,7 @@ impl Node {
         let next = self.with_split(at, side, new).ok_or(Refused::Room)?;
         let (across, down) = next.extent();
         if across > ACROSS_MAX || down > DOWN_MAX {
-            return Err(Refused::Room);
+            return Err(Refused::Cap { across: across > ACROSS_MAX });
         }
         let rects = next.rects(Rect { x: 0., y: 0., w: area.0, h: area.1 });
         if rects.iter().any(|(_, r)| r.w + 0.5 < PANE_MIN_W || r.h + 0.5 < PANE_MIN_H) {
@@ -358,7 +363,7 @@ impl Node {
         match self.split(at, Side::Right, new, area) {
             Ok(n) => Ok((n, Side::Right)),
             Err(Refused::Most) => Err(Refused::Most),
-            Err(Refused::Room) => self.split(at, Side::Down, new, area).map(|n| (n, Side::Down)),
+            Err(_) => self.split(at, Side::Down, new, area).map(|n| (n, Side::Down)),
         }
     }
 
@@ -986,10 +991,10 @@ mod tests {
     fn the_caps_and_the_minimums_refuse() {
         let one = Node::Leaf(p(0));
         let two = one.split(p(0), Side::Down, p(1), A).unwrap();
-        assert_eq!(two.split(p(1), Side::Down, p(2), A), Err(Refused::Room), "a 3rd row");
+        assert_eq!(two.split(p(1), Side::Down, p(2), A), Err(Refused::Cap { across: false }), "a 3rd row");
         let three = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), (2000., 1000.)).unwrap();
         let three = three.split(p(0), Side::Right, p(2), (2000., 1000.)).unwrap();
-        assert_eq!(three.split(p(2), Side::Right, p(3), (4000., 1000.)), Err(Refused::Room), "a 4th column");
+        assert_eq!(three.split(p(2), Side::Right, p(3), (4000., 1000.)), Err(Refused::Cap { across: true }), "a 4th column");
         let four = three.split(p(0), Side::Down, p(3), (2000., 1000.)).unwrap();
         assert_eq!(four.len(), 4);
         assert_eq!(four.split(p(1), Side::Down, PaneId::nth(3), (2000., 1000.)), Err(Refused::Most));
