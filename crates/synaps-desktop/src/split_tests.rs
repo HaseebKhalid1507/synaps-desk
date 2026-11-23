@@ -6850,3 +6850,142 @@ fn the_key_scenarios_hold_at_one_and_at_two_panes(cx: &mut TestAppContext) {
     }
     assert!(fails.is_empty(), "{fails:#?}");
 }
+
+// ── #67's composer pickers, per pane (Shady #69 r3) ─────────────────────
+
+/// The `set` commands among a connection's next frames.
+fn sets(c: &mut Conn) -> Vec<Value> {
+    c.cmds(Duration::from_millis(400)).into_iter().filter(|c| c["cmd"] == "set").collect()
+}
+
+/// In the open picker, `value`'s row chosen by the keyboard (Down to it,
+/// Enter), as a user would.
+fn choose(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, value: &str) {
+    let row = view.read_with(cx, |v, _| {
+        let (m, t) = v.choice.menu.as_ref().expect("a picker open");
+        let i = t.values.iter().position(|(x, _)| x == value).unwrap_or_else(|| panic!("{value} listed: {:?}", t.values));
+        m.items.iter().position(|it| it.act == i).expect("its row")
+    });
+    let sel = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.choice.menu.as_ref().and_then(|(m, _)| m.sel));
+    for _ in 0..20 {
+        if sel(cx) == Some(row) {
+            break;
+        }
+        key(cx, window, "down");
+    }
+    assert_eq!(sel(cx), Some(row), "{value}'s row selected");
+    key(cx, window, "enter");
+}
+
+/// #67 with split panes on (its PR: "each pane's labels open their own
+/// session's picker; the pick goes to the attachment the menu opened
+/// for"). Two panes, A (thinking `low`) and B (`high`), B focused. A click
+/// on A's level opens A's picker over A's label (A's pane focused by the
+/// press) and its pick is a `set` on A's attachment only; A's label
+/// follows A's `setting_changed`, B's stays. B's picker, picked, then
+/// focus back on A before the daemon answers: B's refusal is said on B's
+/// composer, never A's. Ctrl+K's "Change thinking…" opens the focused
+/// pane's picker.
+#[gpui_kit::test]
+fn the_composer_pickers_are_each_panes_own(cx: &mut TestAppContext) {
+    let with_view = |mut v: Value, model: &str, level: &str| {
+        v["view"] = json!({"model": model, "reasoning_level": level});
+        v
+    };
+    let (window, view, client, mut a, attaches, events) =
+        on_a_in(cx, "panes-choice", with_view(attached(A, None), "ma", "low"), (1920., 1080.));
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = attaches.recv_timeout(T).expect("B's attach at the daemon");
+    b.send(with_view(attached(B, None), "mb", "high"));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    frame(cx, window);
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    let _ = (a.cmds(Duration::from_millis(400)), b.cmds(Duration::from_millis(400)));
+    let live = |v: &AppView, id| v.panes.get(id).expect("the pane").live;
+    let level = |cx: &mut TestAppContext, id| {
+        view.read_with(cx, |v, _| v.model.lives[live(v, id)].stats.view.as_ref().map(|s| s.effort.clone()).unwrap_or_default())
+    };
+    let seq = |cx: &mut TestAppContext, id| view.read_with(cx, |v, _| v.model.lives[live(v, id)].attachment().expect("attached"));
+    let open = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.choice.menu.as_ref().map(|(m, t)| (t.pane, t.attach_seq, t.current.clone(), m.at, m.sel)))
+    };
+    let note =
+        |cx: &mut TestAppContext, id| view.read_with(cx, |v, _| v.panes.get(id).and_then(|p| p.watch_note.as_ref().map(|n| n.to_string())));
+    let over = |cx: &mut TestAppContext, at: crate::menu::At, id: crate::pane::PaneId| {
+        let crate::menu::At::Point(pt) = at else { panic!("a picker sits at a point") };
+        let s = drawn(cx, window, format!("pane {}", id.index())).expect("the pane drawn");
+        let x = f32::from(pt.x);
+        x >= s[0] && x <= s[0] + s[2]
+    };
+    assert_eq!((level(cx, pa), level(cx, pb)), ("low".into(), "high".into()), "each session's level");
+    assert!(drawn(cx, window, format!("choice-thinking {}", pa.index())).is_some(), "A's level drawn as a picker's label");
+    assert!(drawn(cx, window, format!("choice-thinking {}", pb.index())).is_some(), "B's level drawn as a picker's label");
+
+    // A's level, from B's pane: A's picker, over A's label.
+    let at = mid(cx, window, format!("choice-thinking {}", pa.index()));
+    click_at(cx, window, at);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pa, "the press focused A's pane");
+    let (pane, s, current, at, _) = open(cx).expect("a click on A's level opens a picker");
+    assert_eq!((pane, s, current.as_str()), (pa, seq(cx, pa), "low"), "A's picker: A's pane, A's attachment, A's level");
+    assert!(over(cx, at, pa), "over A's label, in A's pane: {at:?}");
+    choose(cx, window, &view, "xhigh");
+    let (to_a, to_b) = (sets(&mut a), sets(&mut b));
+    assert!(to_b.is_empty(), "nothing set on B: {to_b:?}");
+    assert_eq!(to_a.len(), 1, "one set on A: {to_a:?}");
+    assert_eq!(to_a[0]["setting"], json!({"setting": "reasoning_level", "level": "xhigh"}));
+    a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t", "event": {"ev": "setting_changed",
+        "applied": {"id": to_a[0]["id"], "setting": "reasoning_level", "ok": true, "message": null,
+        "view": {"model": "ma", "reasoning_level": "xhigh"}}}}));
+    feed(cx, window, &view, &events, "A's level applied", |v| {
+        v.choice.menu.is_none() && v.model.lives[live(v, pa)].stats.view.as_ref().is_some_and(|s| s.effort == "xhigh")
+    });
+    assert_eq!((level(cx, pa), level(cx, pb)), ("xhigh".into(), "high".into()), "A's label follows A's session; B's stays");
+
+    // B's level: B's picker; focus back on A before the daemon refuses.
+    let at = mid(cx, window, format!("choice-thinking {}", pb.index()));
+    click_at(cx, window, at);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pb, "the press focused B's pane");
+    let (pane, s, current, at, _) = open(cx).expect("a click on B's level opens a picker");
+    assert_eq!((pane, s, current.as_str()), (pb, seq(cx, pb), "high"), "B's picker: B's pane, B's attachment, B's level");
+    assert!(over(cx, at, pb), "over B's label, in B's pane: {at:?}");
+    choose(cx, window, &view, "off");
+    let (to_a, to_b) = (sets(&mut a), sets(&mut b));
+    assert!(to_a.is_empty(), "nothing set on A: {to_a:?}");
+    assert_eq!(to_b.len(), 1, "one set on B: {to_b:?}");
+    assert_eq!(to_b[0]["setting"], json!({"setting": "reasoning_level", "level": "off"}));
+    key(cx, window, "escape");
+    assert!(open(cx).is_none(), "Esc closed the picker");
+    let at = mid(cx, window, format!("composer-frame {}", pa.index()));
+    click_at(cx, window, at);
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), pa, "A's pane focused");
+    b.send(json!({"type": "event", "session_id": B, "seq": 1, "ts": "t", "event": {"ev": "setting_changed",
+        "applied": {"id": to_b[0]["id"], "setting": "reasoning_level", "ok": false, "message": "off is not for this model",
+        "view": {"model": "mb", "reasoning_level": "high"}}}}));
+    feed(cx, window, &view, &events, "B's refusal", |v| v.panes.get(pb).is_some_and(|p| p.watch_note.is_some()));
+    assert_eq!(note(cx, pb).as_deref(), Some("thinking not changed: off is not for this model"), "said on B's composer");
+    assert!(note(cx, pa).is_none_or(|n| !n.contains("not changed")), "never on A's: {:?}", note(cx, pa));
+    assert_eq!((level(cx, pa), level(cx, pb)), ("xhigh".into(), "high".into()), "neither level moved");
+
+    // From the keyboard: Ctrl+K's "Change thinking…" in the focused pane (A).
+    key(cx, window, crate::app::palette_keys(cfg!(target_os = "macos")).1);
+    frame(cx, window);
+    VisualTestContext::from_window(window, cx).simulate_input("change thinking");
+    frame(cx, window);
+    key(cx, window, "enter");
+    frame(cx, window);
+    let (pane, s, current, at, sel) = open(cx).expect("Ctrl+K's Change thinking… opens a picker");
+    assert_eq!((pane, s, current.as_str()), (pa, seq(cx, pa), "xhigh"), "the focused pane's: A's");
+    assert!(over(cx, at, pa), "over A's label: {at:?}");
+    assert!(sel.is_some(), "from the keyboard, its current row selected");
+    key(cx, window, "escape");
+    assert!(sets(&mut a).is_empty() && sets(&mut b).is_empty(), "nothing set");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
