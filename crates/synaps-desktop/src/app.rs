@@ -8938,6 +8938,11 @@ impl Render for AppView {
             // None in a flight, the layout's or the panels' (a press there
             // would start from where a divider is going; Shady #42 L1).
             let still = self.panes.flight.is_none() && !self.panel_fx.moving();
+            if let Some(t0) = crate::pane::FILM_LOG.get() {
+                let t = self.fx.now().saturating_duration_since(*t0).as_secs_f64();
+                let w: Vec<f32> = rects.iter().map(|(_, r)| r.w).collect();
+                eprintln!("HANDLES {t:.4} {still} panels {rail_w} {right_w} panes {w:?}");
+            }
             let handles = if still { self.divider_handles(&drawn, area(centre), &p, cx) } else { Vec::new() };
             div().flex_1().h_full().min_w_0().relative().child(self.lay_panes(&drawn, &rects, &mut mains, &p, cx)).children(handles)
         } else {
