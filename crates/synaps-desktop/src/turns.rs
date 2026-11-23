@@ -1574,7 +1574,7 @@ impl AppView {
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
         // its slice, the first and last its edges. The slice (fill,
-        // hairline, caps) is drawn outside the row's reveal clip and lift
+        // caps) is drawn outside the row's reveal clip and lift
         // (Shady #23 H2): a row that reveals grows the card, whose edges
         // are whole on every frame.
         let card: Option<CardFrame> = match crate::cards::edges(&self.panes.cur.disp, ix) {
@@ -1583,7 +1583,7 @@ impl AppView {
                 // Folding (N1): its card goes on in the room under it.
                 let bottom =
                     bottom && !self.panes.cur.fold_gap.borrow().iter().any(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
-                let (pal, geo) = (p, crate::cards::Geo::of(&m));
+                let (pal, geo, scale) = (p, crate::cards::Geo::of(&m), self.scale);
                 let id = d.id;
                 let click = matches!(d.kind, Kind::Summary { .. }).then(|| {
                     cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
@@ -1592,7 +1592,7 @@ impl AppView {
                     })
                 });
                 Some(Box::new(move |inner: AnyElement| {
-                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo).debug_selector(move || format!("card-slice {id}"));
+                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo, scale).debug_selector(move || format!("card-slice {id}"));
                     match click {
                         // Its card's edge and inset unfold it too.
                         Some(f) => slab.id(("run-card", id)).cursor_pointer().on_click(f).into_any_element(),
@@ -1898,7 +1898,7 @@ impl AppView {
         // The card's edges and inset, the row's padding, the glyph, the
         // label, the trail and the chevron, the four gaps between them.
         let trail = s.trail_w(m.meta, tight);
-        let avail = lay.column - 2. - 2. * g.inset - 2. * g.pad - g.glyph - label_w - trail - g.chevron - 4. * g.gap;
+        let avail = lay.column - 2. * (g.edge + g.inset) - 2. * g.pad - g.glyph - label_w - trail - g.chevron - 4. * g.gap;
         // `+N more` and the dot before it.
         let more_w = text_w(5, cw) + 3. + 12.;
         let names: Vec<SharedString> = s.tally.iter().map(|t| crate::cards::verb(&t.name)).collect();
@@ -2003,15 +2003,8 @@ impl AppView {
             )
             .when_some(row_tip, |d, tip| d.tooltip(tip));
         let _ = cx;
-        // Opened: the 1 px `line` rule under it, and the card's inset under
-        // that, so the row is as tall open as folded (its card's bottom
-        // edge goes to the run's last row): nothing below it moves.
         if open {
-            return v_flex()
-                .child(row)
-                .child(div().h(px(1.)).bg(p.line).debug_selector(move || format!("run-rule {id}")))
-                .pb(px(g.inset))
-                .into_any_element();
+            return crate::cards::opened(row, id, p, g).into_any_element();
         }
         row.into_any_element()
     }
