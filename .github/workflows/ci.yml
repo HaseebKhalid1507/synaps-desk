@@ -39,20 +39,28 @@ jobs:
       # desktop's `[lints]`) and every other lint, as errors.
       - name: Clippy (workspace, all targets, -D warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test synaps-client (fixtures, named-pipe derivation on Windows)
+      # The client on its own, as a crate that uses it alone builds it:
+      # serde_json without `preserve_order` (its maps sort their keys).
+      - name: Test synaps-client on its own (fixtures, named-pipe derivation on Windows)
         run: cargo test -p synaps-client --locked
-      # The desktop's logic tests and its UI tests (GPUI's headless test
-      # window: no display, no GPU, no daemon). The counts are printed so
-      # the log shows they ran.
-      - name: Test synaps-desktop (logic + headless UI tests)
+      # The workspace as it ships (#28): one build of every crate, so
+      # serde_json's features are unified as in the release build below.
+      # gpui's http client turns on `preserve_order` (maps keep insertion
+      # order), so the client's fixtures run here in the desktop's build,
+      # where `-p synaps-client` alone never ran them. With the desktop's
+      # logic tests and its UI tests (GPUI's headless test window: no
+      # display, no GPU, no daemon). The counts are printed so the log
+      # shows they ran.
+      - name: Test the workspace as shipped (client + desktop, logic + headless UI tests)
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p synaps-desktop --locked 2>&1 | tee desktop-tests.log
-          passed=$(grep -E '^test result: ok' desktop-tests.log | awk '{s += $4} END {print s + 0}')
-          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' desktop-tests.log || true)
-          echo "synaps-desktop: $passed tests passed, $ui of them UI tests"
-          test "$passed" -gt 0 && test "$ui" -gt 0
+          cargo test --workspace --locked 2>&1 | tee workspace-tests.log
+          passed=$(grep -E '^test result: ok' workspace-tests.log | awk '{s += $4} END {print s + 0}')
+          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' workspace-tests.log || true)
+          fixtures=$(grep -cE '^test catalog_page_requests_encode_as_the_daemon_expects \.\.\. ok' workspace-tests.log || true)
+          echo "workspace: $passed tests passed, $ui of them UI tests; the client's fixtures ran: $fixtures"
+          test "$passed" -gt 0 && test "$ui" -gt 0 && test "$fixtures" -eq 1
       - name: Build release
         run: cargo build --release --locked -p synaps-desktop -p synaps-client
       - name: Binary size
