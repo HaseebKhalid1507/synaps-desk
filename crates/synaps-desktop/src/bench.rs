@@ -867,6 +867,8 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             // - a new turn's call streams into the held room
                             //   while the reader scrolls up 0.5 px a frame
                             //   (a touchpad) for 3 s, and after.
+                            // `SYNAPS_BENCH_FOLDS=wrap`: the streamed lines
+                            // are long, each wrapping (#26 L6).
                             let t0 = Instant::now();
                             let mark = |what: &str| eprintln!("FOLDS {what} {:.3}", t0.elapsed().as_secs_f64());
                             let run = |v: &AppView| v.panes.cur.disp.iter().rev().find(|d| matches!(d.kind, crate::turns::Kind::Summary { .. })).map(|d| d.id);
@@ -941,19 +943,27 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                             apply(cx, vec![call("z9", "bash", cmd("tail -f logs/relay.log")), started("z9")]);
                             sleep(1.).await;
                             mark("slow-scroll");
+                            let wrap = std::env::var("SYNAPS_BENCH_FOLDS").is_ok_and(|v| v == "wrap");
+                            let line = |k: usize| {
+                                if wrap {
+                                    format!("relay: refresh {k} ok, {}\n", "token rotated, cache warmed, upstream answered 200 in 41 ms; ".repeat(3))
+                                } else {
+                                    format!("relay: refresh {k} ok\n")
+                                }
+                            };
                             for k in 0..430 {
                                 let _ = upd(cx, &|v, _| {
                                     v.panes.cur.scroller.touch();
                                     v.panes.cur.list.scroll_by(gpui::px(-0.5));
                                 });
                                 if k % 40 == 0 {
-                                    apply(cx, vec![delta("z9", &format!("relay: refresh {k} ok\n"))]);
+                                    apply(cx, vec![delta("z9", &line(k))]);
                                 }
                                 sleep(0.007).await;
                             }
                             mark("scroll-stopped");
                             for k in 0..8 {
-                                apply(cx, vec![delta("z9", &format!("relay: refresh {} ok\n", 500 + k))]);
+                                apply(cx, vec![delta("z9", &line(500 + k))]);
                                 sleep(0.3).await;
                             }
                             mark("done");
