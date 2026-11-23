@@ -2356,6 +2356,49 @@ mod tests {
         assert_eq!((r.add_bg, r.del_bg, r.you_mark_t), (0x1c2023, 0x261e20, 0x81a1c1));
     }
 
+    /// No outline on a card (Haseeb, 07:18): `card_d` reads by its fill
+    /// alone, [`D_FILL`] off the canvas, in every theme and every accent
+    /// (the card is the canvas's: the accent never moves it). Each theme's
+    /// card and its ratio off the canvas, as #71's table gives them. Paper's
+    /// white is short of it (1.072), so paper's card steps toward the ink.
+    #[test]
+    fn a_card_stands_off_the_canvas_by_its_fill_alone() {
+        let cards = [
+            ("default", 0x171921, 1.107),
+            ("night-city", 0x17181f, 1.110),
+            ("neon-rain", 0x17141c, 1.107),
+            ("amber", 0x191510, 1.101),
+            ("phosphor", 0x08190c, 1.109),
+            ("solarized-dark", 0x0d3843, 1.101),
+            ("blood", 0x191111, 1.102),
+            ("ocean", 0x10161e, 1.105),
+            ("rose-pine", 0x1b181e, 1.120),
+            ("nord", 0x151618, 1.107),
+            ("dracula", 0x19171e, 1.108),
+            ("monokai", 0x21221e, 1.104),
+            ("gruvbox", 0x292827, 1.107),
+            ("catppuccin", 0x1e1f2c, 1.109),
+            ("tokyo-night", 0x1b1c25, 1.111),
+            ("sunset", 0x211413, 1.108),
+            ("ice", 0x11161c, 1.104),
+            ("forest", 0x121a0e, 1.107),
+            ("lavender", 0x1a1523, 1.108),
+            ("paper", 0xeaecee, 1.105),
+        ];
+        assert_eq!(cards.len(), palettes::THEMES.len());
+        for ((name, raw), (want_name, want, ratio)) in palettes::THEMES.iter().zip(cards) {
+            assert_eq!(*name, want_name);
+            for a in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
+                let (r, _) = resolve(raw, a);
+                let c = contrast(r.card_d, r.canvas);
+                assert_eq!(r.card_d, want, "{name} {a:?}: card_d #{:06x} ({c:.3})", r.card_d);
+                assert!(c >= D_FILL - 1e-9 && (c - ratio).abs() < 5e-4, "{name} {a:?}: {c:.4} off the canvas");
+            }
+        }
+        let paper = resolve(&palettes::THEMES.iter().find(|t| t.0 == "paper").expect("paper").1, None).0;
+        assert!(contrast(0xffffff, paper.canvas) < D_FILL && luminance(paper.card_d) < luminance(paper.canvas));
+    }
+
     /// Cards D's roles (cards4/proposal.md §1) meet their floors in every
     /// theme and accent preset: the card a surface step off the canvas, its
     /// hover and well off it, `line` on all three; every text a row
