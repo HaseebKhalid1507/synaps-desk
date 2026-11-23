@@ -8549,6 +8549,33 @@ impl AppView {
         (l, r)
     }
 
+    /// A panel that yields to the split, or comes back from it, moves on
+    /// the flight of what made it (#51): a rail's fold or unfold, a split,
+    /// a close. It springs with it on `sheet` as a fold does, so the panes
+    /// re-wrap once, and land with it. A window resize (the window
+    /// manager's) and anything else not in flight stay a cut, as the
+    /// panels' own widths do then. `was`: the yields of the frame before.
+    /// Whether it flies on the layout's flight alone (the layout then
+    /// rides it: [`crate::split::Flight::ride`]). A panel already flying
+    /// (Ctrl+B, then Ctrl+\ inside its flight) rides nothing: the layout
+    /// flies on its own spring over the moving centre, as before #51.
+    fn yield_on_flight(&mut self, was: Option<(bool, bool, bool)>, resized: bool) -> bool {
+        let panels = self.panel_fx.sides.iter().any(|f| f.from.is_some() || f.moving);
+        if resized || !(panels || self.panes.flight.is_some()) {
+            return false;
+        }
+        let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
+        let (was, now) = (of(was), of(self.pane_yield));
+        let mut flew = false;
+        for i in 0..2 {
+            if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
+                self.panel_fx.fly(i == 0, crate::motion::SHEET_RESPONSE, true);
+                flew = true;
+            }
+        }
+        flew && !panels
+    }
+
     /// [`AppView::pane_sides`], judged now.
     fn pane_yields(&mut self, rail: Side, right: Side) -> (Side, Side) {
         use crate::split::{PANE_MIN_H, PANE_MIN_W, Rect};
@@ -8629,8 +8656,30 @@ impl AppView {
                 return self.panes.tree.clone();
             }
             // From rest where it is drawn (a flight taking over another's
-            // starts again from there).
-            self.fx.spring_jump(PANE_FLIGHT, 0., f.travel, crate::motion::SHEET_RESPONSE);
+            // starts again from there). Riding a panel: parked at rest,
+            // landed; read only if the ride is handed back (Shady #54 M2).
+            let from = if f.ride.is_some() { f.travel } else { 0. };
+            self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
+        }
+        // A panel yielding on it (#51): the layout rides the panel's
+        // spring, by how far the centre has gone, and lands with it (the
+        // frame the panel is drawn at its target, #50).
+        if let Some(r) = f.ride {
+            if self.panel_fx.moving() {
+                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(0., 1.) };
+                let at = |w: f32| crate::split::Rect { w, ..area };
+                return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
+            }
+            let now = self.fx.now();
+            match r.landed {
+                Some(at) if at < now => self.panes.flight = None,
+                Some(_) => {}
+                None => {
+                    f.ride = Some(crate::split::Ride { landed: Some(now), ..r });
+                    self.fx.want_frame();
+                }
+            }
+            return self.panes.tree.clone();
         }
         let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
         if let Some(t0) = crate::pane::FILM_LOG.get() {
@@ -8967,7 +9016,8 @@ impl Render for AppView {
         // A window resize is the window manager's (fluid.md §3.8, `follow`):
         // the dock and the draft take the heights it gives them at once, as
         // after a switch.
-        if (width, height) != (self.width, self.height) {
+        let resized = (width, height) != (self.width, self.height);
+        if resized {
             for pane in self.panes.iter() {
                 pane.dock_h.set(f32::NAN);
                 pane.composer_h.set(f32::NAN);
@@ -8981,7 +9031,9 @@ impl Render for AppView {
         // drew the old bar).
         self.top_short = self.height - crate::chrome::TOP < crate::fit::short_below(&m);
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
+        let yielded = self.pane_yield;
         let (rail, right) = self.pane_sides(rail, right);
+        let with_panes = self.yield_on_flight(yielded, resized);
         if let Side::Open(w) = rail {
             self.rail_width = w;
         }
@@ -9003,6 +9055,30 @@ impl Render for AppView {
         let pane = column_of(&[crate::chrome::MARK, rail_w, right_w]);
         let pane_to = column_of(&[crate::chrome::MARK, rail.width(), right.width()]);
         self.panel_fx.freeze = self.panel_fx.moving().then(|| self.panel_fx.freeze.unwrap_or(pane).min(pane).min(pane_to));
+        // At Reduced and Off the panel is there at once, the layout too.
+        // Over a view the layout is drawn without the right panel (below:
+        // `view_pane`), so it has nothing to ride: it flies on its own
+        // spring (Shady #54 M1).
+        if with_panes
+            && self.panel_fx.moving()
+            && !(view.is_some() && !self.panes.split())
+            && let Some(f) = self.panes.flight.as_mut()
+        {
+            f.ride = Some(crate::split::Ride { from: pane, to: pane_to, landed: None });
+        }
+        // Its ends moved under it (a fold or unfold, an edge drag, a width
+        // reset, a resize): the layout flies on from where it is drawn on
+        // its own spring, from rest, as on main (Shady #54 M2). Its wraps
+        // carry on, the narrower kept (`wrap_at`: none yet).
+        if let Some(f) = self.panes.flight.as_mut()
+            && let Some(r) = f.ride.filter(|r| r.landed.is_none())
+            && (resized || (r.to - pane_to).abs() >= 0.5)
+        {
+            f.from = self.panes.drawn.clone();
+            f.ride = None;
+            f.travel = 0.;
+            f.wrap_at = None;
+        }
         let wrap = self.panel_fx.freeze.unwrap_or(pane);
         // A view is not a session: no right panel (it describes one); the
         // pane takes its width. The session's column keeps its layout.
@@ -9061,6 +9137,8 @@ impl Render for AppView {
             // measured the list again).
             let at = |w: f32| self.panes.tree.rects(area(w));
             let (rects_to, rects_wrap) = (at(pane_to), at(wrap));
+            // A panel yielding on the layout's flight (#51): its own ends.
+            let ride_from = self.panes.flight.as_ref().and_then(|f| f.ride).map(|r| r.from);
             let (grow, ghosts) = self.panes.flight.as_ref().map_or((Vec::new(), Vec::new()), |f| (f.grow.clone(), f.ghosts.clone()));
             // The tree itself drawn (the pixel landing, before the spring
             // rests): each column at its landed wrap in this frame, the
@@ -9070,7 +9148,10 @@ impl Render for AppView {
             // Each pane's wrap in the flight, from its ends at the panels'
             // narrowest centre (Shady #42 L2).
             if let Some(f) = self.panes.flight.as_mut() {
-                f.set_wraps(area(wrap));
+                match ride_from {
+                    Some(from) => f.set_wraps_at(area(from), area(pane_to)),
+                    None => f.set_wraps(area(wrap)),
+                }
             }
             // Where each closing share goes (its rectangle at 0).
             let to_rects = self.panes.flight.as_ref().filter(|_| !ghosts.is_empty()).map(|f| f.to.rects(area(centre))).unwrap_or_default();
@@ -9107,15 +9188,24 @@ impl Render for AppView {
                         r.w.min(l.w)
                     }
                 });
-                let pane = if grows { l.w } else { r.w };
+                let pane = match (grows, ride_from) {
+                    (true, Some(_)) => of(&rects_to),
+                    (true, None) => l.w,
+                    _ => r.w,
+                };
                 // One pane left (a close's flight to it): its height read
                 // as one pane's is (under the full bar), as it lands.
                 let win_h = if self.panes.split() { l.h + crate::chrome::TOP } else { self.height };
                 let g = PaneFrame {
                     pane,
                     // Its narrowest of the flight, set at its start, not this
-                    // frame's box (it would rewrap as that moved).
-                    wrap: of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                    // frame's box (it would rewrap as that moved). With a
+                    // panel yielding on it, its narrower end (#51): it
+                    // moves linearly between them.
+                    wrap: match ride_from {
+                        Some(_) => of(&rects_to).min(narrowest.filter(|_| !grows && !landed).unwrap_or(f32::INFINITY)),
+                        None => of(&rects_wrap).min(narrowest.filter(|_| !grows && !landed).unwrap_or(pane)),
+                    },
                     pane_to: of(&rects_to),
                     view_pane: pane,
                     win_h,
@@ -9127,7 +9217,7 @@ impl Render for AppView {
                     v.panes.cur.land.set(l);
                     v.pane_main(g, window, cx)
                 }) {
-                    let el = if grows { div().flex_none().w(px(l.w)).h(px(l.h)).child(el) } else { el };
+                    let el = if grows { div().flex_none().w(px(pane)).h(px(l.h)).child(el) } else { el };
                     mains.push((*id, el));
                 }
             }

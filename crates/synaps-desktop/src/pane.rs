@@ -637,7 +637,7 @@ impl Panes {
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
             }
             _ => Flight::new(tree.grown_beside(new, Some(at)), tree.clone(), vec![new], Vec::new()),
         };
@@ -653,7 +653,7 @@ impl Panes {
         ghosts.push(id);
         let to = to.zeroed(id);
         self.drawn = drawn.clone();
-        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None });
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None });
     }
 
     /// The layout's flight to `to` (split.md §10: an equalise, a detent),
@@ -667,11 +667,11 @@ impl Panes {
         let was = std::mem::replace(&mut self.tree, to.clone());
         let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
             let to = end.fitted(&to.rects(area), &ghosts);
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
         } else if ghosts.is_empty() && drawn.same_shape(&to) {
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
         } else {
-            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None }
+            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None, ride: None }
         };
         self.drawn = flight.from.clone();
         self.flight = Some(flight);
@@ -2067,7 +2067,8 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 /// palette's Equalise, then Join all panes. `three[:fold=<w>x<h>]`: three
 /// panes across (the panels yield), then the window narrowed to fold.
 /// `filmarrive` (#47's landing): the rail folds and unfolds in one pane,
-/// then a split, and it folds and unfolds again.
+/// then a split, and it folds and unfolds again; then the second pane
+/// closes (#54: the right panel comes back with it).
 pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, window: &mut Window, cx: &mut App) {
     use crate::app::AppView;
     use crate::split::Side;
@@ -2116,6 +2117,13 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                         sleep(1.5).await;
                     }
                 }
+                mark("2p-close");
+                act(cx, &|v, _, _| {
+                    if let Some(last) = v.reading_order().last().copied() {
+                        v.in_pane(last, |v| v.close_pane());
+                    }
+                });
+                sleep(1.5).await;
                 mark("done");
                 return;
             }

@@ -3781,6 +3781,335 @@ fn nothing_moves_after_the_panels_and_panes_stop(cx: &mut TestAppContext) {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
+/// #51 (the design gate of #50, FU1): a panel that yields to the split,
+/// or comes back from it, moves on the flight of what made it. With a
+/// split on screen it cut from its strip to open (or back) in one frame:
+/// a two-pane rail fold re-wrapped both columns twice and landed them 20 px
+/// narrower than they started, after a 228 px jump. 1920 px, the rail at
+/// 480 and the right panel at 520, at Full, frame by frame (144 Hz) through
+/// a split (the right panel yields), the rail's fold (it comes back) and
+/// unfold (it yields), and a close (it comes back): no panel's width steps
+/// further in a frame than its spring does (its top speed, `D·ω/e`), each
+/// pane's column re-wraps at most once a flight, and from the last frame
+/// an edge moves nothing drawn in the panes changes.
+#[gpui_kit::test]
+fn a_yielding_panel_flies_with_the_move_that_made_it(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    view.update(cx, |v, cx| {
+        v.panels.rail_collapsed = false;
+        v.panels.right_collapsed = false;
+        v.panels.rail_width = Some(480);
+        v.panels.right_width = Some(520);
+        cx.notify();
+    });
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    frame(cx, window);
+    // A frame: the panels as drawn, each pane's box and column, and what
+    // is drawn in it (the column, its left and the labels' hang, its
+    // first rows' boxes).
+    type Snap = ([f32; 2], Vec<(crate::pane::PaneId, [f32; 4], f32)>, Vec<f32>);
+    let snap = |cx: &mut TestAppContext| -> Snap {
+        view.read_with(cx, |v, _| {
+            let mut panes = Vec::new();
+            let mut drawn = Vec::new();
+            for id in v.reading_order() {
+                let pane = v.panes.get(id).expect("the pane");
+                let b = pane.list.viewport_bounds();
+                panes.push((
+                    id,
+                    [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)],
+                    pane.layout.column,
+                ));
+                drawn.extend([pane.layout.column, pane.layout.left, pane.layout.hang_k]);
+                let top = pane.list.logical_scroll_top().item_ix;
+                for ix in top..(top + 10).min(pane.list.item_count()) {
+                    match pane.list.bounds_for_item(ix) {
+                        Some(r) => {
+                            drawn.extend([f32::from(r.origin.x), f32::from(r.origin.y), f32::from(r.size.width), f32::from(r.size.height)])
+                        }
+                        None => drawn.extend([f32::NAN; 4]),
+                    }
+                }
+            }
+            ([v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown], panes, drawn)
+        })
+    };
+    let same =
+        |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.01 || (a.is_nan() && b.is_nan()));
+    let edges = |s: &Snap| -> Vec<f32> { s.0.iter().copied().chain(s.1.iter().flat_map(|(_, b, _)| *b)).collect() };
+    let mut fails = Vec::new();
+    let mut yields = 0;
+    for case in ["the split", "the rail folds", "the rail unfolds", "the close"] {
+        let mut seen = vec![snap(cx)];
+        // Each frame's own instant, what its springs sampled: the test's
+        // clock, or a timer's due instant when it woke the frame a hair
+        // ahead of it (`Motion::tick`).
+        let mut at = vec![view.read_with(cx, |v, _| v.fx.frame_now())];
+        let right_was = view.read_with(cx, |v, _| v.panel_fx.sides[1].shown);
+        match case {
+            "the split" => key(cx, window, "ctrl-\\"),
+            "the close" => view.update(cx, |v, cx| {
+                let last = *v.reading_order().last().expect("a pane");
+                v.in_pane(last, |v| v.close_pane());
+                cx.notify();
+            }),
+            _ => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+        }
+        cx.run_until_parked();
+        let mut rest = 0;
+        while rest < 10 {
+            frame_144(cx, window, &view);
+            seen.push(snap(cx));
+            at.push(view.read_with(cx, |v, _| v.fx.frame_now()));
+            let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+            rest = if busy { 0 } else { rest + 1 };
+            assert!(seen.len() < 500, "{case}: never landed");
+        }
+        let n = seen.len();
+        if (seen[n - 1].0[1] - right_was).abs() > 100. {
+            yields += 1;
+        }
+        // No cut and no doubled step: each panel steps at most its
+        // spring's top speed over that frame's time (a sheet spring from
+        // rest: travel · ω / e per second), and a pixel for the rounding.
+        // A cut is the whole travel, 20 times it; a step taken twice, 2.
+        let speed = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE / std::f32::consts::E;
+        for i in 0..2 {
+            let travel = (seen[n - 1].0[i] - seen[0].0[i]).abs();
+            for k in 1..n {
+                let (step, dt) = ((seen[k].0[i] - seen[k - 1].0[i]).abs(), (at[k] - at[k - 1]).as_secs_f32());
+                if step > travel * speed * dt + 1. {
+                    fails.push(format!(
+                        "{case}: the {} steps {step} px in frame {k} (travel {travel}, its spring's top step over {:.2} ms {:.1})",
+                        ["rail", "right panel"][i],
+                        dt * 1e3,
+                        travel * speed * dt
+                    ));
+                }
+            }
+        }
+        // Riding a panel, each pane only grows or only narrows (a split's
+        // new pane grows, the pane beside it yields), and no pane moves
+        // after the panels have stopped (Shady #54 L2). A pane's edge
+        // that travels less than the panel's can stop a frame or two
+        // before it (the same step, rounded).
+        let rides = matches!(case, "the split" | "the close");
+        for id in seen[n - 1].1.iter().map(|p| p.0).filter(|_| rides) {
+            let ws: Vec<f32> = seen.iter().filter_map(|s| s.1.iter().find(|p| p.0 == id).map(|p| p.1[2])).collect();
+            let (up, down) = ws.windows(2).fold((false, false), |(u, d), w| (u || w[1] > w[0] + 0.5, d || w[1] < w[0] - 0.5));
+            if up && down {
+                fails.push(format!("{case}: pane {} both grows and narrows: {ws:?}", id.index()));
+            }
+        }
+        let moved = |k: usize, f: &dyn Fn(&Snap) -> Vec<f32>| !same(&f(&seen[k]), &f(&seen[k - 1]));
+        let panels_last = (1..n).rev().find(|&k| moved(k, &|s| s.0.to_vec())).unwrap_or(0);
+        let panes_last = (1..n).rev().find(|&k| moved(k, &|s| s.1.iter().flat_map(|(_, b, _)| *b).collect())).unwrap_or(0);
+        if panes_last > panels_last && panels_last > 0 {
+            fails.push(format!("{case}: the panels stop at frame {panels_last}, the panes at {panes_last}"));
+        }
+        // Each pane's column re-wraps at most once a flight.
+        for id in seen[n - 1].1.iter().map(|p| p.0) {
+            let cols: Vec<f32> = seen.iter().filter_map(|s| s.1.iter().find(|p| p.0 == id).map(|p| p.2)).collect();
+            let wraps = cols.windows(2).filter(|w| (w[0] - w[1]).abs() > 0.01).count();
+            if wraps > 1 {
+                fails.push(format!("{case}: pane {} re-wraps {wraps} times: {cols:?}", id.index()));
+            }
+        }
+        // Nothing moves after the last frame an edge moves.
+        let last = (1..n).rev().find(|&k| !same(&edges(&seen[k]), &edges(&seen[k - 1]))).unwrap_or(0);
+        if last == 0 {
+            fails.push(format!("{case}: nothing moved"));
+        } else if let Some(k) = (last + 1..n).find(|&k| !same(&seen[k].2, &seen[last].2)) {
+            fails.push(format!("{case}: the edges stop at frame {last} of {n}; frame {k} draws the panes apart"));
+        }
+    }
+    assert_eq!(yields, 4, "the right panel yields or comes back in every case: {fails:#?}");
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// The panels as a test wants them: the rail open or folded, both widths.
+fn panels_at(cx: &mut TestAppContext, view: &Entity<AppView>, rail_open: bool, rail: u16, right: u16) {
+    view.update(cx, |v, cx| {
+        v.panels.rail_collapsed = !rail_open;
+        v.panels.right_collapsed = false;
+        v.panels.rail_width = Some(rail);
+        v.panels.right_width = Some(right);
+        cx.notify();
+    });
+}
+
+/// Pane `id`'s width in the layout as the last frame drew it.
+fn drawn_w(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId) -> f32 {
+    view.read_with(cx, |v, _| {
+        let (w, h) = v.centre.get();
+        v.panes.drawn.rects(crate::split::Rect { x: 0., y: 0., w, h }).iter().find(|(i, _)| *i == id).map_or(0., |(_, r)| r.w)
+    })
+}
+
+/// Shady #54 M1: with Settings on screen in the pane that stays, a close
+/// is drawn without the right panel (a view has none), so the layout has
+/// nothing to ride: the closing share goes on the layout's own spring,
+/// frame by frame, not frozen for the hidden panel's flight and then gone
+/// in one frame.
+#[gpui_kit::test]
+fn a_close_beside_a_view_flies_on_its_own_spring(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    panels_at(cx, &view, true, 480, 520);
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let (kept, gone) = (order[0], order[1]);
+    view.update(cx, |v, cx| {
+        v.focus_pane(kept, crate::pane::KeysTo::Pane, cx);
+        v.model.tabs.open_view(crate::tabs::Kind::Settings);
+        v.reconcile(None);
+        cx.notify();
+    });
+    for _ in 0..60 {
+        frame_144(cx, window, &view);
+    }
+    assert!(view.read_with(cx, |v, _| v.model.tabs.view().is_some()), "Settings on screen in the pane that stays");
+    let right_was = view.read_with(cx, |v, _| v.panel_fx.sides[1].shown);
+    view.update(cx, |v, cx| {
+        v.in_pane(gone, |v| v.close_pane());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    // From the close's first frame (the centre loses the right panel's
+    // strip in it: a view has none, as on main).
+    frame_144(cx, window, &view);
+    let mut widths = vec![drawn_w(cx, &view, kept)];
+    let mut rest = 0;
+    while rest < 10 {
+        frame_144(cx, window, &view);
+        widths.push(drawn_w(cx, &view, kept));
+        let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+        rest = if busy { 0 } else { rest + 1 };
+        assert!(widths.len() < 500, "never landed");
+    }
+    assert!((view.read_with(cx, |v, _| v.panel_fx.sides[1].shown) - right_was).abs() > 100., "the right panel comes back from its strip");
+    let travel = widths[widths.len() - 1] - widths[0];
+    let top = std::f32::consts::TAU / crate::motion::SHEET_RESPONSE * 0.006944 / std::f32::consts::E;
+    let step = widths.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0., f32::max);
+    let moving = widths.windows(2).filter(|w| (w[1] - w[0]).abs() > 0.5).count();
+    assert!(travel > 100., "the kept pane takes the closing share: {widths:?}");
+    assert!(
+        step <= travel * top * 1.25 + 2. && moving >= 10,
+        "the kept pane steps at most its spring's top step ({:.1} px), in {moving} frames: {step} px; {widths:?}",
+        travel * top
+    );
+}
+
+/// Shady #54 M2: a ride whose ends move under it (the rail folds or
+/// unfolds, the window is resized) hands the layout back to its own
+/// spring from where it is drawn: the new pane doesn't stall and then
+/// jump the rest of the way as the panel lands. No frame steps it more
+/// than a tenth of its landed width (but the resize's own), and it lands.
+#[gpui_kit::test]
+fn a_ride_whose_ends_move_hands_the_layout_back(cx: &mut TestAppContext) {
+    let mut fails = Vec::new();
+    for case in ["the rail unfolds", "the rail folds", "a resize"] {
+        let (w, rail_open) = if case == "the rail unfolds" { (1400., false) } else { (1920., true) };
+        let (window, view) = demo_split(cx, w, 1080.);
+        panels_at(cx, &view, rail_open, 480, 520);
+        frame(cx, window);
+        level(cx, crate::motion::Level::Full);
+        frame(cx, window);
+        let before = view.read_with(cx, |v, _| v.panes.ids());
+        key(cx, window, "ctrl-\\");
+        cx.run_until_parked();
+        frame_144(cx, window, &view);
+        let new = view.read_with(cx, |v, _| v.panes.ids().into_iter().find(|i| !before.contains(i))).expect("a new pane");
+        assert!(
+            view.read_with(cx, |v, _| v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some())),
+            "{case}: the split rides the right panel"
+        );
+        let mut widths = vec![drawn_w(cx, &view, new)];
+        let mut rest = 0;
+        for k in 1.. {
+            if k == 15 {
+                match case {
+                    "a resize" => VisualTestContext::from_window(window, cx).simulate_resize(size(px(1700.), px(1080.))),
+                    _ => view.update(cx, |v, cx| v.toggle_panel(true, cx)),
+                }
+                cx.run_until_parked();
+            }
+            frame_144(cx, window, &view);
+            widths.push(drawn_w(cx, &view, new));
+            let busy = view.read_with(cx, |v, _| v.panel_fx.moving() || v.panes.flight.is_some() || v.fx.pending().0);
+            rest = if busy || k <= 15 { 0 } else { rest + 1 };
+            if rest == 10 || k == 500 {
+                break;
+            }
+        }
+        let landed = widths[widths.len() - 1];
+        // The resize's own frame scales the layout with the window (a cut:
+        // the window manager's, as on main).
+        let step = widths
+            .windows(2)
+            .enumerate()
+            .filter(|(i, _)| !(case == "a resize" && *i == 14))
+            .map(|(_, w)| (w[1] - w[0]).abs())
+            .fold(0., f32::max);
+        if rest < 10 {
+            fails.push(format!("{case}: never landed"));
+        } else if step > landed * 0.1 {
+            fails.push(format!("{case}: the new pane steps {step} px in a frame (landed {landed}): {widths:?}"));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Shady #54 L1: at 125 % a panel that a layout rides lands in the frame
+/// it is drawn at its target, as at 100 %, with a target off the device
+/// grid (the right panel at 481, snapped 480.8), and nothing moves after.
+#[gpui_kit::test]
+fn a_ride_lands_on_arrival_at_a_fractional_scale(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    VisualTestContext::from_window(window, cx).simulate_scale_factor_change(1.25);
+    panels_at(cx, &view, true, 480, 481);
+    frame(cx, window);
+    level(cx, crate::motion::Level::Full);
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    land(cx, window, &view);
+    for _ in 0..60 {
+        frame_144(cx, window, &view);
+    }
+    let target = view.read_with(cx, |v, _| v.fx.snap(481.));
+    assert!((target - 481.).abs() > 0.01, "481 is off the device grid at 125 %: {target}");
+    let last = view.read_with(cx, |v, _| *v.reading_order().last().expect("a pane"));
+    view.update(cx, |v, cx| {
+        v.in_pane(last, |v| v.close_pane());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut seen = Vec::new();
+    let mut rest = 0;
+    while rest < 10 {
+        frame_144(cx, window, &view);
+        let s = view.read_with(cx, |v, _| {
+            (v.panel_fx.sides[1].shown, v.panel_fx.moving(), v.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()))
+        });
+        seen.push(s);
+        rest = if s.1 || s.2 || view.read_with(cx, |v, _| v.fx.pending().0) { 0 } else { rest + 1 };
+        assert!(seen.len() < 500, "never landed");
+    }
+    assert!(seen.iter().any(|s| s.2), "the close rides the right panel: {seen:?}");
+    // Drawn at its target (within half a pixel, as rounded) only once it
+    // has landed, and it stays where it landed.
+    let late: Vec<usize> = (0..seen.len()).filter(|&k| (seen[k].0 - target).abs() < 0.5 && seen[k].1).collect();
+    let first_rest = seen.iter().position(|s| !s.1).expect("it rests");
+    let after: Vec<f32> = seen[first_rest..].iter().map(|s| s.0).filter(|w| (w - seen[first_rest].0).abs() > 0.001).collect();
+    assert!(
+        late.is_empty() && after.is_empty(),
+        "lands in the frame it arrives: still moving at its target in frames {late:?}, moves after {after:?}; {seen:?}"
+    );
+}
+
 /// Design gate F5 (#44 r3): after Join lands, the pane kept's worker chips
 /// take their landed grid in the landing frame (one a line in a quarter of
 /// the centre, two in the whole): no chip slides after the panes stop.
