@@ -4550,7 +4550,7 @@ impl AppView {
     /// shows (`shown`) in a visible window. Cold, or nothing counting:
     /// nothing armed (an idle window draws no frame for it).
     fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
-        let now = crate::warm::Now::now();
+        let now = crate::warm::Moment::now();
         let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
         let seq = self.model.lives[self.panes.cur.live].attachment();
         let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
@@ -4573,7 +4573,7 @@ impl AppView {
                 v.warm_tick = None;
                 // The machine slept since the answer: what it said is aged
                 // by the sleep, and asked again.
-                let now = crate::warm::Now::now();
+                let now = crate::warm::Moment::now();
                 let slept = v.model.lives[v.panes.cur.live].stats.warm.as_mut().is_some_and(|w| {
                     let slept = w.slept(now);
                     if slept {

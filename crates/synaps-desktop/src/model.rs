@@ -1555,7 +1555,7 @@ impl Model {
             }
             Event::SessionStatus { attach_seq, value } => {
                 if self.lives[lid].current(attach_seq) {
-                    self.lives[lid].stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Now::now()));
+                    self.lives[lid].stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now()));
                     self.view_dirty = true;
                 }
                 return effects;
@@ -3091,7 +3091,7 @@ mod tests {
             fresh(&mut m);
             assert_eq!(asked(&m.apply(ev)), 1, "{why}: asked again");
             let w = m.lives[LiveId::FIRST].stats.warm.as_ref().unwrap();
-            assert!(w.expires.is_none() && w.next_change(crate::warm::Now::now()).is_none(), "{why}: stopped");
+            assert!(w.expires.is_none() && w.next_change(crate::warm::Moment::now()).is_none(), "{why}: stopped");
         }
     }
 

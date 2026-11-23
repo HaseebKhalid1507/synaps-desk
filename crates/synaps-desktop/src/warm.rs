@@ -10,7 +10,7 @@
 //! changes, once a second under ten minutes, once a minute above, only
 //! while the panel shows it, and not at all once the cache is cold.
 //!
-//! A snapshot ages on both of this machine's clocks ([`Now`]): a suspended
+//! A snapshot ages on both of this machine's clocks ([`Moment`]): a suspended
 //! laptop wakes to `cold`, not to the minutes it showed when it slept.
 
 use std::time::{Duration, Instant, SystemTime};
@@ -38,21 +38,21 @@ const SLEPT: Duration = Duration::from_secs(5);
 /// (the provider's TTL keeps running while this machine sleeps), never by
 /// the daemon's clock: a forwarded socket's daemon may disagree with ours.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Now {
+pub(crate) struct Moment {
     pub mono: Instant,
     pub wall: SystemTime,
 }
 
-impl Now {
-    pub fn now() -> Now {
-        Now { mono: Instant::now(), wall: SystemTime::now() }
+impl Moment {
+    pub fn now() -> Moment {
+        Moment { mono: Instant::now(), wall: SystemTime::now() }
     }
 }
 
 /// One `Status` answer, read at `at`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Warm {
-    pub at: Now,
+    pub at: Moment,
     /// `off`, `auto`, `<N>h`; empty: the daemon did not say (parked).
     pub mode: String,
     pub pinned: bool,
@@ -74,7 +74,7 @@ pub(crate) struct Warm {
 }
 
 impl Warm {
-    pub fn from_status(v: &Value, at: Now) -> Warm {
+    pub fn from_status(v: &Value, at: Moment) -> Warm {
         let kw = &v["keepwarm"];
         let secs = |v: &Value| v.as_u64().map(Duration::from_secs);
         let cache = &v["cache"];
@@ -95,31 +95,31 @@ impl Warm {
 
     /// Since the answer: the larger of the two clocks' (a wall clock set
     /// back counts nothing; a suspended machine's sleep counts).
-    fn age(&self, now: Now) -> Duration {
+    fn age(&self, now: Moment) -> Duration {
         let mono = now.mono.saturating_duration_since(self.at.mono);
         let wall = now.wall.duration_since(self.at.wall).unwrap_or_default();
         mono.max(wall)
     }
 
     /// Until the cache expires, now (zero: cold).
-    pub fn left(&self, now: Now) -> Option<Duration> {
+    pub fn left(&self, now: Moment) -> Option<Duration> {
         self.expires.map(|d| d.saturating_sub(self.age(now)))
     }
 
     /// Until the next keep-warm ping, now.
-    pub fn ping_in(&self, now: Now) -> Option<Duration> {
+    pub fn ping_in(&self, now: Moment) -> Option<Duration> {
         self.next_ping.map(|d| d.saturating_sub(self.age(now)))
     }
 
     /// The machine slept (or its clock jumped ahead) since the answer.
-    pub fn slept(&self, now: Now) -> bool {
+    pub fn slept(&self, now: Moment) -> bool {
         let mono = now.mono.saturating_duration_since(self.at.mono);
         now.wall.duration_since(self.at.wall).is_ok_and(|wall| wall > mono + SLEPT)
     }
 
     /// The snapshot as it stands now, read again at `now` (after a sleep:
     /// both clocks agree from here on).
-    pub fn rebase(&mut self, now: Now) {
+    pub fn rebase(&mut self, now: Moment) {
         (self.expires, self.next_ping) = (self.left(now), self.ping_in(now));
         self.at = now;
     }
@@ -135,7 +135,7 @@ impl Warm {
     /// When what the panel says next changes (a countdown's next second
     /// under ten minutes, its next minute above); `None`: nothing counts
     /// down (no cache known, cold, no ping due).
-    pub fn next_change(&self, now: Now) -> Option<Instant> {
+    pub fn next_change(&self, now: Moment) -> Option<Instant> {
         let step = |d: Duration| -> Option<Duration> {
             if d.is_zero() {
                 return None;
@@ -154,7 +154,7 @@ impl Warm {
     /// When to ask the daemon again: a little after the next ping is due
     /// (it moves the cache's anchor), and not within [`REFRESH_MIN`] of the
     /// last answer. `None`: no ping is due.
-    pub fn refresh_at(&self, now: Now) -> Option<Instant> {
+    pub fn refresh_at(&self, now: Moment) -> Option<Instant> {
         self.next_ping.map(|d| now.mono + (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.age(now)))
     }
 }
@@ -214,14 +214,14 @@ mod tests {
     }
 
     /// `d` s later on both clocks (the machine awake, its clock steady).
-    fn after(t: Now, secs: u64) -> Now {
+    fn after(t: Moment, secs: u64) -> Moment {
         let d = Duration::from_secs(secs);
-        Now { mono: t.mono + d, wall: t.wall + d }
+        Moment { mono: t.mono + d, wall: t.wall + d }
     }
 
     #[test]
     fn reads_the_status_and_counts_down() {
-        let t0 = Now::now();
+        let t0 = Moment::now();
         let w = Warm::from_status(&status(json!({"ttl": "5m", "ttl_secs": 300, "expires_in_secs": 222, "downgraded": true})), t0);
         assert_eq!((w.mode.as_str(), w.pinned, w.pings), ("auto", true, 3));
         assert_eq!(mode_line(&w), "auto · pinned");
@@ -235,10 +235,10 @@ mod tests {
 
     #[test]
     fn ticks_once_a_second_under_ten_minutes_else_once_a_minute_and_stops_cold() {
-        let t0 = Now::now();
+        let t0 = Moment::now();
         let mut w = Warm::from_status(&status(json!({"ttl": "1h", "expires_in_secs": 3125})), t0);
         w.next_ping = None;
-        let wait = |w: &Warm, now: Now| w.next_change(now).map(|at| at.duration_since(now.mono));
+        let wait = |w: &Warm, now: Moment| w.next_change(now).map(|at| at.duration_since(now.mono));
         // 52:05 left: the minute changes in 5 s.
         assert_eq!(wait(&w, t0), Some(Duration::from_millis(5005)));
         // 10:30 left: at the 10:00 line, then every second.
@@ -268,13 +268,13 @@ mod tests {
     /// nap: the panel wakes to `cold`, not to 3:00, and nothing ticks.
     #[test]
     fn a_suspended_machine_wakes_to_the_cache_s_real_age() {
-        let t0 = Now::now();
+        let t0 = Moment::now();
         let mut w = Warm::from_status(&status(json!({"ttl": "5m", "expires_in_secs": 240})), t0);
         w.next_ping = Some(Duration::from_secs(120));
         let awake = after(t0, 60);
         assert_eq!(clock(w.left(awake).unwrap()), "3:00");
         assert!(!w.slept(awake));
-        let woke = Now { mono: awake.mono, wall: awake.wall + Duration::from_secs(600) };
+        let woke = Moment { mono: awake.mono, wall: awake.wall + Duration::from_secs(600) };
         assert!(w.slept(woke), "the wall clock ran on");
         assert_eq!(clock(w.left(woke).unwrap()), "cold", "not 3:00");
         assert_eq!(w.ping_in(woke), Some(Duration::ZERO), "the ping was due while asleep");
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(w2.left(after(woke, 1)), Some(Duration::ZERO));
         // A short nap: aged by it, still counting.
         let w = Warm::from_status(&status(json!({"ttl": "1h", "expires_in_secs": 3000})), t0);
-        let napped = Now { mono: t0.mono + Duration::from_secs(10), wall: t0.wall + Duration::from_secs(610) };
+        let napped = Moment { mono: t0.mono + Duration::from_secs(10), wall: t0.wall + Duration::from_secs(610) };
         assert_eq!(clock(w.left(napped).unwrap()), "39m");
     }
 
@@ -295,13 +295,13 @@ mod tests {
     /// monotonic clock's age stands, and it is no sleep.
     #[test]
     fn a_clock_set_back_does_not_rewind_the_countdown() {
-        let t0 = Now::now();
+        let t0 = Moment::now();
         let w = Warm::from_status(&status(json!({"ttl": "5m", "expires_in_secs": 240})), t0);
-        let now = Now { mono: t0.mono + Duration::from_secs(60), wall: t0.wall - Duration::from_secs(3600) };
+        let now = Moment { mono: t0.mono + Duration::from_secs(60), wall: t0.wall - Duration::from_secs(3600) };
         assert_eq!(clock(w.left(now).unwrap()), "3:00");
         assert!(!w.slept(now));
         // Ages past zero saturate at cold, on either clock.
-        let far = Now { mono: t0.mono + Duration::from_secs(86_400), wall: t0.wall - Duration::from_secs(1) };
+        let far = Moment { mono: t0.mono + Duration::from_secs(86_400), wall: t0.wall - Duration::from_secs(1) };
         assert_eq!(w.left(far), Some(Duration::ZERO));
         assert_eq!(clock(w.left(far).unwrap()), "cold");
         assert_eq!(w.next_change(far), None);
@@ -311,7 +311,7 @@ mod tests {
     /// session's any more (cold until the daemon answers again).
     #[test]
     fn invalidated_the_countdown_stops() {
-        let t0 = Now::now();
+        let t0 = Moment::now();
         let mut w = Warm::from_status(&status(json!({"ttl": "5m", "expires_in_secs": 240, "downgraded": true})), t0);
         w.next_ping = None;
         assert!(w.next_change(t0).is_some());

@@ -1219,7 +1219,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         move |v: &mut AppView, _: &mut Context<AppView>| {
                             v.model.lives[v.panes.cur.live].stats.warm = secs.map(|s| {
                                 let st = json!({"keepwarm": {"mode": "auto"}, "cache": {"ttl": "5m", "expires_in_secs": s}});
-                                crate::warm::Warm::from_status(&st, crate::warm::Now::now())
+                                crate::warm::Warm::from_status(&st, crate::warm::Moment::now())
                             });
                         }
                     };
