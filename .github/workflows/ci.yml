@@ -53,6 +53,21 @@ jobs:
           ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' desktop-tests.log || true)
           echo "synaps-desktop: $passed tests passed, $ui of them UI tests"
           test "$passed" -gt 0 && test "$ui" -gt 0
+      # The same suites with every test's view split panes on (one pane;
+      # the split tests add two), as a launch with no settings file has
+      # been since split panes are on by default (Shady #59 M1). Linux: the
+      # layout is the same on every platform.
+      - name: Test synaps-desktop, split panes on (the split-on-tests lane)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p synaps-desktop --locked --features split-on-tests 2>&1 | tee desktop-tests-split-on.log
+          passed=$(grep -E '^test result: ok' desktop-tests-split-on.log | awk '{s += $4} END {print s + 0}')
+          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' desktop-tests-split-on.log || true)
+          grep -qE '^test split_tests::the_split_on_lane_builds_every_view_split_on \.\.\. ok' desktop-tests-split-on.log
+          echo "synaps-desktop, split on: $passed tests passed, $ui of them UI tests"
+          test "$passed" -gt 0 && test "$ui" -gt 0
       - name: Build release
         run: cargo build --release --locked -p synaps-desktop -p synaps-client
       - name: Binary size

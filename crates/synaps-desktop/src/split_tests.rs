@@ -973,6 +973,8 @@ fn an_unfocused_panes_worker_view_stays_when_its_worker_ends(cx: &mut TestAppCon
 #[gpui_kit::test]
 fn with_split_panes_off_alt_1_is_not_a_pane_key(cx: &mut TestAppContext) {
     let (window, view) = open(cx);
+    // Off, whatever the tests' lane starts with (`split-on-tests`).
+    view.update(cx, |v, _| v.app_settings.split = false);
     assert!(!view.read_with(cx, |v, _| v.split_on()), "split panes off");
     key(cx, window, crate::app::palette_keys(cfg!(target_os = "macos")).1);
     frame(cx, window);
@@ -6539,4 +6541,155 @@ fn frame_144_matches_fluid_frame() {
     assert_eq!(spelt(body(ours, "frame_144")), fluid, "frame_144 drifted from ui_tests' fluid_frame");
     let notify = "    view.update(cx, |_, cx| cx.notify());\n";
     assert_eq!(spelt(body(ours, "asked_frame")), fluid.replacen(notify, "", 1), "asked_frame drifted from fluid_frame");
+}
+
+/// Shady #59 M1: the tests' split-on lane is what it says. Every test's
+/// view is built by [`AppView::new`] (here as in the protected fixtures:
+/// `test_kit`'s `open_with`, which `held_tests`, `send_tests` and
+/// `hang_tests` use, and `ui_tests`' own `open`), and none of the
+/// protected suites sets `app_settings` after: with `--features
+/// split-on-tests` every view starts with split panes on, one pane;
+/// without, off. A launch with no settings file has them on (the run's
+/// override unset).
+#[gpui_kit::test]
+fn the_split_on_lane_builds_every_view_split_on(cx: &mut TestAppContext) {
+    let (_window, view) = open(cx);
+    let (on, panes) = view.read_with(cx, |v, _| (v.split_on(), v.panes.len()));
+    assert_eq!(on, cfg!(feature = "split-on-tests"), "a test's view, split panes on in the lane alone");
+    assert_eq!(panes, 1, "one pane");
+    let protected = [
+        ("ui_tests.rs", include_str!("ui_tests.rs")),
+        ("held_tests.rs", include_str!("held_tests.rs")),
+        ("send_tests.rs", include_str!("send_tests.rs")),
+        ("test_kit.rs", include_str!("test_kit.rs")),
+        ("hang_tests.rs", include_str!("hang_tests.rs")),
+    ];
+    for (file, src) in protected {
+        assert!(src.contains("AppView::new(") || !src.contains("cx.new("), "{file}: its views by AppView::new");
+        assert!(!src.contains("app_settings"), "{file} sets app_settings: the lane would not be split on");
+    }
+    if crate::settings_view::split_env().is_none() {
+        assert!(crate::settings_view::AppSettings::load(None).split, "no settings file: split panes on");
+    }
+}
+
+/// Shady #59 M1, the split-on lane at two panes: the protected suites' key
+/// scenarios at one pane and at two, split panes on both times (the second
+/// pane on A by Ctrl+\, focused). A long A, the focused pane's list
+/// scrolled back as the wheel leaves it (`send_tests`' `scroll_back`): a
+/// message typed in its composer goes out on A's attachment and brings that
+/// pane back to its end (`send_tests`' submit), and text streamed after
+/// keeps it there, the other pane at its end too (`held_tests`' tail
+/// follow). Ctrl+T and Ctrl+W after the send act in the focused pane alone
+/// (the window's fallbacks). With the keys off the composer, a second at
+/// rest draws nothing (`ui_tests`' idle, by #61's [`idle_step`]).
+#[gpui_kit::test]
+fn the_key_scenarios_hold_at_one_and_at_two_panes(cx: &mut TestAppContext) {
+    let mut fails = Vec::new();
+    for panes in [1usize, 2] {
+        let messages = synaps_client::synthetic::history(60, 7);
+        let long = json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
+            "meta": {"id": A, "model": "m", "lifecycle": "live"},
+            "conversation": {"api_messages": messages, "messages_len": messages.len()}, "pending_prompts": []});
+        let (window, view, client, mut a, _attaches, events) = on_a_as(cx, &format!("lane-{panes}"), long);
+        if panes == 2 {
+            key(cx, window, "ctrl-\\");
+            land(cx, window, &view);
+        }
+        let (focused, other) = view.read_with(cx, |v, _| (v.panes.focused, v.panes.ids().into_iter().find(|i| *i != v.panes.focused)));
+        assert_eq!(view.read_with(cx, |v, _| (v.split_on(), v.panes.len())), (true, panes), "split panes on, {panes} pane(s)");
+        let _ = cx.update_window(window, |_, w, cx| {
+            let h = view.read(cx).panes.cur.composer.read(cx).focus_handle(cx);
+            w.focus(&h, cx);
+        });
+        for _ in 0..10 {
+            frame(cx, window);
+        }
+        let at_end = |cx: &mut TestAppContext, id: crate::pane::PaneId| view.update(cx, |v, _| v.in_pane(id, |v| v.at_end()).flatten());
+        // Its end, then 600 px back.
+        view.update(cx, |v, cx| {
+            v.panes.cur.list.scroll_to_end();
+            cx.notify();
+        });
+        for _ in 0..4 {
+            frame(cx, window);
+        }
+        view.update(cx, |v, cx| {
+            v.panes.cur.scroller.touch();
+            v.panes.cur.list.scroll_by(px(-600.));
+            cx.notify();
+        });
+        for _ in 0..4 {
+            frame(cx, window);
+        }
+        if at_end(cx, focused) != Some(false) {
+            fails.push(format!("{panes} pane(s): the focused pane not scrolled back: {:?}", at_end(cx, focused)));
+        }
+        type_enter(cx, window, "lane: where does the refresh race start?");
+        let sent = names(&mut a);
+        if sent != ["submit"] {
+            fails.push(format!("{panes} pane(s): the message on A's attachment: {sent:?}"));
+        }
+        for _ in 0..30 {
+            frame(cx, window);
+        }
+        if at_end(cx, focused) != Some(true) {
+            fails.push(format!("{panes} pane(s): the send didn't bring its pane to the end: {:?}", at_end(cx, focused)));
+        }
+        // The reply, streamed.
+        let items = |v: &AppView| v.model.lives[v.panes.cur.live].transcript.items().len();
+        let n0 = view.read_with(cx, |v, _| items(v));
+        a.send(json!({"type": "event", "session_id": A, "seq": 1, "ts": "t", "event": {"ev": "turn_started", "turn_baseline": 0, "trigger": "user"}}));
+        for (i, seq) in (2..8).enumerate() {
+            let text = format!("Line {i}: the relay's token cache, two lines down from the lock, under the read guard.\n").repeat(3);
+            a.send(json!({"type": "event", "session_id": A, "seq": seq, "ts": "t",
+                "event": {"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": text}}}));
+        }
+        a.send(json!({"type": "event", "session_id": A, "seq": 8, "ts": "t", "event": {"ev": "idle"}}));
+        feed(cx, window, &view, &events, "the reply", |v| items(v) > n0 && !v.model.lives[v.panes.cur.live].transcript.busy());
+        for _ in 0..30 {
+            frame(cx, window);
+        }
+        for id in std::iter::once(focused).chain(other) {
+            if at_end(cx, id) != Some(true) {
+                fails.push(format!("{panes} pane(s): pane {} not at its end as the reply streams: {:?}", id.index(), at_end(cx, id)));
+            }
+        }
+        // Ctrl+T, Ctrl+W: the focused pane's.
+        let count = |cx: &mut TestAppContext, id: crate::pane::PaneId| {
+            view.read_with(cx, |v, _| {
+                let p = v.panes.get(id).expect("the pane");
+                if p.id == v.panes.cur.id { v.model.tabs.len() } else { p.parked.tabs.len() }
+            })
+        };
+        let before = (count(cx, focused), other.map(|o| count(cx, o)));
+        key(cx, window, "ctrl-t");
+        let now = (count(cx, focused), other.map(|o| count(cx, o)));
+        if now != (before.0 + 1, before.1) {
+            fails.push(format!("{panes} pane(s): Ctrl+T, the tabs (focused, other): {before:?} → {now:?}"));
+        }
+        key(cx, window, "ctrl-w");
+        let now = (count(cx, focused), other.map(|o| count(cx, o)), view.read_with(cx, |v, _| v.panes.len()));
+        if now != (before.0, before.1, panes) {
+            fails.push(format!("{panes} pane(s): Ctrl+W, the tabs (focused, other) and panes: {before:?} → {now:?}"));
+        }
+        // At rest: nothing drawn (the rail's rows at rest too, as in
+        // `nothing_is_drawn_after_a_landing`: the fake daemon's list).
+        view.update(cx, |v, cx| {
+            for m in v.model.sessions.iter_mut() {
+                (m.busy, m.subagents_running) = (false, 0);
+            }
+            v.model.rail_gen += 1;
+            cx.notify();
+        });
+        let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| w.focus(&v.focus, cx)));
+        idle_step(cx, window, &view, Duration::from_millis(600));
+        let ran: usize = (0..144).map(|_| idle_step(cx, window, &view, Duration::from_micros(6944))).sum();
+        if ran != 0 {
+            fails.push(format!("{panes} pane(s): {ran} frames drawn in a second at rest"));
+        }
+        view.update(cx, |v, _| v.client = None);
+        let _ = client.shutdown();
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
 }

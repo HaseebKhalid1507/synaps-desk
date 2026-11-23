@@ -15,6 +15,13 @@ disallowed_methods = "deny"
 name = "synaps-desktop"
 path = "src/main.rs"
 
+[features]
+# Tests only (Shady #59 M1): every test's view starts with split panes on,
+# one pane, as a launch with no settings file does since they are on by
+# default. `cargo test -p synaps-desktop --features split-on-tests` runs the
+# unchanged suites so; without it they start off, as before.
+split-on-tests = []
+
 [dependencies]
 synaps-client.workspace = true
 gpui-kit.workspace = true

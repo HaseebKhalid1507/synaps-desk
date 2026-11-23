@@ -57,7 +57,8 @@ pub(crate) struct AppSettings {
     /// Split panes (`panes.split`): on by default since split panes step
     /// 6; `"panes.split": false` in the file turns them off, and
     /// `SYNAPS_DESK_SPLIT=0` (or `=1`) for a run. Off, the window is one
-    /// pane, as before them. (The tests' views start off: `Default`.)
+    /// pane, as before them. (The tests' views start off, `Default`, or
+    /// on with the `split-on-tests` feature: Shady #59 M1.)
     pub split: bool,
 }
 
