@@ -38,6 +38,9 @@ pub const SAVED_SESSIONS_MAX: u32 = 1000;
 /// watch-sessions replacement of `saved_sessions`). An older daemon
 /// answers the frame with `Error{unknown variant}`.
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
+/// `Welcome.features` entry: the daemon's `Status` says when the session's
+/// prompt cache expires (`cache`). An older daemon omits the field.
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
 pub const CATALOG_PAGE_MAX: u32 = 200;

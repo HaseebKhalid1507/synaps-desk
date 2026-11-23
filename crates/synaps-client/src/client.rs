@@ -303,6 +303,9 @@ pub enum Command {
         name: String,
         arg: String,
     },
+    /// `SessionQuery::Status` → `Event::SessionStatus`. See
+    /// [`SessionRef::status`].
+    Status,
 }
 
 impl Command {
@@ -326,6 +329,7 @@ impl Command {
             Command::SubagentWatch { .. } => "subagent_watch",
             Command::SubagentSteer { .. } => "subagent_steer",
             Command::CancelWorker { .. } | Command::EngineCommand { .. } => "engine_command",
+            Command::Status => "query",
         }
     }
 }
@@ -375,6 +379,7 @@ impl std::fmt::Debug for Command {
             Command::CancelWorker { handle_id } => f.debug_struct("CancelWorker").field("handle_id", handle_id).finish(),
             Command::EngineCommand { name, .. } => f.debug_struct("EngineCommand").field("name", name).finish(),
             other => f.write_str(match other {
+                Command::Status => "Status",
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
                 Command::Resync => "Resync",
@@ -598,6 +603,13 @@ pub enum Event {
         name: String,
         reply: CommandReply,
     },
+    /// The answer to [`SessionRef::status`]: the session's `Status` value
+    /// (`model`, `cost`, `keepwarm`, `pinned`, `cache_ttl`, and from newer
+    /// daemons `cache`), as the daemon sent it.
+    SessionStatus {
+        attach_seq: u64,
+        value: Value,
+    },
 }
 
 /// What became of a slash command ([`Event::EngineReply`]).
@@ -661,6 +673,7 @@ impl Event {
             | Event::SubagentWatch { attach_seq, .. }
             | Event::WorkerCancel { attach_seq, .. }
             | Event::EngineReply { attach_seq, .. }
+            | Event::SessionStatus { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -1085,6 +1098,14 @@ impl SessionRef<'_> {
     /// Run a slash command ([`Client::engine_command`]).
     pub fn engine_command(&self, name: impl Into<String>, arg: impl Into<String>) -> Result<(), ClientClosed> {
         self.send(Command::EngineCommand { name: name.into(), arg: arg.into() })
+    }
+
+    /// The session's status (`SessionQuery::Status`: cost, keep-warm, the
+    /// cache's TTL and, from newer daemons, when the cache expires) →
+    /// `Event::SessionStatus`. Read-only, any attach mode. Not connected:
+    /// nothing comes back (ask again on the next attach).
+    pub fn status(&self) -> Result<(), ClientClosed> {
+        self.send(Command::Status)
     }
 
     /// Leave this attachment only (`Detach` + `Bye`); the others stay. Its
@@ -1637,7 +1658,7 @@ async fn without_session<F: Future>(
             out = &mut fut => return Some(out),
             cmd = cmds.recv() => match cmd {
                 None | Some(Command::Detach) | Some(Command::Shutdown) => return None,
-                Some(Command::Resync) | Some(Command::RefreshSessions) => {}
+                Some(Command::Resync) | Some(Command::RefreshSessions) | Some(Command::Status) => {}
                 Some(Command::CancelWorker { handle_id }) => emit(events, Event::WorkerCancel {
                     attach_seq,
                     handle_id,
@@ -1856,6 +1877,8 @@ async fn session_loop(
         let mut watches: VecDeque<(u64, String, u64)> = VecDeque::new();
         // Engine commands in flight: `(query id, what)`, oldest first.
         let mut cancels: VecDeque<(u64, Asked)> = VecDeque::new();
+        // `Status` queries in flight (ids).
+        let mut statuses: VecDeque<u64> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1952,6 +1975,19 @@ async fn session_loop(
                             cancels.push_back((id, Asked::Run(name.clone(), arg.clone())));
                             SessionCommand::EngineCommand { id, name, arg }
                         }
+                        Command::Status => {
+                            let id = loop {
+                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
+                                if id != query_id && !statuses.contains(&id) && !cancels.iter().any(|c| c.0 == id) {
+                                    break id;
+                                }
+                            };
+                            if statuses.len() == WATCHES_MAX {
+                                statuses.pop_front();
+                            }
+                            statuses.push_back(id);
+                            SessionCommand::Query { id, query: SessionQuery::Status }
+                        }
                         _ => continue,
                     };
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
@@ -1995,6 +2031,14 @@ async fn session_loop(
                                 Asked::Run(name, arg) => run_reply(name, arg, value),
                             };
                             answer(&events, attach_seq, asked, reply);
+                            continue;
+                        }
+                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| statuses.iter().position(|o| *o == q))
+                        {
+                            statuses.remove(k);
+                            let value = v.get_mut("value").map(Value::take).unwrap_or_default();
+                            emit(&events, Event::SessionStatus { attach_seq, value });
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {

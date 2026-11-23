@@ -172,6 +172,9 @@ pub enum Effect {
         name: String,
         reply: synaps_client::CommandReply,
     },
+    /// Ask attachment `attach_seq`'s session for its `Status` (the right
+    /// panel's cache and keep-warm numbers, [`crate::warm`]).
+    Status(u64),
 }
 
 /// A resume in flight (`Client::resume`).
@@ -414,6 +417,10 @@ pub struct Model {
     /// for its dash again).
     pub daemon: Option<Daemon>,
     pub daemon_gen: u64,
+    /// The daemon's `Status` says when the prompt cache expires
+    /// (`Welcome.features: cache_expiry`): only then is it asked for the
+    /// right panel's cache and keep-warm ([`crate::warm`]).
+    pub cache_expiry: bool,
 }
 
 /// Tests only (split/architecture.md §6.6): `v.model.transcript`,
@@ -476,6 +483,7 @@ impl Model {
             view_dirty: false,
             daemon: None,
             daemon_gen: 0,
+            cache_expiry: false,
         }
     }
 
@@ -1428,6 +1436,12 @@ impl Model {
             None => self.lives.shown(),
         };
         let mut effects = Vec::new();
+        // The right panel's cache and keep-warm numbers are asked again
+        // (attach, a turn's end, a keep-warm notice): the store's own
+        // attachment only, from a daemon that says when the cache expires.
+        if let Some(seq) = crate::warm::asks(&ev).filter(|s| self.cache_expiry && self.lives[lid].current(*s)) {
+            effects.push(Effect::Status(seq));
+        }
         let ev = match ev {
             Event::Sessions(mut s) => {
                 self.lists += 1;
@@ -1516,6 +1530,13 @@ impl Model {
                 }
                 return effects;
             }
+            Event::SessionStatus { attach_seq, value } => {
+                if self.lives[lid].current(attach_seq) {
+                    self.lives[lid].stats.warm = Some(crate::warm::Warm::from_status(&value, std::time::Instant::now()));
+                    self.view_dirty = true;
+                }
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
@@ -1546,6 +1567,7 @@ impl Model {
                     // Pages when the daemon has them; `saved_sessions` (#408,
                     // on local builds only) until it does not.
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
+                    self.cache_expiry = features.iter().any(|f| f == synaps_client::FEATURE_CACHE_EXPIRY);
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     self.named.polled = None;
                     self.named.retries = 0;
@@ -2961,6 +2983,31 @@ mod tests {
         m.apply(connected(&[]));
         m.apply(st(Status::Reconnecting { why: "daemon closed the connection".into() }));
         assert_eq!((m.reload, m.reload_seq), (false, 2), "any other drop is not a reload");
+    }
+
+    /// The right panel's cache and keep-warm (`crate::warm`): asked from a
+    /// daemon that says when the cache expires, on the attachment's attach,
+    /// turn end and keep-warm notices, nothing else; the answer is the store's.
+    #[test]
+    fn cache_status_is_asked_on_attach_turn_end_and_keep_warm_notices() {
+        let asked = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Status(1))).count();
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[]));
+        m.want(LiveId::FIRST, 1);
+        let fx = m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        assert_eq!(asked(&fx), 0, "an older daemon is never asked");
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        let fx = m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: true });
+        assert_eq!(asked(&fx), 1, "attach");
+        assert_eq!(asked(&m.apply(session(1, SessionEvent::Idle))), 1, "turn end");
+        let notice = |t: &str| session(1, SessionEvent::SystemNotice { text: t.into() });
+        assert_eq!(asked(&m.apply(notice("cache keep-warm ended: bound reached"))), 1, "keep-warm notice");
+        assert_eq!(asked(&m.apply(notice("model → x"))), 0, "any other notice");
+        assert_eq!(asked(&m.apply(session(7, SessionEvent::Idle))), 0, "not this store's attachment");
+        let st = json!({"pinned": true, "keepwarm": {"mode": "auto", "session_pings": 2}, "cache": {"ttl": "5m", "expires_in_secs": 200}});
+        m.apply(Event::SessionStatus { attach_seq: 1, value: st });
+        let w = m.lives[LiveId::FIRST].stats.warm.clone().expect("kept");
+        assert_eq!((w.mode.as_str(), w.pinned, w.pings, w.expires.map(|d| d.as_secs())), ("auto", true, 2, Some(200)));
     }
 
     fn connected(features: &[&str]) -> Event {

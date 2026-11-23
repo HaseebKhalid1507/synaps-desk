@@ -86,6 +86,14 @@ pub mod label {
     /// Cache writes (`cache_creation`).
     pub const WRITE: &str = "W R I T E";
     pub const CACHE_HIT: &str = "C A C H E   H I T";
+    /// The right panel's cache countdown and keep-warm ([`crate::warm`]).
+    pub const PROMPT_CACHE: &str = "P R O M P T   C A C H E";
+    pub const EXPIRES: &str = "E X P I R E S";
+    pub const TTL: &str = "T T L";
+    pub const KEEP_WARM: &str = "K E E P   W A R M";
+    pub const PINGS: &str = "P I N G S";
+    pub const SPENT: &str = "S P E N T";
+    pub const NEXT_PING: &str = "N E X T   P I N G";
     pub const COST: &str = "C O S T";
     pub const WINDOW: &str = "W I N D O W";
     pub const AGENT: &str = "A G E N T";

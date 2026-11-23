@@ -2006,6 +2006,9 @@ pub struct AppView {
     pub(crate) window_active: bool,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
+    /// The right panel's cache countdown: its next redraw (or status ask),
+    /// armed only while the panel shows a countdown ([`crate::warm`]).
+    warm_tick: Option<(Instant, Task<()>)>,
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
     /// not wholly covered, not minimized). Nothing polls while it is not.
     visible: bool,
@@ -2593,6 +2596,7 @@ impl AppView {
             view_seen: None,
             window_active: true,
             watch_poll: None,
+            warm_tick: None,
             visible: i.visible,
             fx: Rc::default(),
             receipts: HashMap::new(),
@@ -2811,6 +2815,11 @@ impl AppView {
                     && matches!(reply, synaps_client::CommandReply::Done(_))
                 {
                     self.panes.cur.cmd_clear = Some(text);
+                }
+            }
+            Effect::Status(seq) => {
+                if let Some(c) = &self.client {
+                    let _ = c.on(seq).status();
                 }
             }
         }
@@ -4483,6 +4492,46 @@ impl AppView {
             let _ = this.update(cx, |v, cx| v.watch_poll_now(cx));
         });
         self.watch_poll = Some((due, task));
+    }
+
+    /// The right panel's countdown redraws when what it says changes (each
+    /// second under ten minutes, each minute above), and the status is asked
+    /// again a little after a keep-warm ping is due: only while the panel
+    /// shows (`shown`) in a visible window. Cold, or nothing counting:
+    /// nothing armed (an idle window draws no frame for it).
+    fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
+        let seq = self.model.lives[self.panes.cur.live].attachment();
+        let refresh = warm.and_then(|w| w.refresh_at()).filter(|_| seq.is_some() && self.client.is_some());
+        let due = [warm.and_then(|w| w.next_change(now)), refresh].into_iter().flatten().min();
+        let Some(due) = due else {
+            self.warm_tick = None;
+            return;
+        };
+        if self.warm_tick.as_ref().is_some_and(|(at, _)| *at == due) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let left = due.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                cx.background_executor().timer(left).await;
+            }
+            let _ = this.update(cx, |v, cx| {
+                v.warm_tick = None;
+                // A due ping moved the cache's anchor: ask once.
+                if refresh.is_some_and(|r| Instant::now() >= r)
+                    && let (Some(c), Some(seq)) = (&v.client, seq)
+                {
+                    let _ = c.on(seq).status();
+                    if let Some(w) = v.model.lives[v.panes.cur.live].stats.warm.as_mut() {
+                        w.next_ping = None;
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.warm_tick = Some((due, task));
     }
 
     fn watch_poll_now(&mut self, cx: &mut Context<Self>) {
@@ -9245,6 +9294,7 @@ impl Render for AppView {
         self.schedule_tabs_save(cx);
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
+        self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
         let main = main.debug_selector(|| "pane-centre".into());

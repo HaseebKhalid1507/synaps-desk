@@ -128,6 +128,9 @@ pub struct Stats {
     pub subagents: Subagents,
     /// The attachment ended: these are the last numbers seen, not live.
     pub detached: bool,
+    /// Its prompt cache and keep-warm, as its last `Status` said
+    /// ([`crate::warm`]); kept across a re-attach of the same session.
+    pub warm: Option<crate::warm::Warm>,
 }
 
 impl Stats {
@@ -146,6 +149,7 @@ impl Stats {
         }
         subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
+        let warm = if same { self.warm.take() } else { None };
         *self = Stats {
             session: Some(a.meta.id.clone()),
             view: RuntimeInfo::from_value(&a.view),
@@ -156,6 +160,7 @@ impl Stats {
             files,
             subagents,
             detached: false,
+            warm,
         };
         self.subagents.replaying(true);
         for env in &a.replay {
