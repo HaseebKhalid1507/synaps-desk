@@ -1722,6 +1722,12 @@ async fn film4(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowConte
     let mut frames = gpui_kit::profiler::FrameTimingCollector::new();
     let _ = FILM_LOG.set(t0);
     film4_scene(view, cx, ex, t0, four).await;
+    film_frames(&mut frames, t0);
+}
+
+/// The frames drawn and presented since `frames` began, on the marks'
+/// clock (`FRAME`).
+fn film_frames(frames: &mut gpui_kit::profiler::FrameTimingCollector, t0: Instant) {
     for f in frames.collect_unseen() {
         let at = |i: Instant| i.checked_duration_since(t0).map_or(-1., |d| d.as_secs_f64());
         match f {
@@ -2104,12 +2110,36 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 return;
             }
             if how == "filmarrive" {
+                // Every frame on the marks' clock (#52: the handles and
+                // the idle after each landing, beside the capture). Nothing
+                // ambient: the rail's sessions rest (no beat) and an idle
+                // session is on screen (no running turn's dots), so a frame
+                // after a landing is one the landing asked for.
+                gpui_kit::profiler::set_trace_enabled(true);
+                let mut frames = gpui_kit::profiler::FrameTimingCollector::new();
+                let _ = FILM_LOG.set(t0);
+                act(cx, &|v, _, _| {
+                    for m in v.model.sessions.iter_mut() {
+                        (m.busy, m.subagents_running) = (false, 0);
+                    }
+                    v.model.rail_gen += 1;
+                    let idle = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+                    v.open_tab(idle, crate::tabs::Place::Current);
+                });
+                // The focus off the composer once each move has started: its
+                // caret blinks a frame every 500 ms.
+                let unfocus = |cx: &mut AsyncWindowContext| {
+                    mark("unfocus");
+                    act(cx, &|v, w, cx| w.focus(&v.focus, cx));
+                };
                 sleep(5.0).await;
                 for panes in ["1p", "2p"] {
                     if panes == "2p" {
                         mark("split");
                         act(cx, &|v, w, cx| v.split_pane(None, w, cx));
-                        sleep(2.0).await;
+                        sleep(0.1).await;
+                        unfocus(cx);
+                        sleep(1.9).await;
                     }
                     for what in ["fold", "unfold"] {
                         mark(&format!("{panes}-rail-{what}"));
@@ -2123,8 +2153,11 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                         v.in_pane(last, |v| v.close_pane());
                     }
                 });
-                sleep(1.5).await;
+                sleep(0.1).await;
+                unfocus(cx);
+                sleep(1.4).await;
                 mark("done");
+                film_frames(&mut frames, t0);
                 return;
             }
             // Three across (the panels yield to their strips), then the

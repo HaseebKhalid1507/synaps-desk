@@ -1194,26 +1194,19 @@ impl AppView {
             if dragged == Some(i) {
                 self.fx.spring_jump(PANEL_W[i], to, to, f.response);
             }
-            let asked = self.fx.asks();
-            let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
-            // A layout riding it (#51): on whole pixels, as its panes are,
+            // Landed in the frame it is drawn at its target (#47, #52). A
+            // layout riding it (#51): on whole pixels, as its panes are,
             // and its target itself once it rounds to it, at any scale (at
             // 125 % a target off the device grid, 481 → 480.8, would never
             // equal a whole pixel: Shady #54 L1).
             let at = self.fx.snap(to);
-            let w = match self.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()) {
+            let ride = self.panes.flight.as_ref().is_some_and(|f| f.ride.is_some());
+            let whole = move |w: f32| match ride {
                 true if w.round() == at.round() => at,
                 true => w.round(),
                 false => w,
             };
-            // Drawn at its target: landed, its spring at rest (no frame
-            // and no timer for the settling it would draw nothing of).
-            let landed = moving && w == at;
-            if landed {
-                self.fx.spring_jump(PANEL_W[i], to, to, f.response);
-                self.fx.ask_back(asked);
-            }
-            (f.shown, f.moving) = (w, moving && !landed);
+            (f.shown, f.moving) = self.fx.spring_px_land_as(PANEL_W[i], to, f.response, whole);
             if let Side::Open(ow) = side {
                 f.open = ow;
             }

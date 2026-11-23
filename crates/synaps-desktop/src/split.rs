@@ -94,16 +94,12 @@ pub(crate) struct Flight {
 /// A layout riding a yielding panel's spring (#51): its step is how far
 /// the centre has gone from where they start to where they land (each
 /// pane's width moving linearly between its ends, [`Node::lerp_px_from`]),
-/// and it lands with the panel.
+/// and it lands with the panel, in the frame the panel does (#52).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Ride {
     /// The centre's width where they start, and where they land.
     pub from: f32,
     pub to: f32,
-    /// The frame it first drew the landed layout: the flight is over the
-    /// frame after (as a layout's own flight, which lands a frame or more
-    /// before its spring rests).
-    pub landed: Option<std::time::Instant>,
 }
 
 impl Flight {

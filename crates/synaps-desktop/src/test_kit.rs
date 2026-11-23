@@ -107,8 +107,17 @@ fn motion_level(cx: &mut TestAppContext, view: &Entity<AppView>, level: crate::m
 /// One 144 Hz frame later, drawn.
 fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let dt = std::time::Duration::from_micros(6944);
-    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-    cx.executor().advance_clock(dt);
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();

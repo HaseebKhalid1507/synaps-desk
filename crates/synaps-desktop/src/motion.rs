@@ -1626,13 +1626,14 @@ impl Motion {
 
     /// What this frame has asked for so far (a frame, a timer), to take
     /// back what a step asked after it ([`Motion::ask_back`]).
-    pub(crate) fn asks(&self) -> (bool, bool, Option<Instant>) {
+    fn asks(&self) -> (bool, bool, Option<Instant>) {
         (self.display.get(), self.pane_wants.get(), self.next.get())
     }
 
-    /// The asks as [`Motion::asks`] read them: a spring landed by its
-    /// caller asks for no frame and no timer of its own.
-    pub(crate) fn ask_back(&self, (display, pane, next): (bool, bool, Option<Instant>)) {
+    /// The asks as [`Motion::asks`] read them: a spring landed on arrival
+    /// asks for no frame and no timer of its own
+    /// ([`Motion::spring_px_land`]).
+    fn ask_back(&self, (display, pane, next): (bool, bool, Option<Instant>)) {
         self.display.set(display);
         self.pane_wants.set(pane);
         self.next.set(next);
@@ -2032,6 +2033,36 @@ impl Motion {
             self.want_at(next);
         }
         (shown, true)
+    }
+
+    /// [`Motion::spring_px`], landed on arrival (#52): the frame it is
+    /// drawn at its target it is at rest there. It says it no longer moves,
+    /// its spring is settled, and it asks for no frame and no timer for the
+    /// settling that follows (under a pixel, 6 or 7 frames at 144 Hz, that
+    /// draws nothing new). What waits for it to stop (a panel's column
+    /// re-wrap, a layout's flight and the dividers' handles, a composer's
+    /// inset) goes in the frame it arrives, and nothing wakes after it. A
+    /// move after it starts from rest ([`Motion::spring_jump`]); at Reduced
+    /// and Off a spring never moves, so this is [`Motion::spring_px`].
+    pub(crate) fn spring_px_land(&self, key: u64, target: f32, response: f32) -> (f32, bool) {
+        self.spring_px_land_as(key, target, response, |v| v)
+    }
+
+    /// [`Motion::spring_px_land`] for a value drawn as `draw` maps it (a
+    /// layout riding a panel on whole logical pixels; a layout's travel,
+    /// its end drawn within a pixel of it): it lands in the frame `draw`
+    /// gives the target on the device grid (`snap(target)`), and that is
+    /// what it returns then.
+    pub(crate) fn spring_px_land_as(&self, key: u64, target: f32, response: f32, draw: impl Fn(f32) -> f32) -> (f32, bool) {
+        let asked = self.asks();
+        let (v, moving) = self.spring_px(key, target, response);
+        let (v, at) = (draw(v), self.snap(target));
+        if moving && v == at {
+            self.spring_jump(key, target, target, response);
+            self.ask_back(asked);
+            return (at, false);
+        }
+        (v, moving)
     }
 
     /// Value `key` eased toward `to` (a label's colour, as 0..1): over `up`
@@ -3974,5 +4005,63 @@ mod column_tests {
         assert_eq!(fx.col(PaneId::nth(1)).birth(9), None);
         fx.rescope(5, 5);
         assert_eq!(fx.col(PaneId::FIRST).birth(9), None, "the delegate rescoped the first column");
+    }
+}
+
+/// #52: [`Motion::spring_px_land`] (its own module: `tests` and
+/// `column_tests` stay as they were).
+#[cfg(test)]
+mod land_tests {
+    use super::{Level, Motion, SHEET_RESPONSE};
+    use std::time::{Duration, Instant};
+
+    /// A pixel spring landed on arrival, driven as the app drives it (the
+    /// next 144 Hz frame, or the timer it asks for): in the frame it is
+    /// drawn at its target it no longer moves and asks for no frame and no
+    /// timer, and it stays there. [`Motion::spring_px`] on the same flight
+    /// draws that frame still moving, and wakes again as it settles. At
+    /// Reduced it is there at once, as `spring_px` is.
+    #[test]
+    fn a_pixel_spring_lands_in_the_frame_it_arrives() {
+        let mut lands = Vec::new();
+        for land in [false, true] {
+            let t0 = Instant::now();
+            let m = Motion::new(t0);
+            let step = |m: &Motion| if land { m.spring_px_land(9, 0., SHEET_RESPONSE) } else { m.spring_px(9, 0., SHEET_RESPONSE) };
+            m.begin_frame(Level::Full, false, t0);
+            m.spring_jump(9, 280., 0., SHEET_RESPONSE);
+            let (mut t, mut frames) = (t0, Vec::new());
+            for _ in 0..200 {
+                m.begin_frame(Level::Full, false, t);
+                let (v, moving) = step(&m);
+                let asks = m.demand();
+                frames.push((v, moving, asks));
+                if !moving {
+                    break;
+                }
+                t = match asks {
+                    (true, _) => t + Duration::from_micros(6944),
+                    (false, Some(at)) => at,
+                    (false, None) => panic!("moving, and nothing asked for"),
+                };
+            }
+            let arrives = frames.iter().position(|f| f.0 == 0.).expect("drawn at its target");
+            if land {
+                assert_eq!(arrives, frames.len() - 1, "lands in the frame it arrives: {frames:?}");
+                assert_eq!(frames[arrives].2, (false, None), "and asks for nothing");
+                for k in 1..4u64 {
+                    m.begin_frame(Level::Full, false, t + Duration::from_millis(100 * k));
+                    assert_eq!((step(&m), m.demand()), ((0., false), (false, None)), "at rest after it");
+                }
+            } else {
+                assert!(arrives + 1 < frames.len() && frames[arrives].1, "spring_px moves on at its target: {frames:?}");
+            }
+            lands.push(arrives);
+        }
+        assert_eq!(lands[0], lands[1], "the same frames up to the arrival");
+        let m = Motion::new(Instant::now());
+        m.begin_frame(Level::Reduced, false, Instant::now());
+        m.spring_jump(9, 280., 0., SHEET_RESPONSE);
+        assert_eq!((m.spring_px_land(9, 0., SHEET_RESPONSE), m.demand()), ((0., false), (false, None)), "Reduced: at once");
     }
 }
