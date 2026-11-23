@@ -7039,7 +7039,8 @@ impl AppView {
         if !moving.get() {
             return to;
         }
-        let (at, still_moving) = self.fx.spring_px(key, to, crate::motion::SHEET_RESPONSE);
+        // Landed in the frame it is drawn at `to` (#52): no wake after.
+        let (at, still_moving) = self.fx.spring_px_land(key, to, crate::motion::SHEET_RESPONSE);
         moving.set(still_moving);
         at
     }
@@ -8351,9 +8352,12 @@ impl AppView {
     /// The layout as drawn this frame in `area` (split.md §10): the tree at
     /// rest; in a flight, its step on `sheet`, on whole pixels. The step
     /// is `from` to `to` by the spring's travel; within a pixel of its end
-    /// it is the tree itself, so the last frame that moves draws the landed
-    /// layout and nothing moves after it. Reduced and Off: the tree, at
-    /// once ([`crate::motion::Motion::spring_jump`] starts nothing).
+    /// it is the tree itself, and the flight is over in that frame (#52:
+    /// [`crate::motion::Motion::spring_px_land`]), so the last frame that
+    /// moves draws the landed layout, its closing panes go and its dividers
+    /// take their handles in it, and nothing moves or wakes after it.
+    /// Reduced and Off: the tree, at once
+    /// ([`crate::motion::Motion::spring_jump`] starts nothing).
     pub(crate) fn pane_flight_frame(&mut self, area: crate::split::Rect) -> crate::split::Node {
         let drawn = self.pane_flight_step(area);
         // Where the next flight starts (Shady #42 M1).
@@ -8376,35 +8380,31 @@ impl AppView {
             self.fx.spring_jump(PANE_FLIGHT, from, f.travel, crate::motion::SHEET_RESPONSE);
         }
         // A panel yielding on it (#51): the layout rides the panel's
-        // spring, by how far the centre has gone, and lands with it (the
-        // frame the panel is drawn at its target, #50).
+        // spring, by how far the centre has gone, and lands with it, in the
+        // frame the panel is drawn at its target (#50, #52).
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
                 let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(0., 1.) };
                 let at = |w: f32| crate::split::Rect { w, ..area };
                 return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
             }
-            let now = self.fx.now();
-            match r.landed {
-                Some(at) if at < now => self.panes.flight = None,
-                Some(_) => {}
-                None => {
-                    f.ride = Some(crate::split::Ride { landed: Some(now), ..r });
-                    self.fx.want_frame();
-                }
-            }
+            self.panes.flight = None;
             return self.panes.tree.clone();
         }
-        let (d, moving) = self.fx.spring_px(PANE_FLIGHT, f.travel, crate::motion::SHEET_RESPONSE);
+        // Within a pixel of its travel it is drawn at its end (the tree):
+        // landed then, not when the spring settles (#52).
+        let travel = f.travel;
+        let end = self.fx.snap(travel);
+        let near = |d: f32| if (travel - d).abs() < 1. { end } else { d };
+        let (d, moving) = self.fx.spring_px_land_as(PANE_FLIGHT, travel, crate::motion::SHEET_RESPONSE, near);
         if let Some(t0) = crate::pane::FILM_LOG.get() {
-            eprintln!("FLIGHT {:.4} {d:.1} of {:.1}", self.fx.now().saturating_duration_since(*t0).as_secs_f64(), f.travel);
+            eprintln!("FLIGHT {:.4} {d:.1} of {:.1}", self.fx.now().saturating_duration_since(*t0).as_secs_f64(), travel);
         }
         if !moving {
             self.panes.flight = None;
             return self.panes.tree.clone();
         }
-        let t = if (f.travel - d).abs() < 1. { 1. } else { (d / f.travel).clamp(0., 1.) };
-        if t >= 1. { self.panes.tree.clone() } else { f.to.lerp_from(&f.from, t) }
+        f.to.lerp_from(&f.from, (d / travel).clamp(0., 1.))
     }
 
     /// The layout changes to `to` on `sheet` from where it is drawn
@@ -8770,20 +8770,23 @@ impl Render for AppView {
         // Over a view the layout is drawn without the right panel (below:
         // `view_pane`), so it has nothing to ride: it flies on its own
         // spring (Shady #54 M1).
+        let lone_view = view.is_some() && !self.panes.split();
         if with_panes
             && self.panel_fx.moving()
-            && !(view.is_some() && !self.panes.split())
+            && !lone_view
             && let Some(f) = self.panes.flight.as_mut()
         {
-            f.ride = Some(crate::split::Ride { from: pane, to: pane_to, landed: None });
+            f.ride = Some(crate::split::Ride { from: pane, to: pane_to });
         }
         // Its ends moved under it (a fold or unfold, an edge drag, a width
-        // reset, a resize): the layout flies on from where it is drawn on
-        // its own spring, from rest, as on main (Shady #54 M2). Its wraps
+        // reset, a resize), or a view came on screen in the pane a close
+        // leaves (Settings, Usage: drawn without the right panel, as M1
+        // above): the layout flies on from where it is drawn on its own
+        // spring, from rest, as on main (Shady #54 M2, L3). Its wraps
         // carry on, the narrower kept (`wrap_at`: none yet).
         if let Some(f) = self.panes.flight.as_mut()
-            && let Some(r) = f.ride.filter(|r| r.landed.is_none())
-            && (resized || (r.to - pane_to).abs() >= 0.5)
+            && let Some(r) = f.ride
+            && (resized || (r.to - pane_to).abs() >= 0.5 || lone_view)
         {
             f.from = self.panes.drawn.clone();
             f.ride = None;

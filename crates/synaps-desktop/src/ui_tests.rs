@@ -1833,9 +1833,7 @@ fn idle_requests_no_frames(cx: &mut TestAppContext) {
 /// never fight. Folding and unfolding the rail on `sheet` asks for the
 /// same display frames at the same widths whether its sessions run (their
 /// lattices on the beat layer, clipped with the flight's box) or rest: the
-/// beat adds no frame to the spring (#47: the panel lands in the frame it
-/// arrives at its width; running, the unfold can arrive a frame sooner,
-/// never later). Folded, the strip draws no lattice:
+/// beat adds no frame to the spring. Folded, the strip draws no lattice:
 /// nothing on the layer, no frame, no timer, though the sessions still run.
 /// Unfolded, their lattices are back on the beat.
 #[gpui_kit::test]
@@ -1894,24 +1892,11 @@ fn the_rails_lattices_and_its_fold_never_fight(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.fx.on_beats(at, 1)), "the timer is the beat's");
     busy(cx, false);
     assert_eq!(spins(cx), 0, "at rest");
-    // #47: the unfold landed in a frame stamped with a wake ahead of the
-    // test's clock, and `settle` doesn't move the clock; the late landing's
-    // settling frames moved it past. At rest a while: the fold starts on the
-    // clock, as the running one did.
-    wait(cx, w, &view, 500);
     let rest_fold = fly(cx);
     settle(cx, w, 8);
     let rest_unfold = fly(cx);
     assert_eq!(busy_fold, rest_fold, "the fold: the same frames, running or not");
-    // #47: the panel lands in the frame it arrives at its width. Running, a
-    // beat's wake can fall on the spring's (one wake, the later one:
-    // `Motion::arm`), and the frame it draws is stamped with it
-    // (`Motion::tick`): the unfold can arrive a frame sooner. The beat adds
-    // no frame: running, the same frames as at rest, up to the arrival.
-    assert!(
-        rest_unfold.starts_with(&busy_unfold) && rest_unfold.len() - busy_unfold.len() <= 1,
-        "the unfold: the same frames, running or not (none added): {busy_unfold:?} {rest_unfold:?}"
-    );
+    assert_eq!(busy_unfold, rest_unfold, "the unfold: the same frames, running or not");
 }
 
 /// Nothing runs in the column, the composer or the tray (Shady #17 M3,
@@ -4861,11 +4846,22 @@ fn a_change_after_beats_still_draws(cx: &mut TestAppContext) {
 // ── fluid (cohesion/fluid.md §7, F1) ──────────────────────────────────
 
 /// One display frame (144 Hz) later: the motion clock (the test's, [`open_with`])
-/// and the executor's move on together, then the app draws.
+/// and the executor's move on together, then the app draws. Timer by timer: each
+/// fires with the motion clock at its deadline, as it would read then (#52: set to
+/// the step's end first, a timer firing mid-step drew, and armed the next, ahead).
 fn fluid_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let dt = std::time::Duration::from_micros(6944);
-    view.read_with(cx, |v, _| v.fx.set_clock(v.fx.clock() + dt));
-    cx.executor().advance_clock(dt);
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
     view.update(cx, |_, cx| cx.notify());
     cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
     cx.run_until_parked();
@@ -7824,7 +7820,8 @@ fn scroll_tests_unchanged() {
         // The helpers they call.
         ("a_folded_run", 0x19bc_8ea1_9ee7_246c),
         ("attached", 0x121a_81e7_74c9_398c),
-        ("fluid_frame", 0xbbfc_1d0b_594d_4177),
+        // #52: timer by timer, the motion clock at each deadline.
+        ("fluid_frame", 0xe627_fe81_33af_a721),
         ("frame", 0xb938_3690_352a_5ffb),
         ("frames", 0x78aa_3c16_3afd_0efe),
         ("motion_pending", 0x8743_a6e6_23ae_a4c0),
