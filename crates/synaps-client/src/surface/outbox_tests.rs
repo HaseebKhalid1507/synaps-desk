@@ -179,6 +179,34 @@ fn retryable_refusals_back_off_1_2_4_to_30_seconds() {
     }
 }
 
+/// Shady #75 O2: the automatic backoff is for a result that says `retry:
+/// true`, as §3.3 has `reloading`, `rate_limited` and `busy` say. One that
+/// says `false`, or nothing (a daemon off the spec), is never re-sent by
+/// the clock: it waits for the user's Retry, with the action unchanged.
+#[test]
+fn only_a_refusal_that_says_retry_is_retried_automatically() {
+    let t = Instant::now();
+    for reason in [SurfaceRefusal::Reloading, SurfaceRefusal::RateLimited, SurfaceRefusal::Busy] {
+        let yes = SurfaceResult { retry: Some(true), ..refused(reason) };
+        assert!(matches!(sent(t).on_result(&yes, t), Next::Stay(Step::Backoff { .. })), "{reason:?}");
+        for retry in [Some(false), None] {
+            let r = SurfaceResult { retry, ..refused(reason) };
+            let backing_off = at(Step::Backoff { connection: CONN, due: t + s(2), delay: s(2), reason });
+            for e in [sent(t), backing_off] {
+                let from = e.step;
+                let next = e.on_result(&r, t + s(1));
+                assert!(matches!(next, Next::Stay(Step::Held { .. })), "{reason:?} retry {retry:?} from {from:?}: {next:?}");
+                let e = e.apply(next).unwrap();
+                assert_eq!(e.due(t + s(1)), None, "{reason:?} retry {retry:?}");
+                assert_eq!(e.tick(t + s(3600)), Next::Stay(e.step), "never re-sent by the clock");
+                let again = Next::Send(Step::Sent { connection: CONN, sends: 1, at: t + s(9), backoff: None });
+                assert_eq!(e.retry(CONN, t + s(9)), again, "the user's Retry");
+                assert_eq!(e.action, action(Verb::Answer, 0), "the same id and values");
+            }
+        }
+    }
+}
+
 /// Row 4: `storage` and `unavailable` (each `detail`, or none) hold for
 /// the user's Retry, which re-sends the same id; nothing else re-sends it.
 #[test]
@@ -279,6 +307,67 @@ fn no_reply_resends_until_three_sends_then_holds() {
     let retry = held.retry(CONN, t + s(20));
     let retried = held.apply(retry).unwrap();
     assert_eq!(retried.tick(t + s(25)), Next::Send(Step::Sent { connection: CONN, sends: 2, at: t + s(25), backoff: None }));
+}
+
+/// Shady #75 M1, his sequence on one connection: sends at 0, 5 and 10 s
+/// unanswered, held at 15 s ("Not sent · Retry"), and the daemon's
+/// `pending` at 16 s. The daemon holds the action, so the entry waits for
+/// the final result, "saving…" from 18 s (§3.8): the user's Retry at 17 s
+/// and the clock send nothing on that connection, and a new connection's
+/// snapshot re-sends it there. A later send's `pending` while held for the
+/// daemon's `storage` or `unavailable` is the same. Held across a
+/// disconnect, an entry waits for the new connection's snapshot.
+#[test]
+fn a_late_pending_after_the_cap_waits_for_the_final_result() {
+    let t = Instant::now();
+    let pending = result(SurfaceOutcome::Pending, None);
+    let mut e = sent(t);
+    for (k, sends) in [(5, 2), (10, 3)] {
+        let next = e.tick(t + s(k));
+        assert_eq!(next, Next::Send(Step::Sent { connection: CONN, sends, at: t + s(k), backoff: None }), "+{k} s");
+        e = e.apply(next).unwrap();
+    }
+    let held = e.tick(t + s(15));
+    assert!(matches!(held, Next::Stay(Step::Held { .. })), "{held:?}");
+    let e = e.apply(held).unwrap();
+    let late = e.on_result(&pending, t + s(16));
+    assert_eq!(late, Next::Stay(Step::Pending { connection: CONN, since: t + s(16) }), "the daemon holds it: pending, not held");
+    let e = e.apply(late).unwrap();
+    assert_eq!(e.retry(CONN, t + s(17)), Next::Stay(e.step), "Retry sends nothing on the connection it is pending on");
+    assert_eq!(e.due(t + s(17)), Some(t + s(18)), "one wake, for \"saving…\"");
+    assert!(!e.saving(t + s(17)) && e.saving(t + s(18)));
+    for later in [s(18), s(20), s(600)] {
+        assert_eq!(e.tick(t + later), Next::Stay(e.step), "no re-send at +{later:?}");
+    }
+    assert_eq!(e.on_result(&result(SurfaceOutcome::Accepted, None), t + s(30)), Next::Done, "its final result settles it");
+    // Or its connection goes first: the new one's snapshot re-sends it.
+    let gone = e.on_disconnect();
+    assert_eq!(gone, Next::Stay(Step::Detached));
+    let away = e.apply(gone).unwrap();
+    let resend = Next::Send(Step::Sent { connection: CONN + 1, sends: 1, at: t + s(40), backoff: None });
+    assert_eq!(away.on_snapshot(Some(&card(None)), CONN + 1, t + s(40)), resend);
+
+    // Held for the daemon's refusal of one send; a later send's `pending`.
+    let unavailable = SurfaceResult { detail: Some(SurfaceUnavailable::QueueFull), ..refused(SurfaceRefusal::Unavailable) };
+    for r in [refused(SurfaceRefusal::Storage), unavailable] {
+        let next = sent(t).on_result(&r, t + s(1));
+        assert!(matches!(next, Next::Stay(Step::Held { .. })), "{r:?}: {next:?}");
+        let e = sent(t).apply(next).unwrap();
+        assert_eq!(e.on_result(&pending, t + s(2)), Next::Stay(Step::Pending { connection: CONN, since: t + s(2) }), "{r:?}");
+    }
+
+    // Held, then the connection goes: only the new connection's snapshot
+    // decides (§3.8), so no Retry on either connection before it.
+    let held = sent(t).apply(sent(t).on_result(&refused(SurfaceRefusal::Storage), t)).unwrap();
+    let gone = held.on_disconnect();
+    assert!(matches!(gone, Next::Stay(Step::Held { .. })), "still \"Not sent · Retry\": {gone:?}");
+    let away = held.apply(gone).unwrap();
+    assert_eq!(away.on_result(&pending, t + s(1)), Next::Stay(away.step));
+    for c in [CONN, CONN + 1] {
+        assert_eq!(away.retry(c, t + s(2)), Next::Stay(away.step), "connection {c}, before the snapshot");
+    }
+    let resend = Next::Send(Step::Sent { connection: CONN + 1, sends: 1, at: t + s(3), backoff: None });
+    assert_eq!(away.on_snapshot(Some(&card(None)), CONN + 1, t + s(3)), resend);
 }
 
 /// A lost connection sends nothing until a new one's snapshot reconciles
