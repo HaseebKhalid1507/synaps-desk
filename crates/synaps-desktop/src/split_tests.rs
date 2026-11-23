@@ -5557,10 +5557,9 @@ fn the_layout_is_saved_after_a_change_and_on_quit(cx: &mut TestAppContext) {
 /// unfold) is lit in the frame it is drawn: on `cf28780` its fill came a
 /// frame later, at Off the one frame after the move. Frame by frame
 /// drawn ([`draws`]), only the frames the app asks for ([`asked_frame`]).
-/// A split's new pane takes the focus: its composer's caret comes on a
-/// frame after (the kit's input), so a split is checked for its strip.
-/// The panels' save ([`crate::app::SAVE_DELAY`] after a fold) is its own.
-/// At Full, within 100 ms of the landing (its follow-up, a settling tail).
+/// A split's new pane takes the focus, and its frames after the move are
+/// its own (its composer's), so a split is checked for its strip. At
+/// Full, within 100 ms of the landing (a follow-up, a settling tail).
 #[gpui_kit::test]
 fn nothing_is_drawn_after_a_landing(cx: &mut TestAppContext) {
     use crate::motion::Level;
@@ -5662,9 +5661,10 @@ fn nothing_is_drawn_after_a_landing(cx: &mut TestAppContext) {
                 continue;
             }
             // The landing's own: within 100 ms (a follow-up frame, a
-            // spring's settling tail: 6-7 frames). Later ones are not the
-            // landing's (not a motion ask, not the app's frame requests:
-            // the kit's tooltip delay under the resting pointer).
+            // spring's settling tail: 6-7 frames). A later one is not the
+            // landing's: no motion ask and none of the app's frame
+            // requests drew it (one, ~0.5 s after a fold or an unfold
+            // under the resting pointer, is a notify of its own).
             let after: Vec<f64> = seen[last + 1..].iter().map(|s| s.0.duration_since(seen[last].0).as_secs_f64() * 1000.).collect();
             if case != "a split" && after.iter().any(|&ms| ms < 100.) {
                 fails.push(format!("{l:?}, {case}: frames drawn after the landing (frame {last}), ms after it: {after:.1?}"));
