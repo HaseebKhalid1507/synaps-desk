@@ -8567,6 +8567,11 @@ impl AppView {
         }
         let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
         let (was, now) = (of(was), of(self.pane_yield));
+        // Taking over a flight that rode a yielding panel (a split's close
+        // mid-flight): that panel turns back with its velocity, and the
+        // layout rides it on, if no other panel flies.
+        let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride));
+        let others = (0..2).any(|i| was[i] == now[i] && (self.panel_fx.sides[i].from.is_some() || self.panel_fx.sides[i].moving));
         let mut flew = false;
         for i in 0..2 {
             if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
@@ -8581,7 +8586,7 @@ impl AppView {
                 }
             }
         }
-        flew && !panels
+        flew && (!panels || (rode && !others))
     }
 
     /// [`AppView::pane_sides`], judged now.
@@ -8674,10 +8679,12 @@ impl AppView {
             // at rest, landed; read only if the ride is handed back (Shady
             // #54 M2).
             let from = if f.ride.is_some() { f.travel } else { 0. };
-            let v = carry
-                .filter(|_| f.ride.is_none())
-                .and_then(|was| Some(f.carried(&was, self.fx.spring_velocity(PANE_FLIGHT)?, area)))
-                .unwrap_or(0.);
+            let v = match carry {
+                Some(crate::pane::Carry::Spring(a, b, len)) if f.ride.is_none() => {
+                    self.fx.spring_velocity(PANE_FLIGHT).map_or(0., |v| f.carried(&(a, b, len), v, area))
+                }
+                _ => 0.,
+            };
             self.fx.spring_jump_moving(PANE_FLIGHT, from, f.travel, v, crate::motion::SHEET_RESPONSE);
         }
         // A panel yielding on it (#51): the layout rides the panel's
@@ -8685,7 +8692,9 @@ impl AppView {
         // frame the panel is drawn at its target (#50, #52).
         if let Some(r) = f.ride {
             if self.panel_fx.moving() {
-                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(0., 1.) };
+                // Under 0 while a panel turned back carries on its way first
+                // (a split's close mid-flight: [`crate::pane::Carry::Ride`]).
+                let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).clamp(-1., 1.) };
                 let at = |w: f32| crate::split::Rect { w, ..area };
                 return f.to.lerp_px_from(&f.from, t, at(r.from), at(r.to), area);
             }
@@ -9081,7 +9090,12 @@ impl Render for AppView {
             && !lone_view
             && let Some(f) = self.panes.flight.as_mut()
         {
-            f.ride = Some(crate::split::Ride { from: pane, to: pane_to });
+            // Riding on (`Carry::Ride`): from the width its `from` was drawn
+            // at, the last frame's, so this frame carries on as that ride
+            // would have.
+            let rode = matches!(self.panes.carry, Some(crate::pane::Carry::Ride));
+            let from = if rode { self.centre.get().0 } else { pane };
+            f.ride = Some(crate::split::Ride { from, to: pane_to });
         }
         // Its ends moved under it (a fold or unfold, an edge drag, a width
         // reset, a resize), or a view came on screen in the pane a close
