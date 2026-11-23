@@ -722,7 +722,11 @@ fn one() -> u64 {
 /// A position in the saved-session order (`wire::CatalogCursor`, today
 /// `{updated_at, id}`). Opaque to the client: whatever JSON a reply's
 /// `next` is goes back as the next request's `before`, unchanged, so a
-/// change of the cursor's shape never makes a page undecodable.
+/// change of the cursor's shape never makes a page undecodable. Unchanged
+/// as a JSON value, not as bytes: built without serde_json's
+/// `preserve_order` (the client crate on its own) its keys go back sorted;
+/// the desktop's build keeps the daemon's order. The daemon reads it by
+/// field, so either is the same cursor; compare it as a value (#28).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CatalogCursor(pub Value);
