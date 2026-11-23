@@ -112,7 +112,7 @@ pub(crate) fn mark_edges(mut out: Vec<Disp>) -> Vec<Disp> {
 /// scale.
 pub(crate) fn slab(top: bool, bottom: bool, body: impl IntoElement, p: &Palette, g: Geo, scale: f32) -> Div {
     let r = px(g.radius);
-    let edge = if g.edge > 0. { g.edge } else { 0. };
+    let edge = if g.edge > 0. && scale > 0. { g.edge } else { 0. };
     let pad = |d: Div, w: f32| d.px(px(w)).when(top, |d| d.pt(px(w))).when(bottom, |d| d.pb(px(w)));
     let fill = div().w_full().bg(p.card_d).when(top, |d| d.rounded_tl(r).rounded_tr(r)).when(bottom, |d| d.rounded_bl(r).rounded_br(r));
     pad(fill, edge).child(pad(div(), g.inset).child(body))
