@@ -64,7 +64,17 @@ pub fn register(cx: &mut App) {
     if let Err(e) = cx.text_system().add_fonts(FILES.iter().map(|b| Cow::Borrowed(*b)).collect()) {
         eprintln!("synaps-desktop: embedded fonts not loaded: {e}");
     }
+    #[cfg(test)]
+    cx.set_global(Registered);
 }
+
+/// Tests: [`register`] ran (the test platform's text system loads no font,
+/// so it has nothing else to show).
+#[cfg(test)]
+pub(crate) struct Registered;
+
+#[cfg(test)]
+impl gpui_kit::Global for Registered {}
 
 /// Tracked display labels.
 pub mod label {

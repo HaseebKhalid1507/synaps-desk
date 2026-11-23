@@ -1,0 +1,1 @@
+{"version":"1.0","createSurface":{"surfaceId":"plan-preview","catalogId":"synaps-desk:preview/1","components":[{"id":"root","component":"Column","children":["title","step"]},{"id":"title","component":"Text","text":"Implementation plan"},{"id":"step","component":"Text","text":"1. Validate the native surface renderer."}]}}
