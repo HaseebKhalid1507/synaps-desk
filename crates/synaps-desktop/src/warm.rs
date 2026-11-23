@@ -174,14 +174,30 @@ pub(crate) fn mode_line(w: &Warm) -> String {
     if w.pinned { format!("{mode} · pinned") } else { mode.to_string() }
 }
 
-/// The TTL as honoured, and what was asked when it differs: `5m (1h asked)`.
+/// The TTL as honoured, and what was asked when it differs, short enough
+/// for the panel's half column (at most [`TTL_CHARS`]): `5m ↓ 1h` (a 1h
+/// request the server kept for 5m), `5m of 1h` (asked 1h, not proved yet).
 pub(crate) fn ttl_line(w: &Warm) -> Option<String> {
     let ttl = w.ttl.as_deref()?;
     Some(match w.setting.as_deref() {
-        _ if w.downgraded => format!("{ttl} (1h downgraded)"),
-        Some(s) if s != ttl && s != "auto" => format!("{ttl} ({s} asked)"),
+        _ if w.downgraded => format!("{ttl} ↓ 1h"),
+        Some(s) if s != ttl && s != "auto" => format!("{ttl} of {s}"),
         _ => ttl.to_string(),
     })
+}
+
+/// The TTL line's longest, in mono characters: the half column of a
+/// 296 px panel holds about 124 px (7.8 px a character at mono 13).
+pub(crate) const TTL_CHARS: usize = 15;
+
+/// What a short TTL line means, in words (its tooltip); `None`: it says it.
+pub(crate) fn ttl_tip(w: &Warm) -> Option<String> {
+    let ttl = w.ttl.as_deref()?;
+    match w.setting.as_deref() {
+        _ if w.downgraded => Some(format!("1h asked; the server kept {ttl} (a silent downgrade)")),
+        Some(s) if s != ttl && s != "auto" => Some(format!("{s} asked; counted as {ttl} until a {s} write proves it")),
+        _ => None,
+    }
 }
 
 /// The status is asked again for this event: an attach (or a reconnect),
@@ -225,7 +241,8 @@ mod tests {
         let w = Warm::from_status(&status(json!({"ttl": "5m", "ttl_secs": 300, "expires_in_secs": 222, "downgraded": true})), t0);
         assert_eq!((w.mode.as_str(), w.pinned, w.pings), ("auto", true, 3));
         assert_eq!(mode_line(&w), "auto · pinned");
-        assert_eq!(ttl_line(&w).as_deref(), Some("5m (1h downgraded)"));
+        assert_eq!(ttl_line(&w).as_deref(), Some("5m ↓ 1h"));
+        assert!(ttl_tip(&w).is_some_and(|t| t.contains("downgrade")));
         assert_eq!(clock(w.left(t0).unwrap()), "3:42");
         assert_eq!(clock(w.left(after(t0, 222)).unwrap()), "cold");
         assert_eq!(clock(w.left(after(t0, 400)).unwrap()), "cold", "never below zero");
@@ -319,5 +336,25 @@ mod tests {
         assert_eq!((w.left(t0), w.ttl.as_deref(), w.downgraded), (None, None, false));
         assert!(w.knows_expiry, "cold, not unknown");
         assert_eq!(w.next_change(t0), None);
+    }
+
+    /// Every TTL line fits the half column of the default 296 px panel
+    /// (finish gate M2: "5m (1h downgraded)" was ~140 px in ~124).
+    #[test]
+    fn the_ttl_line_fits_its_column() {
+        let t0 = Moment::now();
+        for (cache, setting) in [
+            (json!({"ttl": "5m", "downgraded": true}), "1h"),
+            (json!({"ttl": "5m"}), "1h"),
+            (json!({"ttl": "1h"}), "1h"),
+            (json!({"ttl": "5m"}), "auto"),
+            (json!({"ttl": "5m"}), "hybrid"),
+        ] {
+            let mut st = status(cache);
+            st["cache_ttl"]["setting"] = json!(setting);
+            let w = Warm::from_status(&st, t0);
+            let line = ttl_line(&w).unwrap();
+            assert!(line.chars().count() <= TTL_CHARS, "{line:?}");
+        }
     }
 }
