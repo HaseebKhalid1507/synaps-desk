@@ -1528,10 +1528,16 @@ pub fn load_str(path: &Path, key: &str) -> Option<String> {
     load_settings(path)?.get(key)?.as_str().map(str::to_string).filter(|v| !v.is_empty())
 }
 
-/// A flag the app reads under `key` (`panes.split`); missing or not a
-/// bool: off.
-pub fn load_flag(path: &Path, key: &str) -> bool {
-    load_settings(path).and_then(|v| v.get(key)?.as_bool()).unwrap_or(false)
+/// Split panes on (`panes.split`): on unless the file says `false`
+/// (split panes step 6 turned them on by default; that is the off switch,
+/// with `SYNAPS_DESK_SPLIT=0` for a run).
+pub fn split_flag(v: &serde_json::Value) -> bool {
+    v.get("panes.split").and_then(serde_json::Value::as_bool).unwrap_or(true)
+}
+
+/// [`split_flag`] in the settings file at `path` (none, or unreadable: on).
+pub fn load_split(path: &Path) -> bool {
+    load_settings(path).is_none_or(|v| split_flag(&v))
 }
 
 /// The theme the picker saved, as written ([`resolve_theme`] checks it).
@@ -1948,15 +1954,16 @@ pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<(
 }
 
 /// What a launch restores under `key`, from one read of the file (Shady
-/// #55 n3): the layout when split panes are on (`split`, or `panes.split`
-/// in the file; off, `layout.<key>` is never read: n2), it is whole and
+/// #55 n3): the layout when split panes are on (`env`, the run's
+/// `SYNAPS_DESK_SPLIT`, if set; else [`split_flag`]; off, `layout.<key>`
+/// is never read: n2), it is whole and
 /// `tabs.<key>` is still exactly its union (an older build since, writing
 /// only the tabs, a rename or a tab switch as much as other sessions,
 /// leaves it stale: its tabs win, as one pane: L1); else the tabs alone.
-pub fn load_restore(path: &Path, key: &str, split: bool) -> (Option<Layout>, Option<crate::tabs::Saved>) {
+pub fn load_restore(path: &Path, key: &str, env: Option<bool>) -> (Option<Layout>, Option<crate::tabs::Saved>) {
     let Some(v) = load_settings(path) else { return (None, None) };
     let tabs = v.get("tabs").and_then(|t| t.get(key)).and_then(saved_of);
-    let split = split || v.get("panes.split").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let split = env.unwrap_or_else(|| split_flag(&v));
     let layout = split.then(|| layout_of(&v, key)).flatten().filter(|l| tabs.as_ref().is_none_or(|t| *t == l.union()));
     (layout, tabs)
 }
@@ -3112,6 +3119,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Split panes step 6: on by default; `"panes.split": false` in the
+    /// file, or the run's `SYNAPS_DESK_SPLIT=0`, turns them off (the layout
+    /// never read), and `=1` on whatever the file says.
+    #[test]
+    fn split_panes_are_on_unless_the_file_or_the_run_turns_them_off() {
+        use crate::tabs::Saved;
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-split-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        assert!(load_split(&path), "no file: on");
+        let union = Saved { sessions: vec!["s1".into(), "s2".into()], active: Some(1), ..Saved::default() };
+        let layout = Layout {
+            focused: 1,
+            tree: LayoutNode::Split {
+                axis: crate::split::Axis::Row,
+                ratios: vec![0.5, 0.5],
+                kids: vec![LayoutNode::Pane(0), LayoutNode::Pane(1)],
+            },
+            panes: vec![
+                Saved { sessions: vec!["s1".into()], active: Some(0), ..Saved::default() },
+                Saved { sessions: vec!["s2".into()], active: Some(0), ..Saved::default() },
+            ],
+        };
+        save_layout(&path, "k", &layout).unwrap();
+        assert_eq!(layout.union(), union);
+        assert!(load_split(&path), "the key missing: on");
+        assert_eq!(load_restore(&path, "k", None), (Some(layout.clone()), Some(union.clone())), "on: the layout");
+        assert_eq!(load_restore(&path, "k", Some(false)), (None, Some(union.clone())), "SYNAPS_DESK_SPLIT=0: the tabs alone");
+        save_settings(&path, &[("panes.split", false.into())]).unwrap();
+        assert!(!load_split(&path), "`false`: off");
+        assert_eq!(load_restore(&path, "k", None), (None, Some(union.clone())), "off: the tabs alone");
+        assert_eq!(load_restore(&path, "k", Some(true)), (Some(layout), Some(union)), "SYNAPS_DESK_SPLIT=1: on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// split/architecture.md §5: `layout.<key>` round-trips per daemon,
     /// written with `tabs.<key>` as every pane's tabs, a session once (what
     /// an older build reads: the downgrade reopens them all, in one strip);
@@ -3154,27 +3197,27 @@ mod tests {
         assert_eq!(union.active, Some(3), "the focused pane's visible tab");
         assert_eq!(load_tabs(&path, "socket:/b").map(|t| t.sessions), Some(s(&["t1"])), "other daemons kept");
         assert_eq!(load_accent(&path).as_deref(), Some("#2d7bff"), "other keys kept");
-        assert_eq!(load_restore(&path, "socket:/a", true), (Some(layout.clone()), Some(union.clone())));
+        assert_eq!(load_restore(&path, "socket:/a", Some(true)), (Some(layout.clone()), Some(union.clone())));
         // Split panes off (Shady #55 n2): the layout is not read.
-        assert_eq!(load_restore(&path, "socket:/a", false), (None, Some(union.clone())), "flag off: the tabs alone");
+        assert_eq!(load_restore(&path, "socket:/a", Some(false)), (None, Some(union.clone())), "flag off: the tabs alone");
         // An older build's rename, or its tab switch, the sessions the same
         // (Shady #55 L1): its tabs, not the stale layout.
         let renamed = Saved { labels: s(&["Relay v2", "", "", ""]), ..union.clone() };
         save_tabs(&path, "socket:/a", &renamed).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(renamed)), "a rename since");
+        assert_eq!(load_restore(&path, "socket:/a", Some(true)), (None, Some(renamed)), "a rename since");
         let switched = Saved { active: Some(0), ..union.clone() };
         save_tabs(&path, "socket:/a", &switched).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(switched)), "a tab switch since");
+        assert_eq!(load_restore(&path, "socket:/a", Some(true)), (None, Some(switched)), "a tab switch since");
         // An older build since: its tabs, not the stale layout.
         let older = Saved { sessions: s(&["s1", "s5"]), active: Some(1), ..Saved::default() };
         save_tabs(&path, "socket:/a", &older).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a", true), (None, Some(older)));
+        assert_eq!(load_restore(&path, "socket:/a", Some(true)), (None, Some(older)));
         // A layout with no tabs beside it (written by hand): the layout.
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut v2 = v.clone();
         v2["tabs"].as_object_mut().unwrap().remove("socket:/a");
         std::fs::write(&path, v2.to_string()).unwrap();
-        assert_eq!(load_restore(&path, "socket:/a", true).0, Some(layout));
+        assert_eq!(load_restore(&path, "socket:/a", Some(true)).0, Some(layout));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3305,7 +3348,7 @@ mod tests {
             let file = format!(r#"{{"tabs": {{"k": {{"sessions": ["s1"], "active": 0}}}}, "layout": {{"k": {layout}}}}}"#);
             std::fs::write(&path, file).unwrap();
             assert_eq!(load_layout(&path, "k"), None, "{what}");
-            let (l, tabs) = load_restore(&path, "k", true);
+            let (l, tabs) = load_restore(&path, "k", Some(true));
             assert!(l.is_none(), "{what}");
             assert_eq!(tabs.map(|t| t.sessions), Some(vec!["s1".to_string()]), "{what}: the tabs, as one pane");
         }
