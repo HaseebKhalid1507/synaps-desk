@@ -1216,8 +1216,16 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // history (its tool rows and prose at rest: the finish
                 // gate's idle with the transcript's rows drawn).
                 let idle = std::env::var("SYNAPS_BENCH_IDLE_SECS").ok().and_then(|s| s.parse::<u64>().ok());
+                // `SYNAPS_BENCH_WARM=S`: the session's prompt cache expires in
+                // S s (the right panel's countdown, `crate::warm`): what it
+                // costs with the panel open, and that it costs nothing folded.
+                let warm = std::env::var("SYNAPS_BENCH_WARM").ok().and_then(|s| s.parse::<u64>().ok());
                 let _ = upd(cx, &|v, _| {
                     v.model.local_session(v.panes.cur.live, "bench-motion-idle");
+                    if let Some(s) = warm {
+                        let st = json!({"keepwarm": {"mode": "auto"}, "cache": {"ttl": "5m", "expires_in_secs": s}});
+                        v.model.lives[v.panes.cur.live].stats.warm = Some(crate::warm::Warm::from_status(&st, Instant::now()));
+                    }
                     if idle.is_some() {
                         v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::history(40, 3)));
                         v.sync_list();
