@@ -1905,9 +1905,4 @@ mod outcome_tests {
         assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None]);
         assert_eq!(PromptOutcome::of_event(&serde_json::json!({"ev": "idle", "outcome": "allowed"})), None, "only prompt_resolved");
     }
-        t.apply(&decode_event(&serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7})).unwrap());
-        let got: Vec<_> = (1..=8).map(|id| t.resolved_outcome(id)).collect();
-        use PromptOutcome::*;
-        assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None]);
-    }
 }
