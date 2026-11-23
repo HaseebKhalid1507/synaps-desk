@@ -87,6 +87,27 @@ fn frame_every(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     cx.run_until_parked();
 }
 
+/// One 144 Hz frame of the clock, its timers firing, and a frame drawn
+/// only if the window asked for one: whether it drew. Nothing forces a
+/// draw, so what it counts is demand.
+fn idle_frame(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> bool {
+    let dt = Duration::from_micros(6944);
+    let (t0, at) = (cx.executor().now(), view.read_with(cx, |v, _| v.fx.clock()));
+    let _end = cx.executor().timer(dt);
+    loop {
+        cx.dispatcher.advance_clock_to_next_timer();
+        let t = cx.executor().now() - t0;
+        view.read_with(cx, |v, _| v.fx.set_clock(at + t));
+        cx.run_until_parked();
+        if t >= dt {
+            break;
+        }
+    }
+    let ran = cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+    cx.run_until_parked();
+    ran > 0
+}
+
 /// L5: a frame is late past half again the display's pace, not past a
 /// 60 Hz frame's: at 30 Hz (VNC, a throttled window) a fold lands in about
 /// the time it takes at 144 Hz (each frame paused for 16.6 ms, it took
@@ -366,4 +387,149 @@ fn a_held_fold_room_goes_when_the_pointer_leaves_its_header(cx: &mut TestAppCont
         assert!(step <= 30., "over {over}: a row moved {step} px in a frame as the room went");
         flip(cx, &view, last);
     }
+}
+
+/// Shady #73 M1: a held room asks for nothing once it is gone (nothing
+/// after a landing, #58). Released on its timer with the pointer away, its
+/// sheet lands and the window draws no frame after that; used up by rows
+/// growing in before its deadline, no release timer wakes it later. Only
+/// the clock and its timers move: no frame is forced.
+#[gpui_kit::test]
+fn a_held_room_asks_for_nothing_once_it_is_gone(cx: &mut TestAppContext) {
+    let mut seen = Vec::new();
+    for used_up in [false, true] {
+        let (w, view, _events) = idle_cpu(cx, 900.);
+        let runs = runs(cx, &view);
+        let last = runs[runs.len() - 1];
+        let mut vcx = VisualTestContext::from_window(w, cx);
+        vcx.simulate_event(MouseMoveEvent {
+            position: gpui_kit::point(px(2.), px(2.)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        });
+        vcx.run_until_parked();
+        flip(cx, &view, last);
+        for _ in 0..240 {
+            fluid_frame(cx, w, &view);
+        }
+        view.update(cx, |v, cx| {
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        for _ in 0..8 {
+            fluid_frame(cx, w, &view);
+        }
+        flip(cx, &view, last);
+        let mut n = 0;
+        while n == 0 || folding(cx, w) {
+            fluid_frame(cx, w, &view);
+            n += 1;
+            assert!(n < 600, "never landed");
+        }
+        let held = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.fold_slack.get().map(|s| s.last()));
+        assert!(held(cx).is_some_and(|r| r >= 1.), "used up {used_up}: the fold's room, held");
+        if used_up {
+            // Rows grow in under it (a history append): they take the room.
+            view.update(cx, |v, cx| {
+                let t = &mut v.model.transcript;
+                let text = "A long answer that fills the room the fold left. ".repeat(60);
+                let messages =
+                    (0..6).map(|_| serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": text}]})).collect();
+                t.apply_update(&synaps_client::HistoryUpdate::Append { base_len: t.history_len(), messages }).expect("an append");
+                v.sync_list();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+        // Idle until the room is gone, then for two seconds more: the draws
+        // after it are what its release left behind.
+        let mut n = 0;
+        while held(cx).is_some() {
+            idle_frame(cx, w, &view);
+            n += 1;
+            assert!(n < 1200, "used up {used_up}: the room never went");
+        }
+        let gone_at = view.read_with(cx, |v, _| v.fx.clock());
+        let mut late = Vec::new();
+        for _ in 0..288 {
+            if idle_frame(cx, w, &view) {
+                late.push(view.read_with(cx, |v, _| v.fx.clock()).saturating_duration_since(gone_at).as_millis());
+            }
+        }
+        seen.push((used_up, late));
+    }
+    // Released: nothing after its sheet lands. Used up: rows that grew in
+    // may still be landing, but nothing past that, and nothing at the
+    // deadline the room had (a second from its landing).
+    let ok = |(used_up, late): &(bool, Vec<u128>)| if *used_up { late.iter().all(|ms| *ms < 700) } else { late.is_empty() };
+    assert!(seen.iter().all(ok), "draws after the room went (used up?, ms after): {seen:?}");
+}
+
+/// Shady #73 M2: a streamed line retires (drawn whole, unclipped) only once
+/// its clip is within half a pixel of its measured height, however tall
+/// it wraps: a long line in a narrow window draws no step in the frame its
+/// clip goes. Before, it retired at 1 % of its spring left: a step of
+/// about 1 % of its height.
+#[gpui_kit::test]
+fn a_tall_wrapped_line_retires_without_a_step(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (900., 1400.), crate::theme::Panels::default().text_size);
+    motion_level(cx, &view, crate::motion::Level::Full);
+    view.update(cx, |v, cx| {
+        v.client = None;
+        let t = &mut v.model.transcript;
+        t.set_busy(true);
+        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
+        t.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: "tall-0".into() }),
+        });
+        t.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolUse {
+                tool_name: "bash".into(),
+                tool_id: "tall-0".into(),
+                input: serde_json::json!({"command": "cargo build"}),
+            }),
+        });
+        v.sync_list();
+        v.list.scroll_to_end();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let delta = |cx: &mut TestAppContext, text: &str| {
+        view.update(cx, |v, cx| {
+            v.model.transcript.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "tall-0".into(), delta: text.into() }),
+            });
+            v.sync_list();
+            v.list.scroll_to_end();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    delta(cx, "compiling\n");
+    wait(cx, w, &view, 600);
+    let id = view.read_with(cx, |v, _| v.model.transcript.items().last().map(|i| i.id)).expect("the call");
+    let line = cx.update(|cx| (19. * crate::theme::metrics(cx).r).round());
+    let tall = format!("{}\n", "warning: unused variable `x` in this long diagnostic line; ".repeat(60));
+    delta(cx, &tall);
+    // Each frame as painted: the clipped line's height (while it has a
+    // clip), and the well's.
+    let mut frames: Vec<(Option<f32>, f32)> = Vec::new();
+    for _ in 0..150 {
+        fluid_frame(cx, w, &view);
+        let mut vcx = VisualTestContext::from_window(w, cx);
+        let clip = vcx.debug_bounds(String::leak(format!("stream-line {id} 1"))).map(|b| f32::from(b.size.height));
+        let well = vcx.debug_bounds(String::leak(format!("well {id}"))).map(|b| f32::from(b.size.height)).expect("the well");
+        frames.push((clip, well));
+    }
+    let retired = frames.windows(2).position(|p| p[0].0.is_some() && p[1].0.is_none()).expect("the line's clip goes") + 1;
+    let (before, after) = (frames[retired - 1], frames[retired]);
+    let tall_h = frames.iter().filter_map(|f| f.0).fold(0f32, f32::max);
+    assert!(tall_h >= 12. * line, "the line wraps tall: {tall_h} px (a line {line})");
+    assert!(
+        (after.1 - before.1).abs() <= 1.,
+        "the frame its clip went, the well stepped {} px (clipped {:?} -> unclipped): {frames:?}",
+        after.1 - before.1,
+        before.0
+    );
+    assert!(frames.windows(2).all(|p| p[1].1 >= p[0].1), "it only grows: {frames:?}");
 }

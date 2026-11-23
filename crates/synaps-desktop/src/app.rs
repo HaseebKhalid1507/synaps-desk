@@ -5373,12 +5373,19 @@ impl AppView {
         if s.gone.is_none() && (!self.panes.cur.synced_busy && !s.held || release) {
             s.gone = Some((s.last, clock, crate::motion::SHEET_RESPONSE));
         }
-        if s.held && s.row.is_some() && s.gone.is_none() && !s.input && !over && !s.over {
-            self.fx.want_at(s.since + RELEASE_AFTER);
-        }
         if let Some((from, at, response)) = s.gone {
             s.last = (from * crate::motion::Spring::from_rest(1., response, clock.saturating_duration_since(at).as_secs_f32())).round();
-            self.fx.want_frame();
+        }
+        // Only a room that is still there asks for anything: the frame its
+        // sheet lands on, or rows growing in took the rest, asks for no
+        // next frame and no release timer (nothing after a landing, #58;
+        // Shady #73 M1).
+        if s.last >= 1. {
+            if s.gone.is_some() {
+                self.fx.want_frame();
+            } else if s.held && s.row.is_some() && !s.input && !over && !s.over {
+                self.fx.want_at(s.since + RELEASE_AFTER);
+            }
         }
         if s.last < 1. {
             self.panes.cur.fold_slack.set(None);

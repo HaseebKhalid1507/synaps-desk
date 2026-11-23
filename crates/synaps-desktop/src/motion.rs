@@ -2909,10 +2909,17 @@ impl PaneFx<'_> {
         }
         (s.n, s.frame) = (n, frame);
         let curve = stream_curve();
-        s.born.retain(|(_, at, _)| {
-            now < *at
-                || Spring::from_rest(1., FLICK_RESPONSE, now.saturating_duration_since(*at).as_secs_f32()) > 0.01
-                || now.saturating_duration_since(*at) < STREAM_FADE
+        // A line retires (drawn whole, unclipped) once what its clip has
+        // left is under half a pixel of its measured height: a tall wrapped
+        // line never steps when it does (Shady #73 M2). Unmeasured (not
+        // painted yet, so nothing to step): on the spring alone, as
+        // `Reveal` does.
+        s.born.retain(|(_, at, h)| {
+            let t = now.saturating_duration_since(*at);
+            let left = Spring::from_rest(1., FLICK_RESPONSE, t.as_secs_f32());
+            let h = h.get();
+            let moving = if h.is_nan() { left > 0.01 } else { left * h >= FLUID_EPSILON };
+            now < *at || moving || t < STREAM_FADE
         });
         if s.born.is_empty() {
             return Vec::new();
