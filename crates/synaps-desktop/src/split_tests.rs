@@ -2222,6 +2222,9 @@ fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestApp
         cmds.iter().find(|e| matches!(e.act, crate::palette::Act::App(crate::palette::AppAct::JumpWaiting))).map(|e| e.off.is_none())
     });
     assert_eq!(offered, Some(true), "the palette offers the jump: A's pane waits");
+    // The card's arm on the test's clock (`pin_arm_clock`): its keys read
+    // at the jump's instant, however long two frames take to draw.
+    crate::app::pin_arm_clock(Some(Instant::now()));
     key(cx, window, "ctrl-j");
     frame(cx, window);
     frame(cx, window);
@@ -2229,6 +2232,7 @@ fn ctrl_j_with_nothing_waiting_here_focuses_the_pane_that_waits(cx: &mut TestApp
     assert!(root_has_keys(cx, window, &view), "the card's keys (the window's root) have the focus");
     // The press that jumped answers nothing: the card waits its arm.
     view.update(cx, |v, _| v.in_pane(pa, |v| assert!(!v.panes.cur.card.as_ref().expect("A's card").keys_armed(), "its keys wait again")));
+    crate::app::pin_arm_clock(None);
     assert!(!names(&mut a).iter().any(|n| n == "answer"), "nothing answered");
     // Again, with the card's pane focused: Ctrl+J stays (its own card).
     key(cx, window, "ctrl-j");
@@ -5172,12 +5176,17 @@ fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
 
 /// #53 R3-L1, the rest of a growing pane's flight at Full, frame by frame
 /// at 144 Hz, its card up (its arm, if counted from the pane's first
-/// frame, run out in the real time slept before): the card's buttons as
-/// drawn against the pane's share. A click on Allow while it shows but the
+/// frame, run out in the 600 ms before): the card's buttons as drawn
+/// against the pane's share. A click on Allow while it shows but the
 /// buttons are cut off, and on the first frame they are whole a click and
 /// a Ctrl+Enter (the root has the keys after the click), answer nothing;
 /// the arm counts from that frame. Then, 600 ms on, Allow answers. What
 /// failed, by `what`.
+///
+/// The card's arm is on the test's clock (`pin_arm_clock`): those 600 ms,
+/// then 6.944 ms a frame, the clicks at their frame's instant. On wall
+/// time a loaded runner's frame and click took longer than the arm itself
+/// (#69: CI's ubuntu runner, the side case's first whole frame).
 fn arm_from_whole(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -5187,13 +5196,15 @@ fn arm_from_whole(
     what: &str,
 ) -> Vec<String> {
     let mut fails = Vec::new();
-    std::thread::sleep(Duration::from_millis(600));
+    let mut t = Instant::now() + Duration::from_millis(600);
     let card_at =
         |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.get(new).and_then(|p| p.card.as_ref().map(|c| c.arm.shown_at())));
     let allow = |b: [f32; 4]| gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
     let (mut whole_at, mut cut_clicked, mut rest, mut i) = (None, false, 0, 0);
     while rest < 12 {
-        let before = Instant::now();
+        t += Duration::from_micros(6944);
+        crate::app::pin_arm_clock(Some(t));
+        let before = t;
         frame_144(cx, window, view);
         let share = drawn(cx, window, format!("pane {}", new.index()));
         let buttons = drawn(cx, window, format!("card-buttons {}", new.index()));
@@ -5234,10 +5245,11 @@ fn arm_from_whole(
         assert!(i < 400, "{what}: never landed");
     }
     if whole_at.is_none() {
+        crate::app::pin_arm_clock(None);
         fails.push(format!("{what}: its buttons never drawn whole"));
         return fails;
     }
-    std::thread::sleep(Duration::from_millis(600));
+    crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
     cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     match drawn(cx, window, format!("card-buttons {}", new.index())) {
@@ -5250,6 +5262,7 @@ fn arm_from_whole(
         }
         None => fails.push(format!("{what}: no card left to answer")),
     }
+    crate::app::pin_arm_clock(None);
     fails
 }
 
@@ -5337,7 +5350,9 @@ fn a_growing_panes_card_arms_from_the_first_frame_its_buttons_are_whole(cx: &mut
 /// #53 R3-L2: a card in a pane the fold hides waits again when widening
 /// shows it: a click on its Allow on the first frame it is drawn again
 /// answers nothing (it had been up for longer than its arm); 600 ms on,
-/// one answers.
+/// one answers. The card's arm on the test's clock (`pin_arm_clock`), as
+/// in `arm_from_whole`: the click at its frame's instant, however long the
+/// machine takes to draw it.
 #[gpui_kit::test]
 fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let (window, view, client, mut a, _attaches, events) = on_a(cx, "arm-fold", Some(1));
@@ -5347,13 +5362,15 @@ fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let p1 = view.read_with(cx, |v, _| v.panes.focused);
     assert_ne!(p1, p0);
     // Armed in both panes, then the first one hidden by the fold.
-    std::thread::sleep(Duration::from_millis(600));
+    let mut t = Instant::now() + Duration::from_millis(600);
+    crate::app::pin_arm_clock(Some(t));
     frame(cx, window);
     let _ = names(&mut a);
     resize(cx, window, 700., 800.);
     assert!(view.read_with(cx, |v, _| v.panes.folded && v.panes.focused == p1), "folded on the second pane");
     assert!(drawn(cx, window, format!("pane {}", p0.index())).is_none(), "the first pane not drawn");
-    std::thread::sleep(Duration::from_millis(600));
+    t += Duration::from_millis(600);
+    crate::app::pin_arm_clock(Some(t));
     frame(cx, window);
     // Widened: its first frame shows the first pane's card, armed or not.
     VisualTestContext::from_window(window, cx).simulate_resize(size(px(1280.), px(800.)));
@@ -5363,11 +5380,12 @@ fn widening_back_from_a_fold_rearms_the_card_it_shows(cx: &mut TestAppContext) {
     let allow = gpui_kit::point(px(b[0] + b[2] - 24.), px(b[1] + b[3] / 2.));
     click_at(cx, window, allow);
     assert_eq!(names(&mut a), Vec::<String>::new(), "a click on its first frame back answers nothing");
-    // Its arm runs out (real time; its repaint on the test's clock).
-    std::thread::sleep(Duration::from_millis(600));
+    // Its arm runs out (its repaint on the test's clock too).
+    crate::app::pin_arm_clock(Some(t + Duration::from_millis(600)));
     cx.executor().advance_clock(Duration::from_millis(600));
     frame(cx, window);
     click_at(cx, window, allow);
+    crate::app::pin_arm_clock(None);
     assert_eq!(names(&mut a), ["answer"], "armed, the click answers");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
