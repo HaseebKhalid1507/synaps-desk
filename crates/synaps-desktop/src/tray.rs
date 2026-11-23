@@ -616,10 +616,13 @@ impl AppView {
                     // moves none. One that came rises 8 px and lifts from
                     // 70 %, in turn (polish.md P13).
                     // In a new grid (the column took another count of chips
-                    // a line: a layout or panel flight landed), a chip is in
-                    // its cell at once, from the frame that lands it (design
-                    // gate #44 F5: after Join one slid 17 frames on,
-                    // across another): each grid keys its own slides.
+                    // a line, whatever changed its width: a layout or panel
+                    // flight landed, a divider or panel dragged, the window
+                    // resized), a chip is in its cell at once, from the frame
+                    // that lands it (design gate #44 F5: after Join one slid
+                    // 17 frames on, across another; Shady #44 n15: under a
+                    // drag the chips snap too, nothing lags the pointer):
+                    // each grid keys its own slides.
                     let grid = (chips.per as u64) << 32;
                     let off = fx.col(self.panes.cur.id).slide(TRAY | grid | r.id, line as f32 * (row_h + CHIP_GAP));
                     let dx = fx.cell_slide(self.panes.cur.id.salt(TRAY_X | grid | r.id), col as u64, col as f32 * (w + CHIP_GAP));

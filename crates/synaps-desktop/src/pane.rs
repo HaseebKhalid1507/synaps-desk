@@ -274,6 +274,9 @@ pub struct Pane {
     /// Tests: the strength its rows' column was drawn at, last frame.
     #[cfg(test)]
     pub(crate) drawn_k: std::cell::Cell<f32>,
+    /// Tests: the width it was laid out at, last frame (`PaneFrame::pane`).
+    #[cfg(test)]
+    pub(crate) laid_w: std::cell::Cell<f32>,
     /// The authorization card's prompt (see [`PromptCard`]).
     pub(crate) card: Option<PromptCard>,
     /// Its keys were live at the last frame ([`AppView::card_keys_live`]):
@@ -511,6 +514,8 @@ impl Pane {
             rows_in: None,
             #[cfg(test)]
             drawn_k: std::cell::Cell::new(1.),
+            #[cfg(test)]
+            laid_w: std::cell::Cell::new(0.),
             card: None,
             keys_live: false,
             chord: CardChord::default(),
@@ -1261,6 +1266,9 @@ impl crate::app::AppView {
             None if self.split_refusal(Some(crate::split::Side::Right)).is_none() => {
                 // Its new tab of this pane's session becomes the row's.
                 self.split_pane(Some(crate::split::Side::Right), window, cx);
+                // Its rows wait for the split to land, as a rail row's
+                // dropped on an edge (#53 nit; finish gate #48 F2).
+                self.panes.cur.hold_rows = self.panes.flight.is_some();
                 run(self, Place::Current);
             }
             None => run(self, Place::New),
@@ -1315,8 +1323,9 @@ impl crate::app::AppView {
                 // `session#sa_N` (Shady #44 L10).
                 let drafts: Vec<_> = v.model.tabs.iter().filter_map(|t| Some((t.id, t.draft_key()?.to_string()))).collect();
                 let drafts: Vec<_> = drafts.into_iter().filter_map(|(tab, s)| v.take_draft(tab, &s, cx)).collect();
-                // A tab still being created stays with its pane: its create
-                // is its store's, and goes (detached) as the pane closes;
+                // A tab still being created goes with its pane (Shady #44
+                // n12: not to the reopen stack): its create is its store's,
+                // and goes (detached) as the pane closes;
                 // carried, it was a tab nothing would ever fill (Shady #44
                 // L12).
                 let tabs = v.model.tabs.take_all().into_iter().filter(|t| !t.pending()).collect::<Vec<_>>();
@@ -1424,18 +1433,43 @@ impl crate::app::AppView {
                 self.in_pane(source, take);
                 self.focus_composer(cx);
             }
-            None if !back && self.model.tabs.len() > 1 => {
-                let before = self.panes.len();
-                self.split_pane(None, window, cx);
-                if self.panes.len() > before {
-                    let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
-                    if let Some((k, d)) = draft {
-                        self.give_draft(&k, d);
-                    }
-                    self.in_pane(source, take);
-                }
-            }
+            None if !back && self.model.tabs.len() > 1 => self.move_tab_to_new_pane(window, cx),
             None => {}
+        }
+        cx.notify();
+    }
+
+    /// The focused pane's shown session tab into a new pane split off
+    /// it (Ctrl+Alt+→ at the end of the order; the tab menu's Move to
+    /// new pane), its draft with it, out of its pane with no reopen
+    /// entry. Not a pane's only tab (its pane would be left empty).
+    pub(crate) fn move_tab_to_new_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.split_on() || self.model.tabs.len() < 2 {
+            return;
+        }
+        let Some(ix) = self.model.tabs.active() else { return };
+        let Some((tab, session)) =
+            self.model.tabs.iter().nth(ix).filter(|t| t.kind == crate::tabs::Kind::Session).and_then(|t| Some((t.id, t.session.clone()?)))
+        else {
+            return;
+        };
+        let source = self.panes.focused;
+        let before = self.panes.len();
+        self.split_pane(None, window, cx);
+        if self.panes.len() > before {
+            let draft = self.in_pane(source, |v| v.take_draft(tab, &session, cx)).flatten();
+            if let Some((k, d)) = draft {
+                self.give_draft(&k, d);
+            }
+            self.in_pane(source, |v| {
+                let ix = v.model.tabs.iter().position(|t| t.id == tab);
+                if let Some(ix) = ix
+                    && v.model.tabs.take(ix).is_some()
+                {
+                    v.model.rail_gen += 1;
+                    v.reconcile(None);
+                }
+            });
         }
         cx.notify();
     }
@@ -1508,6 +1542,11 @@ impl crate::app::AppView {
         self.panes.fly_close(id);
         self.panes.tree = tree;
         self.panes.grab = None;
+        // Its id is free for the next pane (`free_id`): no restore that
+        // waits acts on that one (Shady #55 n4: a collapse closed the
+        // user's new pane; a restore filled it with the saved tabs).
+        self.restored.retain(|p| *p != id);
+        self.restore_panes.retain(|(p, _)| *p != id);
         // Focus moves only off the pane that had it (Shady #36 L3b: a close
         // an event made never takes it from the pane in use), and the keys
         // with it, from the inputs that went (L3a).

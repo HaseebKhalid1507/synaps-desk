@@ -1123,6 +1123,13 @@ pub(crate) enum SessionAct {
     Close,
     /// Favourite or unfavourite it (desktop only: never the daemon's pin).
     Favourite,
+    /// Split panes (split.md §2): Open to the side (a tab's or a row's),
+    /// and a tab's Split right, Split down, Move to new pane, Close pane.
+    OpenSide,
+    SplitRight,
+    SplitDown,
+    MoveToNewPane,
+    ClosePane,
 }
 
 /// Where a session's menu was opened: its tab, or its rail row (its key).
@@ -1159,6 +1166,48 @@ pub(crate) fn session_items(f: MenuFor) -> Vec<crate::menu::Item<SessionAct>> {
     let rename = if f.live { rename } else { rename.off("open it to name it") };
     let close = Item::new(SessionAct::Close, "Close tab").key(CLOSE_KEY);
     vec![rename, fav, if f.tab { close } else { close.off("it is not open in a tab") }]
+}
+
+/// The held rows' strength ([`AppView::rows_lift`]): 70 → 100 % on
+/// `quick` (`q`, its progress) from the frame they came in, and never less
+/// than their share's own progress over its last [`crate::pane::HOLD_UNTIL`]
+/// px (`left`: the px still to go). So it is full on the frame the share
+/// lands, whatever is left of `quick` (#53 nit: a flight that landed
+/// first, a slow frame rate, stepped it to full in one frame).
+pub(crate) fn rows_strength(q: f32, left: f32) -> f32 {
+    let landing = 1. - (left / crate::pane::HOLD_UNTIL).clamp(0., 1.);
+    crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q).max(landing)
+}
+
+/// The session menu's pane items, ahead of [`session_items`]'s (split.md
+/// §2: Open to the side first; then a tab's Split right, Split down, Move
+/// to new pane and Close pane), each greyed with why when it can't run.
+/// `off`: why Open to the side can't (no session to open), and the tab's
+/// items' reasons, `None` for a rail row's menu without a tab.
+pub(crate) fn pane_items(side: Option<&'static str>, tab: Option<PaneItemsOff>) -> Vec<crate::menu::Item<SessionAct>> {
+    use crate::menu::Item;
+    let off = |i: Item<SessionAct>, why: Option<&'static str>| match why {
+        Some(w) => i.off(w),
+        None => i,
+    };
+    let mac = cfg!(target_os = "macos");
+    let mut v = vec![off(Item::new(SessionAct::OpenSide, "Open to the side").key(if mac { "⌥click" } else { "Alt+click" }), side)];
+    if let Some(t) = tab {
+        v.push(off(Item::new(SessionAct::SplitRight, "Split right").key(if mac { "⌘\\" } else { "Ctrl+\\" }), t.right));
+        v.push(off(Item::new(SessionAct::SplitDown, "Split down").key(if mac { "⌘⇧\\" } else { "Ctrl+Shift+\\" }), t.down));
+        v.push(off(Item::new(SessionAct::MoveToNewPane, "Move to new pane"), t.new_pane));
+        v.push(off(Item::new(SessionAct::ClosePane, "Close pane"), t.close));
+    }
+    v
+}
+
+/// Why each of a tab's pane items can't run, if it can't ([`pane_items`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PaneItemsOff {
+    pub(crate) right: Option<&'static str>,
+    pub(crate) down: Option<&'static str>,
+    pub(crate) new_pane: Option<&'static str>,
+    pub(crate) close: Option<&'static str>,
 }
 
 /// The close-tab key as the session menu shows it.
@@ -1877,13 +1926,15 @@ pub struct AppView {
     /// §5), built before the first frame draws ([`Self::restore_layout_now`]).
     pub restore_layout: Option<theme::Layout>,
     /// Its panes' tabs, for the first session list ([`Self::start_tabs`]).
-    restore_panes: Vec<(PaneId, Saved)>,
+    pub(crate) restore_panes: Vec<(PaneId, Saved)>,
     /// The panes it restored whose tabs still wait for their sessions: one
     /// whose tabs all close collapses (architecture §5).
-    restored: Vec<PaneId>,
-    /// The layout's ratios are re-clamped to the window when it is next
-    /// laid out ([`Self::pane_yields`]).
-    layout_clamp: bool,
+    pub(crate) restored: Vec<PaneId>,
+    /// A restored layout's tree, its ratios re-clamped to the window when
+    /// it is next laid out ([`Self::pane_yields`]); kept until that fits,
+    /// or the user changes the layout (Shady #55 L3: a window too small at
+    /// launch clamps once it widens, never over the user's own layout).
+    layout_clamp: Option<crate::split::Node>,
     /// The layout's generation ([`Self::layout_gen`]) handed to a save,
     /// and the one written (or meant to stay unwritten); 0: none yet.
     layout_saved: u64,
@@ -2527,7 +2578,7 @@ impl AppView {
             restore_layout: None,
             restore_panes: Vec::new(),
             restored: Vec::new(),
-            layout_clamp: false,
+            layout_clamp: None,
             layout_saved: 0,
             layout_hash: Default::default(),
             #[cfg(test)]
@@ -3473,8 +3524,15 @@ impl AppView {
             // them or drew another session's items under them). Nothing is
             // attached to it: no event, input or card reaches it.
             self.sync_list();
-            let l = &self.model.lives[live];
+            // The stats without their files and workers, which are the
+            // shown ones' (Shady #44 n13: they were cloned twice). The
+            // transcript is cloned whole, on this frame: bounded, and
+            // dropped as the share lands. Its worker view is not carried
+            // (n14): for the flight its composer reads the session's.
+            let l = &mut self.model.lives[live];
+            let kept = (std::mem::take(&mut l.stats.files), std::mem::take(&mut l.stats.subagents));
             let mut stats = l.stats.clone();
+            (l.stats.files, l.stats.subagents) = kept;
             (stats.files, stats.subagents) = (l.shown_files().clone(), l.shown_subagents().clone());
             let transcript = l.shown().clone();
             let own = self.fresh_live();
@@ -3745,6 +3803,10 @@ impl AppView {
             ids.sort_by_key(|id| *id != focused);
             for id in ids {
                 self.in_pane(id, |v| {
+                    // Every pane's tabs read the list (the model's are the
+                    // pane acted on as it came): a daemon-side rename shows,
+                    // and is saved, in every pane (Shady #55 r2 n7).
+                    v.model.tabs.listed(&sessions);
                     let first = v.panes.ids().first() == Some(&v.panes.cur.id);
                     let quiet = first && v.model.tabs.generation == v.tabs_saved;
                     let shown = v.model.tabs.confirm(&sessions);
@@ -3845,7 +3907,7 @@ impl AppView {
         self.panes.tree = crate::split::Node::from_saved(&layout.tree, &ids);
         self.panes.drawn = self.panes.tree.clone();
         self.panes.flight = None;
-        self.layout_clamp = true;
+        self.layout_clamp = Some(self.panes.tree.clone());
         let focused = ids.get(layout.focused).copied().unwrap_or(ids[0]);
         self.focus_pane(focused, crate::pane::KeysTo::Pane, cx);
         self.restore_panes = ids.into_iter().zip(layout.panes).collect();
@@ -4205,6 +4267,13 @@ impl AppView {
             if self.tabs_key.is_none() || self.bench.is_some() || pending || self.layout_gen() == self.layout_written {
                 return;
             }
+            // A delayed save's background write already under way is not
+            // stopped (dropping its task leaves the job): it may take the
+            // writer after this one and land the older layout last (Shady
+            // #55 n6; `save_tabs` had the same race). Its completion then
+            // sets `layout_written` back to its own generation, so the
+            // second flush at quit (`on_app_quit` after `on_release`) writes
+            // this one again, last. Keep the two flushes.
             if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
                 match theme::save_layout(&path, key, &self.layout_now()) {
                     Ok(()) => self.layout_written = self.layout_gen(),
@@ -4658,8 +4727,9 @@ impl AppView {
     /// strength, 70 → 100 % on `quick` (fluid.md §3.6) from the frame they
     /// come in, 16 px from landing, where the `sheet` spring has 200 ms
     /// or more left: it ends before the flight's last moving frame. Ended
-    /// at once if the flight has (nothing changes after it, #50).
-    fn rows_lift(&mut self) -> Option<f32> {
+    /// at once if the flight has (nothing changes after it, #50). `left`:
+    /// the px its share has still to go ([`rows_strength`]).
+    fn rows_lift(&mut self, left: f32) -> Option<f32> {
         let at = self.panes.cur.rows_in?;
         let q = (self.fx.now().saturating_duration_since(at).as_secs_f32() / crate::motion::QUICK.as_secs_f32()).min(1.);
         if q >= 1. || !self.fx.fluid() || self.panes.flight.is_none() {
@@ -4667,7 +4737,7 @@ impl AppView {
             return None;
         }
         self.fx.want_frame();
-        Some(crate::motion::LIFT + (1. - crate::motion::LIFT) * crate::motion::ease::OUT.sample(q))
+        Some(rows_strength(q, left))
     }
 
     /// The column's layer this frame: its offset and strength, or none.
@@ -6896,7 +6966,20 @@ impl AppView {
         }
         window.focus(&self.focus, cx);
         self.gear_menu = false;
-        let menu = crate::menu::Menu::new(session_items(for_), crate::menu::At::Point(pt), false).born(self.fx.clock());
+        // Split panes on: the pane items first (split.md §2).
+        let mut items = Vec::new();
+        if self.split_on() {
+            let side = self.side_action(&session, row).is_none().then_some("open it first");
+            let tab = tab.map(|_| PaneItemsOff {
+                right: self.split_refusal(None),
+                down: self.split_refusal(Some(crate::split::Side::Down)),
+                new_pane: if self.model.tabs.len() < 2 { Some("its pane's only tab") } else { self.split_refusal(None) },
+                close: (!self.panes.split()).then_some("one pane"),
+            });
+            items = pane_items(side, tab);
+        }
+        items.extend(session_items(for_));
+        let menu = crate::menu::Menu::new(items, crate::menu::At::Point(pt), false).born(self.fx.clock());
         self.smenu = Some((menu, SessionTarget { session, tab, row }));
         cx.notify();
     }
@@ -6928,8 +7011,33 @@ impl AppView {
                 Some(key) => self.toggle_fav_row(key),
                 None => self.toggle_fav_session(&t.session),
             },
+            SessionAct::OpenSide => {
+                if let Some(action) = self.side_action(&t.session, t.row) {
+                    self.open_to_side(&action, window, cx);
+                }
+            }
+            // A tab's: on that tab (it is the pane's shown one first).
+            SessionAct::SplitRight | SessionAct::SplitDown | SessionAct::MoveToNewPane | SessionAct::ClosePane => {
+                let Some(ix) = t.tab.and_then(|id| self.model.tabs.iter().position(|x| x.id == id)) else { return };
+                self.focus_tab(ix);
+                match act {
+                    SessionAct::SplitRight => self.split_pane(None, window, cx),
+                    SessionAct::SplitDown => self.split_pane(Some(crate::split::Side::Down), window, cx),
+                    SessionAct::MoveToNewPane => self.move_tab_to_new_pane(window, cx),
+                    _ => self.close_pane_tabs(),
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// What Open to the side opens from a session menu: its rail row's
+    /// action, or its session's (a tab's menu).
+    fn side_action(&self, session: &str, row: Option<u64>) -> Option<crate::named::RowAction> {
+        match row.and_then(|key| self.rail.rail.rows.iter().find(|r| r.key == key)) {
+            Some(r) => Some(r.action.clone()),
+            None => (!session.is_empty()).then(|| crate::named::RowAction::Attach(session.to_string())),
+        }
     }
 
     /// A key while the session menu is open: `true` if it took it.
@@ -8050,8 +8158,14 @@ impl AppView {
         // `sheet` spring moves a pixel or two a frame, so their first layout
         // and the frame after it (the scrollbar's hint) are drawn before it
         // lands: nothing changes after the last frame that moves (#50).
+        // Its width as laid out (`g.pane`), not the tree's at this frame's
+        // centre: under a panel's yield the centre itself grows, and a new
+        // pane is laid out at its width in the centre the flight lands at
+        // (Shady #55 r2 L5).
         let (drawn_at, land_at) = (self.panes.cur.rect.get(), self.panes.cur.land.get());
-        let left = (land_at.w - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
+        let left = (g.pane - drawn_at.w).abs() + (land_at.h - drawn_at.h).abs();
+        #[cfg(test)]
+        self.panes.cur.laid_w.set(g.pane);
         // A new pane laid out at its landed size in a share still more
         // than that short of it: its card's buttons may be cut off (#53
         // R3-L1). Within it they are whole: the share clips at most
@@ -8161,7 +8275,7 @@ impl AppView {
             .size_0()
         });
         // Over the list's right padding, after its layout (and the hold-back's).
-        let layer = match (self.layer_now(), self.rows_lift()) {
+        let layer = match (self.layer_now(), self.rows_lift(left)) {
             (Some((x, y, k)), Some(r)) => Some((x, y, k.min(r))),
             (None, Some(r)) => Some((0., 0., r)),
             (layer, None) => layer,
@@ -8456,8 +8570,12 @@ impl AppView {
                 // pointer gets to it); without it (a ghost: its id is an
                 // open pane's now), an empty pane's ground.
                 if self.panes.flight.as_ref().is_some_and(|f| f.ghosts.contains(&id)) {
+                    // Its own `("pane", n)` still (Shady #55 n1): what it
+                    // draws as it closes keeps its element state; a reused
+                    // id is a ghost's (index past `PANES_MAX`), never an
+                    // open pane's.
                     let share = div()
-                        .id(("pane-closing", id.index()))
+                        .id(("pane", id.index()))
                         .flex_none()
                         .w(px(r.w))
                         .h(px(r.h))
@@ -8566,10 +8684,16 @@ impl AppView {
         }
         let of = |y: Option<(bool, bool, bool)>| y.map_or([false; 2], |(l, r, _)| [l, r]);
         let (was, now) = (of(was), of(self.pane_yield));
+        // On the spring of the panel whose flight made it, if one did
+        // (Shady #54 n2: a drag let go onto a detent flies on `snap`; a
+        // yield on `sheet` beside it made the centre non-monotone, and the
+        // columns rewrap twice); else `sheet`, the layout's.
+        let response =
+            self.panel_fx.sides.iter().find(|f| f.from.is_some() || f.moving).map_or(crate::motion::SHEET_RESPONSE, |f| f.response);
         let mut flew = false;
         for i in 0..2 {
             if was[i] != now[i] && self.panel_fx.sides[i].from.is_none() {
-                self.panel_fx.fly(i == 0, crate::motion::SHEET_RESPONSE, true);
+                self.panel_fx.fly(i == 0, response, true);
                 flew = true;
             }
         }
@@ -8588,7 +8712,12 @@ impl AppView {
         let right = if centre(rail, right) + 0.5 >= wide { right } else { Side::Strip };
         // A restored layout's ratios, re-clamped to this window first
         // (split/architecture.md §5): every pane at its minimum if it can be.
-        if std::mem::take(&mut self.layout_clamp) {
+        // Tried until it fits (Shady #55 L3), while the tree is still the
+        // one restored: any change of the user's (a split, a close, a
+        // divider, Equalise, Join) ends it.
+        if let Some(restored) = self.layout_clamp.take()
+            && restored == *tree
+        {
             for (l, r) in [(rail, right), (Side::Strip, right)] {
                 let area = Rect { x: 0., y: 0., w: centre(l, r), h };
                 let c = tree.clamped(area);
@@ -8598,6 +8727,7 @@ impl AppView {
                     return (l, r);
                 }
             }
+            self.layout_clamp = Some(restored);
         }
         for (l, r) in [(rail, right), (Side::Strip, right)] {
             if fits(centre(l, r)) {
@@ -9225,21 +9355,33 @@ impl Render for AppView {
             // would start from where a divider is going; Shady #42 L1).
             let still = self.panes.flight.is_none() && !self.panel_fx.moving();
             let handles = if still { self.divider_handles(&drawn, area(centre), &p, cx) } else { Vec::new() };
-            div().flex_1().h_full().min_w_0().relative().child(self.lay_panes(&drawn, &rects, &mut mains, &p, cx)).children(handles)
+            div()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .relative()
+                .child(self.lay_panes(&drawn, &rects, &mut mains, &p, cx))
+                .children(handles)
+                .debug_selector(|| "pane-centre".into())
+                .into_any_element()
         } else {
             // The last close's pane goes, if a frame of it is left.
             self.reap_closing();
             let g = PaneFrame { pane, wrap, pane_to, view_pane, win_h: self.height, p, m };
             self.panes.cur.rect.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
             self.panes.cur.land.set(crate::split::Rect { x: 0., y: 0., w: centre, h: centre_h });
-            self.pane_main(g, window, cx)
+            // Under its own `("pane", n)`, as when split (Shady #55 n1): a
+            // split, a fold or the last close never moves the element
+            // path of what it draws (GPUI's per-element state: a scroll
+            // offset, hover, a press held).
+            let id = self.panes.cur.id.index();
+            self.pane_main(g, window, cx).id(("pane", id)).debug_selector(|| "pane-centre".into()).into_any_element()
         };
         self.schedule_tabs_save(cx);
         self.schedule_favs_save(cx);
         self.arm_watch_poll(cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
-        let main = main.debug_selector(|| "pane-centre".into());
         h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -9311,7 +9453,9 @@ impl Render for AppView {
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
-                    && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty() || this.waiting_pane().is_some())
+                    && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
+                        || this.waiting_pane().is_some()
+                        || this.jump_elsewhere().is_some())
                 {
                     cx.stop_propagation();
                     if this.palette.is_some() {
@@ -9602,6 +9746,23 @@ impl Render for AppView {
 
 #[cfg(test)]
 mod tests {
+    /// #53 nit: the held rows' strength is full on the frame their share
+    /// lands, whatever is left of `quick`, and rises with either.
+    #[test]
+    fn held_rows_are_full_strength_as_their_share_lands() {
+        use crate::motion::LIFT;
+        use crate::pane::HOLD_UNTIL;
+        assert_eq!(super::rows_strength(0., HOLD_UNTIL), LIFT, "in, 16 px out: 70 %");
+        assert_eq!(super::rows_strength(0.2, 0.), 1., "landed early in `quick`: full");
+        assert_eq!(super::rows_strength(1., HOLD_UNTIL), 1., "`quick` done: full");
+        let mut last = 0.;
+        for i in 0..=16 {
+            let k = super::rows_strength(i as f32 / 64., HOLD_UNTIL - i as f32);
+            assert!(k >= last, "never falls: {k} after {last}");
+            last = k;
+        }
+    }
+
     // Not `super::*`: that brings in gpui's `test` attribute through `gpui_kit::*`.
     use std::time::{Duration, Instant};
 
