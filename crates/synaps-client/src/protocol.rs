@@ -330,6 +330,10 @@ pub struct ModelOptions {
     /// The levels the session takes for its current model.
     #[serde(default)]
     pub thinking: Vec<String>,
+    /// Why the list is short or no model change would apply now (workers
+    /// to reconcile, the credential broker did not answer).
+    #[serde(default)]
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -337,8 +341,13 @@ pub struct ModelOption {
     pub id: String,
     #[serde(default)]
     pub label: String,
+    /// The provider's name (its section).
     #[serde(default)]
     pub provider: String,
+    /// The provider's stable key: rows group by it (empty from a daemon
+    /// before SynapsCLI #435's review: then by `provider`).
+    #[serde(default)]
+    pub provider_key: String,
 }
 
 impl std::fmt::Debug for SessionCommand {

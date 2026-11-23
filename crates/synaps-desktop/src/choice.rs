@@ -89,9 +89,11 @@ pub(crate) struct Target {
     pub off: Option<String>,
     /// More models than shown.
     pub more: usize,
-    /// A model menu: every model the daemon listed (id, label, provider).
-    /// One provider's are the values; the others are rows of their own.
+    /// A model menu: every model the daemon listed (id, label, provider
+    /// key). One provider's are the values; the others are rows of their own.
     pub all: Vec<(String, String, String)>,
+    /// The providers' names by key (a row says the name).
+    pub names: Vec<(String, String)>,
     /// The providers whose models are not shown, with how many each has.
     pub providers: Vec<(String, usize)>,
 }
@@ -126,11 +128,24 @@ impl Target {
         self.loading = false;
         match (self.kind, options) {
             (Kind::Model, Some(o)) => {
+                let key = |m: &synaps_client::ModelOption| {
+                    if m.provider_key.is_empty() { m.provider.clone() } else { m.provider_key.clone() }
+                };
                 self.all = o
                     .models
                     .iter()
-                    .map(|m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() }, m.provider.clone()))
+                    .map(|m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() }, key(m)))
                     .collect();
+                self.names.clear();
+                for m in &o.models {
+                    if !self.names.iter().any(|(k, _)| *k == key(m)) {
+                        self.names.push((key(m), m.provider.clone()));
+                    }
+                }
+                // The daemon's word on the list (a block, a broker that did not answer).
+                if o.notice.is_some() {
+                    self.note = o.notice.clone();
+                }
                 self.show(None);
             }
             (Kind::Thinking, Some(o)) => self.set_values(o.thinking.iter().map(|l| (l.clone(), l.clone())).collect()),
@@ -224,7 +239,8 @@ impl Target {
         }
         let home = self.home();
         for (j, (p, n)) in self.providers.iter().enumerate() {
-            let name = if p.is_empty() { "other" } else { p.as_str() };
+            let name = self.names.iter().find(|(k, _)| k == p).map_or(p.as_str(), |(_, name)| name.as_str());
+            let name = if name.is_empty() { "other" } else { name };
             let mut it =
                 Item::new(PROVIDER + j, cut(&format!("{name} · {n}"))).key(if home == Some(p.as_str()) { "current ▸" } else { "▸" });
             if self.pending.is_some() {
@@ -392,6 +408,7 @@ impl AppView {
             more: 0,
             all: Vec::new(),
             providers: Vec::new(),
+            names: Vec::new(),
         };
         let cached = self.choice.cache.as_ref().filter(|c| c.0 == attach_seq).map(|c| c.1.clone());
         if supported {
@@ -598,11 +615,17 @@ mod tests {
             more: 0,
             all: Vec::new(),
             providers: Vec::new(),
+            names: Vec::new(),
         }
     }
 
     fn opts() -> ModelOptions {
-        let m = |id: &str, label: &str, provider: &str| ModelOption { id: id.into(), label: label.into(), provider: provider.into() };
+        let m = |id: &str, label: &str, provider: &str| ModelOption {
+            id: id.into(),
+            label: label.into(),
+            provider: provider.into(),
+            provider_key: String::new(),
+        };
         ModelOptions {
             model: "anthropic/claude-opus-5-5".into(),
             thinking_level: "high".into(),
@@ -612,6 +635,7 @@ mod tests {
                 m("anthropic/claude-opus-5-5", "Opus 5.5", "Anthropic"),
             ],
             thinking: vec!["off".into(), "adaptive".into(), "high".into(), "max".into()],
+            notice: None,
         }
     }
 
@@ -637,6 +661,37 @@ mod tests {
         let mut t = target(Kind::Thinking, "high");
         t.fill(Some(&opts()));
         assert_eq!(t.items().iter().filter(|i| i.key == Some("current")).map(|i| i.act).collect::<Vec<_>>(), [2]);
+    }
+
+    /// Sections are the daemon's provider keys, named by its names: two
+    /// providers that share a name stay apart; its notice is a note row.
+    #[test]
+    fn sections_follow_the_daemons_provider_keys_and_notice() {
+        let m = |id: &str, provider: &str, key: &str| ModelOption {
+            id: id.into(),
+            label: String::new(),
+            provider: provider.into(),
+            provider_key: key.into(),
+        };
+        let o = ModelOptions {
+            model: "anthropic/claude-opus-5-5".into(),
+            models: vec![
+                m("anthropic/claude-opus-5-5", "Anthropic", "anthropic"),
+                m("a:llm:x", "LLM", "a:llm"),
+                m("b:llm:y", "LLM", "b:llm"),
+            ],
+            notice: Some("model change blocked: workers require collection/reconciliation".into()),
+            ..ModelOptions::default()
+        };
+        let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
+        t.fill(Some(&o));
+        let items = t.items();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
+        assert_eq!(labels[1..], ["anthropic/claude-opus-5-5", "LLM · 1", "LLM · 1"], "{labels:?}");
+        assert_eq!(items[0].act, NOTE);
+        assert!(labels[0].starts_with("model change blocked"), "{labels:?}");
+        t.show(t.provider(items[3].act).as_deref());
+        assert_eq!(t.values, [("b:llm:y".to_string(), "b:llm:y".to_string())], "the second LLM's own");
     }
 
     #[test]
@@ -668,7 +723,12 @@ mod tests {
     fn read_only_rows_say_why_and_a_long_list_is_cut() {
         let mut t = target(Kind::Model, "anthropic/m19");
         t.off = Some("read-only: this window observes the session".into());
-        let models = (0..20).map(|i| ModelOption { id: format!("anthropic/m{i}"), label: String::new(), provider: "Anthropic".into() });
+        let models = (0..20).map(|i| ModelOption {
+            id: format!("anthropic/m{i}"),
+            label: String::new(),
+            provider: "Anthropic".into(),
+            provider_key: "anthropic".into(),
+        });
         t.fill(Some(&ModelOptions { models: models.collect(), ..ModelOptions::default() }));
         let items = t.items();
         assert!(items.iter().all(|i| !i.enabled()));
