@@ -5230,8 +5230,12 @@ impl AppView {
     /// ([`Slack::row`]), as the last layout placed it.
     fn over_held_row(&self, window: &Window) -> bool {
         let Some((id, summary)) = self.panes.cur.fold_slack.get().and_then(|s| s.row) else { return false };
-        let Some(ix) =
-            self.panes.cur.disp.iter().position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == summary && d.kind != Kind::Prompt)
+        let Some(ix) = self
+            .panes
+            .cur
+            .disp
+            .iter()
+            .position(|d| d.id == id && matches!(d.kind, Kind::Summary { .. }) == summary && d.kind != Kind::Prompt)
         else {
             return false;
         };

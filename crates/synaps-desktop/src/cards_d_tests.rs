@@ -135,7 +135,9 @@ fn a_call_appended_to_a_run_keeps_one_bottom_edge(cx: &mut TestAppContext) {
                 t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
             }
             let id = format!("edge-run-{k}");
-            t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }) });
+            t.apply(&SessionEvent::Stream {
+                event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: id.clone() }),
+            });
             t.apply(&SessionEvent::Stream {
                 event: StreamEvent::Llm(LlmEvent::ToolUse {
                     tool_name: "bash".into(),
@@ -160,7 +162,8 @@ fn a_call_appended_to_a_run_keeps_one_bottom_edge(cx: &mut TestAppContext) {
                 .iter()
                 .enumerate()
                 .filter(|(_, d)| {
-                    d.kind == Kind::Work && items.get(d.item).and_then(|i| i.tool.as_ref()).is_some_and(|t| t.tool_id.starts_with("edge-run-"))
+                    d.kind == Kind::Work
+                        && items.get(d.item).and_then(|i| i.tool.as_ref()).is_some_and(|t| t.tool_id.starts_with("edge-run-"))
                 })
                 .map(|(ix, d)| (ix, d.id))
                 .collect()
@@ -203,7 +206,9 @@ fn a_wrapped_streamed_line_never_pops(cx: &mut TestAppContext) {
         let t = &mut v.model.transcript;
         t.set_busy(true);
         t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
-        t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: "wrap-0".into() }) });
+        t.apply(&SessionEvent::Stream {
+            event: StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: "bash".into(), tool_id: "wrap-0".into() }),
+        });
         t.apply(&SessionEvent::Stream {
             event: StreamEvent::Llm(LlmEvent::ToolUse {
                 tool_name: "bash".into(),
