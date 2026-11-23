@@ -1819,6 +1819,13 @@ impl Model {
                     _ => {}
                 }
                 self.lives[lid].transcript.apply_at(&event, &ts);
+                // What the daemon applied (SynapsCLI #437), from the raw
+                // event: the receipt takes its word ([`crate::authorize`]).
+                if let SessionEvent::PromptResolved { prompt_id } = &event
+                    && let Some(o) = synaps_client::protocol::PromptOutcome::of_event(&raw)
+                {
+                    self.lives[lid].transcript.note_outcome(*prompt_id, o);
+                }
                 let l = &mut self.lives[lid];
                 if !l.answered.is_empty() {
                     let pending = l.transcript.pending_prompts();

@@ -1619,7 +1619,8 @@ mod tests {
     /// build does not know) the call decides, as for #25.
     #[test]
     fn a_reported_outcome_decides_the_receipt() {
-        use PromptOutcome as O;
+        use synaps_client::protocol::PromptOutcome as O;
+        use synaps_client::transcript::ToolStatus;
         let r = |answer, secret, outcome| Receipt {
             call: "toolu_1".into(),
             own: false,
@@ -1644,7 +1645,11 @@ mod tests {
         assert_eq!(ours(O::TimedOut).answer_for(denied, held), Answer::Cancelled);
         assert!(!ours(O::Cancelled).applied_yes(held));
         assert_eq!(r(Answer::AllowedAll, false, Some(O::Allowed)).answer_for(running, unknown), Answer::AllowedAll);
-        assert_eq!(r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, unknown), Answer::Allowed, "ours was not the one applied");
+        assert_eq!(
+            r(Answer::Denied, false, Some(O::Allowed)).answer_for(running, unknown),
+            Answer::Allowed,
+            "ours was not the one applied"
+        );
         // A secret.
         assert_eq!(r(Answer::Provided, true, Some(O::Answered)).answer_for(cancelled, held), Answer::Provided);
         assert_eq!(r(Answer::Provided, true, Some(O::Denied)).answer_for(running, unknown), Answer::Cancelled, "dismissed elsewhere first");

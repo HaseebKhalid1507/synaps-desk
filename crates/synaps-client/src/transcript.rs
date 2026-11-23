@@ -475,13 +475,17 @@ impl Transcript {
     /// What the daemon applied when prompt `id` resolved (SynapsCLI #437).
     /// `None`: a daemon that does not say, an outcome this build does not
     /// know, or not among the last few resolved here.
+    /// What the daemon applied when prompt `id` resolved, from its raw
+    /// event ([`crate::protocol::PromptOutcome::of_event`]), right after
+    /// [`Transcript::apply`] took the event.
+    pub fn note_outcome(&mut self, id: u64, outcome: crate::protocol::PromptOutcome) {
+        if let Some(r) = self.resolved.iter_mut().rev().find(|r| r.0 == id) {
+            r.2 = Some(outcome);
+        }
+    }
+
     pub fn resolved_outcome(&self, id: u64) -> Option<crate::protocol::PromptOutcome> {
-        self.resolved
-            .iter()
-            .rev()
-            .find(|r| r.0 == id)
-            .and_then(|r| r.2)
-            .filter(|o| *o != crate::protocol::PromptOutcome::Unknown)
+        self.resolved.iter().rev().find(|r| r.0 == id).and_then(|r| r.2).filter(|o| *o != crate::protocol::PromptOutcome::Unknown)
     }
 
     /// Whether call `tool_id` showed it got past its gate: output streamed
@@ -1330,12 +1334,12 @@ impl Transcript {
                 self.settle();
             }
             SessionEvent::Prompt { request } => self.pending_prompts.push(request.clone()),
-            SessionEvent::PromptResolved { prompt_id, outcome } => {
+            SessionEvent::PromptResolved { prompt_id } => {
                 self.pending_prompts.retain(|p| p.id != *prompt_id);
                 if self.resolved.len() == 16 {
                     self.resolved.pop_front();
                 }
-                self.resolved.push_back((*prompt_id, self.busy, *outcome));
+                self.resolved.push_back((*prompt_id, self.busy, None));
             }
             SessionEvent::External { event } => self.live_event(event),
             // The input owner's own steer, whatever it looks like: events
@@ -1873,22 +1877,34 @@ mod outcome_tests {
     fn a_resolved_prompt_remembers_whether_a_turn_ran() {
         let mut t = Transcript::new();
         t.apply(&SessionEvent::TurnStarted { turn_baseline: 0, trigger: String::new(), user_text: None });
-        t.apply(&SessionEvent::PromptResolved { prompt_id: 3, outcome: None });
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 3 });
         t.apply(&SessionEvent::Idle);
-        t.apply(&SessionEvent::PromptResolved { prompt_id: 4, outcome: None });
+        t.apply(&SessionEvent::PromptResolved { prompt_id: 4 });
         assert_eq!((t.resolved_busy(3), t.resolved_busy(4), t.resolved_busy(5)), (Some(true), Some(false), None));
     }
 
-    /// SynapsCLI #437: a prompt remembers what the daemon applied, decoded
-    /// from the wire; an older daemon's (no `outcome`) and one this build
-    /// does not know read as nothing said.
+    /// SynapsCLI #437: a prompt remembers what the daemon applied, read
+    /// from the raw event; an older daemon's (no `outcome`) and one this
+    /// build does not know read as nothing said.
     #[test]
     fn a_resolved_prompt_remembers_what_the_daemon_applied() {
         use crate::protocol::{PromptOutcome, decode_event};
         let mut t = Transcript::new();
+        let mut resolve = |raw: serde_json::Value| {
+            t.apply(&decode_event(&raw).unwrap());
+            if let (Some(o), Some(id)) = (PromptOutcome::of_event(&raw), raw["prompt_id"].as_u64()) {
+                t.note_outcome(id, o);
+            }
+        };
         for (id, outcome) in [(1, "allowed"), (2, "denied"), (3, "answered"), (4, "cancelled"), (5, "timed_out"), (6, "vetoed")] {
-            t.apply(&decode_event(&serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": outcome})).unwrap());
+            resolve(serde_json::json!({"ev": "prompt_resolved", "prompt_id": id, "outcome": outcome}));
         }
+        resolve(serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7}));
+        let got: Vec<_> = (1..=8).map(|id| t.resolved_outcome(id)).collect();
+        use PromptOutcome::*;
+        assert_eq!(got, [Some(Allowed), Some(Denied), Some(Answered), Some(Cancelled), Some(TimedOut), None, None, None]);
+        assert_eq!(PromptOutcome::of_event(&serde_json::json!({"ev": "idle", "outcome": "allowed"})), None, "only prompt_resolved");
+    }
         t.apply(&decode_event(&serde_json::json!({"ev": "prompt_resolved", "prompt_id": 7})).unwrap());
         let got: Vec<_> = (1..=8).map(|id| t.resolved_outcome(id)).collect();
         use PromptOutcome::*;

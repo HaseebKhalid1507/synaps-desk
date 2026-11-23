@@ -777,7 +777,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                         let _ = upd(cx, &|v, cx| {
                             // Not `sync_list` here: the frame resolves the card
                             // first (it folds into its row), as a daemon's event.
-                            v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7, outcome: None });
+                            v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                             cx.notify();
                         });
                         // `SYNAPS_BENCH_STATES=denied|halted` (#25): what the
@@ -1055,7 +1055,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = upd(cx, &|v, cx| {
                         // Not `sync_list` here: the frame resolves the card
                         // first (it folds into its row), as a daemon's event.
-                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7, outcome: None });
+                        v.model.lives[v.panes.cur.live].transcript.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                         cx.notify();
                     });
                     sleep(1.5).await;
@@ -1554,7 +1554,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 // answered first (NEEDS YOU outranks RUNNING: no orbit).
                 let _ = upd(cx, &|v, _| {
                     let t = &mut v.model.lives[v.panes.cur.live].transcript;
-                    t.apply(&SessionEvent::PromptResolved { prompt_id: 7, outcome: None });
+                    t.apply(&SessionEvent::PromptResolved { prompt_id: 7 });
                     t.apply(&SessionEvent::TurnStarted { turn_baseline: 12, trigger: "user".into(), user_text: Some("Go on.".into()) });
                     t.apply(&SessionEvent::Stream { event: StreamEvent::Llm(LlmEvent::ResponseStart) });
                     v.sync_list();

@@ -13,7 +13,7 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
 };
-use synaps_client::protocol::{PromptOutcome, SessionEvent};
+use synaps_client::protocol::SessionEvent;
 
 use crate::app::AppView;
 use crate::motion::Level;
@@ -102,12 +102,14 @@ fn allow_then(
     allow_resolved_then(cx, level, None, end)
 }
 
-/// [`allow_then`], the prompt resolved with `outcome` (SynapsCLI #437;
-/// `None`: a daemon before it).
+/// [`allow_then`], the prompt resolved with `outcome` (SynapsCLI #437's
+/// wire name; `None`: a daemon before it). With one, the event goes the
+/// way a daemon's does, through [`crate::model::Model::apply`] with its raw
+/// form (where the outcome is read).
 fn allow_resolved_then(
     cx: &mut TestAppContext,
     level: Level,
-    outcome: Option<PromptOutcome>,
+    outcome: Option<&str>,
     end: impl FnOnce(&mut TestAppContext, &Entity<AppView>, &str),
 ) -> (Vec<(u64, &'static str, bool)>, u64, AnyWindowHandle) {
     let (w, view, _events) = open(cx);
@@ -119,7 +121,16 @@ fn allow_resolved_then(
     crate::authorize::RECEIPT_LIT.with(|l| l.borrow_mut().clear());
     assert!(view.update(cx, |v, _| v.answer(key, Some(crate::model::CONFIRM_YES.into()))), "sent");
     view.update(cx, |v, cx| {
-        v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: key.1, outcome });
+        match outcome {
+            None => v.model.transcript.apply(&SessionEvent::PromptResolved { prompt_id: key.1 }),
+            Some(o) => {
+                let a = v.model.active.clone().expect("the demo session attached");
+                let raw = serde_json::json!({"ev": "prompt_resolved", "prompt_id": key.1, "outcome": o});
+                let event = synaps_client::protocol::decode_event(&raw).expect("an event");
+                let _ = v.model.apply(synaps_client::Event::session(a.attach_seq, a.session_id, 0, event, std::sync::Arc::new(raw)));
+                assert!(v.model.transcript.resolved_outcome(key.1).is_some(), "the model read the outcome: {o}");
+            }
+        }
         cx.notify();
     });
     cx.run_until_parked();
@@ -264,7 +275,7 @@ fn an_allow_whose_call_streamed_is_not_taken_back(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_reported_deny_reads_denied_from_the_landing(cx: &mut TestAppContext) {
     for level in [Level::Full, Level::Off] {
-        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Denied), |_, _, _| {});
+        let (seen, row, w) = allow_resolved_then(cx, level, Some("denied"), |_, _, _| {});
         assert!(!seen.is_empty(), "{level:?}: the receipt was drawn");
         assert!(seen.iter().all(|s| s.1 == "denied" && !s.2), "{level:?}: denied in every frame, unlit: {seen:?}");
         assert!(drawn(cx, w, format!("receipt-word {row} denied")), "{level:?}");
@@ -281,7 +292,7 @@ fn a_reported_deny_reads_denied_from_the_landing(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_reported_allow_lights_as_it_lands_and_outlives_a_halt(cx: &mut TestAppContext) {
     for level in [Level::Full, Level::Off] {
-        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Allowed), |cx, view, call| {
+        let (seen, row, w) = allow_resolved_then(cx, level, Some("allowed"), |cx, view, call| {
             result(cx, view, call, "Canceled by user");
         });
         assert!(seen.iter().all(|s| s.1 == "allowed"), "{level:?}: {seen:?}");
@@ -303,7 +314,7 @@ fn a_reported_allow_lights_as_it_lands_and_outlives_a_halt(cx: &mut TestAppConte
 #[gpui_kit::test]
 fn a_reported_cancel_reads_cancelled_though_the_call_reads_denied(cx: &mut TestAppContext) {
     for level in [Level::Full, Level::Off] {
-        let (seen, row, w) = allow_resolved_then(cx, level, Some(PromptOutcome::Cancelled), |cx, view, call| {
+        let (seen, row, w) = allow_resolved_then(cx, level, Some("cancelled"), |cx, view, call| {
             result(cx, view, call, "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this command");
         });
         assert!(seen.iter().all(|s| s.1 == "cancelled" && !s.2), "{level:?}: {seen:?}");

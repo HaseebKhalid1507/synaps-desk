@@ -1248,6 +1248,18 @@ pub enum PromptOutcome {
     Unknown,
 }
 
+impl PromptOutcome {
+    /// A raw `prompt_resolved` event's `outcome`. `None`: another event, or
+    /// a daemon before SynapsCLI #437 (no `outcome`); a value this build
+    /// does not know is `Unknown`.
+    pub fn of_event(raw: &Value) -> Option<Self> {
+        if raw.get("ev").and_then(Value::as_str) != Some("prompt_resolved") {
+            return None;
+        }
+        serde_json::from_value(raw.get("outcome")?.clone()).ok()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
@@ -1434,12 +1446,11 @@ pub enum SessionEvent {
     Prompt {
         request: PromptRequest,
     },
-    /// `outcome`: what the daemon applied (SynapsCLI #437). `None` from a
-    /// daemon before it.
+    /// What the daemon applied (`outcome`, SynapsCLI #437) is read from the
+    /// raw event, [`PromptOutcome::of_event`]: this variant keeps its one
+    /// field, so code that builds it (the desktop's tests) is unchanged.
     PromptResolved {
         prompt_id: u64,
-        #[serde(default)]
-        outcome: Option<PromptOutcome>,
     },
     Idle,
     Steered {
