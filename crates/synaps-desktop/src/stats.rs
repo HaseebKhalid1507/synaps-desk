@@ -192,8 +192,12 @@ impl Stats {
     }
 
     /// A live event; `raw` is the wire event (fields the mirror drops).
-    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) {
+    /// `true`: the session's prompt cache is not what it was (the history
+    /// was replaced, or the model changed): the countdown stops, and the
+    /// daemon is asked again.
+    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) -> bool {
         self.subagents.on_session(ev);
+        let mut new_cache = false;
         match ev {
             SessionEvent::Conversation { digest } => {
                 // `keepwarm_tokens` is not on the decoded digest: from the wire event.
@@ -226,14 +230,24 @@ impl Stats {
                     }
                 }
             }
-            SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => self.context = None,
+            SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => {
+                self.context = None;
+                new_cache = true;
+            }
             _ if raw["ev"] == "setting_changed" => {
                 if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {
+                    // Only an effective change of model: a refused or
+                    // same-model `Set`, or a thinking change, keeps it.
+                    new_cache = self.view.as_ref().is_some_and(|o| !same_model(&o.model, &v.model));
                     self.view = Some(v);
                 }
             }
             _ => {}
         }
+        if new_cache && let Some(w) = self.warm.as_mut() {
+            w.invalidate();
+        }
+        new_cache
     }
 
     /// Context use, 0..=1, when both the prompt size and the window are known.

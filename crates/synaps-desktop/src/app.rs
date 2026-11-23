@@ -4550,11 +4550,13 @@ impl AppView {
     /// shows (`shown`) in a visible window. Cold, or nothing counting:
     /// nothing armed (an idle window draws no frame for it).
     fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
-        let now = Instant::now();
+        let now = crate::warm::Now::now();
         let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
         let seq = self.model.lives[self.panes.cur.live].attachment();
-        let refresh = warm.and_then(|w| w.refresh_at()).filter(|_| seq.is_some() && self.client.is_some());
-        let due = [warm.and_then(|w| w.next_change(now)), refresh].into_iter().flatten().min();
+        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
+        // Woken from a sleep: read again at once (the callback rebases).
+        let slept = warm.is_some_and(|w| w.slept(now)).then_some(now.mono);
+        let due = [warm.and_then(|w| w.next_change(now)), refresh, slept].into_iter().flatten().min();
         let Some(due) = due else {
             self.warm_tick = None;
             return;
@@ -4569,8 +4571,18 @@ impl AppView {
             }
             let _ = this.update(cx, |v, cx| {
                 v.warm_tick = None;
+                // The machine slept since the answer: what it said is aged
+                // by the sleep, and asked again.
+                let now = crate::warm::Now::now();
+                let slept = v.model.lives[v.panes.cur.live].stats.warm.as_mut().is_some_and(|w| {
+                    let slept = w.slept(now);
+                    if slept {
+                        w.rebase(now);
+                    }
+                    slept
+                });
                 // A due ping moved the cache's anchor: ask once.
-                if refresh.is_some_and(|r| Instant::now() >= r)
+                if (slept || refresh.is_some_and(|r| now.mono >= r))
                     && let (Some(c), Some(seq)) = (&v.client, seq)
                 {
                     let _ = c.on(seq).status();
@@ -4605,6 +4617,10 @@ impl AppView {
     fn visibility_changed(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         self.arm_watch_poll(cx);
+        // Hidden: the cache countdown's timer goes now, not at its wake.
+        if !visible {
+            self.warm_tick = None;
+        }
         // Hidden, the heartbeat stops; shown again, the next frame re-arms it.
         self.fx.set_visible(visible);
         if visible {

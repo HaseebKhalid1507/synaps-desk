@@ -2338,7 +2338,7 @@ impl AppView {
         // the session's status has come.
         let cache =
             s.warm.as_ref().map(|w| {
-                let now = std::time::Instant::now();
+                let now = crate::warm::Now::now();
                 let left = w.left(now);
                 let (exp, exp_c) = match left {
                     Some(d) if d.is_zero() => ("cold".to_string(), p.dim_ch),
