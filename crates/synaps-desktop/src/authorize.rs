@@ -1195,6 +1195,8 @@ impl AppView {
                 .child(f)
         });
         let status = foot.map(|f| h_flex().flex_none().mt(px(8.)).items_center().child(f));
+        // With split panes, each pane's card is named by its pane (tests).
+        let pane = self.panes.split().then(|| self.panes.cur.id.index());
         // The folder and the box left, the buttons right; in a narrow card
         // the buttons wrap under them, still right.
         let line = h_flex()
@@ -1209,9 +1211,12 @@ impl AppView {
             .justify_between()
             .track_scroll(&c.actions)
             .child(h_flex().flex_1().min_w_0().gap(px(16.)).items_center().children(folder).children(check))
-            .children(actions.map(|a| a.flex_none().justify_end()));
-        // With split panes, each pane's card is named by its pane (tests).
-        let pane = self.panes.split().then(|| self.panes.cur.id.index());
+            .children(actions.map(|a| {
+                a.flex_none().justify_end().debug_selector(move || match pane {
+                    None => "card-buttons".into(),
+                    Some(i) => format!("card-buttons {i}"),
+                })
+            }));
         v_flex()
             .id("prompt-card")
             .debug_selector(move || match (live, pane) {

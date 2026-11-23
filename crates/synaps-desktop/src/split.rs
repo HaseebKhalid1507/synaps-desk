@@ -86,12 +86,29 @@ pub(crate) struct Flight {
     /// (Shady #42 L2: set once, not the narrowest drawn so far, which crept
     /// frame by frame under a panel's flight); `None`: not yet (the wraps
     /// a flight carries on from are kept where narrower).
-    pub wrap_at: Option<f32>,
+    pub wrap_at: Option<(f32, f32)>,
+    /// A panel yielding on this flight (#51): the layout rides its spring.
+    pub ride: Option<Ride>,
+}
+
+/// A layout riding a yielding panel's spring (#51): its step is how far
+/// the centre has gone from where they start to where they land (each
+/// pane's width moving linearly between its ends, [`Node::lerp_px_from`]),
+/// and it lands with the panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Ride {
+    /// The centre's width where they start, and where they land.
+    pub from: f32,
+    pub to: f32,
+    /// The frame it first drew the landed layout: the flight is over the
+    /// frame after (as a layout's own flight, which lands a frame or more
+    /// before its spring rests).
+    pub landed: Option<std::time::Instant>,
 }
 
 impl Flight {
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
-        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None }
+        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
     }
 
     /// Each pane's wrap (its narrowest width on the way), set from the
@@ -101,11 +118,20 @@ impl Flight {
     /// changes (a panel's flight starts or lands, a resize). A growing or
     /// closing pane keeps its landed or last box, as before.
     pub(crate) fn set_wraps(&mut self, area: Rect) {
-        if self.wrap_at == Some(area.w) {
+        self.set_wraps_at(area, area);
+    }
+
+    /// [`Flight::set_wraps`] from its ends each in its own centre: `from`
+    /// where the flight starts, `to` where it lands. A panel yielding on
+    /// this flight (#51) moves on its spring from its start, so the centre
+    /// and the ratios move together: a pane's width, the product of a
+    /// share and the centre moving the other way, is still least at an end.
+    pub(crate) fn set_wraps_at(&mut self, from: Rect, to: Rect) {
+        if self.wrap_at == Some((from.w, to.w)) {
             return;
         }
         let carried = self.wrap_at.is_none();
-        let ends = [self.from.rects(area), self.to.rects(area)];
+        let ends = [self.from.rects(from), self.to.rects(to)];
         for id in self.to.leaves() {
             if self.grow.contains(&id) || self.ghosts.contains(&id) {
                 continue;
@@ -119,7 +145,7 @@ impl Flight {
                 None => self.wrap.push((id, w)),
             }
         }
-        self.wrap_at = Some(area.w);
+        self.wrap_at = Some((from.w, to.w));
     }
 }
 
@@ -159,6 +185,25 @@ impl Refused {
 pub(crate) enum Node {
     Leaf(PaneId),
     Split { axis: Axis, kids: Vec<Node>, ratios: Vec<f32> },
+}
+
+/// Whether a saved tree keeps the caps: at most [`ACROSS_MAX`] panes side
+/// by side and [`DOWN_MAX`] stacked.
+pub(crate) fn fits_caps(tree: &crate::theme::LayoutNode) -> bool {
+    fn extent(n: &crate::theme::LayoutNode) -> (usize, usize) {
+        match n {
+            crate::theme::LayoutNode::Pane(_) => (1, 1),
+            crate::theme::LayoutNode::Split { axis, kids, .. } => {
+                let ex: Vec<(usize, usize)> = kids.iter().map(extent).collect();
+                match axis {
+                    Axis::Row => (ex.iter().map(|e| e.0).sum(), ex.iter().map(|e| e.1).max().unwrap_or(1)),
+                    Axis::Column => (ex.iter().map(|e| e.0).max().unwrap_or(1), ex.iter().map(|e| e.1).sum()),
+                }
+            }
+        }
+    }
+    let (across, down) = extent(tree);
+    across <= ACROSS_MAX && down <= DOWN_MAX
 }
 
 /// A rectangle in the centre's own pixels.
@@ -471,6 +516,97 @@ impl Node {
         }
     }
 
+    /// Its shape into `h`: the axes, each kid, each ratio's bits, each leaf
+    /// (a cheap key for [`crate::app::AppView`]'s layout generation).
+    pub(crate) fn hash_shape(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            Node::Leaf(id) => (0u8, id).hash(h),
+            Node::Split { axis, kids, ratios } => {
+                (1u8, *axis == Axis::Row, kids.len()).hash(h);
+                for (k, r) in kids.iter().zip(ratios) {
+                    r.to_bits().hash(h);
+                    k.hash_shape(h);
+                }
+            }
+        }
+    }
+
+    /// This tree as the settings file keeps it (split/architecture.md §5):
+    /// each pane by its index in `order`.
+    pub(crate) fn to_saved(&self, order: &[PaneId]) -> crate::theme::LayoutNode {
+        match self {
+            Node::Leaf(id) => crate::theme::LayoutNode::Pane(order.iter().position(|o| o == id).unwrap_or(0)),
+            Node::Split { axis, kids, ratios } => crate::theme::LayoutNode::Split {
+                axis: *axis,
+                ratios: ratios.clone(),
+                kids: kids.iter().map(|k| k.to_saved(order)).collect(),
+            },
+        }
+    }
+
+    /// A saved tree with its pane `i` as `ids[i]` (a whole one:
+    /// [`crate::theme::load_layout`]), normalised.
+    pub(crate) fn from_saved(n: &crate::theme::LayoutNode, ids: &[PaneId]) -> Node {
+        fn build(n: &crate::theme::LayoutNode, ids: &[PaneId]) -> Node {
+            match n {
+                crate::theme::LayoutNode::Pane(i) => Node::Leaf(ids.get(*i).copied().unwrap_or(PaneId::FIRST)),
+                crate::theme::LayoutNode::Split { axis, ratios, kids } => {
+                    Node::Split { axis: *axis, kids: kids.iter().map(|k| build(k, ids)).collect(), ratios: ratios.clone() }
+                }
+            }
+        }
+        build(n, ids).normalise()
+    }
+
+    /// Its ratios re-clamped to `area` (a restored layout in this window,
+    /// architecture §5): a pane its share puts under its minimum gets it
+    /// (and a pixel for the rounding, when there is room), the others
+    /// keep their proportions of what is left; a split whose minimums
+    /// need more than its room is left as it is (the window folds).
+    pub(crate) fn clamped(&self, area: Rect) -> Node {
+        let Node::Split { axis, kids, ratios } = self else { return self.clone() };
+        let len = match axis {
+            Axis::Row => area.w,
+            Axis::Column => area.h,
+        };
+        let room = (len - DIVIDER * (kids.len() - 1) as f32).max(1.);
+        let mins: Vec<f32> = kids.iter().map(|k| k.min_along(*axis)).collect();
+        let mut out = self.clone();
+        if mins.iter().sum::<f32>() <= room + 1e-3 {
+            let pad = if mins.iter().map(|m| m + 1.).sum::<f32>() <= room { 1. } else { 0. };
+            let mut held = vec![false; kids.len()];
+            let shares = loop {
+                let fixed: f32 = mins.iter().zip(&held).filter(|(_, h)| **h).map(|(m, _)| m + pad).sum();
+                let free: f32 = ratios.iter().zip(&held).filter(|(_, h)| !**h).map(|(r, _)| r).sum();
+                let rest = room - fixed;
+                let share = |i: usize| if free > 0. { rest * ratios[i] / free } else { 0. };
+                let mut raised = false;
+                for i in 0..kids.len() {
+                    if !held[i] && share(i) < mins[i] + pad {
+                        held[i] = true;
+                        raised = true;
+                    }
+                }
+                if !raised || held.iter().all(|h| *h) {
+                    break (0..kids.len()).map(|i| if held[i] { mins[i] + pad } else { share(i) } / room).collect::<Vec<f32>>();
+                }
+            };
+            let sum: f32 = shares.iter().sum();
+            if let Node::Split { ratios, .. } = &mut out {
+                *ratios = shares.iter().map(|s| s / sum).collect();
+            }
+        }
+        let mut subs = Vec::new();
+        out.kid_rects(area, &mut subs);
+        if let Node::Split { kids, .. } = &mut out {
+            for (k, sub) in kids.iter_mut().zip(subs) {
+                *k = k.clamped(sub);
+            }
+        }
+        out
+    }
+
     fn at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
         match path.split_first() {
             None => Some(self),
@@ -622,6 +758,49 @@ impl Node {
             {
                 let kids = kids.iter().zip(k2).map(|(k, f)| k.lerp_from(f, t)).collect();
                 let ratios = ratios.iter().zip(r2).map(|(to, fr)| fr + (to - fr) * t).collect();
+                Node::Split { axis: *axis, kids, ratios }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// The layout's step at `t` with the centre moving under it (#51):
+    /// `from` laid out in `a` and this tree in `b`, every edge between
+    /// panes at its place there lerped in pixels and on a whole one, as
+    /// shares of the room each split is drawn in (`now`, `t` of the way
+    /// from `a` to `b`). Each pane's edges move linearly between their
+    /// ends, as the panel's does: a pane's width never goes past either.
+    pub(crate) fn lerp_px_from(&self, from: &Node, t: f32, a: Rect, b: Rect, now: Rect) -> Node {
+        if t >= 1. {
+            return self.clone();
+        }
+        match (self, from) {
+            (Node::Leaf(x), Node::Leaf(y)) if x == y => self.clone(),
+            (Node::Split { axis, kids, .. }, Node::Split { axis: a2, kids: k2, .. }) if axis == a2 && kids.len() == k2.len() => {
+                let (mut fa, mut tb) = (Vec::new(), Vec::new());
+                from.kid_rects(a, &mut fa);
+                self.kid_rects(b, &mut tb);
+                // A kid's far edge, from the split's start.
+                let row = *axis == Axis::Row;
+                let end = |r: &Rect| if row { r.x + r.w } else { r.y + r.h };
+                let (start, len) = if row { (now.x, now.w) } else { (now.y, now.h) };
+                let room = (len - DIVIDER * (kids.len() - 1) as f32).max(0.);
+                let mut at = 0f32;
+                let mut ratios = Vec::with_capacity(kids.len());
+                for i in 0..kids.len() {
+                    let e = if i + 1 == kids.len() {
+                        room
+                    } else {
+                        let (f, to) = (end(&fa[i]), end(&tb[i]));
+                        ((f + (to - f) * t).round() - start - DIVIDER * i as f32).clamp(at, room)
+                    };
+                    ratios.push(if room > 0. { (e - at) / room } else { 1. / kids.len() as f32 });
+                    at = e;
+                }
+                let step = Node::Split { axis: *axis, kids: kids.clone(), ratios: ratios.clone() };
+                let mut nk = Vec::new();
+                step.kid_rects(now, &mut nk);
+                let kids = kids.iter().enumerate().map(|(i, k)| k.lerp_px_from(&k2[i], t, fa[i], tb[i], nk[i])).collect();
                 Node::Split { axis: *axis, kids, ratios }
             }
             _ => self.clone(),
@@ -1023,6 +1202,45 @@ mod tests {
     /// Step 4's drops on a left or a top edge: the new pane before the one
     /// it splits (beside it in its split on that axis, else the two in a
     /// new split), its share from that pane, and grown from 0 there.
+    /// split/architecture.md §5: a layout saved in a wide window, restored
+    /// in a narrower one, keeps every pane at its minimum (the others in
+    /// proportion); one whose minimums cannot fit is left to the fold; a
+    /// tree round-trips through its saved form.
+    #[test]
+    fn a_restored_layout_is_reclamped_to_the_window() {
+        let t = Node::Split {
+            axis: Axis::Row,
+            kids: vec![
+                Node::Leaf(p(0)),
+                Node::Split { axis: Axis::Column, kids: vec![Node::Leaf(p(1)), Node::Leaf(p(2))], ratios: vec![0.1, 0.9] },
+                Node::Leaf(p(3)),
+            ],
+            ratios: vec![0.15, 0.6, 0.25],
+        };
+        let order = [p(0), p(1), p(2), p(3)];
+        assert_eq!(Node::from_saved(&t.to_saved(&order), &order), t, "round trip");
+        let ids = [p(3), p(2), p(1), p(0)];
+        assert_eq!(Node::from_saved(&t.to_saved(&order), &ids).leaves(), ids, "named as given");
+        for (w, h) in [(1100., 700.), (1600., 1000.), (2400., 1200.)] {
+            let area = Rect { x: 0., y: 0., w, h };
+            let c = t.clamped(area);
+            assert!(c.same_shape(&t));
+            let r = c.rects(area);
+            assert!(r.iter().all(|(_, r)| r.w >= PANE_MIN_W && r.h >= PANE_MIN_H), "{w}×{h}: {r:?}");
+            // The rest in proportion: pane 1 (0.6 of the row) stays wider than pane 3 (0.25).
+            let at = |id: PaneId| r.iter().find(|(i, _)| *i == id).unwrap().1;
+            assert!(at(p(1)).w > at(p(3)).w, "{w}: {r:?}");
+            if w >= 2400. {
+                assert_eq!(c.clamped(area), c, "already whole: unchanged");
+            }
+        }
+        // No room for three across: left to the fold.
+        let area = Rect { x: 0., y: 0., w: 900., h: 700. };
+        if let (Node::Split { ratios: a, .. }, Node::Split { ratios: b, .. }) = (&t.clamped(area), &t) {
+            assert_eq!(a, b, "left as it was");
+        }
+    }
+
     #[test]
     fn a_split_left_or_up_puts_the_new_pane_first() {
         let two = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), A).unwrap();

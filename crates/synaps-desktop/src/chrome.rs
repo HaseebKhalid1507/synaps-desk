@@ -1196,9 +1196,19 @@ impl AppView {
             }
             let asked = self.fx.asks();
             let (w, moving) = self.fx.spring_px(PANEL_W[i], to, f.response);
+            // A layout riding it (#51): on whole pixels, as its panes are,
+            // and its target itself once it rounds to it, at any scale (at
+            // 125 % a target off the device grid, 481 → 480.8, would never
+            // equal a whole pixel: Shady #54 L1).
+            let at = self.fx.snap(to);
+            let w = match self.panes.flight.as_ref().is_some_and(|f| f.ride.is_some()) {
+                true if w.round() == at.round() => at,
+                true => w.round(),
+                false => w,
+            };
             // Drawn at its target: landed, its spring at rest (no frame
             // and no timer for the settling it would draw nothing of).
-            let landed = moving && w == self.fx.snap(to);
+            let landed = moving && w == at;
             if landed {
                 self.fx.spring_jump(PANEL_W[i], to, to, f.response);
                 self.fx.ask_back(asked);
