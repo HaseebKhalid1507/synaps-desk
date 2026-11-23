@@ -18,6 +18,9 @@ pub(crate) const SECONDS_UNDER: Duration = Duration::from_secs(600);
 /// After a due ping, the status is asked again this much later (the ping's
 /// new anchor).
 const AFTER_PING: Duration = Duration::from_secs(5);
+/// Never asked again sooner than this after the last answer, whatever the
+/// next ping says (a ping held at `0 s` must not become a poll).
+const REFRESH_MIN: Duration = Duration::from_secs(30);
 
 /// One `Status` answer, read at `at`.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,9 +100,10 @@ impl Warm {
     }
 
     /// When to ask the daemon again: a little after the next ping is due
-    /// (it moves the cache's anchor). `None`: no ping is due.
+    /// (it moves the cache's anchor), and not within [`REFRESH_MIN`] of the
+    /// last answer. `None`: no ping is due.
     pub fn refresh_at(&self) -> Option<Instant> {
-        self.next_ping.map(|d| self.at + d + AFTER_PING)
+        self.next_ping.map(|d| self.at + (d + AFTER_PING).max(REFRESH_MIN))
     }
 }
 
@@ -194,5 +198,10 @@ mod tests {
         let w = Warm::from_status(&status(Value::Null), t0);
         assert!(w.knows_expiry && w.left(t0).is_none());
         assert_eq!(w.refresh_at(), Some(t0 + Duration::from_secs(3005)));
+        // A ping the daemon says is due now, answer after answer: asked at
+        // most every 30 s, never a poll.
+        let mut w = w;
+        w.next_ping = Some(Duration::ZERO);
+        assert_eq!(w.refresh_at(), Some(t0 + REFRESH_MIN));
     }
 }
