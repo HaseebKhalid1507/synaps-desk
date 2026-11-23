@@ -96,6 +96,8 @@ pub(crate) struct Target {
     pub names: Vec<(String, String)>,
     /// The providers whose models are not shown, with how many each has.
     pub providers: Vec<(String, usize)>,
+    /// The provider whose models are shown (its key).
+    pub shown: Option<String>,
 }
 
 fn cut(s: &str) -> String {
@@ -176,6 +178,7 @@ impl Target {
         }
         providers.retain(|(p, _)| Some(p) != shown.as_ref());
         self.providers = providers;
+        self.shown = shown.clone();
         let values = self.all.iter().filter(|m| Some(&m.2) == shown.as_ref()).map(|m| (m.0.clone(), m.1.clone())).collect();
         if shown == home || home.is_none() && provider.is_none() {
             self.set_values(values);
@@ -219,6 +222,11 @@ impl Target {
         if self.loading {
             out.push(Item::new(NOTE, "asking the daemon…").off("the session's list is on its way"));
         }
+        // With other providers' rows below: whose models these are.
+        if let Some(p) = self.shown.as_ref().filter(|_| !self.providers.is_empty()) {
+            let name = self.name(p);
+            out.push(Item::new(NOTE, name.to_uppercase()).off(format!("{name}'s models; the other providers below")));
+        }
         for (i, (v, label)) in self.values.iter().enumerate() {
             let mut it = Item::new(i, cut(label));
             if self.pending == Some(i) {
@@ -239,8 +247,7 @@ impl Target {
         }
         let home = self.home();
         for (j, (p, n)) in self.providers.iter().enumerate() {
-            let name = self.names.iter().find(|(k, _)| k == p).map_or(p.as_str(), |(_, name)| name.as_str());
-            let name = if name.is_empty() { "other" } else { name };
+            let name = self.name(p);
             let mut it =
                 Item::new(PROVIDER + j, cut(&format!("{name} · {n}"))).key(if home == Some(p.as_str()) { "current ▸" } else { "▸" });
             if self.pending.is_some() {
@@ -249,6 +256,12 @@ impl Target {
             out.push(it);
         }
         out
+    }
+
+    /// A provider's name, by its key.
+    fn name<'a>(&'a self, key: &'a str) -> &'a str {
+        let name = self.names.iter().find(|(k, _)| k == key).map_or(key, |(_, name)| name.as_str());
+        if name.is_empty() { "other" } else { name }
     }
 
     /// A provider's row: its provider.
@@ -268,6 +281,9 @@ pub(crate) struct Choices {
     pub at: Rc<RefCell<[Slot; PANES_MAX]>>,
     /// The last list each attachment's daemon gave (shown while it is asked again).
     cache: Option<(u64, ModelOptions)>,
+    /// The open menu's widest box so far: its least width while it is open
+    /// (another provider's rows do not narrow it under the pointer).
+    pub width: Rc<std::cell::Cell<f32>>,
 }
 
 impl Choices {
@@ -290,6 +306,20 @@ impl Choices {
         if self.leaving.as_ref().is_some_and(|(_, at)| fx.leave(*at).is_none()) {
             self.leaving = None;
         }
+    }
+
+    /// `t`'s menu at `at`: opened by the pointer at `born`, else by the
+    /// keyboard, which selects the current value (not the first row).
+    pub fn open(&mut self, t: Target, at: At, born: Option<Instant>) {
+        let mut m = Menu::new(t.items(), at, born.is_none());
+        // `refresh` places a keyboard menu's selection not on a value yet.
+        m.sel = None;
+        if let Some(b) = born {
+            m = m.born(b);
+        }
+        self.width.set(0.);
+        self.menu = Some((m, t));
+        self.refresh();
     }
 
     /// The open menu's rows again, the selection kept on the same value.
@@ -409,6 +439,7 @@ impl AppView {
             all: Vec::new(),
             providers: Vec::new(),
             names: Vec::new(),
+            shown: None,
         };
         let cached = self.choice.cache.as_ref().filter(|c| c.0 == attach_seq).map(|c| c.1.clone());
         if supported {
@@ -453,13 +484,8 @@ impl AppView {
                 point(px(w / 2.), px(h - 80.))
             }
         };
-        let keyboard = pt.is_none();
-        let mut m = Menu::new(t.items(), At::Point(anchor), keyboard);
-        if !keyboard {
-            m = m.born(self.fx.clock());
-        }
-        self.choice.menu = Some((m, t));
-        self.choice.refresh();
+        let born = pt.map(|_| self.fx.clock());
+        self.choice.open(t, At::Point(anchor), born);
         cx.notify();
     }
 
@@ -589,15 +615,38 @@ impl AppView {
             }
         };
         let At::Point(pt) = m.at else { return None };
-        let body = crate::menu::render("choice-menu", m, p, AppView::choice_pick, |this, _| this.close_menu(), phase, &self.fx, cx);
+        let width = self.choice.width.clone();
+        let menu = crate::menu::render("choice-menu", m, p, AppView::choice_pick, |this, _| this.close_menu(), phase, &self.fx, cx)
+            .min_w(px(width.get().max(236.)));
+        // Its box, border included, measured as drawn.
+        let body = div().relative().debug_selector(|| "choice-menu-box".into()).child(menu).child(
+            canvas(
+                move |b, _, _| {
+                    let w = f32::from(b.size.width);
+                    if w > width.get() {
+                        width.set(w);
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        );
         Some(deferred(anchored().anchor(Anchor::BottomLeft).position(pt).snap_to_window_with_margin(px(8.)).child(body)).with_priority(3))
     }
 }
 
+/// The pickers in a window (`choice_tests.rs`).
+#[cfg(all(test, unix))]
+#[path = "choice_tests.rs"]
+mod ui_tests;
+
 #[cfg(test)]
 mod tests {
-    use super::{Kind, NOTE, PROVIDER, SHOWN, Target};
+    use super::{Choices, Kind, NOTE, PROVIDER, SHOWN, Target};
+    use crate::menu::At;
     use crate::pane::PaneId;
+    use gpui_kit::{point, px};
     use synaps_client::{ModelOption, ModelOptions};
 
     fn target(kind: Kind, current: &str) -> Target {
@@ -616,6 +665,7 @@ mod tests {
             all: Vec::new(),
             providers: Vec::new(),
             names: Vec::new(),
+            shown: None,
         }
     }
 
@@ -647,16 +697,18 @@ mod tests {
         let ids: Vec<&str> = t.values.iter().map(|v| v.0.as_str()).collect();
         assert_eq!(ids, ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-5-5"], "its provider's models");
         let items = t.items();
-        assert_eq!(items[1].key, Some("current"));
-        assert!(items.iter().all(|i| i.enabled()));
+        // Headed by their provider (other providers' rows follow).
+        assert_eq!((items[0].act, items[0].label.as_ref(), items[0].enabled()), (NOTE, "ANTHROPIC", false));
+        assert_eq!(items[2].key, Some("current"));
+        assert!(items[1..].iter().all(|i| i.enabled()));
         // The other providers are rows: one opens its models in place.
-        assert_eq!((items[2].act, items[2].label.as_ref(), items[2].key), (PROVIDER, "OpenAI Codex · 1", Some("▸")));
-        t.show(t.provider(items[2].act).as_deref());
+        assert_eq!((items[3].act, items[3].label.as_ref(), items[3].key), (PROVIDER, "OpenAI Codex · 1", Some("▸")));
+        t.show(t.provider(items[3].act).as_deref());
         let items = t.items();
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
-        assert_eq!(labels, ["GPT-5.5", "Anthropic · 2"]);
-        assert_eq!((items[0].key, items[1].key), (None, Some("current ▸")), "the current model is the other provider's");
-        t.show(t.provider(items[1].act).as_deref());
+        assert_eq!(labels, ["OPENAI CODEX", "GPT-5.5", "Anthropic · 2"]);
+        assert_eq!((items[1].key, items[2].key), (None, Some("current ▸")), "the current model is the other provider's");
+        t.show(t.provider(items[2].act).as_deref());
         assert_eq!(t.current_ix(), Some(1), "back on the current one");
         let mut t = target(Kind::Thinking, "high");
         t.fill(Some(&opts()));
@@ -687,11 +739,47 @@ mod tests {
         t.fill(Some(&o));
         let items = t.items();
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
-        assert_eq!(labels[1..], ["anthropic/claude-opus-5-5", "LLM · 1", "LLM · 1"], "{labels:?}");
+        assert_eq!(labels[1..], ["ANTHROPIC", "anthropic/claude-opus-5-5", "LLM · 1", "LLM · 1"], "{labels:?}");
         assert_eq!(items[0].act, NOTE);
         assert!(labels[0].starts_with("model change blocked"), "{labels:?}");
-        t.show(t.provider(items[3].act).as_deref());
+        t.show(t.provider(items[4].act).as_deref());
         assert_eq!(t.values, [("b:llm:y".to_string(), "b:llm:y".to_string())], "the second LLM's own");
+    }
+
+    /// From the keyboard (Ctrl+P, "Change thinking…"), the menu opens on
+    /// the session's value, not the first row (finish gate F1); from the
+    /// pointer, on nothing.
+    #[test]
+    fn a_keyboard_menu_opens_on_the_current_value() {
+        let at = At::Point(point(px(0.), px(0.)));
+        let sel = |c: &Choices| c.menu.as_ref().and_then(|(m, _)| m.sel.map(|i| m.items[i].label.to_string()));
+        let mut t = target(Kind::Thinking, "low");
+        t.fill(None);
+        let mut c = Choices::default();
+        c.open(t.clone(), at, None);
+        assert_eq!(sel(&c).as_deref(), Some("low"), "not `off`");
+        c.open(t, at, Some(std::time::Instant::now()));
+        assert_eq!(sel(&c), None);
+        let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
+        t.fill(Some(&opts()));
+        c.open(t, at, None);
+        assert_eq!(sel(&c).as_deref(), Some("Opus 5.5"), "past the head and Sonnet");
+    }
+
+    /// The provider head shows only when other providers' rows follow
+    /// (one provider's list needs no name), and is never picked.
+    #[test]
+    fn the_shown_provider_heads_its_models_only_among_others() {
+        let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
+        let mut o = opts();
+        t.fill(Some(&o));
+        assert_eq!(t.items().iter().filter(|i| i.label.as_ref() == "ANTHROPIC").count(), 1);
+        o.models.retain(|m| m.provider == "Anthropic");
+        t.fill(Some(&o));
+        assert!(t.items().iter().all(|i| i.act != NOTE), "one provider: no head");
+        let mut t = target(Kind::Thinking, "high");
+        t.fill(Some(&opts()));
+        assert!(t.items().iter().all(|i| i.act != NOTE), "levels: no head");
     }
 
     #[test]
