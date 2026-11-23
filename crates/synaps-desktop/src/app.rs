@@ -1840,6 +1840,9 @@ pub struct AppView {
     fold_keys: FoldKeys,
     /// The window's width at the last frame (what a fold acts on).
     pub(crate) width: f32,
+    /// Its scale at the last frame, unclamped (a card's edge holds a device
+    /// pixel at any: `cards::slab`).
+    pub(crate) scale: f32,
     /// Its height (the picker fits under it).
     pub(crate) height: f32,
     pub picker_open: bool,
@@ -2548,6 +2551,7 @@ impl AppView {
             panel_fx: crate::chrome::PanelFx::default(),
             fold_keys: FoldKeys::default(),
             width: 0.,
+            scale: 1.,
             height: 0.,
             picker_open: false,
             picker_note: None,
@@ -8424,8 +8428,9 @@ impl AppView {
             let rows = this.fold_rows(&g.rows, cx);
             let inner = div().w_full().h(px(*h)).overflow_hidden().child(v_flex().w_full().mt(px(g.inner)).children(rows));
             let p = theme::palette(cx);
-            let room =
-                crate::cards::slab(false, true, inner, &p, geo).h(px(*h + geo.edge + geo.inset)).debug_selector(|| "fold-gap".into());
+            let room = crate::cards::slab(false, true, inner, &p, geo, this.scale)
+                .h(px(*h + geo.edge + geo.inset))
+                .debug_selector(|| "fold-gap".into());
             el = div().w_full().child(el).child(room).into_any_element();
         }
         // The room an answered card gave up, under the last row.
@@ -8969,6 +8974,7 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);
         }

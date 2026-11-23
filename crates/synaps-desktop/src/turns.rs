@@ -1583,7 +1583,7 @@ impl AppView {
                 // Folding (N1): its card goes on in the room under it.
                 let bottom =
                     bottom && !self.panes.cur.fold_gap.borrow().iter().any(|g| g.is(d.id) && matches!(d.kind, Kind::Summary { .. }));
-                let (pal, geo) = (p, crate::cards::Geo::of(&m));
+                let (pal, geo, scale) = (p, crate::cards::Geo::of(&m), self.scale);
                 let id = d.id;
                 let click = matches!(d.kind, Kind::Summary { .. }).then(|| {
                     cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
@@ -1592,7 +1592,7 @@ impl AppView {
                     })
                 });
                 Some(Box::new(move |inner: AnyElement| {
-                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo).debug_selector(move || format!("card-slice {id}"));
+                    let slab = crate::cards::slab(top, bottom, inner, &pal, geo, scale).debug_selector(move || format!("card-slice {id}"));
                     match click {
                         // Its card's edge and inset unfold it too.
                         Some(f) => slab.id(("run-card", id)).cursor_pointer().on_click(f).into_any_element(),

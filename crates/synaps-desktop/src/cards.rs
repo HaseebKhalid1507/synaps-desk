@@ -105,13 +105,17 @@ pub(crate) fn mark_edges(mut out: Vec<Disp>) -> Vec<Disp> {
 /// sides and on those edges, two paddings: the old hairline's 1 px and the
 /// 3 px inset, in two layers so each is snapped to device pixels on its own
 /// as the border and the inset were (Shady #71 P2: one 4 px padding is 6
-/// device px at 150 %, the two were 1 + 4). Its rows sit where they sat in
-/// the outlined card at every scale.
-pub(crate) fn slab(top: bool, bottom: bool, body: impl IntoElement, p: &Palette, g: Geo) -> Div {
+/// device px at 150 %, the two were 1 + 4). The hairline's room is at
+/// least a device pixel, as a border is snapped (Shady #71 P3: at 50 % and
+/// under, 1 px of padding is half a pixel, rounded away): `scale`, the
+/// window's. Its rows sit where they sat in the outlined card at every
+/// scale.
+pub(crate) fn slab(top: bool, bottom: bool, body: impl IntoElement, p: &Palette, g: Geo, scale: f32) -> Div {
     let r = px(g.radius);
+    let edge = if g.edge > 0. { g.edge.max(1. / scale) } else { 0. };
     let pad = |d: Div, w: f32| d.px(px(w)).when(top, |d| d.pt(px(w))).when(bottom, |d| d.pb(px(w)));
-    let edge = div().w_full().bg(p.card_d).when(top, |d| d.rounded_tl(r).rounded_tr(r)).when(bottom, |d| d.rounded_bl(r).rounded_br(r));
-    pad(edge, g.edge).child(pad(div(), g.inset).child(body))
+    let fill = div().w_full().bg(p.card_d).when(top, |d| d.rounded_tl(r).rounded_tr(r)).when(bottom, |d| d.rounded_bl(r).rounded_br(r));
+    pad(fill, edge).child(pad(div(), g.inset).child(body))
 }
 
 /// An opened summary: its row, the `line` rule under it where its card's
@@ -290,7 +294,8 @@ mod tests {
     /// No outline (Haseeb, 07:18): a card's slice draws no border, and
     /// its padding is the old hairline's 1 px around the 3 px inset, two
     /// layers where the border and the inset were, so no row moved when it
-    /// went.
+    /// went. The hairline's room is a device pixel at least (Shady #71 P3):
+    /// 2 px at 50 %, 4 at 25 %.
     #[test]
     fn a_card_reads_by_its_fill_alone() {
         use gpui_kit::{DefiniteLength, Div, Styled as _, div, px};
@@ -308,17 +313,22 @@ mod tests {
             assert_eq!((e.top, e.bottom), (top.then_some(pad).flatten(), bottom.then_some(pad).flatten()), "({top}, {bottom}) {w}");
         };
         for (top, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
-            pads(&mut super::slab(top, bottom, div(), &p, g), 1., top, bottom);
+            for (scale, edge) in [(1., 1.), (1.5, 1.), (2., 1.), (0.75, 1. / 0.75), (0.5, 2.), (0.25, 4.)] {
+                pads(&mut super::slab(top, bottom, div(), &p, g, scale), edge, top, bottom);
+            }
         }
     }
 
     /// Shady #71 P2: GPUI snaps a border and a padding to device pixels
     /// each on its own (a border to at least one), so one 4 px padding is
     /// not the hairline's 1 and the inset's 3 at 150 % and 250 % (6 device
-    /// px for 1 + 4, 10 for 2 + 7). Laid out at 100 to 250 %, every slice
+    /// px for 1 + 4, 10 for 2 + 7). Laid out at 25 to 250 %, every slice
     /// (each pair of edges) holds its row where main's outlined slice held
-    /// it, as wide and as tall, and a run's opened summary (its rule) is as
-    /// tall as its folded one (its card's bottom edge).
+    /// it, as wide and as tall: at 50 % and under too, where a border is
+    /// held to a device pixel and a padding is not (P3). A run's opened
+    /// summary (its rule) is laid out as main's, and from 100 % as tall as
+    /// its folded one (its card's bottom edge); under that it was not on
+    /// main either (the rule is a 1 px height, no stroke).
     #[gpui_kit::test]
     fn a_card_keeps_its_outlined_geometry_at_every_scale(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::prelude::FluentBuilder as _;
@@ -328,8 +338,8 @@ mod tests {
         const CAPS: [(bool, bool); 4] = [(false, false), (true, false), (false, true), (true, true)];
         struct Cards(crate::theme::Palette, super::Geo);
         impl Render for Cards {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let (p, g) = (&self.0, self.1);
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let (p, g, scale) = (&self.0, self.1, window.scale_factor());
                 let row = |s: String| div().w_full().h(px(g.row)).debug_selector(move || s);
                 // Main's slice (9659a1a): the `line` hairline and the inset.
                 let outlined = |top: bool, bottom: bool, body: Div| {
@@ -348,18 +358,26 @@ mod tests {
                 for (k, (top, bottom)) in CAPS.into_iter().enumerate() {
                     col = col
                         .child(outlined(top, bottom, row(format!("old row {k}"))).debug_selector(move || format!("old card {k}")))
-                        .child(super::slab(top, bottom, row(format!("new row {k}")), p, g).debug_selector(move || format!("new card {k}")));
+                        .child(
+                            super::slab(top, bottom, row(format!("new row {k}")), p, g, scale)
+                                .debug_selector(move || format!("new card {k}")),
+                        );
                 }
-                col.child(super::slab(true, true, row("folded row".into()), p, g).debug_selector(|| "folded card".into())).child(
-                    super::slab(true, false, super::opened(row("opened row".into()), 7, p, g), p, g)
-                        .debug_selector(|| "opened card".into()),
-                )
+                // Main's opened summary: its row, the 1 px rule, the inset.
+                let old_opened =
+                    gpui_kit::component::v_flex().child(row("old opened row".into())).child(div().h(px(1.)).bg(p.line)).pb(px(3.));
+                col.child(super::slab(true, true, row("folded row".into()), p, g, scale).debug_selector(|| "folded card".into()))
+                    .child(
+                        super::slab(true, false, super::opened(row("opened row".into()), 7, p, g), p, g, scale)
+                            .debug_selector(|| "opened card".into()),
+                    )
+                    .child(outlined(true, false, old_opened).debug_selector(|| "old opened card".into()))
             }
         }
         let g = super::Geo::of(&crate::theme::Metrics::at(crate::theme::DEFAULT_TEXT));
         let p = crate::theme::Palette::of(&crate::theme::resolve(&crate::palettes::THEMES[0].1, None).0);
         let (view, cx) = cx.add_window_view(|_, _| Cards(p, g));
-        for scale in [1., 1.25, 1.5, 1.75, 2., 2.5] {
+        for scale in [1., 1.25, 1.5, 1.75, 2., 2.5, 0.5, 0.25] {
             cx.simulate_scale_factor_change(scale);
             view.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
@@ -379,7 +397,10 @@ mod tests {
             let folded = boxes("folded card".into(), "folded row".into());
             let opened = boxes("opened card".into(), "opened row".into());
             assert_eq!(folded, boxes("old card 3".into(), "old row 3".into()), "{scale}: folded, as the outlined card");
-            assert_eq!(opened, folded, "{scale}: opened, as tall as folded");
+            assert_eq!(opened, boxes("old opened card".into(), "old opened row".into()), "{scale}: opened, as main's");
+            if scale >= 1. {
+                assert_eq!(opened, folded, "{scale}: opened, as tall as folded");
+            }
         }
     }
 
