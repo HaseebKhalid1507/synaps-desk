@@ -83,6 +83,8 @@ mod tabs;
 mod tabstrip;
 #[cfg(test)]
 mod test_kit;
+#[cfg(all(test, unix))]
+mod test_waits;
 mod theme;
 mod times;
 mod tray;
