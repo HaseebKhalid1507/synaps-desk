@@ -1307,6 +1307,63 @@ pub struct ConversationDigest {
     pub pending_events_len: usize,
 }
 
+/// What the daemon applied when a prompt resolved (`PromptResolved.outcome`,
+/// SynapsCLI #437).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// A Confirm answered yes (or Allow all, where its gate takes it): the
+    /// gate opened.
+    Allowed,
+    /// A Confirm answered anything else, or a Secret answered with nothing:
+    /// the gate stayed shut.
+    Denied,
+    /// A Secret's value, handed to its call.
+    Answered,
+    /// No answer was applied: the turn or session ended while it waited, or
+    /// the waiting call was gone. The call never passed its gate.
+    Cancelled,
+    /// Nobody was attached by the abandonment deadline: the daemon answered
+    /// for them, fail-closed.
+    TimedOut,
+    /// One this build does not know (a newer daemon's): as if none came.
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOutcome {
+    /// A raw `prompt_resolved` event's `outcome`. `None`: another event, or
+    /// a daemon before SynapsCLI #437 (no `outcome`); a value this build
+    /// does not know is `Unknown`.
+    pub fn of_event(raw: &Value) -> Option<Self> {
+        if raw.get("ev").and_then(Value::as_str) != Some("prompt_resolved") {
+            return None;
+        }
+        serde_json::from_value(raw.get("outcome")?.clone()).ok()
+    }
+}
+
+/// What a session event says beyond its typed [`SessionEvent`]: fields a
+/// variant leaves out so that code building it (struct literals) stays as
+/// it is. Decoded with the event ([`EventMeta::of`]); every
+/// [`crate::Event::Session`] carries it, and [`crate::Transcript::apply_with`]
+/// takes the two together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventMeta {
+    /// A `prompt_resolved`'s `outcome`: what the daemon applied (SynapsCLI
+    /// #437). `None` from a daemon before it, and for any other event.
+    pub prompt_outcome: Option<PromptOutcome>,
+}
+
+impl EventMeta {
+    /// The metadata of the raw session event `raw` (its envelope's `ev` and
+    /// fields).
+    pub fn of(raw: &Value) -> Self {
+        Self { prompt_outcome: PromptOutcome::of_event(raw) }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptRequest {
     pub id: u64,
@@ -1493,6 +1550,9 @@ pub enum SessionEvent {
     Prompt {
         request: PromptRequest,
     },
+    /// What the daemon applied (`outcome`, SynapsCLI #437) is the event's
+    /// [`EventMeta`]: this variant keeps its one field, so code that builds
+    /// it (the desktop's tests) is unchanged.
     PromptResolved {
         prompt_id: u64,
     },
