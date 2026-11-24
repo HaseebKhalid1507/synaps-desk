@@ -2,6 +2,10 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since d6f8f68
+
+No change. #75 (`3f61cff`) added a mirror of the core card protocol and model (agent-ui D1, SynapsCLI #444 at `6e895d27`), inert; D0 removes it whole, because that core stack is closed and no daemon will speak it. Gone again: `FEATURE_AGENT_SURFACES`, `SURFACES_CATALOG`, `Capabilities::surfaces`, `SessionCommand::SurfaceAction` and `SurfaceAction`, the `surface` and `surface_result` events, `SessionMeta::{surfaces_waiting, surfaces_open}`, `Attached::surfaces`, `Rejected::surfaces`, `Client::surface_action_on` / `SessionRef::surface_action_on` / `Command::SurfaceActionOn`, and the `surface` module with `tests/fixtures/ui/`. The `Hello` was byte for byte the same throughout. Agent cards come back as a Synaps extension (`synaps-cards`: the `cards` extension and the `cards-spec` crate, design v1.2 §9), with no protocol change here.
+
 ## Since c89cc05
 
 Saved sessions as catalog pages (SynapsCLI watch-sessions PR 4, `session_page`), the replacement of #408's `saved_sessions`. Additive apart from one new `SessionMeta` field (below); `saved_sessions` / `SavedSessionList` stay for daemons that still speak them.
