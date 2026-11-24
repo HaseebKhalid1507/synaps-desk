@@ -399,9 +399,39 @@ fn a_replaced_history_takes_its_cards_with_it() {
     let summary = vec![user("<context-summary>Asked two questions.</context-summary>"), json!({"role": "assistant", "content": "Noted."})];
     t.apply_update(&synaps_client::HistoryUpdate::Replace { messages: summary.clone() }).unwrap();
     assert!(cards(&t).is_empty(), "{:?}", cards(&t));
+    // A compaction that keeps an answer's message and drops its card's
+    // call: the message is no answer now, and draws as what it says.
+    let mut kept = vec![user("go")];
+    kept.extend(asked("t1", A, ask()));
+    let answer = said(A, &ask(), &reply(&ask(), json!({"choice": "Leave it"})));
+    kept.push(user(&answer));
+    let mut k = attach(&kept);
+    assert_eq!(cards(&k).len(), 2, "the card and its answer");
+    k.apply_update(&synaps_client::HistoryUpdate::Replace { messages: vec![summary[0].clone(), user(&answer)] }).unwrap();
+    assert!(cards(&k).is_empty(), "{:?}", cards(&k));
     // And one asked after it is the only one.
     let mut after = summary;
     after.extend(asked("t3", A, ship()));
     t.apply_update(&synaps_client::HistoryUpdate::Append { base_len: 2, messages: after[2..].to_vec() }).unwrap();
     assert_eq!(cards(&t).iter().map(|(_, c)| state(c)).collect::<Vec<_>>(), [(State::Open, true, 0)]);
+}
+
+/// A close names the card it closed, though its id is bound again after
+/// (the extension restarted and drew it anew, §1.5): the later card is
+/// open, the close's row still says the first one's question.
+#[test]
+fn a_close_names_the_card_it_closed_not_a_later_one_of_its_id() {
+    let mut h = vec![user("go")];
+    h.extend(asked("t1", A, ask()));
+    h.push(call("t2", "cards_ui", json!({"close": A})));
+    h.push(result("t2", &format!("Card {A} closed (cards/1).")));
+    h.extend(asked("t3", A, ship()));
+    let t = attach(&h);
+    let got: Vec<(ItemKind, String)> = cards(&t).iter().map(|(k, c)| (*k, question(c).to_string())).collect();
+    let (q1, q2) = (ask()["question"].as_str().unwrap().to_string(), ship()["question"].as_str().unwrap().to_string());
+    assert_eq!(got, [(ItemKind::Tool, q1.clone()), (ItemKind::Tool, q1), (ItemKind::Tool, q2)]);
+    let kinds: Vec<_> = cards(&t).iter().map(|(_, c)| matches!(c, CardRow::Close(_))).collect();
+    assert_eq!(kinds, [false, true, false], "the second row is the close");
+    let states: Vec<_> = cards(&t).iter().filter(|(_, c)| matches!(c, CardRow::Ask(_))).map(|(_, c)| state(c).0).collect();
+    assert_eq!(states, [State::Closed, State::Open]);
 }
