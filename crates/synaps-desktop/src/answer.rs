@@ -363,6 +363,19 @@ impl AppView {
         self.after_card(row, cx);
     }
 
+    /// "Check again" on the card `painted`, dropped events not read again
+    /// in time: the client asks again, and the card checks for another
+    /// while ([`crate::model::Model::check_again`]). No Resend meanwhile.
+    pub(crate) fn ask_check_again(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
+        if self.card_session().filter(|_| self.ask_armed(row, painted, "check")).is_none() {
+            return;
+        }
+        if let Some(fx) = self.model.check_again(self.panes.cur.live, Instant::now()) {
+            self.effect(fx);
+        }
+        self.after_card(row, cx);
+    }
+
     /// A receipt clicked: its whole answer, or back to its line.
     pub(crate) fn ask_open(&mut self, row: u64, tool_id: &str, cx: &mut Context<Self>) {
         let Some(session) = self.card_session() else { return };

@@ -419,6 +419,103 @@ async fn a_lag_notice_asks_for_the_history_again() {
     client.shutdown().unwrap();
 }
 
+/// A slot probe's observer: its `Attach` (an `Observe` of `SID`, a
+/// digest's history), answered as observer `client` with `queued` in the
+/// engine's slot; then its `Detach`, and its goodbye.
+async fn observed(mut p: Conn, client: u64, queued: Option<&str>) {
+    assert_eq!((p.attach["attach"].as_str(), p.attach["session_id"].as_str()), (Some("existing"), Some(SID)));
+    assert_eq!((p.attach["mode"].as_str(), p.hello["client"]["history"].as_str()), (Some("observe"), Some("digest")), "an observer");
+    let mut a = attached_frame(client);
+    a["input_owner"] = json!(2);
+    a["conversation"]["queued_message"] = json!(queued);
+    p.send(a).await;
+    assert_eq!(p.recv_cmd().await, json!({"cmd": "detach", "client": client}), "detached at once");
+}
+
+/// The next `Event::Slot`, and the `ClientJoined` right before it, if
+/// the event before it was one; or, `marker` (a notice's text) first,
+/// `None`.
+async fn next_slot(events: &async_channel::Receiver<Event>, marker: &str) -> Option<(Option<String>, Option<u64>)> {
+    let mut last = None;
+    wait(events, marker, |e| match e {
+        Event::Slot { queued, .. } => Some(Some((queued.clone(), last))),
+        Event::Session { event: synaps_client::SessionEvent::SystemNotice { text }, .. } if text == marker => Some(None),
+        Event::Session { event: synaps_client::SessionEvent::ClientJoined { client, .. }, .. } => {
+            last = Some(*client);
+            None
+        }
+        Event::Session { .. } => {
+            last = None;
+            None
+        }
+        _ => None,
+    })
+    .await
+}
+
+/// Shady #81 round 4: a lag notice leaves the engine's slot unknown (its
+/// digest, and the echoes that moved it, may be among what was dropped),
+/// and no query answers it. The client reads it from the snapshot of an
+/// observer on a connection of its own, detached at once, and puts it
+/// where that observer's `ClientJoined` comes on the attachment's stream
+/// (the actor takes the snapshot and broadcasts the join in one step): a
+/// reply waits for its join, and a join before its reply is its place all
+/// the same. A reply whose join didn't come before another notice is read
+/// again; a digest after the notice says the slot itself. (The reply and
+/// the join come on two sockets: a short wait has the reply in first
+/// where the order is the point.)
+#[tokio::test]
+async fn a_lag_notice_reads_the_slot_again_from_an_observer() {
+    let mut fake = Fake::start("slot").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let conn = attached(&mut fake, &events, 2).await;
+    let lag = |n: u64| json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")});
+    let joined = |c: u64| json!({"ev": "client_joined", "client": c, "kind": "attach", "name": "tester", "mode": "observe"});
+    let note = |s: &str| json!({"ev": "system_notice", "text": s});
+    let settle = || tokio::time::sleep(Duration::from_millis(150));
+
+    // Its reply first: nothing until its place, then right after it.
+    conn.event(u64::MAX, lag(9)).await;
+    observed(fake.next_attach().await, 9, Some("A")).await;
+    settle().await;
+    conn.event(30, note("replied")).await;
+    assert_eq!(next_slot(&events, "replied").await, None, "not before its place");
+    conn.event(31, joined(9)).await;
+    assert_eq!(next_slot(&events, "-").await, Some((Some("A".into()), Some(9))), "right after its join");
+
+    // Its place first, then its reply.
+    conn.event(u64::MAX, lag(3)).await;
+    let p = fake.next_attach().await;
+    conn.event(32, joined(10)).await;
+    conn.event(33, note("joined first")).await;
+    assert_eq!(next_slot(&events, "joined first").await, None);
+    observed(p, 10, None).await;
+    assert_eq!(next_slot(&events, "-").await, Some((None, None)), "at its reply, its place passed");
+
+    // A reply, then another gap before its join: maybe from before that
+    // gap, so read again; the first never placed.
+    conn.event(u64::MAX, lag(4)).await;
+    observed(fake.next_attach().await, 11, Some("B")).await;
+    settle().await;
+    conn.event(u64::MAX, lag(5)).await;
+    observed(fake.next_attach().await, 12, None).await;
+    conn.event(34, joined(11)).await;
+    conn.event(35, joined(12)).await;
+    assert_eq!(next_slot(&events, "-").await.map(|s| s.0), Some(None), "the second's");
+
+    // A digest after the notice says the slot: the probe out is nobody's.
+    conn.event(u64::MAX, lag(6)).await;
+    let p = fake.next_attach().await;
+    conn.event(36, json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": 0, "queued_message": "C"}})).await;
+    observed(p, 13, Some("D")).await;
+    conn.event(37, joined(13)).await;
+    settle().await;
+    conn.event(38, note("a digest")).await;
+    assert_eq!(next_slot(&events, "a digest").await, None, "the digest's word stands");
+    client.shutdown().unwrap();
+}
+
 /// H2: a `Refused` addressed to this client is a typed error (so the app
 /// can give the text back); one for another client is not. A daemon
 /// "refused: ..." / reload-drain `Error` frame is a refusal too.

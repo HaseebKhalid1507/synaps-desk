@@ -1570,7 +1570,7 @@ impl Model {
             ev => ev,
         };
         self.view_dirty = true;
-        if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
+        if !matches!(ev, Event::Session { .. } | Event::History { .. } | Event::Slot { .. }) {
             self.rail_gen += 1;
         }
 
@@ -1914,6 +1914,14 @@ impl Model {
                     if let Some(a) = self.lives[lid].active.as_ref() {
                         self.memos.observe(&a.session_id, &self.lives[lid].transcript, std::time::Instant::now());
                     }
+                }
+            }
+            // The engine's slot read again after dropped events: the cards
+            // check what they had out on it (`deliver`'s "Dropped events").
+            Event::Slot { attach_seq, queued, .. } if self.lives[lid].current(attach_seq) => {
+                self.lives[lid].transcript.apply_slot(queued);
+                if let Some(a) = self.lives[lid].active.as_ref() {
+                    self.memos.observe(&a.session_id, &self.lives[lid].transcript, std::time::Instant::now());
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.lives[lid].current(attach_seq) => {

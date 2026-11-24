@@ -519,6 +519,9 @@ pub struct Transcript {
     /// history again at once, and until it lands what is held may be behind
     /// what was dropped ([`Transcript::resyncing`]).
     resyncing: bool,
+    /// Since the daemon dropped events, no word on the engine's slot
+    /// ([`Transcript::slot_known`]).
+    slot_unknown: bool,
 }
 
 impl Transcript {
@@ -587,9 +590,32 @@ impl Transcript {
     }
 
     /// The steer the engine holds for its next round or turn, by the latest
-    /// word (meaningful on a settled view, [`Transcript::history_settled`]).
+    /// word (meaningful on a settled view, [`Transcript::history_settled`],
+    /// whose slot is known, [`Transcript::slot_known`]).
     pub fn queued_message(&self) -> Option<&str> {
         self.queued.as_deref()
+    }
+
+    /// What [`Transcript::queued_message`] says is the engine's word since
+    /// the last events the daemon dropped for this attachment, if it
+    /// dropped any. On its notice the slot is unknown: the digest that
+    /// moved it, and the echoes, may be among what was dropped, and the
+    /// history asked for again has no slot (a `Messages` reply). It is
+    /// known again from a `Conversation` digest after the notice (one
+    /// ordered stream), a reattach's snapshot, or the slot read again
+    /// ([`crate::Event::Slot`], at its place among the events:
+    /// [`Transcript::apply_slot`]). Not empty: unknown. A steer read as
+    /// lost on a stale slot is sent twice when the engine holds it
+    /// (Shady #81 round 4).
+    pub fn slot_known(&self) -> bool {
+        !self.slot_unknown
+    }
+
+    /// The engine's slot read again after dropped events
+    /// ([`crate::Event::Slot`]): known now.
+    pub fn apply_slot(&mut self, queued: Option<String>) {
+        self.queued = queued;
+        self.slot_unknown = false;
     }
 
     /// A compaction runs: one heard to start (`CompactionStarted`), not yet
@@ -1644,6 +1670,7 @@ impl Transcript {
                 // A digest that matches by hash trusts the hash again.
                 self.mirror.matches(digest);
                 self.queued.clone_from(&digest.queued_message);
+                self.slot_unknown = false;
                 self.digest = Some(crate::protocol::ConversationDigest { header: Value::Null, tokens: Value::Null, ..digest.clone() });
                 self.cost_usd = digest.cost;
                 self.engine_pending = digest.pending_events_len;
@@ -1687,6 +1714,7 @@ impl Transcript {
                 if crate::protocol::stream_lagged(text) && !self.replaying {
                     self.resyncing = true;
                     self.digest = None;
+                    self.slot_unknown = true;
                 }
                 self.notice(ItemKind::Notice, text.clone())
             }

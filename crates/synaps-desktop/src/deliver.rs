@@ -75,17 +75,31 @@
 //! and a Resend of an answer the daemon kept (Shady #81 round 3). So on
 //! the notice the view stops being settled until the history asked for
 //! again lands ([`synaps_client::Transcript::resyncing`]; the client asks
-//! at once, as after a swap). Meanwhile nothing reconciles (the memo, and
-//! what was taken in, wait for a settled view; an answer taken in still
-//! reads "answered"), and a click sends nothing and says why
-//! ([`RESYNCING`]). After it, the first settled view is past the gap and
-//! decides as above, an `Idle` heard in the gap included. Bounded by the
-//! memo's own wait for a settled view ([`CHECK_WAIT`]): past it the card
-//! says it couldn't check the chat ([`UNCHECKED`]), with no Resend until a
-//! view settles. The history asked for again has no slot; the slot held
-//! is the last digest's, and a digest from before the gap may still hold
-//! an answer the engine took in: never read so ([`Memos::slot`]).
-
+//! at once, as after a swap), and the engine's slot is read again
+//! ([`synaps_client::Transcript::slot_known`]): its digest and the echoes
+//! that moved it may be among what was dropped, and a steer read as lost
+//! on a stale slot, a Resend of what the engine holds, goes in twice
+//! (Shady #81 round 4: a turn that failed before taking it in keeps it in
+//! the slot, `actor.rs:4135-4146`, and the next turn takes it in with the
+//! Resend). No query answers the slot and a reattach can move input or
+//! revoke a driver, so the client reads it from an observer's snapshot,
+//! at its place among the events (`synaps_client`'s `probe_slot`); a
+//! digest after the notice says it too. Until both are back nothing
+//! reconciles (the memo, and what was taken in, wait for a settled view
+//! whose slot is known; an answer taken in still reads "answered"), and a
+//! click, Retry or Resend sends nothing and says why ([`RESYNCING`]).
+//! After it, the first settled view is past the gap and decides as
+//! above, an `Idle` heard in the gap included: ours in the slot is queued
+//! or held, an empty slot after the turn's end is not confirmed, with
+//! Resend. Bounded by the memo's own wait for a settled view
+//! ([`CHECK_WAIT`]): past it the card says it couldn't check the chat
+//! ([`UNCHECKED`]), with "Check again" ([`crate::model::Model::check_again`])
+//! where Resend would be, and no Resend until a view settles.
+//!
+//! One edge no frame the desk can ask for settles, the safe way (no
+//! Resend, so nothing goes twice): an `Idle` lost in the gap itself
+//! leaves an answer taken in "answered" until the next turn's end or a
+//! reattach (its `Idle` was the turn's end the history is read against).
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -205,6 +219,20 @@ pub(crate) const OUT: &str = "Its answer is on its way";
 pub(crate) const RESYNCING: &str = "Checking the chat… some updates were dropped";
 /// And it hasn't come in [`CHECK_WAIT`].
 pub(crate) const UNCHECKED: &str = "Couldn't check the chat: some updates were dropped, and it hasn't caught up";
+
+/// The daemon dropped events for `t`'s attachment, and the history or the
+/// engine's slot isn't read again yet (the module's "Dropped events"):
+/// nothing is checked on what is held.
+pub(crate) fn recovering(t: &Transcript) -> bool {
+    t.resyncing() || !t.slot_known()
+}
+
+/// A view the memo may settle on (§3.5's "settled"): the history is the
+/// latest digest's, and the slot is known. One read on a stale slot sends
+/// twice a steer the engine holds (Shady #81 round 4).
+fn settled(t: &Transcript) -> bool {
+    t.history_settled() && t.slot_known()
+}
 
 /// A session whose events the daemon dropped, until the history asked for
 /// again lands ([`synaps_client::Transcript::resyncing`]): since when (the
@@ -343,14 +371,14 @@ impl Memos {
         self.follow_gap(session, t, now);
         self.prune(session, t);
         let fold = self.fold(session, t);
-        let view = self.view(session, &fold, t);
+        let view = Self::view(&fold, t);
         self.with(session, |m| m.observe(&view, now));
     }
 
     /// A gap starts with the first view that resyncs, and ends with the
     /// first that doesn't (the history asked for again, or an attach's).
     fn follow_gap(&mut self, session: &str, t: &Transcript, now: Instant) {
-        if t.resyncing() {
+        if recovering(t) {
             if !self.gaps.contains_key(session) {
                 self.gaps.insert(session.to_string(), Gap { since: now, over: false });
                 self.changes += 1;
@@ -360,26 +388,12 @@ impl Memos {
         }
     }
 
-    /// What a transcript shows the memo of `session`: `fold` (its own,
-    /// with what was taken in on top: [`Memos::observe`]), and on a
-    /// settled history the slot's steer ([`Memos::slot`]) and whether a
+    /// What a transcript shows the memo: `fold` (its own, with what was
+    /// taken in on top: [`Memos::observe`]), and on a settled history
+    /// whose slot is known ([`settled`]) the slot's steer and whether a
     /// turn streams.
-    fn view<'a>(&self, session: &str, fold: &'a Fold, t: &'a Transcript) -> View<'a> {
-        View { fold, settled: t.history_settled(), queued: self.slot(session, t), streaming: t.busy() }
-    }
-
-    /// The slot's steer as `t` holds it (the latest digest's), unless it
-    /// is an answer of `session` the engine took in (taken, or missed by
-    /// its turn's end): the slot gave that one up when the engine took it
-    /// (a Resend makes it another entry's), so a digest that still holds
-    /// it is from before, its clearing among events the daemon dropped
-    /// (the module's "Dropped events").
-    fn slot<'a>(&self, session: &str, t: &'a Transcript) -> Option<&'a str> {
-        let q = t.queued_message()?;
-        let Some(m) = self.by.get(session) else { return Some(q) };
-        let taken = self.taken.get(session).into_iter().flatten().map(|k| &k.card);
-        let gone = taken.chain(self.missed.get(session).into_iter().flatten()).filter_map(|c| m.get(c)).any(|e| e.text == q);
-        (!gone).then_some(q)
+    fn view<'a>(fold: &'a Fold, t: &'a Transcript) -> View<'a> {
+        View { fold, settled: settled(t), queued: t.queued_message(), streaming: t.busy() }
     }
 
     /// Settle each answer taken in on `t`, the module's "Taken in": the
@@ -388,7 +402,7 @@ impl Memos {
     fn prune(&mut self, session: &str, t: &Transcript) {
         let Some(taken) = self.taken.get_mut(session) else { return };
         let m = self.by.get(session);
-        let settled = t.history_settled();
+        let settled = settled(t);
         let mut missed = Vec::new();
         taken.retain(|k| {
             let Some(e) = m.and_then(|m| m.get(&k.card)).filter(|e| e.state == State::InChat) else { return false };
@@ -457,6 +471,16 @@ impl Memos {
         fold
     }
 
+    /// "Check again" on a card of `session`, its gap over: the client asks
+    /// again, and the cards say they are checking for another
+    /// [`CHECK_WAIT`].
+    pub(crate) fn check_again(&mut self, session: &str, now: Instant) {
+        if let Some(g) = self.gaps.get_mut(session).filter(|g| g.over) {
+            *g = Gap { since: now, over: false };
+            self.changes += 1;
+        }
+    }
+
     /// The clock, for every session: and a gap [`CHECK_WAIT`] long is over.
     pub(crate) fn tick(&mut self, now: Instant) {
         let sessions: Vec<String> = self.by.keys().cloned().collect();
@@ -495,7 +519,7 @@ impl Memos {
     pub(crate) fn resend(&mut self, session: &str, card: &CardId, t: &Transcript, now: Instant) -> Resend {
         self.prune(session, t);
         let fold = self.fold(session, t);
-        let view = self.view(session, &fold, t);
+        let view = Self::view(&fold, t);
         let mut out = Resend::No;
         self.with(session, |m| out = m.resend(card, &view, now));
         out
@@ -525,9 +549,10 @@ impl crate::model::Model {
         let (Some(seq), Some(a)) = (l.attachment(), l.active.as_ref()) else {
             return Err("not connected to the session: try again in a moment".into());
         };
-        // Events dropped: nothing is checked on the history held until the
-        // one asked for again lands (the module's "Dropped events").
-        if l.transcript.resyncing() {
+        // Events dropped: nothing is checked on what is held until the
+        // history and the slot are read again (the module's "Dropped
+        // events").
+        if recovering(&l.transcript) {
             return Err(self.memos.gap(&a.session_id).into());
         }
         Ok((seq, a.session_id.clone()))
@@ -595,6 +620,20 @@ impl crate::model::Model {
         if let Some(s) = self.lives[lid].active.as_ref().map(|a| a.session_id.clone()) {
             self.memos.on(&s, Heard::Refused { reason }, Instant::now());
         }
+    }
+
+    /// "Check again" on a card of store `lid`, dropped events not read
+    /// again in [`CHECK_WAIT`] (a probe failed, say): the client asks for
+    /// the history, and the slot while unknown, again
+    /// ([`synaps_client::Client`]'s `Resync`).
+    pub(crate) fn check_again(&mut self, lid: crate::live::LiveId, now: Instant) -> Option<crate::model::Effect> {
+        let l = &self.lives[lid];
+        let (Some(seq), Some(a)) = (l.attachment(), l.active.as_ref()) else { return None };
+        if !recovering(&l.transcript) {
+            return None;
+        }
+        self.memos.check_again(&a.session_id, now);
+        Some(crate::model::Effect::Resync(seq))
     }
 
     /// The card memos' clock: then each attached session's view, so an

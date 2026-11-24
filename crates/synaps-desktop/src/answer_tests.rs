@@ -723,10 +723,10 @@ fn a_cards_options_measured_or_clipped_off_screen_arm_once_in_view(cx: &mut Test
 }
 
 /// Shady #81 round 3: the daemon dropped events for this desk (its lag
-/// notice). Until the history asked for again lands a card's controls
-/// wait, saying why, and a click sends nothing; then one click answers.
-/// Unconfirmed, and another gap: its Resend waits too, its line saying
-/// why.
+/// notice). Until the history asked for again lands, and the engine's
+/// slot is read again (round 5), a card's controls wait, saying why, and
+/// a click sends nothing; then one click answers. Unconfirmed, and
+/// another gap: its Resend waits too, its line saying why.
 #[gpui_kit::test]
 fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut TestAppContext) {
     let lag = || vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})];
@@ -738,7 +738,8 @@ fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut
         };
         let update = synaps_client::HistoryUpdate::Replace { messages };
         view.update(cx, |v, cx| {
-            v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx)
+            let slot = synaps_client::Event::Slot { attach_seq: seq, session_id: sid.clone(), queued: None };
+            v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }, slot], cx)
         });
     };
     let (w, view, _events) = open(cx, crate::demo::ASKS);
@@ -770,5 +771,50 @@ fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut
     resynced(cx, &view);
     settle(cx, w, 8);
     assert!(has(cx, w, format!("ask-resend {id}")), "then it doesn't");
+    crate::app::pin_arm_clock(None);
+}
+
+/// Shady #81 round 4: an answer out through dropped events, the engine's
+/// slot not read again (the client's probe failed, say). Past the wait
+/// its row says the chat couldn't be checked, with "Check again" where
+/// Resend would be; a click asks again, and it checks for another wait,
+/// Resend waiting. The history and the slot read again (empty), it is
+/// not confirmed, with Resend.
+#[gpui_kit::test]
+fn past_the_wait_a_card_offers_check_again_not_resend(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    let (id, ix) = card(cx, &view, SHIP);
+    show(cx, w, &view, ix);
+    arm(cx, &view, id, true);
+    click(cx, w, &view, format!("ask-option {id} 3"));
+    assert_eq!(sends(cx, &view).len(), 1, "one click answers");
+    heard(cx, w, &view, vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})]);
+    let t0 = Instant::now();
+    view.update(cx, |v, cx| {
+        v.model.tick_cards(t0 + Duration::from_secs(11));
+        v.model.tick_cards(t0 + Duration::from_secs(22));
+        v.cards_moved(cx);
+    });
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-state {id} not confirmed")), "it couldn't be checked");
+    assert!(has(cx, w, format!("ask-check {id}")), "Check again");
+    assert!(!has(cx, w, format!("ask-resend {id}")) && !has(cx, w, format!("ask-resend {id} off")), "no Resend");
+    arm(cx, &view, id, true);
+    click(cx, w, &view, format!("ask-check {id}"));
+    settle(cx, w, 8);
+    assert!(!has(cx, w, format!("ask-check {id}")), "checking again");
+    assert!(has(cx, w, format!("ask-resend {id} off")), "Resend waits");
+    let (seq, sid) = attachment(cx, &view);
+    let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
+        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+        other => panic!("{other:?}"),
+    };
+    view.update(cx, |v, cx| {
+        let update = synaps_client::HistoryUpdate::Replace { messages };
+        let slot = synaps_client::Event::Slot { attach_seq: seq, session_id: sid.clone(), queued: None };
+        v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }, slot], cx)
+    });
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-resend {id}")), "read again: Resend");
     crate::app::pin_arm_clock(None);
 }

@@ -520,6 +520,15 @@ pub enum Event {
         seq: u64,
         update: HistoryUpdate,
     },
+    /// The steer the engine holds (`queued_message`), read again after the
+    /// daemon dropped events for this attachment (`Full` mode): its value
+    /// where this stream's order puts it, among the events around it
+    /// ([`crate::Transcript::slot_known`]).
+    Slot {
+        attach_seq: u64,
+        session_id: String,
+        queued: Option<String>,
+    },
     /// Who owns input changed. `client` is this connection's id.
     InputOwner {
         attach_seq: u64,
@@ -688,6 +697,7 @@ impl Event {
             | Event::Reattaching { attach_seq, .. }
             | Event::Session { attach_seq, .. }
             | Event::History { attach_seq, .. }
+            | Event::Slot { attach_seq, .. }
             | Event::InputOwner { attach_seq, .. }
             | Event::CwdFallback { attach_seq, .. }
             | Event::SubagentWatch { attach_seq, .. }
@@ -1673,6 +1683,56 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
     }
 }
 
+/// What the engine's slot holds (`queued_message`) after a lag notice,
+/// read from the snapshot of an `Observe` attach on a connection of its
+/// own (`Digest` history: no messages), detached at once: the observer's
+/// id and the slot. No `Query` answers it, and a reattach is a `Detach`
+/// (SynapsCLI `189a5a19`, `daemon/conn.rs:866-890`) that can hand input to
+/// another client or, the last client gone, revoke a driver and deny its
+/// prompts (`session/actor.rs:4954-5004`). An observer never owns input
+/// (`:4873-4876`), and the attachment it reads for stays, so neither
+/// moves. The actor takes the snapshot and broadcasts the observer's
+/// `ClientJoined` in one step (`:4905-4910`): that event's place on the
+/// attachment's stream is the snapshot's.
+async fn probe_slot(sh: Shared, sid: String) -> Result<(u64, Option<String>), String> {
+    let sh = Shared { identity: sh.identity.clone().with_history(HistoryMode::Digest, 1), ..sh };
+    match attempt(&sh, &Target::Existing(sid.clone()), AttachMode::Observe, None, &mut false).await {
+        Attempt::Attached(mut c, a) => {
+            let _ = c.send(&ClientFrame::Cmd { session_id: sid, cmd: SessionCommand::Detach { client: a.client } }).await;
+            c.bye().await;
+            Ok((a.client, a.conversation.queued_message))
+        }
+        Attempt::Retry { why, .. } | Attempt::Fatal(why) => Err(why),
+    }
+}
+
+/// A slot probe's result, by its id: the observer's id and the slot, or
+/// why it couldn't read it.
+type Probed = (u64, Result<(u64, Option<String>), String>);
+
+/// A slot probe out ([`probe_slot`]), until its value has its place.
+struct Probe {
+    id: u64,
+    /// A lag notice came while it was out: what it reads may be from
+    /// before that gap, unless its `ClientJoined` comes after the notice.
+    again: bool,
+    /// The `ClientJoined`s heard since it started, or since the last lag
+    /// notice: past those places.
+    joined: Vec<u64>,
+    /// Its reply, the observer's id and the slot, waiting for that
+    /// observer's `ClientJoined`.
+    reply: Option<(u64, Option<String>)>,
+}
+
+/// Start slot probe `id` of attachment `sid`; its result comes on `tx`.
+fn spawn_probe(sh: &Shared, sid: &str, id: u64, tx: &mpsc::UnboundedSender<Probed>) -> Probe {
+    let (sh, sid, tx) = (sh.clone(), sid.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let _ = tx.send((id, probe_slot(sh, sid).await));
+    });
+    Probe { id, again: false, joined: Vec::new(), reply: None }
+}
+
 /// Run `fut` while answering session commands: there is no session to send
 /// them to, so input is refused (back to the user) instead of being
 /// delivered late to whatever turn runs after the reconnect. `None`: a
@@ -1926,6 +1986,14 @@ async fn session_loop(
         let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
         // `Status` queries in flight (ids).
         let mut statuses: VecDeque<u64> = VecDeque::new();
+        // The engine's slot (`queued_message`): known from the snapshot on;
+        // unknown from a lag notice (its digest may be among what was
+        // dropped) until a digest after it, or a probe's snapshot at its
+        // place ([`probe_slot`]).
+        let mut slot_known = true;
+        let mut probe: Option<Probe> = None;
+        let mut probes = 0u64;
+        let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<Probed>();
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1966,7 +2034,17 @@ async fn session_loop(
                             });
                             continue;
                         }
-                        Command::Resync if mirror.is_some() && resync.is_none() => {
+                        // The app's "check again": the slot read again too,
+                        // while it is unknown and no probe is out (one
+                        // failed, say).
+                        Command::Resync if mirror.is_some() => {
+                            if !slot_known && probe.is_none() {
+                                probes += 1;
+                                probe = Some(spawn_probe(&sh, &sid, probes, &probe_tx));
+                            }
+                            if resync.is_some() {
+                                continue;
+                            }
                             resync = Some(None);
                             SessionCommand::Query { id: query_id, query: SessionQuery::Messages }
                         }
@@ -2058,6 +2136,28 @@ async fn session_loop(
                     if let Err(e) = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: wire }).await {
                         emit_error(&events, Some(attach_seq), Error::Refused { command: Some(name.into()), reason: format!("send failed: {e:#}") });
                         break 'conn (format!("send failed: {e:#}"), Duration::ZERO);
+                    }
+                }
+                Some((id, res)) = probe_rx.recv() => {
+                    let Some(p) = probe.as_mut().filter(|p| p.id == id) else { continue };
+                    match res {
+                        // Its place came first, and nothing since moved
+                        // the slot (a digest ends the probe): it holds.
+                        Ok((client, queued)) if p.joined.contains(&client) => {
+                            probe = None;
+                            slot_known = true;
+                            emit(&events, Event::Slot { attach_seq, session_id: sid.clone(), queued });
+                        }
+                        // A gap since it started, and its place not heard
+                        // after it: it may be from before the gap.
+                        Ok(_) if p.again => {
+                            probes += 1;
+                            probe = Some(spawn_probe(&sh, &sid, probes, &probe_tx));
+                        }
+                        Ok(reply) => p.reply = Some(reply),
+                        // Not read: unknown until a digest, or the app asks
+                        // again (`Command::Resync`).
+                        Err(_) => probe = None,
                     }
                 }
                 frame = conn.recv() => match frame {
@@ -2153,7 +2253,39 @@ async fn session_loop(
                             }
                         };
                         let mut send_query = false;
+                        // A probe's value, at its place: right after it.
+                        let mut slot: Option<Option<String>> = None;
                         match &event {
+                            // A probe's observer joined here: its snapshot's
+                            // place on this stream.
+                            SessionEvent::ClientJoined { client, .. } if probe.is_some() => {
+                                let p = probe.as_mut().expect("some");
+                                if p.reply.as_ref().is_some_and(|r| r.0 == *client) {
+                                    slot = p.reply.take().map(|r| r.1);
+                                    probe = None;
+                                    slot_known = true;
+                                } else {
+                                    p.joined.push(*client);
+                                }
+                            }
+                            SessionEvent::Conversation { digest } => {
+                                // After a lag notice (one ordered stream): the
+                                // slot as it is now. A probe's snapshot comes
+                                // before or after it, its place unknown yet.
+                                slot_known = true;
+                                probe = None;
+                                if let Some(m) = mirror.as_mut()
+                                    && !m.matches(digest)
+                                {
+                                    if digest.messages_len == 0 {
+                                        m.reset(&[]);
+                                        emit(&events, Event::History { attach_seq, session_id: esid.clone(), seq, update: HistoryUpdate::Replace { messages: Vec::new() } });
+                                    } else {
+                                        send_query = resync.is_none();
+                                        resync = Some(Some(digest.clone()));
+                                    }
+                                }
+                            }
                             SessionEvent::Reloading { generation: g, .. } => generation = *g,
                             SessionEvent::InputOwnerChanged { to, reason, .. } => {
                                 owner = *to;
@@ -2172,19 +2304,6 @@ async fn session_loop(
                             SessionEvent::Refused { client, command, reason } if *client == me => {
                                 emit_error(&events, Some(attach_seq), Error::Refused { command: Some(command.clone()), reason: reason.clone() });
                             }
-                            SessionEvent::Conversation { digest } => {
-                                if let Some(m) = mirror.as_mut()
-                                    && !m.matches(digest)
-                                {
-                                    if digest.messages_len == 0 {
-                                        m.reset(&[]);
-                                        emit(&events, Event::History { attach_seq, session_id: esid.clone(), seq, update: HistoryUpdate::Replace { messages: Vec::new() } });
-                                    } else {
-                                        send_query = resync.is_none();
-                                        resync = Some(Some(digest.clone()));
-                                    }
-                                }
-                            }
                             // The daemon dropped events for this connection
                             // and carried on (`protocol::stream_lagged`): a
                             // checkpoint or a digest may be among them, and
@@ -2192,9 +2311,25 @@ async fn session_loop(
                             // again; the first reply after this notice is
                             // past the gap (one ordered stream), a second is
                             // dropped as any reply nobody waits for.
+                            // The slot too: its digest, and the echoes that
+                            // moved it, may be among them. Read it again
+                            // ([`probe_slot`]); one out may read from before
+                            // this gap, unless its place comes after it.
                             SessionEvent::SystemNotice { text } if mirror.is_some() && crate::protocol::stream_lagged(text) => {
                                 send_query = true;
                                 resync = Some(None);
+                                slot_known = false;
+                                match probe.as_mut() {
+                                    Some(p) if p.reply.is_none() => {
+                                        p.again = true;
+                                        p.joined.clear();
+                                    }
+                                    // Back, its place not heard: maybe dropped.
+                                    _ => {
+                                        probes += 1;
+                                        probe = Some(spawn_probe(&sh, &sid, probes, &probe_tx));
+                                    }
+                                }
                             }
                             // The conversation was swapped: re-fetch even if a
                             // length-only comparison would not notice.
@@ -2207,6 +2342,9 @@ async fn session_loop(
                         let ended = matches!(event, SessionEvent::Ended { .. });
                         let meta = crate::protocol::EventMeta::of(&raw);
                         emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, meta, raw });
+                        if let Some(queued) = slot {
+                            emit(&events, Event::Slot { attach_seq, session_id: sid.clone(), queued });
+                        }
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered");
                             unset(&events, attach_seq, &mut sets, "the session ended before the daemon answered");

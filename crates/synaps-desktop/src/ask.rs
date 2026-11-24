@@ -853,13 +853,15 @@ impl AppView {
             };
             let mut out = receipt(a, Some(&e.reply), look, id, p, m);
             if lost && let Some(painted) = Painted::of(a) {
-                // Dropped events: nothing is checked until the history
-                // asked for again lands (`deliver`'s "Dropped events").
+                // Dropped events: nothing is checked until the history and
+                // the slot are read again (`deliver`'s "Dropped events");
+                // past the wait, "Check again" where Resend would be.
                 let gate = l
                     .input_gate()
                     .err()
                     .map(str::to_string)
-                    .or_else(|| l.transcript.resyncing().then(|| self.model.memos.gap(s).to_string()));
+                    .or_else(|| crate::deliver::recovering(&l.transcript).then(|| self.model.memos.gap(s).to_string()));
+                let again = gate.as_deref() == Some(crate::deliver::UNCHECKED);
                 let resend = e.state == MemoState::Unconfirmed;
                 let can = gate.is_none()
                     && fold.is_some_and(|c| {
@@ -871,16 +873,26 @@ impl AppView {
                     });
                 let (name, label) = if resend { ("ask-resend", "Resend") } else { ("ask-retry", "Retry") };
                 let key = control(&painted.id, if resend { "resend" } else { "retry" });
-                let btn = (!unchecked).then(|| {
-                    button(name, id, label, resend, can, p, m).when(can, |b| {
-                        b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.in_pane(
-                                pane,
-                                |this| if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) },
-                            );
-                        }))
+                let btn = if again {
+                    let key = control(&painted.id, "check");
+                    Some(
+                        button("ask-check", id, "Check again", false, true, p, m)
+                            .child(probe(&self.panes.cur.ask_shown, id, key))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.in_pane(pane, |this| this.ask_check_again(id, &painted, cx));
+                            })),
+                    )
+                } else {
+                    (!unchecked).then(|| {
+                        button(name, id, label, resend, can, p, m).when(can, |b| {
+                            b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.in_pane(pane, |this| {
+                                    if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) }
+                                });
+                            }))
+                        })
                     })
-                });
+                };
                 let why = said.or(gate).or(cause).unwrap_or_default();
                 out = out.child(
                     h_flex()
@@ -908,8 +920,9 @@ impl AppView {
                 let why = match l.input_gate() {
                     Err(e) => Some(read_only(e, l)),
                     Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
-                    // Dropped events: the history asked for again first.
-                    Ok(()) if l.transcript.resyncing() => {
+                    // Dropped events: the history and the slot read again
+                    // first.
+                    Ok(()) if crate::deliver::recovering(&l.transcript) => {
                         Some(session.as_deref().map_or(crate::deliver::RESYNCING, |s| self.model.memos.gap(s)).to_string())
                     }
                     // The live turn's alone: its controls wait for the
