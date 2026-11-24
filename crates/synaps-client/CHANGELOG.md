@@ -2,6 +2,16 @@
 
 Commit hashes are this repository's (`synaps-desk`). PR numbers other than synaps-desk#N are those of the archived `synaps-desktop` repository this history was rewritten from.
 
+## Since 108223a
+
+Agent cards, read-only (synaps-cards `docs/design.md` v1.2, the D1 row of §9.3). Additive; one new dependency, `cards-spec` (synaps-cards, a git dependency pinned to `62ea8f3`).
+
+- New `cards` module: `CardRow` (`Ask`, `Answer`, `Close`), `Ask` (the normalized doc, `wait`, the bound id, the fold's `State`, the latest reply and how many answers), `Answered`, `Closed`, `is_card_tool`, and `cards_spec`'s doc and answer types re-exported.
+- New `Item::card: Option<Arc<CardRow>>`: what a row draws of the cards, by `cards_spec::fold` over the history (each message as it is folded, read as `fold::events` reads a whole history, so any split of it into updates gives the same) and then the live turn (a call once `ToolUse` makes its input whole, its result, a turn's `user_text`). Part of `rev`: a row whose card changes (answered, closed) is touched, and a refold that changes nothing keeps its `rev`.
+- A live `cards_ui` call keeps its whole input for the fold; `ToolCall::input` stays the 4 KiB preview.
+- **Breaking** for code that builds `Item { .. }`: none outside this crate can (its private fields).
+- Tests: `tests/cards.rs` (every state, the binding cases of §2.2, the §6.3 fallbacks, live then history, the whole input live, F14: answered on another desk, look-alike answers, ids used again, any split of a history, a reset response) and `cards::tests` (read by message, a history is `fold::events` of the whole).
+
 ## Since d6f8f68
 
 No change. #75 (`3f61cff`) added a mirror of the core card protocol and model (agent-ui D1, SynapsCLI #444 at `6e895d27`), inert; D0 removes it whole, because that core stack is closed and no daemon will speak it. Gone again: `FEATURE_AGENT_SURFACES`, `SURFACES_CATALOG`, `Capabilities::surfaces`, `SessionCommand::SurfaceAction` and `SurfaceAction`, the `surface` and `surface_result` events, `SessionMeta::{surfaces_waiting, surfaces_open}`, `Attached::surfaces`, `Rejected::surfaces`, `Client::surface_action_on` / `SessionRef::surface_action_on` / `Command::SurfaceActionOn`, and the `surface` module with `tests/fixtures/ui/`. The `Hello` was byte for byte the same throughout. Agent cards come back as a Synaps extension (`synaps-cards`: the `cards` extension and the `cards-spec` crate, design v1.2 §9), with no protocol change here.

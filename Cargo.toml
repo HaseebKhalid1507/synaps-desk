@@ -17,6 +17,10 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 async-channel = "2"
 anyhow = "1"
+# Agent cards (synaps-cards docs/design.md v1.2, §9.1): the doc, the digest,
+# the answer message and the fold, the same code the `cards` extension runs.
+# Pinned to a revision: a new catalog version is a new pin.
+cards-spec = { git = "https://github.com/HaseebKhalid1507/synaps-cards", rev = "62ea8f35386025b7e863f509a248785a23fc4dc9" }
 
 [profile.release]
 opt-level = 3

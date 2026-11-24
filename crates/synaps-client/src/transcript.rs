@@ -332,12 +332,25 @@ pub struct Item {
     /// `Some(n)`: a client-side row (notice, error), not part of the
     /// history, shown after the first `n` history messages.
     anchor: Option<usize>,
+    /// The agent card it draws ([`crate::cards`]): a card call's, an
+    /// answer's, a close's. Part of `rev`: a row whose card changes (an
+    /// answer came, it closed) is changed.
+    pub card: Option<Arc<crate::cards::CardRow>>,
+    /// A live card call's input, whole (`ToolUse`): [`ToolCall::input`] is
+    /// a preview, and a card input may be up to 8 KiB (synaps-cards design
+    /// §2.1). A history call's is read from its message.
+    card_input: Option<Arc<Value>>,
 }
 
 impl Item {
     /// A notice or error this client added (not part of the history).
     pub fn is_note(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    /// A live card call's whole input.
+    pub(crate) fn card_input(&self) -> Option<&Value> {
+        self.card_input.as_deref()
     }
 }
 
@@ -457,6 +470,13 @@ pub struct Transcript {
     /// the daemon writes after one ([`COMPACTION_ACKS`]), is not drawn
     /// either.
     after_summary: bool,
+    /// The agent cards' fold over the history folded so far
+    /// ([`crate::cards`]).
+    cards: crate::cards::HistoryCards,
+    /// Something the cards read changed since [`Transcript::sync_cards`].
+    cards_dirty: bool,
+    /// Rows that drew a card at the last [`Transcript::sync_cards`].
+    card_rows: usize,
 }
 
 impl Transcript {
@@ -650,7 +670,11 @@ impl Transcript {
         if self.stamp.is_none() && !self.event_ts.is_empty() {
             self.stamp = Some(Arc::from(self.event_ts.as_str()));
         }
-        self.items.insert(ix, Item { id, rev, kind, text, tool, streaming, at: self.stamp.clone(), event: None, form: None, anchor: None });
+        let at = self.stamp.clone();
+        self.items.insert(
+            ix,
+            Item { id, rev, kind, text, tool, streaming, at, event: None, form: None, anchor: None, card: None, card_input: None },
+        );
         self.mark(ix);
         ix
     }
@@ -802,7 +826,13 @@ impl Transcript {
             if carry && o.at.is_some() && o.kind == it.kind && same {
                 it.at = o.at.clone();
             }
-            if o.kind == it.kind && o.streaming == it.streaming && o.text == it.text && o.tool == it.tool && o.event == it.event {
+            if o.kind == it.kind
+                && o.streaming == it.streaming
+                && o.text == it.text
+                && o.tool == it.tool
+                && o.event == it.event
+                && o.card == it.card
+            {
                 it.rev = o.rev;
             }
         }
@@ -871,6 +901,7 @@ impl Transcript {
             self.deliver_all();
             self.settle();
         }
+        self.sync_cards();
         self.keep_revs(carry);
         // The rows, the history's and the replay's, are all back.
         self.rebuilding = false;
@@ -927,6 +958,9 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
+        // The live rows it took were the cards' live ones too.
+        self.cards_dirty = true;
+        self.sync_cards();
         // An append matched this conversation's prefix: the rows it took
         // are its own live ones, whatever swap came before it (a resume of
         // the same journal has no replacement to consume the flag).
@@ -953,6 +987,7 @@ impl Transcript {
         if !self.busy {
             self.settle();
         }
+        self.sync_cards();
         self.keep_revs(!swapped);
     }
 
@@ -960,6 +995,8 @@ impl Transcript {
     /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
         self.after_summary = false;
+        self.cards = crate::cards::HistoryCards::default();
+        self.cards_dirty = true;
         let notes = self.hold_events(notes, messages);
         let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.sort_by_key(|n| n.anchor);
@@ -1152,13 +1189,48 @@ impl Transcript {
     pub fn set_detached(&mut self) {
         self.busy = false;
         self.settle();
+        self.cards_dirty = true;
+        self.sync_cards();
     }
 
     fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
         // Its rows have its time or none: never the event's it came in.
         let outer = (std::mem::replace(&mut self.stamp, message_at(m).map(Arc::from)), std::mem::take(&mut self.event_ts));
+        let first = self.items.len();
         self.fold_blocks(m, reuse);
         (self.stamp, self.event_ts) = outer;
+        // Its rows are the ones it just pushed (notes go between messages).
+        self.cards.message(m, &self.items[first..]);
+        self.cards_dirty = true;
+    }
+
+    /// Every row's card ([`Item::card`]) as the fold now says: the
+    /// history's, then the live rows'. A row whose card changed is touched.
+    fn sync_cards(&mut self) {
+        if !std::mem::take(&mut self.cards_dirty) {
+            return;
+        }
+        let live = self.history_end.min(self.items.len());
+        // No card called anywhere and none drawn: nothing to fold (a
+        // session without cards pays only this).
+        let called = !self.cards.is_empty()
+            || self.items[live..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::cards::is_card_tool(&t.name)));
+        if !called && self.card_rows == 0 {
+            return;
+        }
+        let mut want = crate::cards::rows(&self.cards, &self.items[live..]);
+        self.card_rows = want.len();
+        let mut changed = Vec::new();
+        for (ix, it) in self.items.iter_mut().enumerate() {
+            let card = want.remove(&it.id);
+            if it.card.as_deref() != card.as_ref() {
+                it.card = card.map(Arc::new);
+                changed.push(ix);
+            }
+        }
+        for ix in changed {
+            self.touch(ix);
+        }
     }
 
     fn fold_blocks(&mut self, m: &Value, reuse: &mut Reuse) {
@@ -1386,6 +1458,23 @@ impl Transcript {
         self.apply_event(ev);
         self.event_ts.clear();
         self.stamp = None;
+        // What the cards read changes with a call's input or result, a
+        // turn's start (its user message), a stream reset, a turn's end;
+        // never with the deltas that stream text in.
+        let delta = matches!(
+            ev,
+            SessionEvent::Stream {
+                event: StreamEvent::Llm(
+                    LlmEvent::Text { .. }
+                        | LlmEvent::Thinking { .. }
+                        | LlmEvent::ToolUseStart { .. }
+                        | LlmEvent::ToolUseDelta { .. }
+                        | LlmEvent::ToolResultDelta { .. }
+                )
+            }
+        );
+        self.cards_dirty |= !delta;
+        self.sync_cards();
     }
 
     fn apply_event(&mut self, ev: &SessionEvent) {
@@ -1528,6 +1617,7 @@ impl Transcript {
                         t.input = preview(&compact(input));
                         t.status = Some(ToolStatus::Running);
                     }
+                    self.items[ix].card_input = crate::cards::is_card_tool(tool_name).then(|| Arc::new(input.clone()));
                     self.touch(ix);
                 }
                 LlmEvent::ToolQueued { tool_id } | LlmEvent::ToolStarted { tool_id } => {
