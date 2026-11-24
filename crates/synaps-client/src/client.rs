@@ -1692,7 +1692,7 @@ async fn attempt(sh: &Shared, target: &Target, mode: AttachMode, previous: Optio
 /// prompts (`session/actor.rs:4954-5004`). An observer never owns input
 /// (`:4873-4876`), and the attachment it reads for stays, so neither
 /// moves. The actor takes the snapshot and broadcasts the observer's
-/// `ClientJoined` in one step (`:4905-4910`): that event's place on the
+/// `ClientJoined` in one step (`:4907-4912`): that event's place on the
 /// attachment's stream is the snapshot's.
 async fn probe_slot(sh: Shared, sid: String) -> Result<(u64, Option<String>), String> {
     let sh = Shared { identity: sh.identity.clone().with_history(HistoryMode::Digest, 1), ..sh };

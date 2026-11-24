@@ -80,7 +80,7 @@
 //! that moved it may be among what was dropped, and a steer read as lost
 //! on a stale slot, a Resend of what the engine holds, goes in twice
 //! (Shady #81 round 4: a turn that failed before taking it in keeps it in
-//! the slot, `actor.rs:4135-4146`, and the next turn takes it in with the
+//! the slot, `actor.rs:4136-4146`, and the next turn takes it in with the
 //! Resend). No query answers the slot and a reattach can move input or
 //! revoke a driver, so the client reads it from an observer's snapshot,
 //! at its place among the events (`synaps_client`'s `probe_slot`); a
