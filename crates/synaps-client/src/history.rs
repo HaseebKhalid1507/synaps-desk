@@ -115,6 +115,19 @@ impl HistoryMirror {
         self.hash = messages_hash(messages);
     }
 
+    /// `messages` follow the ones mirrored (an [`HistoryUpdate::Append`]).
+    pub fn append(&mut self, messages: &[Value]) {
+        self.len += messages.len();
+        self.hash = feed(self.hash, messages);
+    }
+
+    /// Whether `digest` describes the mirrored messages, as
+    /// [`HistoryMirror::matches`] says, without re-arming a distrusted
+    /// hash.
+    pub fn agrees(&self, digest: &ConversationDigest) -> bool {
+        digest.messages_len == self.len && (!self.hash_ok || digest.messages_hash == self.hash)
+    }
+
     /// Classify a full `MessageHistory`: an append when its first `len`
     /// messages hash to the mirror's state, else a replacement. While the
     /// hash is distrusted nothing can be told apart: always a replacement.
@@ -135,14 +148,21 @@ impl HistoryMirror {
 
     /// The result of a `Messages` query for `digest`: always a replacement.
     pub fn resynced(&mut self, messages: Vec<Value>, digest: Option<&ConversationDigest>) -> HistoryUpdate {
-        self.reset(&messages);
+        self.replaced(&messages, digest);
+        HistoryUpdate::Replace { messages }
+    }
+
+    /// The mirror of a whole history `messages` that was asked for after
+    /// `digest` ([`HistoryMirror::resynced`], the messages borrowed): one
+    /// that still disagrees with it on the hash alone distrusts the hash.
+    pub fn replaced(&mut self, messages: &[Value], digest: Option<&ConversationDigest>) {
+        self.reset(messages);
         if let Some(d) = digest
             && d.messages_len == self.len
             && d.messages_hash != self.hash
         {
             self.hash_ok = false;
         }
-        HistoryUpdate::Replace { messages }
     }
 
     /// Whether `digest` describes the mirrored messages. A digest that

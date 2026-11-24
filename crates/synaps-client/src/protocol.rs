@@ -1241,6 +1241,10 @@ pub struct ConversationSnapshot {
     /// turn's end), as on [`ConversationDigest::pending_events_len`].
     #[serde(default)]
     pub pending_events_len: usize,
+    /// The one steer the engine holds for its next round or turn (the
+    /// actor's `queued_message`), as on [`ConversationDigest::queued_message`].
+    #[serde(default)]
+    pub queued_message: Option<String>,
 }
 
 /// `wire::ConversationDigest`: what `Conversation` carries on the wire.
@@ -1322,6 +1326,17 @@ impl EventMeta {
     pub fn of(raw: &Value) -> Self {
         Self { prompt_outcome: PromptOutcome::of_event(raw) }
     }
+}
+
+/// A `compaction_applied`'s `queued_restored` in the raw event `raw`: the
+/// steer held through the compaction, which the daemon appended to the
+/// compacted history (the typed variant keeps its three fields). `None`
+/// for any other event.
+pub fn queued_restored(raw: &Value) -> Option<&str> {
+    if raw["ev"] != "compaction_applied" {
+        return None;
+    }
+    raw["queued_restored"].as_str()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1582,6 +1597,14 @@ pub enum SessionEvent {
         message: String,
     },
     CompactionCancelled,
+    /// A session driver's lease ended (SynapsCLI E-P0): the steers still
+    /// in its queue were never sent, and nothing sends them now.
+    DriverRevoked {
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        undelivered_steering: Vec<String>,
+    },
     SubagentRows {
         #[serde(default)]
         rows: Vec<Value>,
