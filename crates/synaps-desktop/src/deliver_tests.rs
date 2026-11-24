@@ -536,6 +536,31 @@ fn ask_live(m: &mut Model, tool: &str, card: &str, input: &Value) {
     ev(m, 1, S, llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": showing(card, input)})));
 }
 
+/// A compaction applied, its history not here yet: the history held is
+/// the old conversation's, and a click there sends nothing (checking).
+/// The compacted history lands with the card still asked: one click sends.
+/// (Round 2's mutations: with the taken-in answers carried, the gap test
+/// above no longer pinned the swap; this does.)
+#[test]
+fn no_answer_while_a_compactions_history_is_coming() {
+    let mut m = one();
+    let p = painted(&m, LiveId::FIRST);
+    ev(&mut m, 1, S, json!({"ev": "compaction_started", "source": "manual", "disclosure": ""}));
+    let applied = json!({"ev": "compaction_applied", "previous_session_id": S, "session_id": "j2", "chains_advanced": [], "msg_count": 5});
+    ev(&mut m, 1, S, applied);
+    assert_eq!(m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now()), Err(UNSETTLED.into()));
+    assert!(m.memos.get_state(S, CARD).is_none(), "nothing went");
+    let mut compacted = vec![
+        json!({"role": "user", "content": "<context-summary>parser work</context-summary>"}),
+        json!({"role": "assistant", "content": "Understood."}),
+    ];
+    compacted.extend(history()[1..].iter().cloned());
+    ev(&mut m, 1, S, digest(&compacted, None));
+    replace(&mut m, 1, S, compacted);
+    let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+    assert_eq!(out.text, answer("Refactor the parser"));
+}
+
 /// Shady #81 P2-1: the history matches its digest, but the card is the
 /// live turn's alone (its call and its result streamed; no digest, no
 /// history since). It draws, and a click, Skip included, sends nothing:
