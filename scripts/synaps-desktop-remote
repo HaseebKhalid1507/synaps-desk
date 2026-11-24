@@ -6,27 +6,25 @@
 # small things from <host> (SYNAPS_DESKTOP_HOST_READ, SYNAPS_DESKTOP_HOST): the reads below.
 #
 # synaps-desktop-remote --read <host> <what> <args...>
-# Small, non-secret reads from <host>, printed on stdout. What a read names is picked out ON
-# <host>: nothing else leaves it. Every argument is a plain word ([A-Za-z0-9._-]), so no shell
-# on either side reads anything into it.
-#   config-key <profile|-> <key>   the lines of the profile's Synaps config that set <key>
-#                                  (`<key> = ...`), as Synaps finds the file. A key that looks
-#                                  secret (provider.*, auth.*, server.*, *token*, *secret*,
-#                                  *password*, *api_key*) is refused.
-#   cli <pid> <profile|-> <read>   the daemon's own CLI (/proc/<pid>/exe; <pid> must be this
-#                                  user's daemon process) running one read from this list:
-#                                    auth-list   `auth list --json` (labels, no secrets)
-# Exit 64: not a read this takes; 65: a secret key; 66: <pid> is not this user's daemon;
-# 255: ssh failed.
+# The two reads the app makes of <host>, printed on stdout. Each is narrowed ON <host>, before
+# anything leaves it, and the host half's stderr never leaves it (nothing the host's tools say,
+# a config warning included, crosses the connection). Every argument is a plain word
+# ([A-Za-z0-9._-]), so no shell on either side reads anything into it.
+#   config-key <profile|-> favorite_models
+#                         the profile's Synaps config's `favorite_models = ...` lines (the file
+#                         as Synaps finds it). That key only: any other is refused, here and on
+#                         <host>, whatever its name.
+#   cli <pid> <profile|-> auth-list
+#                         which providers sign in with OAuth and their accounts' labels, from the
+#                         daemon's own CLI (/proc/<pid>/exe, <pid> this user's daemon process):
+#                         `auth list --json` cut down on <host> to
+#                         {"accounts":[{"provider":P,"label":L}...],"selectors":{K:{}...}},
+#                         plain words only (no identities, selector values or anything else).
+# Exit 64: not a read this takes; 65: a key other than favorite_models; 66: <pid> is not this
+# user's daemon; 67: the read failed on <host> (no listing, an unreadable config); 255: ssh failed.
 set -euo pipefail
 
 plain() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
-secret() {
-  case "$1" in
-    provider.* | auth.* | server.* | *token* | *secret* | *password* | *api_key* | *apikey*) return 0 ;;
-  esac
-  return 1
-}
 usage() { echo "synaps-desktop-remote: $1" >&2; exit 64; }
 
 if [ "${1:-}" = --read ]; then
@@ -37,40 +35,151 @@ if [ "${1:-}" = --read ]; then
   for a in "$@"; do plain "$a" || usage "--read takes plain words only"; done
   case "$1" in
     config-key)
-      [ $# -eq 3 ] || usage "usage: --read <host> config-key <profile|-> <key>"
-      if secret "$3"; then echo "synaps-desktop-remote: refused: $3 looks like a secret" >&2; exit 65; fi
+      [ $# -eq 3 ] || usage "usage: --read <host> config-key <profile|-> favorite_models"
+      [ "$3" = favorite_models ] || { echo "synaps-desktop-remote: config-key reads favorite_models only" >&2; exit 65; }
       ;;
     cli)
-      [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || usage "usage: --read <host> cli <pid> <profile|-> <read>"
-      case "$4" in auth-list) ;; *) usage "cli: no read named $4" ;; esac
+      [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || usage "usage: --read <host> cli <pid> <profile|-> auth-list"
+      [ "$4" = auth-list ] || usage "cli: no read named $4"
       ;;
     *) usage "no read named $1" ;;
   esac
   # The same checks again on <host>, then the read.
   exec ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$host" bash -s -- "$@" <<'REMOTE'
+exec 2>/dev/null
 set -euo pipefail
 for a in "$@"; do [[ "$a" =~ ^[A-Za-z0-9._-]+$ ]] || exit 64; done
 base="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"
 case "$1" in
   config-key)
     [ $# -eq 3 ] || exit 64
-    case "$3" in provider.* | auth.* | server.* | *token* | *secret* | *password* | *api_key* | *apikey*) exit 65 ;; esac
+    [ "$3" = favorite_models ] || exit 65
     # The profile's file when there is one, else the base one (Synaps' resolve_read_path).
     f="$base/config"
     if [ "$2" != - ] && [[ "$2" != .* ]] && [ -e "$base/$2/config" ]; then f="$base/$2/config"; fi
     [ -e "$f" ] || exit 0
-    grep -E "^[[:space:]]*${3//./\\.}[[:space:]]*=" "$f" || true
+    [ -f "$f" ] || exit 67
+    grep -E '^[[:space:]]*favorite_models[[:space:]]*=' "$f" || [ $? -eq 1 ] || exit 67
     ;;
   cli)
     [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || exit 64
-    case "$4" in auth-list) ;; *) exit 64 ;; esac
+    [ "$4" = auth-list ] || exit 64
     [ -O "/proc/$2" ] || exit 66
     tr '\0' '\n' < "/proc/$2/cmdline" | grep -qx daemon || exit 66
     if [ "$3" = - ]; then unset SYNAPS_PROFILE; else export SYNAPS_PROFILE="$3"; fi
-    case "$4" in
-      auth-list) exec "/proc/$2/exe" auth list --json < /dev/null ;;
-      *) exit 64 ;;
-    esac
+    # POSIX awk (no jq or python assumed on <host>).
+    project='
+# `synaps auth list --json` on stdin; on stdout, only what the picker reads:
+# {"accounts":[{"provider":P,"label":L},...],"selectors":{K:{},...}}. A
+# provider, label or key that is not a plain word is left out; anything
+# that is not such a listing prints nothing and exits 1.
+function fail() { bad = 1; pos = n + 1 }
+function ws(   c) {
+  while (pos <= n) {
+    c = substr(s, pos, 1)
+    if (c != " " && c != "\t" && c != "\n" && c != "\r") return
+    pos++
+  }
+}
+function plain(w) { return length(w) <= 64 && w ~ /^[A-Za-z0-9._-]+$/ }
+# The string at pos (an escape becomes "\\": never a plain word).
+function str(   c, out) {
+  if (substr(s, pos, 1) != "\"") { fail(); return "" }
+  pos++
+  out = ""
+  while (pos <= n) {
+    c = substr(s, pos, 1)
+    pos++
+    if (c == "\"") return out
+    if (c == "\\") {
+      pos += (substr(s, pos, 1) == "u") ? 5 : 1
+      c = "\\"
+    }
+    out = out c
+  }
+  fail()
+  return ""
+}
+# The value at pos, at `at`: "top", "accounts", "account", "selectors",
+# "text" (a provider or a label: kept in `got`) or "-" (skipped).
+function value(at,   c, k, p, l) {
+  ws()
+  got = ""
+  if (pos > n) { fail(); return }
+  c = substr(s, pos, 1)
+  if (c == "{") {
+    pos++
+    ws()
+    p = ""
+    l = ""
+    if (substr(s, pos, 1) != "}") {
+      while (!bad) {
+        ws()
+        k = str()
+        ws()
+        if (substr(s, pos, 1) != ":") { fail(); return }
+        pos++
+        if (at == "top" && k == "accounts") value("accounts")
+        else if (at == "top" && k == "selectors") value("selectors")
+        else if (at == "account" && k == "provider") { value("text"); p = got }
+        else if (at == "account" && k == "label") { value("text"); l = got }
+        else {
+          if (at == "selectors" && plain(k)) { sel = sel sep2 "\"" k "\":{}"; sep2 = "," }
+          value("-")
+        }
+        ws()
+        c = substr(s, pos, 1)
+        pos++
+        if (c == "}") break
+        if (c != ",") { fail(); return }
+      }
+    } else pos++
+    if (at == "account" && plain(p) && (l == "" || plain(l))) {
+      acc = acc sep1 "{\"provider\":\"" p "\",\"label\":\"" l "\"}"
+      sep1 = ","
+    }
+    if (at == "top") top = 1
+    got = ""
+    return
+  }
+  if (c == "[") {
+    pos++
+    ws()
+    if (at == "accounts") listed = 1
+    if (substr(s, pos, 1) == "]") { pos++; return }
+    while (!bad) {
+      value(at == "accounts" ? "account" : "-")
+      ws()
+      c = substr(s, pos, 1)
+      pos++
+      if (c == "]") return
+      if (c != ",") { fail(); return }
+    }
+    return
+  }
+  if (c == "\"") {
+    k = str()
+    if (at == "text") got = k
+    return
+  }
+  # A number, true, false or null.
+  k = pos
+  while (pos <= n && index("0123456789+-.eEtrufalsn", substr(s, pos, 1)) > 0) pos++
+  if (pos == k) fail()
+}
+{ s = s $0 "\n"; if (length(s) > 1048576) { bad = 1; exit } }
+END {
+  if (bad) exit 1
+  n = length(s)
+  pos = 1
+  value("top")
+  ws()
+  if (bad || pos <= n || !top || !listed) exit 1
+  print "{\"accounts\":[" acc "],\"selectors\":{" sel "}}"
+}
+'
+    out=$("/proc/$2/exe" auth list --json < /dev/null 2> /dev/null | awk "$project") || exit 67
+    printf '%s\n' "$out"
     ;;
   *) exit 64 ;;
 esac
