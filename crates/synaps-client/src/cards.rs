@@ -12,19 +12,23 @@
 //!   holds, so the tool ids whose latest call is a card's are kept across
 //!   updates ([`HistoryCards::calls`]); read so, any split of a history
 //!   gives `events` of the whole.
-//! - **The live turn**, from its rows: a call once its input is whole
-//!   (`ToolUse`; a card call's input kept whole, §2.1), its result once it
-//!   reports, and the user message that started a turn (`TurnStarted`), so
-//!   an answer sent from another desk shows when its turn starts (F14),
-//!   not when it ends. The history replaces them when it lands, as it
-//!   replaces the rows.
+//! - **The live turn**, from its rows, in the order their events came
+//!   ([`crate::transcript::Item::seq()`]; results need not come in call
+//!   order, and a card id bound twice names the card bound last): a call
+//!   once its input is whole (`ToolUse`; a card call's input kept whole,
+//!   §2.1), its result once it reports, and the user message that started
+//!   a turn (`TurnStarted`), so an answer sent from another desk shows when
+//!   its turn starts (F14), not when it ends. The history replaces them
+//!   when it lands, as it replaces the rows.
 //!
 //! A card is drawn on its call's row ([`crate::transcript::Item::card`]):
 //! a call that asks, bound or still waiting for its result. One whose input
 //! doesn't validate or whose result doesn't bind is plain, `None`: an
 //! ordinary tool row, the fail-safe (§2.2, §6.3). An answer the fold
 //! counted is drawn on its message's row, and a close that closed a card on
-//! its call's row.
+//! its call's row: bound when its result came, for good (the fold names a
+//! tool id's latest call only, and a later call of the id takes the id,
+//! not the receipt).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,37 +91,54 @@ pub fn is_card_tool(name: &str) -> bool {
     NAMES.contains(&name)
 }
 
-/// The fold over the history folded so far, read message by message.
+/// The fold over the history folded so far, read message by message (and,
+/// a copy of it, the live turn read on top: [`rows`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HistoryCards {
     /// Each event's row: a call's, a user message's (the row its text is
     /// drawn in); a result has none. Indexed as the fold numbers events.
     rows: Vec<Option<u64>>,
     /// Each tool id's latest call: whether it is a card call (the results
-    /// `events` keeps are those).
-    calls: HashMap<String, bool>,
-    /// The card calls, in order: tool id, event, row (a close is drawn on
-    /// its row).
-    card_calls: Vec<(String, usize, Option<u64>)>,
+    /// `events` keeps are those), and its row.
+    calls: HashMap<String, (bool, Option<u64>)>,
+    /// Each close that closed a card, as its result came: its call's row
+    /// and the card it closed.
+    closes: Vec<(u64, Arc<CardDoc>)>,
+    /// A card call read.
+    called: bool,
     fold: Fold,
 }
 
 impl HistoryCards {
     /// No card call in the history.
     pub(crate) fn is_empty(&self) -> bool {
-        self.card_calls.is_empty()
+        !self.called
     }
 
+    /// Read event `e`, drawn on `row` (a result's: none).
     fn push(&mut self, e: &Event, row: Option<u64>) {
-        if let Event::Call { tool_id, name, .. } = e {
-            let card = is_card_tool(name);
-            self.calls.insert(tool_id.clone(), card);
-            if card {
-                self.card_calls.push((tool_id.clone(), self.rows.len(), row));
+        // The tool id of a close this result may close.
+        let closing = match e {
+            Event::Call { tool_id, name, .. } => {
+                let card = is_card_tool(name);
+                self.called |= card;
+                self.calls.insert(tool_id.clone(), (card, row));
+                None
             }
-        }
+            Event::Result { tool_id, .. } => self.fold.close(tool_id).filter(|c| c.pending).map(|_| tool_id.as_str()),
+            Event::User { .. } => None,
+        };
         self.fold.apply(e);
         self.rows.push(row);
+        // It closed a card: the one its card id names now. Kept on the
+        // close's row whatever later calls its tool id.
+        if let Some(tool_id) = closing
+            && let Some(close) = self.fold.close(tool_id).filter(|c| c.closed)
+            && let Some(doc) = self.fold.bound(&close.card).and_then(|c| c.doc.as_ref())
+            && let Some(&(_, Some(r))) = self.calls.get(tool_id)
+        {
+            self.closes.push((r, Arc::new(doc.clone())));
+        }
     }
 
     /// History message `m`, folded into `rows` (its rows, in order).
@@ -135,7 +156,7 @@ impl HistoryCards {
                 // The results `events` keeps: a card call's (its tool id's
                 // latest call), which may be in an earlier update.
                 for b in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
-                    if let Some(id) = b["tool_use_id"].as_str().filter(|id| self.calls.get(*id) == Some(&true))
+                    if let Some(id) = b["tool_use_id"].as_str().filter(|id| self.calls.get(*id).is_some_and(|c| c.0))
                         && let Some(text) = result_text(&b["content"])
                     {
                         self.push(&Event::Result { tool_id: id.to_string(), text }, None);
@@ -168,46 +189,41 @@ fn result_text(content: &Value) -> Option<String> {
     }
 }
 
-/// What each row draws: the history's fold, then the live rows
-/// (`live`, the rows after the history's) read on top. By row id.
+/// What each row draws: the history's fold, then the live rows (`live`,
+/// the rows after the history's) read on top, in the order their events
+/// came. By row id.
 pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> HashMap<u64, CardRow> {
-    let mut fold = history.fold.clone();
-    // The live events' rows, numbered on from the history's.
-    let base = history.rows.len();
-    let mut live_rows: Vec<Option<u64>> = Vec::new();
-    let mut card_calls: Vec<(&str, usize, Option<u64>)> = Vec::new();
+    // The live events, each with its place in the stream: a call once its
+    // input is whole (the history never holds a call that is still
+    // streaming), a card call's result (no other binds: it is nothing to
+    // the fold), the user message that started a turn.
+    let mut events: Vec<(u64, Event, Option<u64>)> = Vec::new();
     for it in live.iter().filter(|i| !i.is_note()) {
+        let [came, reported] = it.seq();
         match it.kind {
             ItemKind::Tool => {
-                // A call is one once its input is whole: the history never
-                // holds a call that is still streaming.
                 let Some(t) = it.tool.as_ref().filter(|t| !t.tool_id.is_empty() && t.status != Some(ToolStatus::Streaming)) else {
                     continue;
                 };
                 let card = is_card_tool(&t.name);
                 let input = if card { it.card_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
-                if card {
-                    card_calls.push((&t.tool_id, base + live_rows.len(), Some(it.id)));
-                }
-                fold.apply(&Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input });
-                live_rows.push(Some(it.id));
-                // Only a card call's result can bind; another's is nothing
-                // to the fold.
+                events.push((came, Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input }, Some(it.id)));
                 if card && t.status.is_some_and(ToolStatus::is_terminal) {
-                    fold.apply(&Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() });
-                    live_rows.push(None);
+                    events.push((reported, Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() }, None));
                 }
             }
-            ItemKind::User => {
-                fold.apply(&Event::User { text: it.text.clone() });
-                live_rows.push(Some(it.id));
-            }
+            ItemKind::User => events.push((came, Event::User { text: it.text.clone() }, Some(it.id))),
             _ => {}
         }
     }
-    let row = |at: usize| if at < base { history.rows.get(at).copied().flatten() } else { live_rows.get(at - base).copied().flatten() };
+    events.sort_by_key(|(at, ..)| *at);
+    let mut read = history.clone();
+    for (_, e, row) in &events {
+        read.push(e, *row);
+    }
+    let row = |at: usize| read.rows.get(at).copied().flatten();
     let mut out = HashMap::new();
-    for c in fold.cards() {
+    for c in read.fold.cards() {
         let (Some(doc), Some(r)) = (c.doc.as_ref().filter(|_| c.state != State::Plain), row(c.at)) else { continue };
         let doc = Arc::new(doc.clone());
         let ask = Ask {
@@ -225,19 +241,8 @@ pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> HashMap<u64, CardRo
             }
         }
     }
-    // A close is drawn on its tool id's latest card call, if that call is
-    // still the id's latest ([`Fold::close`]) and closed a card: the last
-    // card bound to the id before it.
-    let mut latest: HashMap<&str, (usize, Option<u64>)> = HashMap::new();
-    for (tool_id, at, r) in history.card_calls.iter().map(|(t, at, r)| (t.as_str(), *at, *r)).chain(card_calls) {
-        latest.insert(tool_id, (at, r));
-    }
-    for (tool_id, (at, r)) in latest {
-        let (Some(r), Some(close)) = (r, fold.close(tool_id).filter(|c| c.closed)) else { continue };
-        let card = fold.cards().iter().rev().find(|c| c.at < at && c.id.as_ref() == Some(&close.card) && c.state == State::Closed);
-        if let Some(doc) = card.and_then(|c| c.doc.as_ref()) {
-            out.insert(r, CardRow::Close(Closed { doc: Arc::new(doc.clone()) }));
-        }
+    for (r, doc) in &read.closes {
+        out.insert(*r, CardRow::Close(Closed { doc: doc.clone() }));
     }
     out
 }

@@ -340,6 +340,11 @@ pub struct Item {
     /// a preview, and a card input may be up to 8 KiB (synaps-cards design
     /// §2.1). A history call's is read from its message.
     card_input: Option<Arc<Value>>,
+    /// A live row's place in the stream ([`Transcript::came`]; 0: not
+    /// yet): its call, once no longer streaming (a user row: its message),
+    /// and its result. The cards fold the live turn in this order, not the
+    /// rows' ([`crate::cards`]): results need not come in call order.
+    seq: [u64; 2],
 }
 
 impl Item {
@@ -351,6 +356,12 @@ impl Item {
     /// A live card call's whole input.
     pub(crate) fn card_input(&self) -> Option<&Value> {
         self.card_input.as_deref()
+    }
+
+    /// Its place in the live stream: its call's (or message's), its
+    /// result's; 0 for not yet.
+    pub(crate) fn seq(&self) -> [u64; 2] {
+        self.seq
     }
 }
 
@@ -477,6 +488,15 @@ pub struct Transcript {
     cards_dirty: bool,
     /// Rows that drew a card at the last [`Transcript::sync_cards`].
     card_rows: usize,
+    /// The live stream's order so far ([`Item::seq()`]).
+    live_seq: u64,
+    /// A card call among the live rows: set as one starts, so a session
+    /// without cards reads no row per event ([`Transcript::sync_cards`]).
+    /// It may stay set once that row is gone: then the fold just runs.
+    live_cards: bool,
+    /// The history landed since [`Transcript::sync_cards`]: count
+    /// [`Transcript::live_cards`] again.
+    recount: bool,
 }
 
 impl Transcript {
@@ -673,7 +693,21 @@ impl Transcript {
         let at = self.stamp.clone();
         self.items.insert(
             ix,
-            Item { id, rev, kind, text, tool, streaming, at, event: None, form: None, anchor: None, card: None, card_input: None },
+            Item {
+                id,
+                rev,
+                kind,
+                text,
+                tool,
+                streaming,
+                at,
+                event: None,
+                form: None,
+                anchor: None,
+                card: None,
+                card_input: None,
+                seq: [0; 2],
+            },
         );
         self.mark(ix);
         ix
@@ -681,7 +715,22 @@ impl Transcript {
 
     /// A live row: above the events not delivered yet.
     fn push_new(&mut self, kind: ItemKind, text: String, tool: Option<ToolCall>, streaming: bool) -> usize {
-        self.push_at(self.live_end(), kind, text, tool, streaming, &mut Reuse::new())
+        let ix = self.push_at(self.live_end(), kind, text, tool, streaming, &mut Reuse::new());
+        // A user row is its message: it came now.
+        if kind == ItemKind::User {
+            self.came(ix, false);
+        }
+        ix
+    }
+
+    /// Row `ix`'s call (a user row's message), or its result, came now:
+    /// its place in the live stream ([`Item::seq()`]), set once.
+    fn came(&mut self, ix: usize, result: bool) {
+        let k = usize::from(result);
+        if self.items[ix].seq[k] == 0 {
+            self.live_seq += 1;
+            self.items[ix].seq[k] = self.live_seq;
+        }
     }
 
     /// Where live rows end: the first of the last rows that are events not
@@ -997,6 +1046,7 @@ impl Transcript {
         self.after_summary = false;
         self.cards = crate::cards::HistoryCards::default();
         self.cards_dirty = true;
+        self.recount = true;
         let notes = self.hold_events(notes, messages);
         let (pending, mut notes): (Vec<Item>, Vec<Item>) = notes.into_iter().partition(|n| self.pending.contains(&n.id));
         notes.sort_by_key(|n| n.anchor);
@@ -1181,6 +1231,11 @@ impl Transcript {
             if let Some(t) = it.tool.as_mut().filter(|_| open_tool) {
                 t.status = Some(ToolStatus::Cancelled);
             }
+            // A call cut off ends now: its call and its result came.
+            if open_tool {
+                self.came(ix, false);
+                self.came(ix, true);
+            }
             self.touch(ix);
         }
     }
@@ -1202,6 +1257,7 @@ impl Transcript {
         // Its rows are the ones it just pushed (notes go between messages).
         self.cards.message(m, &self.items[first..]);
         self.cards_dirty = true;
+        self.recount = true;
     }
 
     /// Every row's card ([`Item::card`]) as the fold now says: the
@@ -1211,11 +1267,12 @@ impl Transcript {
             return;
         }
         let live = self.history_end.min(self.items.len());
+        if std::mem::take(&mut self.recount) {
+            self.live_cards = self.items[live..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::cards::is_card_tool(&t.name)));
+        }
         // No card called anywhere and none drawn: nothing to fold (a
-        // session without cards pays only this).
-        let called = !self.cards.is_empty()
-            || self.items[live..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::cards::is_card_tool(&t.name)));
-        if !called && self.card_rows == 0 {
+        // session without cards pays only this, no row read).
+        if self.cards.is_empty() && !self.live_cards && self.card_rows == 0 {
             return;
         }
         let mut want = crate::cards::rows(&self.cards, &self.items[live..]);
@@ -1584,6 +1641,7 @@ impl Transcript {
                 LlmEvent::Text { text } => self.append_live(ItemKind::Assistant, text),
                 LlmEvent::ToolUseStart { tool_name, tool_id } => {
                     self.end_streaming_text();
+                    self.live_cards |= crate::cards::is_card_tool(tool_name);
                     let tool = ToolCall {
                         tool_id: tool_id.clone(),
                         name: tool_name.clone(),
@@ -1617,7 +1675,10 @@ impl Transcript {
                         t.input = preview(&compact(input));
                         t.status = Some(ToolStatus::Running);
                     }
-                    self.items[ix].card_input = crate::cards::is_card_tool(tool_name).then(|| Arc::new(input.clone()));
+                    let card = crate::cards::is_card_tool(tool_name);
+                    self.items[ix].card_input = card.then(|| Arc::new(input.clone()));
+                    self.live_cards |= card;
+                    self.came(ix, false);
                     self.touch(ix);
                 }
                 LlmEvent::ToolQueued { tool_id } | LlmEvent::ToolStarted { tool_id } => {
@@ -1626,6 +1687,7 @@ impl Transcript {
                         if let Some(t) = self.items[ix].tool.as_mut() {
                             t.status = Some(if queued { ToolStatus::Queued } else { ToolStatus::Running });
                         }
+                        self.came(ix, false);
                         self.touch(ix);
                     }
                 }
@@ -1652,6 +1714,8 @@ impl Transcript {
                             t.status = Some(outcome.status());
                         }
                         self.items[ix].streaming = false;
+                        self.came(ix, false);
+                        self.came(ix, true);
                         self.touch(ix);
                     }
                 }
