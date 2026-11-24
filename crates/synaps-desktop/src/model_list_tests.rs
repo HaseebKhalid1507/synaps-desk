@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -270,55 +271,314 @@ fn a_config_s_secrets_never_leave_the_favourites_line() {
     assert_no_secret("the log", &logged.lock().unwrap());
 }
 
-/// The launcher's reads, run here as its host would run them (the script's
-/// remote half, `scripts/synaps-desktop-remote`): a config key's lines
-/// only, picked out before anything is printed; a secret key refused on
-/// both sides; anything but plain words refused; a pid that is not this
-/// user's daemon refused.
+/// The launcher (`scripts/synaps-desktop-remote`): its text, and its
+/// remote half, the script it sends `<host>`.
 #[cfg(unix)]
-#[test]
-fn the_launcher_reads_one_key_s_lines_only() {
-    use std::process::Command;
+fn launcher() -> (PathBuf, String) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/synaps-desktop-remote");
     let text = std::fs::read_to_string(&script).unwrap();
     let start = text.find("<<'REMOTE'\n").expect("the remote half") + "<<'REMOTE'\n".len();
-    let remote = &text[start..start + text[start..].find("\nREMOTE\n").expect("its end")];
+    let remote = text[start..start + text[start..].find("\nREMOTE\n").expect("its end")].to_string();
+    (script, remote)
+}
+
+/// What a run printed: its exit code, stdout and stderr, apart.
+#[cfg(unix)]
+fn output(c: &mut std::process::Command) -> (Option<i32>, String, String) {
+    let out = c.output().expect("bash");
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A stand-in `ssh` on `PATH` for the launcher's local half: it records
+/// that it ran (`<dir>/ssh-ran`), drops ssh's options and the host and
+/// runs the rest here, the remote half on its stdin, as sshd would.
+#[cfg(unix)]
+fn fake_ssh(dir: &Path) -> std::ffi::OsString {
+    let bin = dir.join("bin");
+    write(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ $# -gt 0 ]; do case \"$1\" in -T) shift;; -o) shift 2;; *) shift; break;; esac; done\nexec \"$@\"\n",
+            dir.join("ssh-ran").display()
+        ),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// `config-key` takes `favorite_models` and nothing else, on both sides:
+/// innocent-looking keys as much as secret ones. The host sends only that
+/// key's lines and nothing on stderr; a refused key never reaches ssh.
+#[cfg(unix)]
+#[test]
+fn the_launcher_reads_favorite_models_only() {
+    use std::process::Command;
+    let (script, remote) = launcher();
     let d = dir("launcher");
-    write(&d.join(".synaps-cli").join("config"), &config_text());
+    write(&d.join(".synaps-cli").join("config"), &format!("{}identity = SECRET_IDENTITY\ncustom_key = SECRET_CUSTOM\n", config_text()));
     write(&d.join(".synaps-cli").join("work").join("config"), "favorite_models = w/1\nprovider.x = SECRET_ONE_MORE\n");
-    let run = |args: &[&str]| {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(remote).arg("remote").args(args).env("HOME", &d).env_remove("SYNAPS_BASE_DIR");
-        let out = c.output().expect("bash");
-        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    let host = |args: &[&str]| {
+        output(Command::new("bash").arg("-c").arg(&remote).arg("remote").args(args).env("HOME", &d).env_remove("SYNAPS_BASE_DIR"))
     };
-    let (code, out) = run(&["config-key", "-", "favorite_models"]);
-    assert_eq!((code, favorites_in(out.as_bytes()).map(|v| v.len())), (Some(0), Some(4)), "{out}");
+    let (code, out, err) = host(&["config-key", "-", "favorite_models"]);
+    assert_eq!((code, favorites_in(out.as_bytes()).map(|v| v.len()), err.as_str()), (Some(0), Some(4), ""), "{out}");
     assert_eq!(out.lines().count(), 1, "that line only: {out}");
     assert_no_secret("the base config's read", &out);
-    let (code, out) = run(&["config-key", "work", "favorite_models"]);
-    assert_eq!((code, out.trim()), (Some(0), "favorite_models = w/1"));
+    let (code, out, err) = host(&["config-key", "work", "favorite_models"]);
+    assert_eq!((code, out.trim(), err.as_str()), (Some(0), "favorite_models = w/1", ""));
+    let others = [
+        "identity",
+        "custom_key",
+        "model",
+        "theme",
+        "favorite_models_backup",
+        "Favorite_models",
+        "favorite_models.x",
+        "provider.groq",
+        "auth.token",
+    ];
+    for key in others {
+        let (code, out, err) = host(&["config-key", "-", key]);
+        assert_eq!((code, out.as_str(), err.as_str()), (Some(65), "", ""), "{key}");
+    }
     for (args, want) in [
-        (&["config-key", "-", "provider.groq"][..], 65),
-        (&["config-key", "-", "auth.token"][..], 65),
         (&["config-key", "-", "x;cat ~/.synaps-cli/config"][..], 64),
         (&["config-key", "-"][..], 64),
         (&["cli", "1", "-", "auth-list"][..], 66),
         (&["cli", "1", "-", "status"][..], 64),
         (&["dump"][..], 64),
     ] {
-        let (code, out) = run(args);
-        assert_eq!(code, Some(want), "{args:?}: {out}");
-        assert_no_secret(&format!("{args:?}"), &out);
+        let (code, out, err) = host(args);
+        assert_eq!((code, out.as_str(), err.as_str()), (Some(want), "", ""), "{args:?}");
     }
     // The launcher's own checks, before any ssh.
-    for (args, want) in [
-        (&["--read", "h", "config-key", "-", "provider.groq"][..], 65),
-        (&["--read", "h", "config-key", "-", "a b"][..], 64),
-        (&["--read", "h;x", "config-key", "-", "k"][..], 64),
-        (&["--read", "h", "cli", "12", "-", "rm-rf"][..], 64),
-    ] {
-        let out = Command::new("bash").arg(&script).args(args).output().expect("bash");
-        assert_eq!(out.status.code(), Some(want), "{args:?}");
+    let path = fake_ssh(&d);
+    let local = |args: &[&str]| output(Command::new("bash").arg(&script).args(args).env("PATH", &path).env("HOME", &d));
+    for key in others {
+        let (code, out, _) = local(&["--read", "h", "config-key", "-", key]);
+        assert_eq!((code, out.as_str()), (Some(65), ""), "{key}");
     }
+    for args in [
+        &["--read", "h", "config-key", "-", "a b"][..],
+        &["--read", "h;x", "config-key", "-", "favorite_models"][..],
+        &["--read", "h", "cli", "12", "-", "rm-rf"][..],
+    ] {
+        assert_eq!(local(args).0, Some(64), "{args:?}");
+    }
+    assert!(!d.join("ssh-ran").exists(), "nothing refused reached ssh");
+    // And through it: the favourites line only.
+    let (code, out, err) = local(&["--read", "h", "config-key", "-", "favorite_models"]);
+    assert!(d.join("ssh-ran").exists());
+    assert_eq!((code, out.lines().count(), err.as_str()), (Some(0), 1, ""), "{out}");
+    assert_no_secret("through the launcher", &out);
+}
+
+/// The worst `auth list` there could be, on `<host>`: it prints every line
+/// of a config full of secrets on stderr, and puts them in its listing
+/// (identities, selector values, an invalid selector's reason, malformed
+/// keys, fields of its own, a label and a provider that are not plain).
+/// What the host half sends, stdout and stderr both, captured before the
+/// desk could drop anything: the providers and labels, none of the rest.
+/// Run as the host runs it and through the launcher (an `ssh` that runs
+/// it here); then as the CLI failing, or printing the config: nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_cuts_auth_list_down_before_it_leaves() {
+    use std::process::Command;
+    let (script, remote) = launcher();
+    let d = dir("auth-list");
+    let config = format!(
+        "{}events.auto_turn = SECRET_CONFIG_VALUE\nauth.account.anthropic = SECRET_SELECTOR\nidentity = SECRET_IDENTITY\n",
+        config_text()
+    );
+    write(&d.join(".synaps-cli").join("config"), &config);
+    let listing = |extra: &str| {
+        format!(
+            r#"cat "$HOME/.synaps-cli/config" >&2
+echo "warning: events.auto_turn = SECRET_CONFIG_VALUE" >&2
+cat <<'JSON'
+{{
+  "schema_version": 1, "source": "local",
+  "accounts": [
+    {{"provider": "anthropic", "label": "default", "identity": "SECRET_IDENTITY@example.com", "seat_fingerprint": "SECRET_FP", "expires": 1795000000000, "selected": false}},
+    {{"provider": "anthropic", "label": "inference2", "selected": true, "x": {{"nested": ["SECRET_NESTED", {{"a": null}}]}}}},
+    {{"provider": "openai-codex", "label": "SECRET\"_QUOTED"}},
+    {{"provider": "SECRET_\u0041", "label": "x"}},
+    {{"provider": "SECRET PROVIDER", "label": "x"}}
+  ],
+  "selectors": {{
+    "anthropic": {{"kind": "account", "account": "SECRET_SELECTOR"}},
+    "xai-auth": {{"kind": "invalid", "source": "config", "reason": "SECRET_CONFIG_VALUE \"quoted\" \\ back"}},
+    "openai-codex": {{"kind": "auto"}}
+  }},
+  "malformed_keys": ["provider.groq = gsk_SECRET_ONE"], "duplicate_identity_keys": []
+}}
+JSON
+{extra}
+"#
+        )
+    };
+    // The daemon: a process of this user's with `daemon` in its command
+    // line. Its executable is bash, so its "CLI" (`/proc/<pid>/exe auth
+    // list --json`) is bash running `./auth`, the stand-in above.
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let daemon = Daemon(Command::new("bash").args(["-c", "sleep 60; :", "daemon"]).spawn().unwrap());
+    let pid = daemon.0.id().to_string();
+    let t = Instant::now();
+    while !std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|a| a == b"daemon")) {
+        assert!(t.elapsed() < Duration::from_secs(5), "the stand-in daemon never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let path = fake_ssh(&d);
+    let host = |cli: &str, via_launcher: bool| {
+        write(&d.join("auth"), cli);
+        let mut c = Command::new("bash");
+        if via_launcher {
+            c.arg(&script).args(["--read", "h", "cli", &pid, "-", "auth-list"]).env("PATH", &path);
+        } else {
+            c.arg("-c").arg(&remote).args(["remote", "cli", &pid, "-", "auth-list"]);
+        }
+        output(c.current_dir(&d).env("HOME", &d).env_remove("SYNAPS_BASE_DIR"))
+    };
+    for via_launcher in [false, true] {
+        let (code, out, err) = host(&listing(""), via_launcher);
+        assert_eq!((code, err.as_str()), (Some(0), ""), "{out}");
+        assert_no_secret("what the host sent", &out);
+        assert_eq!(
+            out.trim(),
+            r#"{"accounts":[{"provider":"anthropic","label":"default"},{"provider":"anthropic","label":"inference2"}],"selectors":{"anthropic":{},"xai-auth":{},"openai-codex":{}}}"#
+        );
+        let l = Logins::parse(out.as_bytes()).unwrap();
+        assert!(l.has_login("anthropic@inference2/m") && !l.has_login("xai-auth/grok-5") && l.has_login("groq/x"), "{l:?}");
+        for (cli, why) in
+            [(listing("exit 3"), "the CLI failed"), (format!("cat \"$HOME/.synaps-cli/config\"; {}", listing("")), "not a listing")]
+        {
+            let (code, out, err) = host(&cli, via_launcher);
+            assert_eq!((code, out.as_str(), err.as_str()), (Some(67), "", ""), "{why}");
+        }
+    }
+}
+
+/// Every source of favourites streams through [`Favorites`]: whatever the
+/// block sizes, it never holds more than a `favorite_models` value, so no
+/// other line of a config is held whole at any point.
+#[test]
+fn a_stream_holds_no_other_line() {
+    let text = format!("{}provider.x = {}\n", config_text(), "SECRET_LONG ".repeat(10_000));
+    for size in [1, 2, 3, 7, 64, 4096, text.len()] {
+        let mut f = Favorites::default();
+        for chunk in text.as_bytes().chunks(size) {
+            f.push(chunk).unwrap();
+            let held = String::from_utf8_lossy(f.held());
+            assert!(!held.contains("SECRET") && !held.contains("provider"), "{size}: {held}");
+            assert!(f.held().len() < 100, "the favourites' value at most");
+        }
+        assert_eq!(f.finish(), Some(FAVS.iter().map(|s| s.to_string()).collect::<Vec<String>>()), "{size}");
+    }
+    // More than a config is not one.
+    let mut f = Favorites::default();
+    assert!(f.push("x".repeat(FILE_MAX + 1).as_bytes()).is_err());
+    // A value past its bound is not a list, and is not held.
+    let mut f = Favorites::default();
+    f.push(format!("favorite_models = {}\n", "a,".repeat(VALUE_MAX)).as_bytes()).unwrap();
+    assert!(f.held().is_empty());
+    assert_eq!(f.finish(), None);
+}
+
+/// A command's whole tree ends with its read: at the deadline (its shell
+/// waiting on a child that holds stdout; a shell gone, its child holding
+/// it), once it printed too much, and after it answered (a child it left
+/// running). The read returns by its deadline, not the child's.
+#[cfg(unix)]
+#[test]
+fn a_command_s_whole_tree_ends_with_its_read() {
+    let d = dir("tree");
+    // Gone, or a zombie its new parent has yet to reap.
+    let gone = |pid: i32| {
+        let t = Instant::now();
+        let zombie = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+        };
+        // SAFETY: signal 0 only checks the pid.
+        while unsafe { libc::kill(pid, 0) } == 0 && !zombie() {
+            assert!(t.elapsed() < Duration::from_secs(5), "{pid} still runs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let child = |f: &Path| std::fs::read_to_string(f).unwrap().trim().parse::<i32>().unwrap();
+    let within = Duration::from_millis(800);
+    for (i, (cmd, want)) in [
+        ("sleep 60 & echo $! > {f}; wait", "did not answer within 0.8 s"),
+        ("sleep 60 & echo $! > {f}", "did not answer within 0.8 s"),
+        ("sleep 60 & echo $! > {f}; yes 'provider.x = SECRET'", "printed more than 1024 KiB"),
+        ("sleep 60 > /dev/null & echo $! > {f}; echo favorite_models = a/b", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = d.join(format!("pid{i}"));
+        let t = Instant::now();
+        let r = run(shell(&cmd.replace("{f}", &f.display().to_string())), "the command", Favorites::default(), within);
+        assert!(t.elapsed() < within + Duration::from_secs(3), "{cmd}: {:?}", t.elapsed());
+        match r {
+            Ok(f) => assert_eq!((want, f.finish()), ("", Some(vec!["a/b".to_string()])), "{cmd}"),
+            Err(e) => {
+                assert_eq!(e, format!("the command {want}"), "{cmd}");
+                assert_no_secret(cmd, &e);
+            }
+        }
+        gone(child(&f));
+    }
+}
+
+/// On Windows: a late command's children go with it (a job object), so
+/// the read ends by its deadline instead of waiting on what holds stdout.
+#[cfg(windows)]
+#[test]
+fn a_late_command_and_its_children_are_killed() {
+    let within = Duration::from_millis(800);
+    let t = Instant::now();
+    let Err(e) = run(shell("ping -n 30 127.0.0.1"), "the command", Capped::default(), within) else { panic!("it answered") };
+    assert_eq!(e, "the command did not answer within 0.8 s", "not left waiting on ping");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    let Ok(r) = run(shell("echo favorite_models = a/b"), "the command", Favorites::default(), Duration::from_secs(5)) else {
+        panic!("it did not answer")
+    };
+    assert_eq!(r.finish(), Some(vec!["a/b".to_string()]));
+}
+
+/// `Debug` of a source says its kind, never the path or the command (a
+/// token can be written inline).
+#[test]
+fn debug_names_no_command_or_path() {
+    let s = Source::parse(Some(&json!({"favorites": {"command": "curl -H 'Bearer SECRET_TOKEN' x"}, "logins": {"file": "/SECRET_DIR/a"}})));
+    assert_eq!(format!("{s:?}"), "Source { favorites: Command(..), logins: File(..), warning: None }");
+    let a = ask(s, Ok(()), Path::new("/tmp"));
+    assert!(!format!("{a:?}").contains("SECRET"), "{a:?}");
+}
+
+/// A FIFO (or a device) is not read: a read of one could block past any
+/// deadline.
+#[cfg(unix)]
+#[test]
+fn a_fifo_is_not_read() {
+    let d = dir("fifo");
+    let p = d.join("config");
+    let c = std::ffi::CString::new(p.display().to_string()).unwrap();
+    // SAFETY: a path we made.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let t = Instant::now();
+    assert_eq!(read_favorites(&p).unwrap_err(), format!("{}: not a regular file", crate::named::home_short(&p.display().to_string())));
+    assert!(read_capped(&p).is_err());
+    assert!(t.elapsed() < Duration::from_secs(1));
 }

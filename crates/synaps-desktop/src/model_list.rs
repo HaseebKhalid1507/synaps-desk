@@ -10,15 +10,24 @@
 //! a command.
 //!
 //! **A Synaps config holds API keys.** Of a config only the
-//! `favorite_models` line is kept: every other line is dropped as it is
-//! read ([`favorite_line`]), never held, logged, shown or said in an
-//! error, and the daemon's host sends that line only
-//! (`scripts/synaps-desktop-remote`, filtered there). No command's stderr
-//! is read, and an error names the source, never what it printed.
+//! `favorite_models` line's value is kept. A config, a command's output
+//! or the reader's is read as it streams ([`Favorites`]): a line is held
+//! only while it can still be `favorite_models = …`, so no other line is
+//! ever held whole, logged, shown or said in an error. The daemon's host
+//! sends that line only, and of `auth list` only the providers and labels
+//! (`scripts/synaps-desktop-remote`: both cut down there, its stderr never
+//! sent). No command's stderr is read, an error names the source, never
+//! what it printed, and a command's whole process tree ends with the read
+//! ([`run`]).
+//!
+//! A `{"command": …}` source is the user's own code: what it reads and
+//! where it sends it is its business. Only its stdout reaches the desk,
+//! filtered as above; a command that reads another machine's config should
+//! cut it down there, as the launcher does.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -34,13 +43,16 @@ pub(crate) const ENV_READ: &str = "SYNAPS_DESKTOP_HOST_READ";
 pub(crate) const ENV_HOST: &str = "SYNAPS_DESKTOP_HOST";
 /// A read's deadline (an SSH round trip, a broker's answer).
 const TIMEOUT: Duration = Duration::from_secs(10);
-/// A command's stdout at most.
+/// A logins listing at most.
 const OUT_MAX: usize = 256 << 10;
-/// A file read at most.
-const FILE_MAX: u64 = 1 << 20;
+/// A config (a file, a command's or the reader's output) at most.
+const FILE_MAX: usize = 1 << 20;
+/// A `favorite_models` value at most (longer: not one).
+const VALUE_MAX: usize = 64 << 10;
 
-/// Where one list comes from.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Where one list comes from. Its `Debug` says which kind only: a path or
+/// a command can carry anything (a token inline).
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) enum Where {
     /// The daemon's machine: this one when the daemon is provably here
     /// ([`crate::views::locality`]), else the launcher's reader
@@ -56,6 +68,18 @@ pub(crate) enum Where {
     Command(String),
     /// None: no favourites (the session's model only), or no login filter.
     Off,
+}
+
+impl std::fmt::Debug for Where {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Where::DaemonHost => "DaemonHost",
+            Where::Local => "Local",
+            Where::File(_) => "File(..)",
+            Where::Command(_) => "Command(..)",
+            Where::Off => "Off",
+        })
+    }
 }
 
 /// `pickers.source`: `"daemon-host"` (the default), `"local"` or `"off"`
@@ -142,6 +166,17 @@ impl Reader {
         let program = std::env::var_os(ENV_READ).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())?;
         let host = std::env::var(ENV_HOST).ok().filter(|h| plain(h))?;
         Some(Reader { program, host })
+    }
+
+    /// Its two reads, and nothing else: no caller names a config key.
+    /// `favorite_models`' lines of the profile's config.
+    fn favorites(&self, profile: Option<&str>) -> Command {
+        self.command(&["config-key", profile.unwrap_or("-"), KEY])
+    }
+
+    /// `auth list`'s providers and labels, from daemon `pid`'s CLI.
+    fn auth_list(&self, pid: u32, profile: Option<&str>) -> Command {
+        self.command(&["cli", &pid.to_string(), profile.unwrap_or("-"), "auth-list"])
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -297,96 +332,199 @@ impl Ask {
 }
 
 fn favorites(ask: &Ask) -> Result<Option<Vec<String>>, String> {
-    match &ask.source.favorites {
-        Where::Off => Ok(Some(Vec::new())),
-        Where::Local => read_favorites(&ask.config()?),
+    let found = match &ask.source.favorites {
+        Where::Off => return Ok(Some(Vec::new())),
+        Where::Local => return read_favorites(&ask.config()?),
         Where::DaemonHost => match (&ask.here, &ask.reader) {
-            (Ok(()), _) => read_favorites(&ask.config()?),
-            (Err(_), Some(r)) => {
-                let out = run(r.command(&["config-key", ask.profile()?.unwrap_or("-"), KEY]), &format!("the reader for {}", r.host))?;
-                Ok(favorites_in(&out))
-            }
-            (Err(_), None) => Err(ask.no_reader()),
+            (Ok(()), _) => return read_favorites(&ask.config()?),
+            (Err(_), Some(r)) => run(r.favorites(ask.profile()?), &format!("the reader for {}", r.host), Favorites::default(), TIMEOUT)?,
+            (Err(_), None) => return Err(ask.no_reader()),
         },
-        Where::File(p) => read_favorites(p),
-        Where::Command(c) => Ok(favorites_in(&run(shell(c), &format!("the {SETTING} command"))?)),
-    }
+        Where::File(p) => return read_favorites(p),
+        Where::Command(c) => run(shell(c), &format!("the {SETTING} command"), Favorites::default(), TIMEOUT)?,
+    };
+    Ok(found.finish())
 }
 
 fn logins(ask: &Ask) -> Option<Result<Logins, String>> {
     let out = match &ask.source.logins {
         Where::Off => return None,
-        Where::Local => ask.local_cli().and_then(|c| run(c, "synaps auth list")),
+        Where::Local => ask.local_cli().and_then(|c| run(c, "synaps auth list", Capped::default(), TIMEOUT)),
         Where::DaemonHost => match (&ask.here, &ask.reader) {
-            (Ok(()), _) => ask.local_cli().and_then(|c| run(c, "synaps auth list")),
-            (Err(_), Some(r)) => ask.profile().and_then(|p| {
-                let pid = ask.pid.to_string();
-                run(r.command(&["cli", &pid, p.unwrap_or("-"), "auth-list"]), &format!("synaps auth list on {}", r.host))
-            }),
+            (Ok(()), _) => ask.local_cli().and_then(|c| run(c, "synaps auth list", Capped::default(), TIMEOUT)),
+            (Err(_), Some(r)) => ask
+                .profile()
+                .and_then(|p| run(r.auth_list(ask.pid, p), &format!("synaps auth list on {}", r.host), Capped::default(), TIMEOUT)),
             (Err(_), None) => Err(ask.no_reader()),
         },
-        Where::File(p) => read_capped(p),
-        Where::Command(c) => run(shell(c), &format!("the {SETTING} logins command")),
+        Where::File(p) => read_capped(p).map(Capped),
+        Where::Command(c) => run(shell(c), &format!("the {SETTING} logins command"), Capped::default(), TIMEOUT),
     };
-    Some(out.and_then(|b| Logins::parse(&b)))
+    Some(out.and_then(|mut b| {
+        let l = Logins::parse(&b.0);
+        b.0.fill(0);
+        l
+    }))
+}
+
+/// A config's `favorite_models`, read as it streams in (a file, a
+/// command's stdout). A line is held only while it can still be that
+/// key's: past its leading blanks, the key and the `=`, only that line's
+/// value is held; any other line is dropped byte by byte as it arrives,
+/// never whole. The last such line wins, as Synaps reads a config.
+#[derive(Default)]
+pub(crate) struct Favorites {
+    at: At,
+    /// The value of the `favorite_models` line being read.
+    value: Vec<u8>,
+    found: Option<Vec<String>>,
+    read: usize,
+}
+
+/// Where in a line [`Favorites`] is.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum At {
+    /// Its leading blanks.
+    #[default]
+    Lead,
+    /// `KEY`'s first `n` bytes matched.
+    Key(usize),
+    /// The blanks between the key and `=`.
+    Gap,
+    /// After `=`: the value.
+    Value,
+    /// Not the key's line: dropped to its end.
+    Skip,
+}
+
+impl Favorites {
+    /// More of the stream. `Err`: more than [`FILE_MAX`] in all.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.read += chunk.len();
+        if self.read > FILE_MAX {
+            self.value.clear();
+            self.at = At::Skip;
+            return Err(format!("more than {} KiB", FILE_MAX >> 10));
+        }
+        let key = KEY.as_bytes();
+        for &b in chunk {
+            if b == b'\n' {
+                self.end_line();
+                continue;
+            }
+            self.at = match self.at {
+                At::Skip => At::Skip,
+                At::Lead | At::Gap if b.is_ascii_whitespace() => self.at,
+                At::Lead if b == key[0] => At::Key(1),
+                At::Key(n) if b == key[n] => {
+                    if n + 1 == key.len() {
+                        At::Gap
+                    } else {
+                        At::Key(n + 1)
+                    }
+                }
+                At::Gap if b == b'=' => At::Value,
+                At::Value if self.value.len() < VALUE_MAX => {
+                    self.value.push(b);
+                    At::Value
+                }
+                _ => {
+                    self.value.clear();
+                    At::Skip
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn end_line(&mut self) {
+        if self.at == At::Value {
+            // Synaps' reading: split on commas, trimmed, empties dropped.
+            if let Ok(v) = std::str::from_utf8(&self.value) {
+                self.found = Some(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect());
+            }
+        }
+        self.value.clear();
+        self.at = At::Lead;
+    }
+
+    /// The last `favorite_models` line's list (`None`: there was none).
+    pub fn finish(mut self) -> Option<Vec<String>> {
+        self.end_line();
+        self.found
+    }
+
+    /// What it holds now (tests: a value of `favorite_models`, or nothing).
+    #[cfg(test)]
+    pub fn held(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+impl Sink for Favorites {
+    fn take(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.push(chunk)
+    }
 }
 
 /// The favourites a `favorite_models = a, b` line names: `None` for any
-/// other line (another key, a comment, not one). Synaps' own reading: the
-/// key trimmed, the values split on commas, trimmed, empties dropped.
+/// other line (another key, a comment, not one).
+#[cfg(test)]
 pub(crate) fn favorite_line(line: &[u8]) -> Option<Vec<String>> {
-    let start = line.iter().position(|b| !b.is_ascii_whitespace())?;
-    let rest = line[start..].strip_prefix(KEY.as_bytes())?;
-    let eq = rest.iter().position(|b| !b.is_ascii_whitespace())?;
-    let value = rest[eq..].strip_prefix(b"=")?;
-    let value = std::str::from_utf8(value).ok()?;
-    Some(value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+    favorites_in(line)
 }
 
 /// The last `favorite_models` line's list in `text` (as Synaps: the last
 /// wins); `None` without one.
+#[cfg(test)]
 pub(crate) fn favorites_in(text: &[u8]) -> Option<Vec<String>> {
-    text.split(|&b| b == b'\n').rev().find_map(favorite_line)
+    let mut f = Favorites::default();
+    f.push(text).ok()?;
+    f.finish()
 }
 
-/// A config's `favorite_models` (`None`: no file, or no such line). Read
-/// a line at a time; a line that is not that key's goes as it is read.
-pub(crate) fn read_favorites(path: &Path) -> Result<Option<Vec<String>>, String> {
+/// A regular file, opened (`Ok(None)`: there is none). Not a FIFO or a
+/// device: a read of one could block past any deadline.
+fn open_regular(path: &Path) -> Result<Option<std::fs::File>, String> {
     let shown = || crate::named::home_short(&path.display().to_string());
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(format!("{}: not a regular file", shown())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {}", shown(), e.kind())),
-    };
-    let mut r = BufReader::new(file.take(FILE_MAX));
-    let (mut line, mut found) = (Vec::new(), None);
-    loop {
-        line.clear();
-        match r.read_until(b'\n', &mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                if let Some(v) = favorite_line(&line) {
-                    found = Some(v);
-                }
-            }
-            Err(e) => {
-                line.clear();
-                return Err(format!("{}: {}", shown(), e.kind()));
-            }
-        }
     }
-    line.clear();
-    Ok(found)
+    std::fs::File::open(path).map(Some).map_err(|e| format!("{}: {}", shown(), e.kind()))
+}
+
+/// A config's `favorite_models` (`None`: no file, or no such line),
+/// through [`Favorites`] a block at a time.
+pub(crate) fn read_favorites(path: &Path) -> Result<Option<Vec<String>>, String> {
+    let shown = || crate::named::home_short(&path.display().to_string());
+    let Some(mut file) = open_regular(path)? else { return Ok(None) };
+    let mut f = Favorites::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("{}: {}", shown(), e.kind())),
+        };
+        let took = f.push(&buf[..n]);
+        buf[..n].fill(0);
+        took.map_err(|e| format!("{}: {e}", shown()))?;
+    }
+    Ok(f.finish())
 }
 
 /// A file's bytes, at most [`OUT_MAX`].
 fn read_capped(path: &Path) -> Result<Vec<u8>, String> {
     let shown = || crate::named::home_short(&path.display().to_string());
+    let Some(file) = open_regular(path)? else { return Err(format!("{}: {}", shown(), std::io::ErrorKind::NotFound)) };
     let mut out = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(OUT_MAX as u64 + 1).read_to_end(&mut out))
-        .map_err(|e| format!("{}: {}", shown(), e.kind()))?;
+    file.take(OUT_MAX as u64 + 1).read_to_end(&mut out).map_err(|e| format!("{}: {}", shown(), e.kind()))?;
     if out.len() > OUT_MAX {
+        out.fill(0);
         return Err(format!("{}: larger than {} KiB", shown(), OUT_MAX >> 10));
     }
     Ok(out)
@@ -399,53 +537,243 @@ fn shell(cmd: &str) -> Command {
     c
 }
 
-/// `c`'s stdout once it exits 0 within [`TIMEOUT`], at most [`OUT_MAX`].
-/// Its stderr is never read; an error says `what` and how it ended only.
-fn run(mut c: Command, what: &str) -> Result<Vec<u8>, String> {
-    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+/// What a read keeps of a command's stdout, given it as it arrives.
+/// `Err`: no more (too much); the command is stopped.
+pub(crate) trait Sink: Send + 'static {
+    fn take(&mut self, chunk: &[u8]) -> Result<(), String>;
+}
+
+/// All of it, at most [`OUT_MAX`] (a logins listing).
+#[derive(Default)]
+pub(crate) struct Capped(pub Vec<u8>);
+
+impl Sink for Capped {
+    fn take(&mut self, chunk: &[u8]) -> Result<(), String> {
+        if self.0.len() + chunk.len() > OUT_MAX {
+            self.0.fill(0);
+            self.0.clear();
+            return Err(format!("more than {} KiB", OUT_MAX >> 10));
+        }
+        self.0.extend_from_slice(chunk);
+        Ok(())
     }
+}
+
+/// How a read of a command's stdout ended, if not at its end.
+enum Stop {
+    /// Not by the deadline.
+    Late,
+    Io(std::io::ErrorKind),
+    /// The sink's: too much.
+    Full(String),
+}
+
+/// `c` run with its stdout given to `sink` as it arrives, within `within`;
+/// the sink once `c` exited 0. Its stderr is never read; an error says
+/// `what` and how it ended only. `c` runs as a tree of its own (a process
+/// group, a job object): at the deadline, or once the sink has had enough,
+/// the whole tree is killed, and so is whatever it left running when it
+/// ends, so no descendant outlives the read and no reader waits on one.
+fn run<S: Sink>(mut c: Command, what: &str, sink: S, within: Duration) -> Result<S, String> {
+    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    tree::own(&mut c);
+    let deadline = Instant::now() + within;
     let mut child = c.spawn().map_err(|e| format!("{what} did not start ({})", e.kind()))?;
-    let mut stdout = child.stdout.take().expect("piped");
+    let tree = tree::Tree::of(&child);
+    let stdout = child.stdout.take().expect("piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let read = (&mut stdout).take(OUT_MAX as u64 + 1).read_to_end(&mut buf);
-        // The rest drained (a full pipe would hold the child).
-        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-        let _ = tx.send(read.map(|_| buf));
+        let mut sink = sink;
+        let r = pump(stdout, &mut sink, deadline);
+        let _ = tx.send(r.map(|()| sink));
     });
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(15)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{what} did not answer within {} s", TIMEOUT.as_secs()));
-            }
+    let left = || deadline.saturating_duration_since(Instant::now());
+    // The reader ends at the end of the output: every writer has closed
+    // it, or was killed with the tree (and on Unix at the deadline anyway).
+    let (read, late) = match rx.recv_timeout(left()) {
+        Ok(r) => {
+            let late = matches!(r, Err(Stop::Late));
+            (Some(r), late)
+        }
+        Err(_) => {
+            tree.kill(&mut child);
+            (rx.recv_timeout(Duration::from_secs(2)).ok(), true)
         }
     };
-    let out = match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("{what}: its output did not read ({})", e.kind())),
-        Err(_) => return Err(format!("{what} left its output open")),
-    };
-    if !status.success() {
-        return Err(match status.code() {
-            Some(255) => format!("{what} failed (exit 255: ssh could not reach the host?)"),
-            Some(n) => format!("{what} failed (exit {n})"),
-            None => format!("{what} was stopped by a signal"),
-        });
+    if !matches!(read, Some(Ok(_))) {
+        tree.kill(&mut child);
     }
-    if out.len() > OUT_MAX {
-        return Err(format!("{what} printed more than {} KiB", OUT_MAX >> 10));
+    // Its own end (not yet reaped: the tree's id stays its own).
+    let mut killed = false;
+    while !tree.exited(&mut child) {
+        if left().is_zero() && !killed {
+            tree.kill(&mut child);
+            killed = true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    Ok(out)
+    tree.kill(&mut child);
+    let status = child.wait().map_err(|e| format!("{what} did not end ({})", e.kind()))?;
+    let late = late || killed;
+    let secs = within.as_secs_f32();
+    match read {
+        None => Err(format!("{what} did not answer within {secs} s and left its output open")),
+        Some(_) if late => Err(format!("{what} did not answer within {secs} s")),
+        Some(Err(Stop::Full(e))) => Err(format!("{what} printed {e}")),
+        Some(Err(Stop::Io(k))) => Err(format!("{what}: its output did not read ({k})")),
+        Some(Err(Stop::Late)) => Err(format!("{what} did not answer within {secs} s")),
+        Some(Ok(sink)) => {
+            if status.success() {
+                Ok(sink)
+            } else {
+                Err(match status.code() {
+                    Some(255) => format!("{what} failed (exit 255: ssh could not reach the host?)"),
+                    Some(n) => format!("{what} failed (exit {n})"),
+                    None => format!("{what} was stopped by a signal"),
+                })
+            }
+        }
+    }
+}
+
+/// `out` into `sink` until its end, the sink's `Err` or (Unix) `deadline`.
+/// Each block is cleared once given.
+fn pump<S: Sink>(mut out: ChildStdout, sink: &mut S, deadline: Instant) -> Result<(), Stop> {
+    let mut buf = [0u8; 8192];
+    loop {
+        #[cfg(unix)]
+        if !tree::readable(&out, deadline) {
+            return Err(Stop::Late);
+        }
+        #[cfg(not(unix))]
+        let _ = deadline;
+        let n = match out.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Stop::Io(e.kind())),
+        };
+        let took = sink.take(&buf[..n]);
+        buf[..n].fill(0);
+        took.map_err(Stop::Full)?;
+    }
+}
+
+/// A command's process tree.
+#[cfg(unix)]
+mod tree {
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, ChildStdout, Command};
+    use std::time::Instant;
+
+    /// `c` leads a process group of its own (its descendants join it).
+    pub fn own(c: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+
+    /// The group, by its leader's pid.
+    pub struct Tree(libc::pid_t);
+
+    impl Tree {
+        pub fn of(child: &Child) -> Tree {
+            Tree(child.id() as libc::pid_t)
+        }
+
+        /// SIGKILL to every process in the group, the leader too. Sound
+        /// until the leader is reaped: till then its pid, the group's id,
+        /// is not reused.
+        pub fn kill(&self, child: &mut Child) {
+            // SAFETY: a plain syscall; a group that is gone is ESRCH.
+            unsafe { libc::kill(-self.0, libc::SIGKILL) };
+            let _ = child.kill();
+        }
+
+        /// The leader has exited, left unreaped (`WNOWAIT`).
+        pub fn exited(&self, _: &mut Child) -> bool {
+            // SAFETY: `info` is ours, zeroed; `waitid` writes it.
+            unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                let r = libc::waitid(libc::P_PID, self.0 as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+                r != 0 || info.si_pid() != 0
+            }
+        }
+    }
+
+    /// `out` has something to read (or is closed) before `deadline`.
+    pub fn readable(out: &ChildStdout, deadline: Instant) -> bool {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let mut p = libc::pollfd { fd: out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let ms = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: one pollfd, ours.
+            match unsafe { libc::poll(&mut p, 1, ms) } {
+                0 => continue,
+                n if n > 0 => return true,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+                // The read says what is wrong.
+                _ => return true,
+            }
+        }
+    }
+}
+
+/// A command's process tree.
+#[cfg(windows)]
+mod tree {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+
+    /// No console window.
+    pub fn own(c: &mut Command) {
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    /// A job object holding the command (its descendants join it).
+    pub struct Tree(HANDLE);
+
+    impl Tree {
+        pub fn of(child: &Child) -> Tree {
+            // SAFETY: a new unnamed job; the child's handle is live.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if !job.is_null() && AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                    CloseHandle(job);
+                    return Tree(std::ptr::null_mut());
+                }
+                Tree(job)
+            }
+        }
+
+        /// Every process in the job (no job: the command itself).
+        pub fn kill(&self, child: &mut Child) {
+            if self.0.is_null() {
+                let _ = child.kill();
+            } else {
+                // SAFETY: our job handle.
+                unsafe { TerminateJobObject(self.0, 1) };
+            }
+        }
+
+        pub fn exited(&self, child: &mut Child) -> bool {
+            !matches!(child.try_wait(), Ok(None))
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: our job handle, closed once.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
 }
 
 /// A plain word: what the reader takes as an argument (no shell on either
@@ -465,11 +793,13 @@ pub(crate) struct Logins {
 
 impl Logins {
     pub fn parse(bytes: &[u8]) -> Result<Logins, String> {
+        // Selectors' keys only: their values (an account a config names)
+        // are skipped unread, as is every other field.
         #[derive(serde::Deserialize)]
         struct Out {
             accounts: Vec<Account>,
             #[serde(default)]
-            selectors: serde_json::Map<String, Value>,
+            selectors: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
         }
         #[derive(serde::Deserialize)]
         struct Account {
@@ -480,7 +810,7 @@ impl Logins {
         // The decoder's error is not passed on: it can quote the input.
         let out: Out = serde_json::from_slice(bytes).map_err(|_| "the answer is not `synaps auth list --json`'s".to_string())?;
         Ok(Logins {
-            oauth: out.selectors.keys().cloned().collect(),
+            oauth: out.selectors.into_keys().collect(),
             accounts: out.accounts.into_iter().map(|a| (a.provider, a.label)).collect(),
         })
     }
