@@ -94,9 +94,6 @@
 //!   reconnect, history drift resync)
 //! - [`history`]: the digest-checked history mirror ([`HistoryUpdate`])
 //! - [`transcript`]: history + live events folded into display rows
-//! - [`surface`]: agent cards' model (agent-ui D1: inert, this client
-//!   declares no catalog): the card types, `ui_sanitize`, validation, the
-//!   history fold by host marks, the outbox's transitions
 //! - [`synthetic`]: deterministic load for benches
 
 pub mod client;
@@ -106,7 +103,6 @@ pub mod events;
 pub mod history;
 pub mod ipc;
 pub mod protocol;
-pub mod surface;
 pub mod synthetic;
 pub mod transcript;
 
@@ -117,9 +113,8 @@ pub use client::{
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, EventMeta, FEATURE_AGENT_SURFACES,
-    FEATURE_CACHE_EXPIRY, FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, PromptOutcome,
-    Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SURFACES_CATALOG, SavedSession, SessionEvent, SessionMeta, Setting,
-    SurfaceAction, SurfaceOutcome, SurfaceRefusal, SurfaceResult, SurfaceUnavailable, WatchEvent, WatchPage, validate_session_name,
+    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, EventMeta, FEATURE_CACHE_EXPIRY,
+    FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, PromptOutcome, Rejected, RenameFailure,
+    RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage, validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

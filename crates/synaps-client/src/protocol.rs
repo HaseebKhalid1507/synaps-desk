@@ -42,16 +42,6 @@ pub const FEATURE_SESSION_PAGE: &str = "session_page";
 /// when the session's prompt cache expires (`cache`), to the asking client
 /// only. An older daemon is never asked.
 pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
-/// `Welcome.features` entry: the daemon takes `surface_action` (agent-ui
-/// §2.1; complete C4a). A client sends one only to a daemon that lists it
-/// ([`crate::Client::surface_action_on`] checks); no daemon does yet.
-pub const FEATURE_AGENT_SURFACES: &str = "agent_surfaces";
-/// The agent-card catalog major this build renders *and* answers
-/// (`capabilities.surfaces`, agent-ui §2.1): none. D1 is the model only;
-/// a daemon sends a client no card, no `surface_result` and no
-/// `Attached.surfaces` below the card's catalog (`wire::surface_decodes`).
-/// D3 declares 1.
-pub const SURFACES_CATALOG: u32 = 0;
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
 pub const CATALOG_PAGE_MAX: u32 = 200;
@@ -202,15 +192,6 @@ pub enum HistoryMode {
 pub struct Capabilities {
     pub tool_queue: bool,
     pub owner_reason_input: bool,
-    /// The agent-card catalog this client renders and answers
-    /// ([`SURFACES_CATALOG`]); omitted when 0, so the `Hello` is the one
-    /// an older client sends.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub surfaces: u32,
-}
-
-fn is_zero(n: &u32) -> bool {
-    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -312,58 +293,6 @@ pub enum SessionCommand {
         id: u64,
         setting: Setting,
     },
-    /// Answer, skip or revise an agent card (agent-ui §2.4). Reply:
-    /// `surface_result` to a client that declared a catalog, else
-    /// `Refused` (`SURFACES_UNAVAILABLE`). Only to a daemon that lists
-    /// [`FEATURE_AGENT_SURFACES`].
-    SurfaceAction(SurfaceAction),
-}
-
-/// `SessionCommand::SurfaceAction`'s body (agent-ui §2.4), as the user
-/// committed it: a retry re-sends it unchanged, under the same `action_id`
-/// (§3.7). `Debug` redacts `values`, as Synaps' does: they are the user's
-/// answer.
-#[derive(Clone, PartialEq, Serialize)]
-pub struct SurfaceAction {
-    pub surface_id: String,
-    /// The card's `contract` as the client drew it (§5.4).
-    pub contract: String,
-    /// 32 lowercase hex, minted per user commit ([`SurfaceAction::mint_id`]),
-    /// reused for every retry of it.
-    pub action_id: String,
-    /// The `answer.rev` the client saw; 0 before any answer.
-    pub expect_rev: u32,
-    /// The `SurfaceState.epoch` the user saw (§3.9).
-    pub epoch: u32,
-    pub verb: crate::surface::Verb,
-    /// Raw, as committed: the daemon parses them against the card's doc
-    /// (§3.3 #11). `answer` and `revise` carry them; `skip` none (v3.4 #5).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub values: Option<Value>,
-}
-
-impl SurfaceAction {
-    /// A fresh `action_id`: 128 bits, 32 lowercase hex (§2.4). Unique, not
-    /// secret: the boundary is the actor's state, the CAS and input
-    /// authority, never the id (§3.7).
-    pub fn mint_id() -> String {
-        let (a, b) = crate::conn::random_pair();
-        format!("{a:016x}{b:016x}")
-    }
-}
-
-impl std::fmt::Debug for SurfaceAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SurfaceAction")
-            .field("surface_id", &self.surface_id)
-            .field("contract", &self.contract)
-            .field("action_id", &self.action_id)
-            .field("expect_rev", &self.expect_rev)
-            .field("epoch", &self.epoch)
-            .field("verb", &self.verb)
-            .field("values", &format_args!("<redacted>"))
-            .finish()
-    }
 }
 
 /// `types::SessionSetting`, the variants this client sets.
@@ -409,7 +338,6 @@ impl std::fmt::Debug for SessionCommand {
                 f.debug_struct("EngineCommand").field("id", id).field("name", name).field("arg", arg).finish()
             }
             Self::Set { id, setting } => f.debug_struct("Set").field("id", id).field("setting", setting).finish(),
-            Self::SurfaceAction(action) => f.debug_tuple("SurfaceAction").field(action).finish(),
         }
     }
 }
@@ -872,18 +800,9 @@ pub struct SessionMeta {
     pub messages: usize,
     #[serde(default)]
     pub state_since: Option<String>,
-    /// Pending prompts (questions, secrets) waiting for an answer. Prompts
-    /// only: agent cards are counted apart (`surfaces_*`).
+    /// Pending prompts (questions, secrets) waiting for an answer.
     #[serde(default)]
     pub awaiting_input: usize,
-    /// Open agent cards a tool waits on (agent-ui §2.7: the desk's NEEDS
-    /// YOU). 0 from an older daemon, and until C4a.
-    #[serde(default)]
-    pub surfaces_waiting: u32,
-    /// Open live agent cards (§2.7: ASKED). 0 from an older daemon, and
-    /// until C4a.
-    #[serde(default)]
-    pub surfaces_open: u32,
     /// The conversation's journal id (`conv.session.id`): differs from `id`
     /// after a compaction into a successor. Empty from an older daemon.
     #[serde(default)]
@@ -1203,10 +1122,6 @@ pub struct Attached {
     pub roster: Vec<ClientInfo>,
     pub client_input: ClientInput,
     pub input_owner: Option<u64>,
-    /// Every retained agent card (agent-ui §2.5), read one at a time
-    /// ([`crate::surface::read_card`]). Only for a client whose catalog
-    /// covers them, so always empty for this build (`surfaces: 0`).
-    pub surfaces: Vec<crate::surface::SurfaceState>,
     /// Entries of the lists above that did not decode (skipped). The client
     /// also reports them as an `Error::Decode`: a skipped prompt is one the
     /// user would otherwise never see.
@@ -1226,26 +1141,21 @@ pub struct Rejected {
     pub pending_prompts: usize,
     pub clients: usize,
     pub roster: usize,
-    /// Agent cards this build can't read (a newer daemon's shape, a doc
-    /// that doesn't revalidate), or a `surfaces` that isn't a list (one).
-    /// A bug guard, never a planned path (agent-ui v3.4 #4).
-    pub surfaces: usize,
 }
 
 impl Rejected {
     pub fn total(&self) -> usize {
-        self.pending_prompts + self.clients + self.roster + self.surfaces
+        self.pending_prompts + self.clients + self.roster
     }
 }
 
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parts: Vec<String> =
-            [("pending_prompts", self.pending_prompts), ("clients", self.clients), ("roster", self.roster), ("surfaces", self.surfaces)]
-                .into_iter()
-                .filter(|(_, n)| *n > 0)
-                .map(|(k, n)| format!("{n} {k}"))
-                .collect();
+        let parts: Vec<String> = [("pending_prompts", self.pending_prompts), ("clients", self.clients), ("roster", self.roster)]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect();
         write!(f, "{} attach snapshot entries did not decode (skipped)", parts.join(", "))
     }
 }
@@ -1272,9 +1182,6 @@ struct RawAttached {
     client_input: ClientInput,
     #[serde(default)]
     input_owner: Option<u64>,
-    /// Any JSON: a list is read card by card, anything else is one rejected.
-    #[serde(default)]
-    surfaces: Value,
 }
 
 impl From<RawAttached> for Attached {
@@ -1282,7 +1189,6 @@ impl From<RawAttached> for Attached {
         let (pending_prompts, p) = lenient(a.pending_prompts);
         let (clients, c) = lenient(a.clients);
         let (roster, r) = lenient(a.roster);
-        let (surfaces, s) = crate::surface::read_cards(a.surfaces);
         Attached {
             client: a.client,
             meta: a.meta,
@@ -1295,8 +1201,7 @@ impl From<RawAttached> for Attached {
             roster,
             client_input: a.client_input,
             input_owner: a.input_owner,
-            surfaces,
-            rejected: Rejected { pending_prompts: p, clients: c, roster: r, surfaces: s },
+            rejected: Rejected { pending_prompts: p, clients: c, roster: r },
             connection: 0,
         }
     }
@@ -1733,103 +1638,6 @@ pub enum SessionEvent {
     External {
         event: Box<crate::events::ExternalEvent>,
     },
-    /// An agent card's full state (agent-ui §2.3): upsert by `(id, rev)`.
-    /// `None`: a card this build can't read ([`crate::surface::read_card`]),
-    /// a bug guard that never fails the frame. Only to a client whose
-    /// catalog covers the card, so never to this build (`surfaces: 0`).
-    Surface {
-        #[serde(default, deserialize_with = "lenient_surface")]
-        surface: Option<Box<crate::surface::SurfaceState>>,
-    },
-    /// One client's reply to its `surface_action` (§2.3). Broadcast to
-    /// every client with a catalog: keep your own (`client`), as with
-    /// `Refused`. Only to a client that declared a catalog.
-    SurfaceResult(SurfaceResult),
-    #[serde(other)]
-    Unknown,
-}
-
-/// The `surface` event's card, read as `Attached.surfaces` reads one.
-fn lenient_surface<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<crate::surface::SurfaceState>>, D::Error> {
-    Ok(crate::surface::read_card(Value::deserialize(d)?).map(Box::new))
-}
-
-/// The reply to one `surface_action` (agent-ui §2.3, §3.3): `types::
-/// SurfaceResult`. Its enums read a newer daemon's values as `Unknown`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SurfaceResult {
-    pub client: u64,
-    pub action_id: String,
-    pub outcome: SurfaceOutcome,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<SurfaceRefusal>,
-    /// Whether retrying the same action may succeed (§3.3's `retry`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry: Option<bool>,
-    /// The answer revision the action produced: always set on `accepted`
-    /// and `duplicate` (v3.4 #1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer_rev: Option<u32>,
-    /// Why the action is `unavailable` (v3.4 #2): meaningful only with
-    /// `reason: unavailable`; ignored with any other.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<SurfaceUnavailable>,
-}
-
-/// `SurfaceResult.outcome` (§2.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SurfaceOutcome {
-    Accepted,
-    /// The write's outcome isn't known yet (§3.4); a final result follows.
-    Pending,
-    /// Accepted before: no effect this time (only accepted actions are
-    /// logged, §3.7).
-    Duplicate,
-    Refused,
-    /// One this build does not know (a newer daemon's).
-    #[serde(other)]
-    Unknown,
-}
-
-/// Why a `surface_action` was refused (§3.3's reasons, in its order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SurfaceRefusal {
-    RateLimited,
-    Forbidden,
-    Reloading,
-    Invalid,
-    Busy,
-    Storage,
-    Resolved,
-    Gone,
-    Stale,
-    Stopped,
-    Conflict,
-    Unavailable,
-    /// One this build does not know (a newer daemon's).
-    #[serde(other)]
-    Unknown,
-}
-
-/// `SurfaceResult.detail`: why a card can't take the action now (§3.3
-/// #12's four cases, in its order; v3.4 #2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SurfaceUnavailable {
-    /// "Not sent: this session needs a reload".
-    ContextBlocked,
-    /// "Not sent: the agent's queue is full".
-    QueueFull,
-    /// "Not sent: earlier answers are still being saved".
-    LedgerFull,
-    /// "Not sent: waiting for the session's owner".
-    AwaitingOwner,
-    /// One this build does not know (a newer daemon's): "Not sent".
     #[serde(other)]
     Unknown,
 }
