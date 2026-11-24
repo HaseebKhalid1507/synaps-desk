@@ -1850,25 +1850,17 @@ async fn attach_more_past_the_cap_is_refused() {
     client.shutdown().unwrap();
 }
 
-/// The composer pickers' wire (synaps-desk #67, SynapsCLI #435): a
-/// `model_options` query answered by id and decoded; a `Set` (the daemon's
+/// The composer pickers' wire (synaps-desk #67): a `Set` (the daemon's
 /// `SessionSetting` shape) answered by its `setting_changed` id: applied
-/// (`Ok`, its note), not applied (`ok: false`: `Err` with the daemon's
-/// message), refused (`Refused{set}`: the oldest in flight); an older daemon's
-/// unknown-variant error answers the query `Err`, never a hang.
+/// (`Ok`, its note: a clamp says so), not applied (`ok: false`: `Err` with
+/// the daemon's message), refused (`Refused{set}`: the oldest in flight).
+/// Another id's `setting_changed` is not the answer.
 #[tokio::test]
-async fn set_and_model_options_wire_shapes_and_replies() {
+async fn set_wire_shapes_and_replies() {
     let mut fake = Fake::start("pickers").await;
     let (client, events) = fake.client();
     let seq = client.attach(SID, AttachMode::Mirror).unwrap();
     let mut conn = attached(&mut fake, &events, 2).await;
-    let options = |events| async move {
-        wait(events, "model options", |e| match e {
-            Event::ModelOptions { attach_seq, reply } => Some((*attach_seq, reply.clone())),
-            _ => None,
-        })
-        .await
-    };
     let set_reply = |events| async move {
         wait(events, "setting reply", |e| match e {
             Event::SettingReply { attach_seq, setting, reply } => Some((*attach_seq, setting.clone(), reply.clone())),
@@ -1877,27 +1869,11 @@ async fn set_and_model_options_wire_shapes_and_replies() {
         .await
     };
 
-    client.on(seq).model_options().unwrap();
-    let cmd = conn.recv_cmd().await;
-    let id = cmd["id"].as_u64().unwrap();
-    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
-    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "model_options"}}));
-    conn.event(
-        40,
-        json!({"ev": "query_result", "id": id, "value": {
-        "model": "anthropic/claude-opus-5-5", "thinking_level": "high",
-        "models": [{"id": "anthropic/claude-opus-5-5", "label": "Opus 5.5", "provider": "Anthropic"}],
-        "thinking": ["off", "adaptive", "high"]}}),
-    )
-    .await;
-    let (s, o) = options(&events).await;
-    let o = o.expect("decoded");
-    assert_eq!((s, o.models[0].id.as_str(), o.thinking.len()), (seq, "anthropic/claude-opus-5-5", 3));
-
     let level = synaps_client::Setting::ReasoningLevel { level: "low".into() };
     client.on(seq).set(level).unwrap();
     let cmd = conn.recv_cmd().await;
     let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
     assert_eq!(cmd, json!({"cmd": "set", "id": id, "setting": {"setting": "reasoning_level", "level": "low"}}));
     let view = json!({"model": "anthropic/claude-opus-5-5", "thinking_level": "low", "reasoning_level": "low"});
     conn.event(41, json!({"ev": "setting_changed", "applied": {"id": id ^ 1, "setting": "reasoning_level", "ok": true, "view": view}}))
@@ -1923,12 +1899,18 @@ async fn set_and_model_options_wire_shapes_and_replies() {
     conn.event(44, json!({"ev": "refused", "client": 2, "command": "set", "reason": "input is owned by client #1"})).await;
     assert_eq!(set_reply(&events).await, (seq, "model".into(), Err("refused: input is owned by client #1".into())));
 
-    client.on(seq).model_options().unwrap();
-    conn.recv_cmd().await;
-    conn.send(json!({"type": "error", "session_id": SID,
-        "message": "malformed frame: unknown variant `model_options`, expected one of `status`, `messages`"}))
-        .await;
-    assert_eq!(options(&events).await, (seq, Err(synaps_client::client::OPTIONS_UNSUPPORTED.to_string())));
+    // A model change that clamps the level: applied, the clamp its note.
+    client.on(seq).set(synaps_client::Setting::Model { model: "anthropic/claude-haiku-4-5".into() }).unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    let clamp = "thinking → high (clamped from max: not supported by anthropic/claude-haiku-4-5)";
+    let clamped = json!({"model": "anthropic/claude-haiku-4-5", "thinking_level": "high", "reasoning_level": "high"});
+    conn.event(
+        45,
+        json!({"ev": "setting_changed", "applied": {"id": id, "setting": "model", "ok": true, "message": clamp, "view": clamped,
+            "clamp": {"from": "max", "to": "high"}}}),
+    )
+    .await;
+    assert_eq!(set_reply(&events).await, (seq, "model".into(), Ok(Some(clamp.into()))));
 }
 
 /// The right panel's cache and keep-warm (synaps-desk #68, SynapsCLI #436):

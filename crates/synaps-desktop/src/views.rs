@@ -100,6 +100,13 @@ pub fn locality(
     Ok(())
 }
 
+/// [`locality`] of the daemon `daemon` for this window's endpoint, now
+/// (blocking: it reads the run dir and `/proc`).
+pub(crate) fn daemon_here(launch: &Launch, daemon: &Daemon) -> Result<(), String> {
+    let socket = launch.endpoint.as_ref().map(Endpoint::resolve);
+    locality(socket.as_deref(), &synaps_client::discovery::list_in(&synaps_client::discovery::run_dir()), daemon, daemon_process)
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     a == b || canon(a) == canon(b)

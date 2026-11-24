@@ -306,9 +306,6 @@ pub enum Command {
     /// `Set` one of the session's settings → `Event::SettingReply`. See
     /// [`SessionRef::set`].
     Set(Setting),
-    /// `SessionQuery::ModelOptions` → `Event::ModelOptions`. See
-    /// [`SessionRef::model_options`].
-    ModelOptions,
     /// `SessionQuery::Status` → `Event::SessionStatus`. See
     /// [`SessionRef::status`].
     Status,
@@ -336,7 +333,6 @@ impl Command {
             Command::SubagentSteer { .. } => "subagent_steer",
             Command::CancelWorker { .. } | Command::EngineCommand { .. } => "engine_command",
             Command::Set(_) => "set",
-            Command::ModelOptions => "model_options",
             Command::Status => "query",
         }
     }
@@ -388,7 +384,6 @@ impl std::fmt::Debug for Command {
             Command::EngineCommand { name, .. } => f.debug_struct("EngineCommand").field("name", name).finish(),
             Command::Set(setting) => f.debug_tuple("Set").field(setting).finish(),
             other => f.write_str(match other {
-                Command::ModelOptions => "ModelOptions",
                 Command::Status => "Status",
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
@@ -627,13 +622,6 @@ pub enum Event {
         setting: String,
         reply: Result<Option<String>, String>,
     },
-    /// The answer to [`SessionRef::model_options`]: the choices, or why
-    /// none (the daemon predates the query, not connected, the reply did
-    /// not decode).
-    ModelOptions {
-        attach_seq: u64,
-        reply: Result<ModelOptions, String>,
-    },
     /// The answer to [`SessionRef::status`]: the session's `Status` value
     /// (`model`, `cost`, `keepwarm`, `pinned`, `cache_ttl`, and from newer
     /// daemons `cache`), as the daemon sent it.
@@ -706,7 +694,6 @@ impl Event {
             | Event::WorkerCancel { attach_seq, .. }
             | Event::EngineReply { attach_seq, .. }
             | Event::SettingReply { attach_seq, .. }
-            | Event::ModelOptions { attach_seq, .. }
             | Event::SessionStatus { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
@@ -1140,15 +1127,6 @@ impl SessionRef<'_> {
     /// value asked for.
     pub fn set(&self, setting: Setting) -> Result<(), ClientClosed> {
         self.send(Command::Set(setting))
-    }
-
-    /// The models and thinking levels this session takes now
-    /// (`SessionQuery::ModelOptions`) → `Event::ModelOptions`. Only a daemon
-    /// whose `Welcome.features` lists [`crate::FEATURE_MODEL_OPTIONS`] knows
-    /// it; check [`Client::supports`] first (an older one is answered
-    /// `Err` here too).
-    pub fn model_options(&self) -> Result<(), ClientClosed> {
-        self.send(Command::ModelOptions)
     }
 
     /// The session's status (`SessionQuery::Status{cache: true}`: cost,
@@ -1727,10 +1705,6 @@ async fn without_session<F: Future>(
                     setting: setting.name().into(),
                     reply: Err("not connected to the session (attaching or reconnecting): not changed".into()),
                 }),
-                Some(Command::ModelOptions) => emit(events, Event::ModelOptions {
-                    attach_seq,
-                    reply: Err("not connected to the session (attaching or reconnecting)".into()),
-                }),
                 Some(c) => emit_error(events, Some(attach_seq), Error::Refused {
                     command: Some(c.name().into()),
                     reason: "not connected to the session (attaching or reconnecting)".into(),
@@ -1775,17 +1749,11 @@ fn answer(events: &Events, attach_seq: u64, asked: Asked, reply: CommandReply) {
     }
 }
 
-/// What an [`Event::ModelOptions`] says when the daemon predates the query.
-pub const OPTIONS_UNSUPPORTED: &str = "this daemon does not list models (it predates model_options)";
-
-/// The `Set`s and model-option queries still in flight as the connection
-/// or the attachment ends: each answered `Err(why)`, never left waiting.
-fn unset(events: &Events, attach_seq: u64, sets: &mut VecDeque<(u64, &'static str)>, options: &mut VecDeque<u64>, why: &str) {
+/// The `Set`s still in flight as the connection or the attachment ends:
+/// each answered `Err(why)`, never left waiting.
+fn unset(events: &Events, attach_seq: u64, sets: &mut VecDeque<(u64, &'static str)>, why: &str) {
     for (_, name) in sets.drain(..) {
         emit(events, Event::SettingReply { attach_seq, setting: name.into(), reply: Err(why.to_string()) });
-    }
-    for _ in options.drain(..) {
-        emit(events, Event::ModelOptions { attach_seq, reply: Err(why.to_string()) });
     }
 }
 
@@ -1954,9 +1922,8 @@ async fn session_loop(
         // Engine commands in flight: `(query id, what)`, oldest first.
         let mut cancels: VecDeque<(u64, Asked)> = VecDeque::new();
         // `Set`s in flight: `(id, setting name)`, oldest first (a refusal
-        // carries no id: it is the oldest's). `ModelOptions` queries: ids.
+        // carries no id: it is the oldest's).
         let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
-        let mut options: VecDeque<u64> = VecDeque::new();
         // `Status` queries in flight (ids).
         let mut statuses: VecDeque<u64> = VecDeque::new();
         let query = |sid: &str| ClientFrame::Cmd {
@@ -1980,7 +1947,7 @@ async fn session_loop(
                             let _ = conn.send(&ClientFrame::Cmd { session_id: sid.clone(), cmd: SessionCommand::Detach { client: me } }).await;
                             conn.bye().await;
                             unanswered(&events, attach_seq, &mut cancels, "detached before the daemon answered");
-                            unset(&events, attach_seq, &mut sets, &mut options, "detached before the daemon answered");
+                            unset(&events, attach_seq, &mut sets, "detached before the daemon answered");
                             return detached(session_id);
                         }
                         Some(c) => c,
@@ -2059,7 +2026,7 @@ async fn session_loop(
                         Command::Set(setting) => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) && !statuses.contains(&id) {
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !statuses.contains(&id) {
                                     break id;
                                 }
                             };
@@ -2071,23 +2038,10 @@ async fn session_loop(
                             sets.push_back((id, setting.name()));
                             SessionCommand::Set { id, setting }
                         }
-                        Command::ModelOptions => {
-                            let id = loop {
-                                let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !options.contains(&id) && !statuses.contains(&id) {
-                                    break id;
-                                }
-                            };
-                            if options.len() == WATCHES_MAX {
-                                options.pop_front();
-                            }
-                            options.push_back(id);
-                            SessionCommand::Query { id, query: SessionQuery::ModelOptions }
-                        }
                         Command::Status => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !statuses.contains(&id) && !options.contains(&id) && !sets.iter().any(|s| s.0 == id) && !cancels.iter().any(|c| c.0 == id) {
+                                if id != query_id && !statuses.contains(&id) && !sets.iter().any(|s| s.0 == id) && !cancels.iter().any(|c| c.0 == id) {
                                     break id;
                                 }
                             };
@@ -2142,18 +2096,6 @@ async fn session_loop(
                                 Asked::Run(name, arg) => run_reply(name, arg, value),
                             };
                             answer(&events, attach_seq, asked, reply);
-                            continue;
-                        }
-                        if v.get("ev").and_then(Value::as_str) == Some("query_result")
-                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| options.iter().position(|o| *o == q))
-                        {
-                            options.remove(k);
-                            let value = v.get_mut("value").map(Value::take).unwrap_or_default();
-                            let reply = match value.get("error").and_then(Value::as_str) {
-                                Some(e) => Err(e.to_string()),
-                                None => serde_json::from_value::<ModelOptions>(value).map_err(|e| format!("the daemon's model options did not decode: {e}")),
-                            };
-                            emit(&events, Event::ModelOptions { attach_seq, reply });
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("setting_changed")
@@ -2256,7 +2198,7 @@ async fn session_loop(
                         emit(&events, Event::Session { attach_seq, session_id: esid, seq, ts, event, meta, raw });
                         if ended {
                             unanswered(&events, attach_seq, &mut cancels, "the session ended before the daemon answered");
-                            unset(&events, attach_seq, &mut sets, &mut options, "the session ended before the daemon answered");
+                            unset(&events, attach_seq, &mut sets, "the session ended before the daemon answered");
                             return Exit { session_id, reason: "session ended".into() };
                         }
                         if send_query && let Err(e) = conn.send(&query(&sid)).await {
@@ -2269,7 +2211,7 @@ async fn session_loop(
                     }
                     Ok(Some(DaemonFrame::Bye(reason))) => {
                         unanswered(&events, attach_seq, &mut cancels, "the daemon said bye before it answered");
-                        unset(&events, attach_seq, &mut sets, &mut options, "the daemon said bye before it answered");
+                        unset(&events, attach_seq, &mut sets, "the daemon said bye before it answered");
                         return Exit { session_id, reason: format!("daemon said bye ({reason:?})") };
                     }
                     Ok(Some(DaemonFrame::Error { session_id: esid, message })) => {
@@ -2287,12 +2229,6 @@ async fn session_loop(
                                     command: Some("subagent_steer".into()),
                                     reason: STEER_UNSUPPORTED.into(),
                                 });
-                                continue;
-                            }
-                            Some("model_options") => {
-                                for _ in options.drain(..) {
-                                    emit(&events, Event::ModelOptions { attach_seq, reply: Err(OPTIONS_UNSUPPORTED.into()) });
-                                }
                                 continue;
                             }
                             _ => {}
@@ -2317,7 +2253,7 @@ async fn session_loop(
             }
         };
         unanswered(&events, attach_seq, &mut cancels, "the link dropped before the daemon answered");
-        unset(&events, attach_seq, &mut sets, &mut options, "the link dropped before the daemon answered (it may have applied)");
+        unset(&events, attach_seq, &mut sets, "the link dropped before the daemon answered (it may have applied)");
         let reload = why == RELOADING;
         emit(&events, Event::Reattaching { attach_seq, session_id: sid.clone(), reason: why });
         previous = Some(Previous { client: me, session_id: sid, was_owner: owner == Some(me), generation });

@@ -56,6 +56,7 @@ mod live;
 mod mem;
 mod menu;
 mod model;
+mod model_list;
 mod motion;
 mod named;
 mod overlay;

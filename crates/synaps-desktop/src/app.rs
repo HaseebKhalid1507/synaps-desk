@@ -3074,7 +3074,6 @@ impl AppView {
                 }
             }
             Effect::Setting { attach_seq, setting, reply } => self.choice_answered(attach_seq, &setting, reply),
-            Effect::Options { attach_seq, reply } => self.choice_options(attach_seq, reply),
             Effect::Status(seq) => {
                 if let Some(c) = &self.client {
                     let _ = c.on(seq).status();
