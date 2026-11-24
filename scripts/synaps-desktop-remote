@@ -1,0 +1,208 @@
+#!/bin/bash
+# synaps-desktop-remote [host [desktop args...]]   (default: avante; SYNAPS_PROFILE=<name>: that profile's daemon)
+# Runs Synaps Desktop here, attached to the Synaps daemon on <host>, through an SSH-forwarded
+# Unix socket. The tunnel lives exactly as long as the app. The local socket is 0600 inside
+# $XDG_RUNTIME_DIR, so no other user on this machine can ride it. The app is told how to read
+# small things from <host> (SYNAPS_DESKTOP_HOST_READ, SYNAPS_DESKTOP_HOST): the reads below.
+#
+# synaps-desktop-remote --read <host> <what> <args...>
+# The two reads the app makes of <host>, printed on stdout. Each is narrowed ON <host>, before
+# anything leaves it, and the host half's stderr never leaves it (nothing the host's tools say,
+# a config warning included, crosses the connection). Every argument is a plain word
+# ([A-Za-z0-9._-]), so no shell on either side reads anything into it.
+#   config-key <profile|-> favorite_models
+#                         the profile's Synaps config's `favorite_models = ...` lines (the file
+#                         as Synaps finds it). That key only: any other is refused, here and on
+#                         <host>, whatever its name.
+#   cli <pid> <profile|-> auth-list
+#                         which providers sign in with OAuth and their accounts' labels, from the
+#                         daemon's own CLI (/proc/<pid>/exe, <pid> this user's daemon process):
+#                         `auth list --json` cut down on <host> to
+#                         {"accounts":[{"provider":P,"label":L}...],"selectors":{K:{}...}},
+#                         plain words only (no identities, selector values or anything else).
+# Exit 64: not a read this takes; 65: a key other than favorite_models; 66: <pid> is not this
+# user's daemon; 67: the read failed on <host> (no listing, an unreadable config); 255: ssh failed.
+set -euo pipefail
+
+plain() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+usage() { echo "synaps-desktop-remote: $1" >&2; exit 64; }
+
+if [ "${1:-}" = --read ]; then
+  shift
+  [ $# -ge 2 ] || usage "usage: --read <host> <what> <args...>"
+  host=$1; shift
+  plain "$host" || usage "--read: the host is not a plain name"
+  for a in "$@"; do plain "$a" || usage "--read takes plain words only"; done
+  case "$1" in
+    config-key)
+      [ $# -eq 3 ] || usage "usage: --read <host> config-key <profile|-> favorite_models"
+      [ "$3" = favorite_models ] || { echo "synaps-desktop-remote: config-key reads favorite_models only" >&2; exit 65; }
+      ;;
+    cli)
+      [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || usage "usage: --read <host> cli <pid> <profile|-> auth-list"
+      [ "$4" = auth-list ] || usage "cli: no read named $4"
+      ;;
+    *) usage "no read named $1" ;;
+  esac
+  # The same checks again on <host>, then the read.
+  exec ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$host" bash -s -- "$@" <<'REMOTE'
+exec 2>/dev/null
+set -euo pipefail
+for a in "$@"; do [[ "$a" =~ ^[A-Za-z0-9._-]+$ ]] || exit 64; done
+base="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"
+case "$1" in
+  config-key)
+    [ $# -eq 3 ] || exit 64
+    [ "$3" = favorite_models ] || exit 65
+    # The profile's file when there is one, else the base one (Synaps' resolve_read_path).
+    f="$base/config"
+    if [ "$2" != - ] && [[ "$2" != .* ]] && [ -e "$base/$2/config" ]; then f="$base/$2/config"; fi
+    [ -e "$f" ] || exit 0
+    [ -f "$f" ] || exit 67
+    grep -E '^[[:space:]]*favorite_models[[:space:]]*=' "$f" || [ $? -eq 1 ] || exit 67
+    ;;
+  cli)
+    [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || exit 64
+    [ "$4" = auth-list ] || exit 64
+    [ -O "/proc/$2" ] || exit 66
+    tr '\0' '\n' < "/proc/$2/cmdline" | grep -qx daemon || exit 66
+    if [ "$3" = - ]; then unset SYNAPS_PROFILE; else export SYNAPS_PROFILE="$3"; fi
+    # POSIX awk (no jq or python assumed on <host>).
+    project='
+# `synaps auth list --json` on stdin; on stdout, only what the picker reads:
+# {"accounts":[{"provider":P,"label":L},...],"selectors":{K:{},...}}. A
+# provider, label or key that is not a plain word is left out; anything
+# that is not such a listing prints nothing and exits 1.
+function fail() { bad = 1; pos = n + 1 }
+function ws(   c) {
+  while (pos <= n) {
+    c = substr(s, pos, 1)
+    if (c != " " && c != "\t" && c != "\n" && c != "\r") return
+    pos++
+  }
+}
+function plain(w) { return length(w) <= 64 && w ~ /^[A-Za-z0-9._-]+$/ }
+# The string at pos (an escape becomes "\\": never a plain word).
+function str(   c, out) {
+  if (substr(s, pos, 1) != "\"") { fail(); return "" }
+  pos++
+  out = ""
+  while (pos <= n) {
+    c = substr(s, pos, 1)
+    pos++
+    if (c == "\"") return out
+    if (c == "\\") {
+      pos += (substr(s, pos, 1) == "u") ? 5 : 1
+      c = "\\"
+    }
+    out = out c
+  }
+  fail()
+  return ""
+}
+# The value at pos, at `at`: "top", "accounts", "account", "selectors",
+# "text" (a provider or a label: kept in `got`) or "-" (skipped).
+function value(at,   c, k, p, l) {
+  ws()
+  got = ""
+  if (pos > n) { fail(); return }
+  c = substr(s, pos, 1)
+  if (c == "{") {
+    pos++
+    ws()
+    p = ""
+    l = ""
+    if (substr(s, pos, 1) != "}") {
+      while (!bad) {
+        ws()
+        k = str()
+        ws()
+        if (substr(s, pos, 1) != ":") { fail(); return }
+        pos++
+        if (at == "top" && k == "accounts") value("accounts")
+        else if (at == "top" && k == "selectors") value("selectors")
+        else if (at == "account" && k == "provider") { value("text"); p = got }
+        else if (at == "account" && k == "label") { value("text"); l = got }
+        else {
+          if (at == "selectors" && plain(k)) { sel = sel sep2 "\"" k "\":{}"; sep2 = "," }
+          value("-")
+        }
+        ws()
+        c = substr(s, pos, 1)
+        pos++
+        if (c == "}") break
+        if (c != ",") { fail(); return }
+      }
+    } else pos++
+    if (at == "account" && plain(p) && (l == "" || plain(l))) {
+      acc = acc sep1 "{\"provider\":\"" p "\",\"label\":\"" l "\"}"
+      sep1 = ","
+    }
+    if (at == "top") top = 1
+    got = ""
+    return
+  }
+  if (c == "[") {
+    pos++
+    ws()
+    if (at == "accounts") listed = 1
+    if (substr(s, pos, 1) == "]") { pos++; return }
+    while (!bad) {
+      value(at == "accounts" ? "account" : "-")
+      ws()
+      c = substr(s, pos, 1)
+      pos++
+      if (c == "]") return
+      if (c != ",") { fail(); return }
+    }
+    return
+  }
+  if (c == "\"") {
+    k = str()
+    if (at == "text") got = k
+    return
+  }
+  # A number, true, false or null.
+  k = pos
+  while (pos <= n && index("0123456789+-.eEtrufalsn", substr(s, pos, 1)) > 0) pos++
+  if (pos == k) fail()
+}
+{ s = s $0 "\n"; if (length(s) > 1048576) { bad = 1; exit } }
+END {
+  if (bad) exit 1
+  n = length(s)
+  pos = 1
+  value("top")
+  ws()
+  if (bad || pos <= n || !top || !listed) exit 1
+  print "{\"accounts\":[" acc "],\"selectors\":{" sel "}}"
+}
+'
+    out=$("/proc/$2/exe" auth list --json < /dev/null 2> /dev/null | awk "$project") || exit 67
+    printf '%s\n' "$out"
+    ;;
+  *) exit 64 ;;
+esac
+REMOTE
+fi
+
+host="${1:-avante}"
+[ $# -eq 0 ] || shift
+plain "$host" || { echo "synaps-desktop-remote: the host is not a plain name" >&2; exit 64; }
+profile="${SYNAPS_PROFILE:-}"
+[ -z "$profile" ] || plain "$profile" || { echo "synaps-desktop-remote: SYNAPS_PROFILE is not a plain name" >&2; exit 64; }
+sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/synaps-$host${profile:+-$profile}.sock"
+remote="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'echo $HOME')/.synaps-cli/run/daemon${profile:+-$profile}.sock"
+rm -f "$sock"
+ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o StreamLocalBindMask=0177 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L "$sock:$remote" "$host" &
+tunnel=$!
+trap 'kill "$tunnel" 2>/dev/null; rm -f "$sock"' EXIT
+for _ in $(seq 1 100); do
+  [ -S "$sock" ] && break
+  kill -0 "$tunnel" 2>/dev/null || { echo "synaps-desktop-remote: ssh tunnel to $host failed" >&2; exit 1; }
+  sleep 0.1
+done
+[ -S "$sock" ] || { echo "synaps-desktop-remote: tunnel socket never appeared" >&2; exit 1; }
+bin="${SYNAPS_DESKTOP_BIN:-$HOME/.local/bin/synaps-desktop}"; bin="${bin/#~/$HOME}"
+SYNAPS_DESKTOP_HOST_READ="$(readlink -f "${BASH_SOURCE[0]}")" SYNAPS_DESKTOP_HOST="$host" "$bin" --socket "$sock" "$@"

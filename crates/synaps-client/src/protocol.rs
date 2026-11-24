@@ -38,10 +38,6 @@ pub const SAVED_SESSIONS_MAX: u32 = 1000;
 /// watch-sessions replacement of `saved_sessions`). An older daemon
 /// answers the frame with `Error{unknown variant}`.
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
-/// `Welcome.features` entry: the daemon answers `SessionQuery::ModelOptions`
-/// (the models and thinking levels a session's `Set` takes). An older
-/// daemon answers the query with `Error{unknown variant}`.
-pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
 /// `Welcome.features` entry: the daemon answers `Status{cache: true}` with
 /// when the session's prompt cache expires (`cache`), to the asking client
 /// only. An older daemon is never asked.
@@ -321,39 +317,6 @@ impl Setting {
     }
 }
 
-/// The reply to `SessionQuery::ModelOptions` (`session::model_options`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub struct ModelOptions {
-    /// The session's model and thinking level as the daemon answered.
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub thinking_level: String,
-    #[serde(default)]
-    pub models: Vec<ModelOption>,
-    /// The levels the session takes for its current model.
-    #[serde(default)]
-    pub thinking: Vec<String>,
-    /// Why the list is short or no model change would apply now (workers
-    /// to reconcile, the credential broker did not answer).
-    #[serde(default)]
-    pub notice: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub struct ModelOption {
-    pub id: String,
-    #[serde(default)]
-    pub label: String,
-    /// The provider's name (its section).
-    #[serde(default)]
-    pub provider: String,
-    /// The provider's stable key: rows group by it (empty from a daemon
-    /// before SynapsCLI #435's review: then by `provider`).
-    #[serde(default)]
-    pub provider_key: String,
-}
-
 impl std::fmt::Debug for SessionCommand {
     /// `Submit`/`Steer`/`Answer` print `<redacted>`, no lengths (as Synaps).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -406,9 +369,6 @@ pub enum SessionQuery {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
-    /// Reply value: [`ModelOptions`]. Only to a daemon that lists
-    /// [`FEATURE_MODEL_OPTIONS`].
-    ModelOptions,
 }
 
 /// One page of a worker's watch journal (`runtime::subagent_watch::WatchPage`,

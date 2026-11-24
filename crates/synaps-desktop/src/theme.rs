@@ -1709,6 +1709,11 @@ pub fn load_str(path: &Path, key: &str) -> Option<String> {
     load_settings(path)?.get(key)?.as_str().map(str::to_string).filter(|v| !v.is_empty())
 }
 
+/// The value saved under `key`, as written (`None`: no file, no key).
+pub fn load_value(path: &Path, key: &str) -> Option<serde_json::Value> {
+    load_settings(path)?.get(key).cloned()
+}
+
 /// Split panes on (`panes.split`): on unless the file says `false`
 /// (split panes step 6 turned them on by default; that is the off switch,
 /// with `SYNAPS_DESK_SPLIT=0` for a run).
