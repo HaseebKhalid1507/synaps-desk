@@ -45,6 +45,7 @@ mod chrome;
 mod dash;
 mod deliver;
 mod demo;
+mod detail;
 mod diag;
 mod dnd;
 mod events;

@@ -301,7 +301,7 @@ impl AppView {
                 .line_height(line(m.label))
                 .text_color(p.prose_t)
                 .debug_selector(move || format!("ask-detail {id}"))
-                .children(d.split('\n').map(|l| div().min_h(line(m.label)).child(l.to_string())))
+                .children(crate::detail::lines(&d).into_iter().map(|l| detail_line(l, p, m)))
         });
         let key = (20. * r).round();
         let pad = (6. * r).round();
@@ -673,6 +673,33 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &P
                     })),
             )
         })
+}
+
+/// A line of a card's detail, markdown-lite ([`crate::detail`]): bold in
+/// semibold, italic, inline code as the prose draws it (`code_in` on its
+/// `well` chip); a list item's mark hangs in its own column, indented by
+/// its depth.
+fn detail_line(l: crate::detail::Line, p: &Palette, m: &Metrics) -> Div {
+    let looks = l.looks.into_iter().map(|(range, k)| {
+        let style = HighlightStyle {
+            font_weight: k.bold.then_some(FontWeight::SEMIBOLD),
+            font_style: k.italic.then_some(FontStyle::Italic),
+            color: k.code.then_some(p.code_in),
+            background_color: k.code.then_some(p.well),
+            ..Default::default()
+        };
+        (range, style)
+    });
+    let text = StyledText::new(l.text).with_highlights(looks);
+    match l.lead {
+        Some(lead) => h_flex()
+            .items_start()
+            .min_h(line(m.label))
+            .pl(px((14. * m.r).round() * l.depth as f32))
+            .child(div().flex_none().w(px((18. * m.r).round())).text_color(p.dim_t).child(lead))
+            .child(div().flex_1().min_w_0().child(text)),
+        None => div().min_h(line(m.label)).child(text),
+    }
 }
 
 /// The line of a card this window can't answer, from the input gate's

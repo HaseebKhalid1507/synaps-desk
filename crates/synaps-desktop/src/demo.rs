@@ -781,7 +781,7 @@ fn asks() -> Vec<Value> {
 fn ask_form() -> Vec<Value> {
     let mut out = vec![json!({"role": "user", "content": "Plan the token backfill with me before you run anything."})];
     let plan = json!({"question": "How should the backfill run?", "wait": true,
-        "detail": "About 2.4 million tokens. The file store stays readable until the cut-over.",
+        "detail": "About **2.4 million** tokens. The file store stays readable until the cut-over.\n- each batch is *verified* before the next\n- a failed batch rolls back with `relay rollback`",
         "options": [{"label": "In batches", "hint": "a pause between each"}, {"label": "All at once", "hint": "locks the table for about 3 minutes"}],
         "default": "In batches",
         "fields": [
