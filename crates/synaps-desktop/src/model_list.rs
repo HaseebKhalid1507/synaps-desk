@@ -571,15 +571,14 @@ enum Stop {
 /// `c` run with its stdout given to `sink` as it arrives, within `within`;
 /// the sink once `c` exited 0. Its stderr is never read; an error says
 /// `what` and how it ended only. `c` runs as a tree of its own (a process
-/// group, a job object): at the deadline, or once the sink has had enough,
-/// the whole tree is killed, and so is whatever it left running when it
-/// ends, so no descendant outlives the read and no reader waits on one.
+/// group, a job object), in it before any of its code runs, or not at all:
+/// at the deadline, or once the sink has had enough, the whole tree is
+/// killed, and so is whatever it left running when it ends, so no
+/// descendant outlives the read and no reader waits on one.
 fn run<S: Sink>(mut c: Command, what: &str, sink: S, within: Duration) -> Result<S, String> {
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-    tree::own(&mut c);
     let deadline = Instant::now() + within;
-    let mut child = c.spawn().map_err(|e| format!("{what} did not start ({})", e.kind()))?;
-    let tree = tree::Tree::of(&child);
+    let (mut child, tree) = tree::spawn(&mut c).map_err(|e| format!("{what} {e}"))?;
     let stdout = child.stdout.take().expect("piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -670,20 +669,21 @@ mod tree {
     use std::process::{Child, ChildStdout, Command};
     use std::time::Instant;
 
-    /// `c` leads a process group of its own (its descendants join it).
-    pub fn own(c: &mut Command) {
+    /// `c` started as the leader of a process group of its own, which its
+    /// descendants join (set in the child before it execs). `Err`: why
+    /// not, after "did not start".
+    pub fn spawn(c: &mut Command) -> Result<(Child, Tree), String> {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
+        let child = c.spawn().map_err(|e| format!("did not start ({})", e.kind()))?;
+        let tree = Tree(child.id() as libc::pid_t);
+        Ok((child, tree))
     }
 
     /// The group, by its leader's pid.
     pub struct Tree(libc::pid_t);
 
     impl Tree {
-        pub fn of(child: &Child) -> Tree {
-            Tree(child.id() as libc::pid_t)
-        }
-
         /// SIGKILL to every process in the group, the leader too. Sound
         /// until the leader is reaped: till then its pid, the group's id,
         /// is not reused.
@@ -728,41 +728,105 @@ mod tree {
 /// A command's process tree.
 #[cfg(windows)]
 mod tree {
+    use std::io;
     use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
+    use std::os::windows::process::{ChildExt, CommandExt};
     use std::process::{Child, Command};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, ResumeThread};
 
-    /// No console window.
-    pub fn own(c: &mut Command) {
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    /// Why a command was not run: no job could hold it.
+    pub const UNCONTAINED: &str = "was not run (no job object to hold its processes)";
+
+    /// A test's stand-in for [`Tree::enrol`]: it fails, or is slow.
+    #[cfg(test)]
+    pub type Enrol = Box<dyn FnOnce(&Child) -> io::Result<Tree>>;
+
+    #[cfg(test)]
+    thread_local! {
+        /// Taken by the next [`spawn`] on this thread.
+        pub static ENROL: std::cell::RefCell<Option<Enrol>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// A job object holding the command (its descendants join it).
+    /// `c` started in a job of its own, which its descendants join, before
+    /// any of its code runs: created suspended, put in the job, then its
+    /// one thread resumed. No window. If the job can't be made or joined,
+    /// or the thread resumed, it is killed unrun (it never runs outside a
+    /// job). `Err`: why not, after the command's name.
+    pub fn spawn(c: &mut Command) -> Result<(Child, Tree), String> {
+        #[cfg(test)]
+        if let Some(enrol) = ENROL.take() {
+            return spawn_with(c, enrol);
+        }
+        spawn_with(c, Tree::enrol)
+    }
+
+    fn spawn_with(c: &mut Command, enrol: impl FnOnce(&Child) -> io::Result<Tree>) -> Result<(Child, Tree), String> {
+        c.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        let mut child = c.spawn().map_err(|e| format!("did not start ({})", e.kind()))?;
+        match enrol(&child).and_then(|tree| resume(&child).map(|()| tree)) {
+            Ok(tree) => Ok((child, tree)),
+            Err(_) => {
+                // Still suspended (it never ran), or in the job just
+                // closed, which killed it.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(UNCONTAINED.into())
+            }
+        }
+    }
+
+    /// The child's first thread, created suspended, resumed. std keeps its
+    /// handle from `CreateProcessW` (`ChildExt::main_thread_handle`), so
+    /// this is that thread and no other; no pid lookup. `Err` unless it
+    /// was suspended once (by `CREATE_SUSPENDED`) and now runs.
+    fn resume(child: &Child) -> io::Result<()> {
+        // SAFETY: the thread handle std holds for `child`, live while it is.
+        match unsafe { ResumeThread(child.main_thread_handle().as_raw_handle()) } {
+            1 => Ok(()),
+            u32::MAX => Err(io::Error::last_os_error()),
+            n => Err(io::Error::other(format!("suspended {n} times"))),
+        }
+    }
+
+    /// A job object holding the command and its descendants. Closing it
+    /// (dropping this) kills what is left in it.
     pub struct Tree(HANDLE);
 
     impl Tree {
-        pub fn of(child: &Child) -> Tree {
-            // SAFETY: a new unnamed job; the child's handle is live.
+        /// A new job that kills what it holds once closed, with `child`
+        /// (still suspended) in it.
+        pub fn enrol(child: &Child) -> io::Result<Tree> {
+            // SAFETY: a new unnamed job, ours, closed once (by `Drop`), on
+            // error too; `limits` is ours, of the size given; the child's
+            // handle is live.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if !job.is_null() && AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-                    CloseHandle(job);
-                    return Tree(std::ptr::null_mut());
+                if job.is_null() {
+                    return Err(io::Error::last_os_error());
                 }
-                Tree(job)
+                let tree = Tree(job);
+                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let size = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+                if SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size) == 0
+                    || AssignProcessToJobObject(job, child.as_raw_handle()) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(tree)
             }
         }
 
-        /// Every process in the job (no job: the command itself).
+        /// Every process in the job, the command too.
         pub fn kill(&self, child: &mut Child) {
-            if self.0.is_null() {
-                let _ = child.kill();
-            } else {
-                // SAFETY: our job handle.
-                unsafe { TerminateJobObject(self.0, 1) };
-            }
+            // SAFETY: our job handle.
+            unsafe { TerminateJobObject(self.0, 1) };
+            let _ = child.kill();
         }
 
         pub fn exited(&self, child: &mut Child) -> bool {
@@ -772,10 +836,8 @@ mod tree {
 
     impl Drop for Tree {
         fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: our job handle, closed once.
-                unsafe { CloseHandle(self.0) };
-            }
+            // SAFETY: our job handle, closed once.
+            unsafe { CloseHandle(self.0) };
         }
     }
 }

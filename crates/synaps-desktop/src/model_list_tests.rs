@@ -557,6 +557,91 @@ fn a_late_command_and_its_children_are_killed() {
     assert_eq!(r.finish(), Some(vec!["a/b".to_string()]));
 }
 
+/// On Windows: a command is in its job before any of its code runs. It
+/// starts a child at once (that holds stdout and, if it lives 5 s, writes
+/// `late`) and exits. Held back half a second, its job's enrolment finds
+/// it not yet run; enrolled at once, likewise. Either way its child dies
+/// with the job at the deadline: the read ends then, and `late` is never
+/// written. Started before its job (the round-2 code), the child would
+/// escape it: the read would wait on it and `late` appear.
+#[cfg(windows)]
+#[test]
+fn a_command_runs_only_inside_its_job() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = dir("enrol");
+    assert!(!d.display().to_string().contains(' '), "{}", d.display());
+    let within = Duration::from_secs(2);
+    let mut last = Instant::now();
+    let mut lates = Vec::new();
+    for held in [true, false] {
+        let (ran, late) = (d.join(format!("ran-{held}")), d.join(format!("late-{held}")));
+        let early = Arc::new(AtomicBool::new(false));
+        if held {
+            let (seen, ran) = (early.clone(), ran.clone());
+            tree::ENROL.set(Some(Box::new(move |child: &std::process::Child| {
+                std::thread::sleep(Duration::from_millis(500));
+                seen.store(ran.exists(), Ordering::SeqCst);
+                tree::Tree::enrol(child)
+            })));
+        }
+        let mut c = Command::new("cmd");
+        c.raw_arg(format!(
+            "/c start /b cmd /c \"ping -n 6 127.0.0.1 > nul & echo late> {}\" & echo ran> {}",
+            late.display(),
+            ran.display()
+        ));
+        last = Instant::now();
+        let r = run(c, "the command", Favorites::default(), within);
+        let took = last.elapsed();
+        assert!(!early.load(Ordering::SeqCst), "held {held}: it ran before it was in its job");
+        assert_eq!(r.err().as_deref(), Some("the command did not answer within 2 s"), "held {held}: its child died with the job");
+        assert!(took < within + Duration::from_secs(2), "held {held}: {took:?}");
+        assert!(ran.exists(), "held {held}: it ran, once in its job");
+        lates.push(late);
+    }
+    std::thread::sleep(Duration::from_secs(8).saturating_sub(last.elapsed()));
+    for late in lates {
+        assert!(!late.exists(), "{}: its child outlived the job", late.display());
+    }
+}
+
+/// On Windows: a command no job can hold is never run. It is killed while
+/// still suspended (by `TerminateProcess`, exit code 1), and the picker
+/// says the source was not read.
+#[cfg(windows)]
+#[test]
+fn a_command_no_job_can_hold_is_never_run() {
+    use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
+    use std::sync::Arc;
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    let d = dir("unjobbed");
+    assert!(!d.display().to_string().contains(' '), "{}", d.display());
+    let ran = d.join("ran");
+    let process: Arc<Mutex<Option<OwnedHandle>>> = Arc::default();
+    let seen = process.clone();
+    tree::ENROL.set(Some(Box::new(move |child: &std::process::Child| -> std::io::Result<tree::Tree> {
+        *seen.lock().unwrap() = Some(child.as_handle().try_clone_to_owned()?);
+        Err(std::io::Error::other("no job today"))
+    })));
+    let cmd = format!("echo ran> {} & echo favorite_models = a/b", ran.display());
+    let list = load(&ask(Source::parse(Some(&json!({"favorites": {"command": cmd}}))), Ok(()), &d));
+    assert!(list.models.is_empty());
+    assert_eq!(
+        list.notice.as_deref(),
+        Some(format!("favourites not read: the {SETTING} command was not run (no job object to hold its processes)").as_str())
+    );
+    let h = process.lock().unwrap().take().expect("it was started");
+    let mut code = 0;
+    // SAFETY: our copy of its handle; `code` is ours.
+    assert_ne!(unsafe { GetExitCodeProcess(h.as_raw_handle(), &mut code) }, 0);
+    assert_eq!(code, 1, "ended by the kill, not by itself");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!ran.exists(), "it ran");
+}
+
 /// `Debug` of a source says its kind, never the path or the command (a
 /// token can be written inline).
 #[test]

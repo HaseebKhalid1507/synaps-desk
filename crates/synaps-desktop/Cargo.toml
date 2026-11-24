@@ -4,7 +4,10 @@ description = "Native desktop client for the Synaps daemon (GPUI spike)."
 license = "MIT"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# 1.100, the pinned toolchain (rust-toolchain.toml), for
+# `ChildExt::main_thread_handle` (`model_list::tree` on Windows). The
+# client keeps the workspace's 1.98.
+rust-version = "1.100"
 publish.workspace = true
 
 # The house rules in `clippy.toml` are errors, not warnings.
@@ -41,7 +44,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # GPUI's headless test window (`TestAppContext`) for the UI tests
