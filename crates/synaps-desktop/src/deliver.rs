@@ -1,0 +1,337 @@
+//! Answering agent cards: the delivery adapter (synaps-cards
+//! `docs/design.md` v1.2, §3.4 and §3.5; the D2a row of §9.3).
+//!
+//! An answer is a user message, sent as the composer sends one: a `Steer`
+//! while the session is busy, a `Submit` when it is idle, always on the
+//! card's own attachment (`client.on(seq)` of the [`crate::live::Live`]
+//! that holds its session, never `Client::submit`). What happens to it
+//! after that is typed text's fate exactly, including where typed text is
+//! lost; the card memo (`cards_spec::memo`, S3's pure state machine)
+//! follows it and the card says so. This module feeds the memo:
+//! - **events** ([`Memos::on`]): the echoes (`TurnStarted`, `Steered`),
+//!   `SteeringDelivered`, a refusal, `Dequeued`, `DriverRevoked`, `Idle`, a
+//!   reconnect's `Attached`, and the "steering queue full" notice;
+//! - **views** ([`Memos::observe`]): the fold the rows draw, and whether
+//!   the history is settled ([`synaps_client::Transcript::history_settled`]),
+//!   with the digest's `queued_message`;
+//! - **the clock** ([`Memos::tick`]): no echo in 10 s, no settled view in
+//!   10 s.
+//!
+//! **One memo per session** (§3.5, "keyed by session"): split panes on a
+//! session share it as they share its `Live` (§3.6), and a tab switch
+//! leaves it to its session, whose next attach (`Attached`) has it check
+//! what it had out.
+//!
+//! **The binding.** A click names the card as it was painted
+//! ([`Painted`]): its call's tool id, its id, its doc and mode. It sends
+//! only if the card the fold holds *now* for that call is that one, bound
+//! to that id, which names it, and may still be answered; and only on a
+//! settled view: the live rows draw a card before the history has it, and
+//! the history wins when it lands (Shady #80), so a click never sends
+//! against a binding the history hasn't settled. A memo entry records its
+//! binding too, and a new binding of the id drops it (§3.5).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use cards_spec::fold::{Card, Fold};
+use cards_spec::memo::{Cause, Entry, Event as Heard, Memo, Resend, State, View};
+use cards_spec::{CardDoc, CardId, Reply};
+use synaps_client::Transcript;
+use synaps_client::cards::Ask;
+use synaps_client::protocol::{AgentEvent, SessionEvent, StreamEvent};
+
+/// The broadcast notice of a driver's full queue (SynapsCLI
+/// `actor.rs:3292-3314`, "steering queue full (16 messages) — message
+/// dropped"): a hint for every entry sending, never a receipt (§3.5).
+pub(crate) fn queue_full(notice: &str) -> bool {
+    notice.starts_with("steering queue full")
+}
+
+/// What the memo hears of session event `event` (`raw`, its wire form), as
+/// §3.4 and §3.5 read each, `t` the session's transcript before it: an
+/// echo (a driver's: `Steered{delivered: false}` while idle and not
+/// compacting), a delivery (`SteeringDelivered`, or the steer a compaction
+/// restored into the compacted history), `Dequeued`, `DriverRevoked`,
+/// `Idle`, or the full-queue notice.
+pub(crate) fn heard<'a>(event: &'a SessionEvent, raw: &'a serde_json::Value, t: &Transcript) -> Option<Heard<'a>> {
+    Some(match event {
+        SessionEvent::TurnStarted { user_text: Some(text), .. } => Heard::Echo { text, driver: false },
+        SessionEvent::Steered { text, delivered } => Heard::Echo { text, driver: !delivered && !t.busy() && !t.compacting() },
+        SessionEvent::Stream { event: StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) } => Heard::Delivered { text: message },
+        SessionEvent::CompactionApplied { .. } => Heard::Delivered { text: synaps_client::protocol::queued_restored(raw)? },
+        SessionEvent::Dequeued { text } => Heard::Dequeued { text },
+        SessionEvent::DriverRevoked { undelivered_steering, .. } => Heard::DriverRevoked { undelivered: undelivered_steering },
+        SessionEvent::Idle => Heard::Idle,
+        SessionEvent::SystemNotice { text } if queue_full(text) => Heard::Notice,
+        _ => return None,
+    })
+}
+
+/// A card as a click saw it: what it names, so the click can tell whether
+/// that card is still the one the fold holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Painted {
+    pub(crate) tool_id: String,
+    pub(crate) id: CardId,
+    pub(crate) doc: Arc<CardDoc>,
+    pub(crate) wait: bool,
+}
+
+impl Painted {
+    /// A drawn card's, once it is bound.
+    pub(crate) fn of(a: &Ask) -> Option<Self> {
+        Some(Painted { tool_id: a.tool_id.clone(), id: a.id.clone()?, doc: a.doc.clone(), wait: a.wait })
+    }
+
+    /// The card it names in `fold`, while its binding holds there: the
+    /// latest call of its tool id, bound to its id, which names that call
+    /// (not a later card bound to it), with the same doc and mode.
+    pub(crate) fn find<'a>(&self, fold: &'a Fold) -> Option<&'a Card> {
+        let c = fold.card(&self.tool_id)?;
+        let same = c.id.as_ref() == Some(&self.id)
+            && c.wait == self.wait
+            && c.doc.as_ref() == Some(&*self.doc)
+            && fold.bound(&self.id).is_some_and(|b| b.tool_id == c.tool_id && b.at == c.at);
+        same.then_some(c)
+    }
+}
+
+/// What a transcript shows the memo: its fold, and on a settled history
+/// the slot's steer and whether a turn streams.
+pub(crate) fn view(t: &Transcript) -> View<'_> {
+    View { fold: t.cards(), settled: t.history_settled(), queued: t.queued_message(), streaming: t.busy() }
+}
+
+/// An answer ready to go: on attachment `seq`, a `Steer` if `busy`, else
+/// a `Submit` (as the composer's, `DESK:sd/app.rs:4640`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Outgoing {
+    pub(crate) seq: u64,
+    pub(crate) busy: bool,
+    pub(crate) card: CardId,
+    pub(crate) text: String,
+}
+
+/// Why a click on a card sends nothing: the card's line says so.
+pub(crate) const UNSETTLED: &str = "Checking the chat… try again in a moment";
+pub(crate) const COMPACTING: &str = "Compacting · answer when it's done";
+pub(crate) const CHANGED: &str = "This card changed: the chat no longer asks it so";
+pub(crate) const OUT: &str = "Its answer is on its way";
+
+/// The window's card memos, by session id.
+#[derive(Debug, Default)]
+pub(crate) struct Memos {
+    by: HashMap<String, Memo>,
+    /// Bumped whenever an entry changes: cards drawn from it are measured
+    /// again.
+    changes: u64,
+}
+
+impl Memos {
+    /// How many times an entry changed: cards drawn from one are measured
+    /// again when it moves.
+    pub(crate) fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// `session`'s entry for `card`, while it answers it (the same binding).
+    pub(crate) fn entry(&self, session: &str, card: &Card) -> Option<&Entry> {
+        let id = card.id.as_ref()?;
+        self.by.get(session)?.get(id).filter(|e| e.answers(card))
+    }
+
+    /// Whether any entry waits on the clock (sending: its echo; checking:
+    /// a settled view).
+    pub(crate) fn timed(&self) -> bool {
+        self.by.values().flat_map(Memo::entries).any(|e| matches!(e.state, State::Sending | State::Checking))
+    }
+
+    /// Run `f` on `session`'s memo, if it has one (an event for a session
+    /// with nothing out costs a lookup); note a change.
+    fn with(&mut self, session: &str, f: impl FnOnce(&mut Memo)) {
+        let Some(m) = self.by.get_mut(session) else { return };
+        let before = m.entries().to_vec();
+        f(m);
+        if m.entries() != before.as_slice() {
+            self.changes += 1;
+        }
+        if m.entries().is_empty() {
+            self.by.remove(session);
+        }
+    }
+
+    /// An event of `session`'s attachment.
+    pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
+        self.with(session, |m| m.on(ev, now));
+    }
+
+    /// `session`'s transcript as it stands: its entries follow the fold
+    /// (and, on a settled view, the settle rule).
+    pub(crate) fn observe(&mut self, session: &str, t: &Transcript, now: Instant) {
+        self.with(session, |m| m.observe(&view(t), now));
+    }
+
+    /// The clock, for every session.
+    pub(crate) fn tick(&mut self, now: Instant) {
+        let sessions: Vec<String> = self.by.keys().cloned().collect();
+        for s in sessions {
+            self.with(&s, |m| m.tick(now));
+        }
+    }
+
+    /// A press on `card` of `session` with `reply`: the text to send, or
+    /// `None` (it can't be answered, or an answer to it is out).
+    pub(crate) fn press(&mut self, session: &str, card: &Card, reply: Reply, now: Instant) -> Option<String> {
+        let m = self.by.entry(session.to_string()).or_default();
+        let text = m.press(card, reply, now);
+        if text.is_some() {
+            self.changes += 1;
+        }
+        if m.entries().is_empty() {
+            self.by.remove(session);
+        }
+        text
+    }
+
+    /// Retry `card`, not sent: the same text.
+    pub(crate) fn retry(&mut self, session: &str, card: &CardId, fold: &Fold, now: Instant) -> Option<String> {
+        let mut out: Option<String> = None;
+        self.with(session, |m| out = m.retry(card, fold, now));
+        out
+    }
+
+    /// A Resend click on `card`, checked on `t`'s view as it is now.
+    pub(crate) fn resend(&mut self, session: &str, card: &CardId, t: &Transcript, now: Instant) -> Resend {
+        let mut out = Resend::No;
+        self.with(session, |m| out = m.resend(card, &view(t), now));
+        out
+    }
+
+    /// `session`'s entry for card `card`'s id, whatever its binding (tests).
+    #[cfg(test)]
+    pub(crate) fn get_state(&self, session: &str, card: &str) -> Option<State> {
+        self.by.get(session)?.get(&CardId::parse(card)?).map(|e| e.state)
+    }
+
+    /// Whether Resend shows on `card` (with the window's `input_gate()`).
+    pub(crate) fn may_resend(&self, session: &str, card: &CardId, fold: &Fold) -> bool {
+        self.by.get(session).is_some_and(|m| m.may_resend(card, fold))
+    }
+}
+
+/// What a card in the memo says of its answer, as §3.5's table words it:
+/// the state word on its receipt line, and (unconfirmed, not sent) the
+/// cause line under it.
+pub(crate) fn words(e: &Entry) -> (&'static str, Option<String>) {
+    match e.state {
+        State::Sending => ("sending…", None),
+        State::Queued => ("queued · the agent reads it at its next step", None),
+        State::Held => ("held · it goes in after the agent's next turn", None),
+        State::Checking => ("checking…", None),
+        State::InChat => ("answered", None),
+        State::Unconfirmed => ("not confirmed", e.cause.as_ref().map(Cause::line)),
+        State::NotSent => ("not sent", e.cause.as_ref().map(Cause::line)),
+    }
+}
+
+impl crate::model::Model {
+    /// Whether store `lid` may send an agent card's answer now: its
+    /// attachment and session, or why not (the card's line).
+    fn card_gate(&self, lid: crate::live::LiveId) -> Result<(u64, String), String> {
+        let l = &self.lives[lid];
+        l.input_gate().map_err(str::to_string)?;
+        if l.transcript.compacting() {
+            return Err(COMPACTING.into());
+        }
+        let (Some(seq), Some(a)) = (l.attachment(), l.active.as_ref()) else {
+            return Err("not connected to the session: try again in a moment".into());
+        };
+        Ok((seq, a.session_id.clone()))
+    }
+
+    /// A click on the card `painted` of store `lid`, answering `reply`: the
+    /// answer to send, or why nothing goes. Checked now, on what the store
+    /// holds now, not on what was painted: the window may send, no
+    /// compaction runs, the history is settled, and the card is still the
+    /// one painted and may be answered (§3.5, "The binding").
+    pub(crate) fn press_card(
+        &mut self,
+        lid: crate::live::LiveId,
+        painted: &Painted,
+        reply: Reply,
+        now: Instant,
+    ) -> Result<Outgoing, String> {
+        let (seq, session) = self.card_gate(lid)?;
+        let t = &self.lives[lid].transcript;
+        if !t.history_settled() {
+            return Err(UNSETTLED.into());
+        }
+        let card = painted.find(t.cards()).filter(|c| c.answerable()).ok_or(CHANGED)?;
+        let busy = t.busy();
+        let text = self.memos.press(&session, card, reply, now).ok_or(OUT)?;
+        Ok(Outgoing { seq, busy, card: painted.id.clone(), text })
+    }
+
+    /// Retry the card `painted`'s answer, not sent: the same text, by the
+    /// same checks.
+    pub(crate) fn retry_card(&mut self, lid: crate::live::LiveId, painted: &Painted, now: Instant) -> Result<Outgoing, String> {
+        let (seq, session) = self.card_gate(lid)?;
+        let t = &self.lives[lid].transcript;
+        if !t.history_settled() {
+            return Err(UNSETTLED.into());
+        }
+        painted.find(t.cards()).ok_or(CHANGED)?;
+        let busy = t.busy();
+        let text = self.memos.retry(&session, &painted.id, t.cards(), now).ok_or(CHANGED)?;
+        Ok(Outgoing { seq, busy, card: painted.id.clone(), text })
+    }
+
+    /// A Resend click on the card `painted` (§3.5, "Resend"): the settle
+    /// rules on the view as it is now, then the gate again. Unsettled, the
+    /// card checks and nothing is sent.
+    pub(crate) fn resend_card(&mut self, lid: crate::live::LiveId, painted: &Painted, now: Instant) -> Result<Outgoing, String> {
+        let (seq, session) = self.card_gate(lid)?;
+        let t = &self.lives[lid].transcript;
+        if painted.find(t.cards()).is_none() {
+            return Err(CHANGED.into());
+        }
+        let busy = t.busy();
+        match self.memos.resend(&session, &painted.id, t, now) {
+            Resend::Send(text) => Ok(Outgoing { seq, busy, card: painted.id.clone(), text }),
+            Resend::Checking => Err(UNSETTLED.into()),
+            Resend::No => Err(CHANGED.into()),
+        }
+    }
+
+    /// `out` went to the daemon from store `lid`: its echo or refusal is
+    /// its card's.
+    pub(crate) fn card_sent(&mut self, lid: crate::live::LiveId, out: Outgoing) {
+        self.lives[lid].card_sent(out.card, out.text);
+    }
+
+    /// `out` could not be handed to the connection (its thread stopped):
+    /// not sent.
+    pub(crate) fn card_unsent(&mut self, lid: crate::live::LiveId, reason: &str) {
+        if let Some(s) = self.lives[lid].active.as_ref().map(|a| a.session_id.clone()) {
+            self.memos.on(&s, Heard::Refused { reason }, Instant::now());
+        }
+    }
+
+    /// The card memos' clock: then each attached session's view, so an
+    /// entry the clock moved to checking settles on it at once.
+    pub(crate) fn tick_cards(&mut self, now: Instant) {
+        self.memos.tick(now);
+        for id in self.lives.ids() {
+            let l = &self.lives[id];
+            if let Some(a) = l.active.as_ref() {
+                self.memos.observe(&a.session_id, &l.transcript, now);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "deliver_tests.rs"]
+mod tests;

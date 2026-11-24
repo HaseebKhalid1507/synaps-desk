@@ -13,7 +13,7 @@
 //! swapped exactly as before.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -133,6 +133,10 @@ pub struct Pane {
     /// summary, each on its own spring ([`FoldGap`], [`AppView::fold_gap_now`];
     /// a second fold never cuts the first: Shady #23 r3 M2).
     pub(crate) fold_gap: RefCell<Vec<FoldGap>>,
+    /// When each agent card row was first drawn in this pane: its
+    /// controls act [`crate::app::ARM`] after (synaps-cards §6.1: "a click
+    /// acts only once the button is armed").
+    pub(crate) ask_shown: RefCell<HashMap<u64, std::time::Instant>>,
     /// A body the user opened or closed (S1) ([`BodyHold`]).
     pub(crate) body_hold: Cell<Option<BodyHold>>,
     /// The user's scroll while an answered card folds: the room it leaves
@@ -460,6 +464,7 @@ impl Pane {
             list_gen: 0,
             fold_slack: Rc::new(Cell::new(None)),
             fold_gap: RefCell::new(Vec::new()),
+            ask_shown: RefCell::new(HashMap::new()),
             body_hold: Cell::new(None),
             touch_kept: Cell::new(false),
             metrics_gen: 0,

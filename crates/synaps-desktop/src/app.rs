@@ -2313,6 +2313,21 @@ pub struct AppView {
     /// HALTs sent ([`AppView::halt`]): the UI tests' record.
     #[cfg(test)]
     pub(crate) halts: usize,
+    /// Agent cards' answers handed to the client ([`AppView::send_card`]):
+    /// the UI tests' record of each `Submit` or `Steer`, its attachment and
+    /// its text.
+    #[cfg(test)]
+    pub(crate) card_sends: Vec<crate::deliver::Outgoing>,
+    /// The agent cards' answers being made, by session and call
+    /// ([`crate::answer::Draft`]).
+    pub(crate) card_drafts: HashMap<(String, String), crate::answer::Draft>,
+    /// Receipts opened to show the whole answer, by session and call.
+    pub(crate) card_open: HashSet<(String, String)>,
+    /// The card memos' clock, while an answer waits on it
+    /// ([`AppView::arm_card_tick`]).
+    pub(crate) card_tick: Option<Task<()>>,
+    /// The memos' change count the cards were last measured at.
+    pub(crate) memo_seen: u64,
 
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -2889,6 +2904,12 @@ impl AppView {
             submits: Vec::new(),
             #[cfg(test)]
             halts: 0,
+            #[cfg(test)]
+            card_sends: Vec::new(),
+            card_drafts: HashMap::new(),
+            card_open: HashSet::new(),
+            card_tick: None,
+            memo_seen: 0,
 
             _tasks: Vec::new(),
             _subs: subs,
@@ -2946,6 +2967,11 @@ impl AppView {
         self.dash_on_welcome(cx);
         // A worker's page came: its next poll, drawn or not.
         self.arm_watch_poll(cx);
+        // An agent card's answer moved (sent, echoed, settled): its card
+        // is measured and drawn again; the memos' clock runs while one
+        // waits on it.
+        self.cards_moved(cx);
+        self.arm_card_tick(cx);
         // An idle daemon's poll changes nothing: no frame, unless
         // the rail's ages have a new minute to show.
         if self.model.view_dirty || self.rail.minute() != crate::chrome::now_secs() / 60 {

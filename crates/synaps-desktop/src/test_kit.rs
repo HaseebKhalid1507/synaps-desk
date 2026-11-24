@@ -10,6 +10,8 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext,
 
 use crate::app::AppView;
 
+#[path = "answer_tests.rs"]
+mod answer_tests;
 #[path = "ask_tests.rs"]
 mod ask_tests;
 #[path = "cards_d_tests.rs"]

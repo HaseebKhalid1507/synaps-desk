@@ -28,6 +28,8 @@
 //! static row: no frame is asked for, at rest or otherwise.
 
 use cards_spec::Lines;
+use cards_spec::memo::State as MemoState;
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -35,8 +37,10 @@ use synaps_client::cards::{Answer, Ask, CardDoc, CardRow, Choice, DefaultChoice,
 use synaps_client::transcript::{Item, ItemKind};
 
 use crate::app::{AppView, display};
+use crate::deliver::Painted;
 use crate::fonts::{self, TextPx as _};
 use crate::glyph::{self, Glyph};
+use crate::pane::PaneId;
 use crate::theme::{Metrics, Palette};
 
 /// A `cards_ui` call that draws a card ([`crate::turns::Kind::Ask`]).
@@ -178,251 +182,634 @@ fn receipt_mark(a: &Ask, p: &Palette) -> (Glyph, Hsla) {
     }
 }
 
-/// The card, open (or asking): head, question, detail, options, fields,
-/// footer.
-pub(crate) fn card(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
-    let doc = &a.doc;
-    let r = m.r;
-    let open = a.state == State::Open;
-    let word = state_word(a);
-    let mark: AnyElement = if a.wait && open {
-        div().debug_selector(move || format!("ask-needs {id}")).child(glyph::draw(Glyph::Needs, p.acc)).into_any_element()
-    } else {
-        div().size(px(6.)).rounded(px(3.)).bg(if open { p.acc } else { p.dim_t }).into_any_element()
-    };
-    let (head_word, word_color) = if a.wait && open { (fonts::label::NEEDS_YOU, p.acc) } else { (fonts::label::QUESTION, p.dim_t) };
-    let head = h_flex()
-        .h(px(head_h(m)))
-        .gap(px(8.))
+/// What an open card's controls may do now ([`AppView::render_ask`]):
+/// `None` on a card drawn read-only (asking, in a worker's view, no
+/// session attached).
+pub(crate) struct Act {
+    /// The card as painted: what a click names ([`crate::deliver`]).
+    pub(crate) painted: Painted,
+    /// The pane it is drawn in: its listeners act there.
+    pub(crate) pane: PaneId,
+    /// Its controls act: the window may send, and no compaction runs. The
+    /// arm and the binding are checked on the click.
+    pub(crate) can: bool,
+    /// The footer's line, instead of how to answer: why the controls don't
+    /// act, or what the last click met.
+    pub(crate) line: Option<String>,
+}
+
+/// How to answer an open card by mouse, its footer's line.
+pub(crate) fn how_click(doc: &CardDoc) -> &'static str {
+    match (doc.mode(), doc.multi, doc.options.is_empty()) {
+        (Mode::Quick, _, _) => "Click one, or reply in your own words",
+        (Mode::Form, true, false) => "Pick any, then Send, or reply in your own words",
+        (Mode::Form, _, _) => "Fill it in and Send, or reply in your own words",
+    }
+}
+
+/// The card's buttons, square and outline-free: a ghost on the card (Skip,
+/// Retry) or the accent's fill (Send, Resend). Hovered a step on, pressed
+/// down [`crate::motion::PRESS`]; disabled, flat and dim.
+fn button(name: &'static str, row: u64, text: &'static str, fill: bool, enabled: bool, p: &Palette, m: &Metrics) -> Stateful<Div> {
+    let (bg, hi, press, fg) = if fill { (p.btn_fill, p.btn_hi, p.btn_press, p.acc_ink) } else { (p.card_d, p.hover, p.hover, p.ink) };
+    let (bg, fg) = if enabled { (bg, fg) } else { (if fill { p.well_d } else { p.card_d }, p.dim_k) };
+    h_flex()
+        .id((name, row))
+        .relative()
+        .flex_none()
+        .h(px(crate::fit::button_h(m)))
+        .px(px(14.))
         .items_center()
-        .child(div().flex_none().size(px(Glyph::Needs.size())).flex().items_center().justify_center().child(mark))
-        .child(display(head_word, fonts::size::D_S, word_color).debug_selector(move || format!("ask-word {id}")))
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex_none()
-                .font_family(fonts::SANS)
-                .text_px(m.meta)
-                .line_height(line(m.meta))
-                .text_color(if a.wait && open { p.acc } else { p.dim_t })
-                .whitespace_nowrap()
-                .debug_selector(move || format!("ask-state {id} {word}"))
-                .child(word),
-        );
-    let question = div()
-        .mt(px((6. * r).round()))
-        .font_family(fonts::SANS)
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_px(m.card_lead)
-        .line_height(px(m.card_lead_line))
-        .text_color(p.ink)
-        .debug_selector(move || format!("ask-question {id}"))
-        .child(shown(&doc.question, Lines::Single));
-    let detail = doc.detail.as_ref().map(|d| {
-        let d = shown(d, Lines::Multi);
-        v_flex()
-            .mt(px((4. * r).round()))
-            .font_family(fonts::SANS)
-            .text_px(m.label)
-            .line_height(line(m.label))
-            .text_color(p.prose_t)
-            .debug_selector(move || format!("ask-detail {id}"))
-            .children(d.split('\n').map(|l| div().min_h(line(m.label)).child(l.to_string())))
-    });
-    let key = (20. * r).round();
-    let options = (!doc.options.is_empty()).then(|| {
-        v_flex().mt(px((10. * r).round())).gap(px((2. * r).round())).children(doc.options.iter().enumerate().map(|(i, o)| {
-            let n = i + 1;
-            let hint = o.hint.as_ref().map(|h| {
+        .bg(bg)
+        .when(enabled, |d| d.cursor_pointer().hover(move |d| d.bg(hi)).active(move |s| s.bg(press).top(px(crate::motion::PRESS))))
+        .child(div().font_family(fonts::SANS).font_weight(FontWeight::SEMIBOLD).text_px(m.label).text_color(fg).child(text))
+        .debug_selector(move || format!("{name} {row}{}", if enabled { "" } else { " off" }))
+}
+
+/// A text field's well, for a static value or an input in it.
+fn well(m: &Metrics, p: &Palette, long: bool) -> Div {
+    let r = m.r;
+    div()
+        .w_full()
+        .min_h(px((28. * r).round()))
+        .px(px((8. * r).round()))
+        .py(px((4. * r).round()))
+        .bg(p.well_d)
+        .font_family(fonts::MONO)
+        .text_px(m.mono)
+        .line_height(px(m.mono_line))
+        .when(long, |d| d.min_h(px(3. * m.mono_line + (8. * r).round())))
+}
+
+impl AppView {
+    /// The card, open (or asking): head, question, detail, options, fields,
+    /// footer. With `act`, its controls answer it: an option click (a quick
+    /// card's answer, a form's pick), a check, a field to type in, Skip and
+    /// Send ([`crate::answer`]).
+    fn card(&self, a: &Ask, id: u64, p: &Palette, m: &Metrics, act: Option<&Act>, cx: &mut Context<Self>) -> Div {
+        let doc = &a.doc;
+        let r = m.r;
+        let open = a.state == State::Open;
+        let word = state_word(a);
+        let draft = act.and_then(|_| self.card_session()).and_then(|s| self.card_drafts.get(&(s, a.tool_id.clone())));
+        // What is picked: the draft's, or a form's default before any click.
+        let picks: Vec<String> = match (act, draft) {
+            (Some(_), Some(d)) => d.picked.clone(),
+            (Some(_), None) => crate::answer::default_picks(doc),
+            (None, _) => Vec::new(),
+        };
+        let can = act.is_some_and(|x| x.can);
+        let mark: AnyElement = if a.wait && open {
+            div().debug_selector(move || format!("ask-needs {id}")).child(glyph::draw(Glyph::Needs, p.acc)).into_any_element()
+        } else {
+            div().size(px(6.)).rounded(px(3.)).bg(if open { p.acc } else { p.dim_t }).into_any_element()
+        };
+        let (head_word, word_color) = if a.wait && open { (fonts::label::NEEDS_YOU, p.acc) } else { (fonts::label::QUESTION, p.dim_t) };
+        let head = h_flex()
+            .h(px(head_h(m)))
+            .gap(px(8.))
+            .items_center()
+            .child(div().flex_none().size(px(Glyph::Needs.size())).flex().items_center().justify_center().child(mark))
+            .child(display(head_word, fonts::size::D_S, word_color).debug_selector(move || format!("ask-word {id}")))
+            .child(div().flex_1())
+            .child(
                 div()
-                    .min_w_0()
-                    .flex_shrink(1.)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
+                    .flex_none()
+                    .font_family(fonts::SANS)
                     .text_px(m.meta)
-                    .text_color(p.dim_t)
-                    .child(shown(h, Lines::Single))
-            });
-            let note = o.note.as_ref().map(|_| div().flex_none().text_px(m.meta).text_color(p.dim_t).child("+ a note"));
-            h_flex()
-                .min_h(px((30. * r).round()))
-                .gap(px((10. * r).round()))
-                .items_center()
+                    .line_height(line(m.meta))
+                    .text_color(if a.wait && open { p.acc } else { p.dim_t })
+                    .whitespace_nowrap()
+                    .debug_selector(move || format!("ask-state {id} {word}"))
+                    .child(word),
+            );
+        let question = div()
+            .mt(px((6. * r).round()))
+            .font_family(fonts::SANS)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_px(m.card_lead)
+            .line_height(px(m.card_lead_line))
+            .text_color(p.ink)
+            .debug_selector(move || format!("ask-question {id}"))
+            .child(shown(&doc.question, Lines::Single));
+        let detail = doc.detail.as_ref().map(|d| {
+            let d = shown(d, Lines::Multi);
+            v_flex()
+                .mt(px((4. * r).round()))
                 .font_family(fonts::SANS)
-                .debug_selector(move || format!("ask-option {id} {n}"))
-                .child(
+                .text_px(m.label)
+                .line_height(line(m.label))
+                .text_color(p.prose_t)
+                .debug_selector(move || format!("ask-detail {id}"))
+                .children(d.split('\n').map(|l| div().min_h(line(m.label)).child(l.to_string())))
+        });
+        let key = (20. * r).round();
+        let pad = (6. * r).round();
+        let form = doc.mode() == Mode::Form;
+        let options = (!doc.options.is_empty()).then(|| {
+            v_flex().mt(px((10. * r).round())).gap(px((2. * r).round())).children(doc.options.iter().enumerate().map(|(i, o)| {
+                let n = i + 1;
+                let picked = picks.contains(&o.label);
+                let hint = o.hint.as_ref().map(|h| {
                     div()
-                        .flex_none()
-                        .size(px(key))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(p.well_d)
-                        .font_family(fonts::MONO)
-                        .text_px(m.meta)
-                        .text_color(p.dim_t)
-                        .child(n.to_string()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w(px((360. * r).round()))
+                        .min_w_0()
+                        .flex_shrink(1.)
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_px(m.card_title)
-                        .text_color(p.prose_t)
-                        .child(shown(&o.label, Lines::Single)),
-                )
-                .children(hint)
-                .children(note)
-                .child(div().flex_1())
-                .when(suggested(doc, &o.label), |d| {
-                    d.child(
+                        .text_px(m.meta)
+                        .text_color(p.dim_t)
+                        .child(shown(h, Lines::Single))
+                });
+                let note = o.note.as_ref().map(|_| div().flex_none().text_px(m.meta).text_color(p.dim_t).child("+ a note"));
+                let (cap_bg, cap_fg) = if picked { (p.acc, p.acc_ink) } else { (p.well_d, p.dim_t) };
+                let row = h_flex()
+                    .id(("ask-option", id * 64 + n as u64))
+                    .relative()
+                    .min_h(px((30. * r).round()))
+                    .mx(px(-pad))
+                    .px(px(pad))
+                    .gap(px((10. * r).round()))
+                    .items_center()
+                    .font_family(fonts::SANS)
+                    .debug_selector(move || format!("ask-option {id} {n}"))
+                    .child(
                         div()
                             .flex_none()
+                            .size(px(key))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(cap_bg)
+                            .font_family(fonts::MONO)
                             .text_px(m.meta)
-                            .text_color(p.acc)
-                            .debug_selector(move || format!("ask-suggested {id} {n}"))
-                            .child("suggested"),
+                            .text_color(cap_fg)
+                            .when(picked, |d| d.debug_selector(move || format!("ask-picked {id} {n}")))
+                            .child(n.to_string()),
                     )
-                })
-        }))
-    });
-    let fields = (!doc.fields.is_empty()).then(|| {
-        v_flex().mt(px((10. * r).round())).gap(px((8. * r).round())).children(doc.fields.iter().map(|f| {
-            let fid = f.id.clone();
-            let value: AnyElement = match (&f.kind, &f.value) {
-                (FieldKind::Check, v) => {
-                    let on = *v == FieldValue::Check(true);
-                    h_flex()
-                        .gap(px(8.))
-                        .items_center()
-                        .child(
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px((360. * r).round()))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_px(m.card_title)
+                            .text_color(if picked { p.ink } else { p.prose_t })
+                            .child(shown(&o.label, Lines::Single)),
+                    )
+                    .children(hint)
+                    .children(note)
+                    .child(div().flex_1())
+                    .when(suggested(doc, &o.label), |d| {
+                        d.child(
                             div()
                                 .flex_none()
-                                .size(px(12.))
-                                .border_1()
-                                .border_color(p.dim_t)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(on, |d| d.child(div().size(px(6.)).bg(p.acc))),
+                                .text_px(m.meta)
+                                .text_color(p.acc)
+                                .debug_selector(move || format!("ask-suggested {id} {n}"))
+                                .child("suggested"),
                         )
-                        .child(div().text_px(m.card_title).text_color(p.prose_t).child(shown(&f.label, Lines::Single)))
-                        .into_any_element()
-                }
-                (_, FieldValue::Text(t)) => {
-                    let (text, color) = match (t.is_empty(), &f.placeholder) {
-                        (false, _) => (shown(t, f.kind.lines()), p.ink),
-                        (true, Some(ph)) => (shown(ph, Lines::Single), p.dim_t),
-                        (true, None) => (String::new(), p.dim_t),
-                    };
-                    v_flex()
-                        .gap(px((4. * r).round()))
-                        .child(div().text_px(m.meta).text_color(p.dim_t).child(shown(&f.label, Lines::Single)))
-                        .child(
-                            div()
-                                .w_full()
-                                .min_h(px((28. * r).round()))
-                                .px(px((8. * r).round()))
-                                .py(px((4. * r).round()))
-                                .bg(p.well_d)
-                                .font_family(fonts::MONO)
-                                .text_px(m.mono)
-                                .line_height(px(m.mono_line))
-                                .text_color(color)
-                                .when(f.kind == FieldKind::Long, |d| d.min_h(px(3. * m.mono_line + (8. * r).round())))
-                                .children(text.split('\n').map(|l| div().min_h(px(m.mono_line)).child(l.to_string()))),
-                        )
-                        .into_any_element()
-                }
-                (_, FieldValue::Check(_)) => div().into_any_element(),
-            };
-            div().font_family(fonts::SANS).debug_selector(move || format!("ask-field {id} {fid}")).child(value)
-        }))
-    });
-    let foot = (a.state != State::Pending).then(|| how(doc));
-    let foot = foot.map(|f| {
-        div()
-            .mt(px((10. * r).round()))
-            .font_family(fonts::SANS)
-            .text_px(m.meta)
-            .line_height(line(m.meta))
-            .text_color(p.dim_t)
-            .debug_selector(move || format!("ask-footer {id}"))
-            .child(f)
-    });
+                    });
+                let row = match act.filter(|_| can) {
+                    Some(x) => {
+                        let (pane, painted, label) = (x.pane, x.painted.clone(), o.label.clone());
+                        row.cursor_pointer()
+                            .hover(|d| d.bg(p.hover))
+                            // Pressed: the accent's soft fill, down a pixel.
+                            .active(|s| s.bg(p.acc_soft).top(px(crate::motion::PRESS)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.in_pane(pane, |this| this.ask_pick(id, &painted, &label, window, cx));
+                            }))
+                    }
+                    None => row,
+                };
+                // A picked option that asks for a note: its field, under it.
+                let note_field = draft.filter(|_| picked && o.note.is_some() && !doc.multi).and_then(|d| d.note.as_ref()).map(|e| {
+                    div().pl(px(key + (10. * r).round())).pb(px((4. * r).round())).debug_selector(move || format!("ask-note {id}")).child(
+                        well(m, p, false)
+                            .child(Input::new(e).appearance(false).text_px(m.mono).line_height(px(m.mono_line)).text_color(p.ink)),
+                    )
+                });
+                v_flex().child(row).children(note_field)
+            }))
+        });
+        let fields = (!doc.fields.is_empty()).then(|| {
+            v_flex().mt(px((10. * r).round())).gap(px((8. * r).round())).children(doc.fields.iter().map(|f| {
+                let fid = f.id.clone();
+                let listen = act.filter(|_| can).map(|x| {
+                    let (pane, painted, fid) = (x.pane, x.painted.clone(), f.id.clone());
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.in_pane(pane, |this| this.ask_field(id, &painted, &fid, window, cx));
+                    })
+                });
+                let value = draft.and_then(|d| d.value(doc, &f.id, cx)).unwrap_or_else(|| f.value.clone());
+                let value: AnyElement = match (&f.kind, &value) {
+                    (FieldKind::Check, v) => {
+                        let on = *v == FieldValue::Check(true);
+                        let row = h_flex()
+                            .id(("ask-check", id * 64 + f.id.len() as u64))
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(12.))
+                                    .bg(p.well_d)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(on, |d| d.child(div().size(px(6.)).bg(p.acc))),
+                            )
+                            .child(div().text_px(m.card_title).text_color(p.prose_t).child(shown(&f.label, Lines::Single)));
+                        match listen {
+                            Some(l) => row.cursor_pointer().on_click(l).into_any_element(),
+                            None => row.into_any_element(),
+                        }
+                    }
+                    (_, FieldValue::Text(t)) => {
+                        let long = f.kind == FieldKind::Long;
+                        let input: Option<AnyElement> = draft.and_then(|d| {
+                            if long {
+                                d.longs.get(&f.id).map(|e| {
+                                    Textarea::new(e)
+                                        .appearance(false)
+                                        .text_px(m.mono)
+                                        .line_height(px(m.mono_line))
+                                        .text_color(p.ink)
+                                        .into_any_element()
+                                })
+                            } else {
+                                d.lines.get(&f.id).map(|e| {
+                                    Input::new(e)
+                                        .appearance(false)
+                                        .text_px(m.mono)
+                                        .line_height(px(m.mono_line))
+                                        .text_color(p.ink)
+                                        .into_any_element()
+                                })
+                            }
+                        });
+                        let field = match input {
+                            Some(input) => well(m, p, false).child(input).into_any_element(),
+                            None => {
+                                let (text, color) = match (t.is_empty(), &f.placeholder) {
+                                    (false, _) => (shown(t, f.kind.lines()), p.ink),
+                                    (true, Some(ph)) => (shown(ph, Lines::Single), p.dim_t),
+                                    (true, None) => (String::new(), p.dim_t),
+                                };
+                                let w = well(m, p, long)
+                                    .id(("ask-text", id * 64 + f.id.len() as u64))
+                                    .text_color(color)
+                                    .children(text.split('\n').map(|l| div().min_h(px(m.mono_line)).child(l.to_string())));
+                                match listen {
+                                    Some(l) => w.cursor_text().hover(|d| d.bg(p.hover)).on_click(l).into_any_element(),
+                                    None => w.into_any_element(),
+                                }
+                            }
+                        };
+                        v_flex()
+                            .gap(px((4. * r).round()))
+                            .child(div().text_px(m.meta).text_color(p.dim_t).child(shown(&f.label, Lines::Single)))
+                            .child(field)
+                            .into_any_element()
+                    }
+                    (_, FieldValue::Check(_)) => div().into_any_element(),
+                };
+                div().font_family(fonts::SANS).debug_selector(move || format!("ask-field {id} {fid}")).child(value)
+            }))
+        });
+        // Send, where a click alone isn't the answer: a form, or a quick
+        // card's option that asks for a note, picked.
+        let sends = form || draft.is_some_and(|d| d.picked.iter().any(|l| doc.option(l).is_some_and(|o| o.note.is_some())));
+        let reply = act.map(|_| match draft {
+            Some(d) => d.reply(doc, cx),
+            None => crate::answer::Draft::new(doc).reply(doc, cx),
+        });
+        let ready = reply.as_ref().is_some_and(Result::is_ok);
+        let (text, warn) = match act {
+            None => (how(doc).to_string(), false),
+            Some(x) => match (&x.line, sends, &reply) {
+                (Some(l), _, _) => (l.clone(), true),
+                (None, true, Some(Err(needs))) if draft.is_some() => (needs.clone(), false),
+                _ => (how_click(doc).to_string(), false),
+            },
+        };
+        let foot = (a.state != State::Pending).then(|| {
+            let buttons = act.map(|x| {
+                let skip = {
+                    let (pane, painted) = (x.pane, x.painted.clone());
+                    button("ask-skip", id, "Skip", false, can, p, m).when(can, |b| {
+                        b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(pane, |this| this.ask_skip(id, &painted, cx));
+                        }))
+                    })
+                };
+                let send = sends.then(|| {
+                    let (pane, painted) = (x.pane, x.painted.clone());
+                    button("ask-send", id, "Send", true, can && ready, p, m).when(can && ready, |b| {
+                        b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(pane, |this| this.ask_submit(id, &painted, cx));
+                        }))
+                    })
+                });
+                h_flex().flex_none().gap(px(8.)).child(skip).children(send)
+            });
+            h_flex()
+                .mt(px((10. * r).round()))
+                .gap(px(12.))
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .line_height(line(m.meta))
+                        .text_color(if warn { p.prose_t } else { p.dim_t })
+                        .debug_selector(move || format!("ask-footer {id}"))
+                        .child(text),
+                )
+                .children(buttons)
+        });
+        v_flex()
+            .w_full()
+            .bg(p.card_d)
+            .px(px(pad_x(m)))
+            .pt(px(pad_y(m)))
+            .pb(px(pad_y(m)))
+            .debug_selector(move || format!("ask-card {id}"))
+            .child(head)
+            .child(question)
+            .children(detail)
+            .children(options)
+            .children(fields)
+            .children(foot)
+    }
+}
+
+/// What an answer says, whole: each pick, the note, then each field's
+/// `Label: value`, a value's own lines kept ([`shown`], §5.2). A receipt
+/// opened shows these.
+pub(crate) fn parts(doc: &CardDoc, reply: &Reply) -> Vec<String> {
+    let a: &Answer = match reply {
+        Reply::Answer(a) | Reply::Change(a) => a,
+        Reply::Skip => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    match &a.choice {
+        Some(Choice::One(l)) => out.push(shown(l, Lines::Single)),
+        Some(Choice::Many(ls)) if ls.is_empty() => out.push("(none)".into()),
+        Some(Choice::Many(ls)) => out.push(shown(&ls.join(", "), Lines::Single)),
+        None => {}
+    }
+    if let (Some(note), Some(Choice::One(l))) = (&a.note, &a.choice) {
+        let prompt = doc.option(l).and_then(|o| o.note.as_deref()).unwrap_or("Note");
+        out.push(format!("{}: {}", shown(prompt, Lines::Single), shown(note, Lines::Single)));
+    }
+    for (id, v) in a.fields.iter().flatten() {
+        let f = doc.field(id);
+        let label = f.map_or(id.as_str(), |f| f.label.as_str());
+        let value = match v {
+            FieldValue::Check(true) => "yes".to_string(),
+            FieldValue::Check(false) => "no".to_string(),
+            FieldValue::Text(t) if t.is_empty() => "—".to_string(),
+            FieldValue::Text(t) => shown(t, f.map_or(Lines::Single, |f| f.kind.lines())),
+        };
+        out.push(format!("{}: {value}", shown(label, Lines::Single)));
+    }
+    out
+}
+
+/// The card's receipt: its head line, the question → the answer, the state
+/// word at its end. `word` and `tone`: the state as the memo says it while
+/// an answer of this desk's is on its way (else the fold's). `open`: the
+/// whole answer under it, a line each ([`parts`]).
+pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &Palette, m: &Metrics) -> Div {
+    let (mark, mark_color) = match look.tone {
+        Tone::Fold => receipt_mark(a, p),
+        Tone::Out => (Glyph::Needs, p.acc),
+        Tone::Lost => (Glyph::Needs, p.warn),
+    };
+    let word = look.word.unwrap_or_else(|| state_word(a));
+    let said = reply.and_then(|r| summary(&a.doc, r));
+    let has_said = said.is_some();
+    let whole: Vec<String> = if look.open { reply.map(|r| parts(&a.doc, r)).unwrap_or_default() } else { Vec::new() };
+    let word_color = match look.tone {
+        Tone::Fold => p.dim_t,
+        Tone::Out => p.acc,
+        Tone::Lost => p.warn,
+    };
     v_flex()
         .w_full()
         .bg(p.card_d)
         .px(px(pad_x(m)))
-        .pt(px(pad_y(m)))
-        .pb(px(pad_y(m)))
-        .debug_selector(move || format!("ask-card {id}"))
-        .child(head)
-        .child(question)
-        .children(detail)
-        .children(options)
-        .children(fields)
-        .children(foot)
-}
-
-/// The card's receipt: its head line, the question → the answer, the state
-/// word at its end.
-pub(crate) fn receipt(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
-    let (mark, mark_color) = receipt_mark(a, p);
-    let word = state_word(a);
-    let said = a.reply.as_ref().and_then(|r| summary(&a.doc, r));
-    let has_said = said.is_some();
-    h_flex().w_full().bg(p.card_d).px(px(pad_x(m))).py(px(pad_y(m))).debug_selector(move || format!("ask-receipt {id}")).child(
-        h_flex()
-            .w_full()
-            .h(px(head_h(m)))
-            .gap(px(8.))
-            .items_center()
-            .font_family(fonts::SANS)
-            .text_px(m.card_title)
-            .whitespace_nowrap()
-            .child(
-                div().flex_none().size(px(Glyph::Needs.size())).flex().items_center().justify_center().child(glyph::draw(mark, mark_color)),
-            )
-            // The question reads first: the answer gives way to it, down
-            // to half the line.
-            .child(
-                div()
-                    .map(|d| question_box(d, has_said))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_color(p.prose_t)
-                    .debug_selector(move || format!("ask-question {id}"))
-                    .child(shown(&a.doc.question, Lines::Single)),
-            )
-            .children(said.map(|s| {
-                h_flex().min_w_0().flex_shrink(1.).gap(px(8.)).child(div().flex_none().text_color(p.dim_t).child("→")).child(
+        .py(px(pad_y(m)))
+        .debug_selector(move || format!("ask-receipt {id}"))
+        .child(
+            h_flex()
+                .w_full()
+                .h(px(head_h(m)))
+                .gap(px(8.))
+                .items_center()
+                .font_family(fonts::SANS)
+                .text_px(m.card_title)
+                .whitespace_nowrap()
+                .child(
                     div()
-                        .min_w_0()
+                        .flex_none()
+                        .size(px(Glyph::Needs.size()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(glyph::draw(mark, mark_color)),
+                )
+                // The question reads first: the answer gives way to it, down
+                // to half the line.
+                .child(
+                    div()
+                        .map(|d| question_box(d, has_said))
                         .overflow_hidden()
                         .text_ellipsis()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(p.ink)
-                        .debug_selector(move || format!("ask-said {id}"))
-                        .child(s),
+                        .text_color(p.prose_t)
+                        .debug_selector(move || format!("ask-question {id}"))
+                        .child(shown(&a.doc.question, Lines::Single)),
                 )
-            }))
-            .child(div().flex_1().min_w(px(12.)))
-            .child(
-                div().flex_none().text_px(m.meta).text_color(p.dim_t).debug_selector(move || format!("ask-state {id} {word}")).child(word),
-            ),
-    )
+                .children(said.filter(|_| !look.open).map(|s| {
+                    h_flex().min_w_0().flex_shrink(1.).gap(px(8.)).child(div().flex_none().text_color(p.dim_t).child("→")).child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.ink)
+                            .debug_selector(move || format!("ask-said {id}"))
+                            .child(s),
+                    )
+                }))
+                .child(div().flex_1().min_w(px(12.)))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_px(m.meta)
+                        .text_color(word_color)
+                        .debug_selector(move || format!("ask-state {id} {word}"))
+                        .child(word),
+                ),
+        )
+        .when(!whole.is_empty(), |d| {
+            d.child(
+                v_flex()
+                    .pl(px(Glyph::Needs.size() + 8.))
+                    .pt(px((4. * m.r).round()))
+                    .gap(px((2. * m.r).round()))
+                    .font_family(fonts::SANS)
+                    .text_px(m.label)
+                    .line_height(line(m.label))
+                    .text_color(p.ink)
+                    .debug_selector(move || format!("ask-whole {id}"))
+                    .children(whole.into_iter().map(|l| {
+                        div().w_full().whitespace_normal().children(l.split('\n').map(|s| div().min_h(line(m.label)).child(s.to_string())))
+                    })),
+            )
+        })
+}
+
+/// The line of a card this window can't answer, from the input gate's
+/// reason (`Live::input_gate`): an exclusive session's other clients are
+/// told whose it is, and how to take it (§3.2).
+fn read_only(gate: &str, l: &crate::live::Live) -> String {
+    if let Some(a) = l.active.as_ref()
+        && a.input == synaps_client::ClientInput::Exclusive
+        && a.mode != synaps_client::AttachMode::Observe
+        && let Some(owner) = a.owner.filter(|o| *o != a.client)
+    {
+        return format!("Answer from client #{owner}, which owns this session's input · /takeover to answer here");
+    }
+    let mut c = gate.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// How a receipt reads: the fold's state, or an answer of this desk's on
+/// its way (the memo's, [`crate::deliver::words`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Look {
+    pub(crate) word: Option<&'static str>,
+    pub(crate) tone: Tone,
+    /// The whole answer shown under it.
+    pub(crate) open: bool,
+}
+
+/// A receipt's tone: the fold's, on its way (the accent), or not
+/// confirmed / not sent (the warning).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Tone {
+    #[default]
+    Fold,
+    Out,
+    Lost,
 }
 
 impl AppView {
-    /// A card's row ([`crate::turns::Kind::Ask`]).
-    pub(crate) fn render_ask(&self, item: &Item, id: u64, p: &Palette, m: &Metrics) -> AnyElement {
+    /// A card's row ([`crate::turns::Kind::Ask`]): the card while it is
+    /// open; once this desk answered it, its receipt with where the answer
+    /// is (§3.5's table) and, unconfirmed or not sent, the cause and
+    /// Resend or Retry; else the fold's receipt, which a click opens.
+    pub(crate) fn render_ask(&self, item: &Item, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
         let Some(CardRow::Ask(a)) = item.card.as_deref() else { return div().into_any_element() };
-        if whole(a) { card(a, id, p, m).into_any_element() } else { receipt(a, id, p, m).into_any_element() }
+        // First drawn here: its controls arm from now.
+        self.panes.cur.ask_shown.borrow_mut().entry(id).or_insert_with(crate::app::arm_now);
+        let pane = self.panes.cur.id;
+        let session = self.card_session();
+        let l = &self.model.lives[self.panes.cur.live];
+        let fold = session.as_ref().and_then(|_| l.transcript.cards().card(&a.tool_id)).filter(|c| c.id == a.id);
+        let entry = session.as_deref().zip(fold).and_then(|(s, c)| self.model.memos.entry(s, c));
+        let open = session.as_ref().is_some_and(|s| self.card_open.contains(&(s.clone(), a.tool_id.clone())));
+        let said = session.as_ref().and_then(|s| self.card_drafts.get(&(s.clone(), a.tool_id.clone()))).and_then(|d| d.said.clone());
+        // An answer of this desk's on its way, or not confirmed.
+        if let Some(e) = entry.filter(|e| e.state != MemoState::InChat || whole(a)) {
+            let (word, cause) = crate::deliver::words(e);
+            let lost = matches!(e.state, MemoState::Unconfirmed | MemoState::NotSent);
+            let look = Look {
+                word: Some(word),
+                tone: if lost {
+                    Tone::Lost
+                } else if e.state == MemoState::InChat {
+                    Tone::Fold
+                } else {
+                    Tone::Out
+                },
+                open,
+            };
+            let mut out = receipt(a, Some(&e.reply), look, id, p, m);
+            if lost && let Some(painted) = Painted::of(a) {
+                let gate = l.input_gate().err().map(str::to_string);
+                let resend = e.state == MemoState::Unconfirmed;
+                let can = gate.is_none()
+                    && fold.is_some_and(|c| {
+                        if resend {
+                            session.as_deref().is_some_and(|s| self.model.memos.may_resend(s, &painted.id, l.transcript.cards()))
+                        } else {
+                            c.answerable()
+                        }
+                    });
+                let (name, label) = if resend { ("ask-resend", "Resend") } else { ("ask-retry", "Retry") };
+                let btn = button(name, id, label, resend, can, p, m).when(can, |b| {
+                    b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.in_pane(
+                            pane,
+                            |this| if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) },
+                        );
+                    }))
+                });
+                let why = said.or(gate).or(cause).unwrap_or_default();
+                out = out.child(
+                    h_flex()
+                        .mt(px((8. * m.r).round()))
+                        .pl(px(Glyph::Needs.size() + 8.))
+                        .gap(px(12.))
+                        .items_center()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(fonts::SANS)
+                                .text_px(m.meta)
+                                .line_height(line(m.meta))
+                                .child(div().text_color(p.prose_t).debug_selector(move || format!("ask-cause {id}")).child(why))
+                                .when(resend, |d| d.child(div().text_color(p.dim_t).child("If it did arrive, the agent reads it twice."))),
+                        )
+                        .child(btn),
+                );
+            }
+            return out.into_any_element();
+        }
+        if whole(a) {
+            let act = Painted::of(a).filter(|_| a.state == State::Open).zip(session.as_ref()).map(|(painted, _)| {
+                let why = match l.input_gate() {
+                    Err(e) => Some(read_only(e, l)),
+                    Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
+                    Ok(()) => None,
+                };
+                Act { painted, pane, can: why.is_none(), line: why.or(said) }
+            });
+            return self.card(a, id, p, m, act.as_ref(), cx).into_any_element();
+        }
+        let tool = a.tool_id.clone();
+        let reply = a.reply.as_ref();
+        let opens = session.is_some() && reply.is_some_and(|r| !parts(&a.doc, r).is_empty());
+        let r = receipt(a, reply, Look { open, ..Look::default() }, id, p, m);
+        if opens {
+            r.id(("ask-receipt", id))
+                .cursor_pointer()
+                .hover(|d| d.bg(p.hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.in_pane(pane, |this| this.ask_open(id, &tool, cx)).unwrap_or_default()
+                }))
+                .into_any_element()
+        } else {
+            r.into_any_element()
+        }
     }
 
     /// An answer's row ([`crate::turns::Kind::Answer`]): the user's turn,

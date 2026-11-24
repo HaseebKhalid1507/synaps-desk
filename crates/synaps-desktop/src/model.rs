@@ -114,7 +114,7 @@ pub struct Active {
 }
 
 /// An attachment a tab switch left, with its input in flight ([`Model::left`]).
-type Left = (u64, String, VecDeque<(PaneId, String)>);
+type Left = (u64, String, VecDeque<(crate::live::Target, String)>);
 
 /// What the view must do after an event (it owns the client and composer).
 #[derive(Clone, Debug, PartialEq)]
@@ -393,6 +393,9 @@ pub struct Model {
     /// The input in flight ([`Live::in_flight`]) of attachments a tab switch left (their last events still
     /// come, until their `Detached`): `(attach_seq, session, texts)`, each text with the pane that sent it.
     left: Vec<Left>,
+    /// The agent cards' answers this window sent, by session
+    /// ([`crate::deliver`]).
+    pub(crate) memos: crate::deliver::Memos,
     pub named: Named,
     /// The favourite sessions (desktop only, per daemon): the rail's
     /// FAVOURITES. Never sent to the daemon.
@@ -478,6 +481,7 @@ impl Model {
             lives: Lives::default(),
             epoch: 0,
             left: Vec::new(),
+            memos: Default::default(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             favs: Default::default(),
             tabs: Tabs::default(),
@@ -1387,32 +1391,44 @@ impl Model {
         let seq = ev.attach_seq().filter(|&s| self.lives.wanting(s).is_none())?;
         let i = self.left.iter().position(|l| l.0 == seq)?;
         let mut effects = Vec::new();
+        let now = std::time::Instant::now();
         let (_, session, texts) = &mut self.left[i];
-        let mut give = |(pane, t): (PaneId, String)| effects.push(Effect::Unsent { pane, session: session.clone(), text: t });
+        let memos = &mut self.memos;
+        use crate::live::Target;
         match ev {
             Event::Session {
                 event: SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }, ..
             } => {
                 if let Some(k) = texts.iter().position(|(_, s)| s.trim() == t.trim()) {
-                    texts.remove(k);
+                    // A card's answer, echoed: its memo hears it (a
+                    // driver's echo can't be told here: no state of that
+                    // session is kept).
+                    if let (Target::Card(_), s) = texts.remove(k).expect("found") {
+                        memos.on(session, cards_spec::memo::Event::Echo { text: &s, driver: false }, now);
+                    }
                 }
             }
-            Event::Error { error, .. } if refused_input(error) => {
-                if let Some(t) = texts.pop_front() {
-                    give(t);
+            Event::Error { error, .. } if refused_input(error) => match texts.pop_front() {
+                Some((Target::Pane(pane), text)) => effects.push(Effect::Unsent { pane, session: session.clone(), text }),
+                Some((Target::Card(_), _)) => {
+                    memos.on(session, cards_spec::memo::Event::Refused { reason: &error.to_string() }, now);
                 }
-            }
-            // The rest, one text for each pane that sent some.
+                None => {}
+            },
+            // The rest, one text for each pane that sent some. A card's
+            // answer stays its card's: its memo checks it when the session
+            // is attached again, or says it couldn't.
             Event::Detached { .. } if !texts.is_empty() => {
                 let mut by: Vec<(PaneId, Vec<String>)> = Vec::new();
                 for (p, t) in std::mem::take(texts) {
+                    let Target::Pane(p) = p else { continue };
                     match by.iter_mut().find(|(q, _)| *q == p) {
                         Some((_, ts)) => ts.push(t),
                         None => by.push((p, vec![t])),
                     }
                 }
-                for (p, ts) in by {
-                    give((p, ts.join("\n")));
+                for (pane, ts) in by {
+                    effects.push(Effect::Unsent { pane, session: session.clone(), text: ts.join("\n") });
                 }
             }
             _ => {}
@@ -1819,6 +1835,11 @@ impl Model {
                 if let Err(e) = self.lives[lid].transcript.load_attached(&attached) {
                     self.lives[lid].last_error = Some(e.to_string());
                 }
+                // A card's answer out when the link dropped (or the tab was
+                // left) may be lost: its memo checks it on this view.
+                let now = std::time::Instant::now();
+                self.memos.on(&attached.meta.id, cards_spec::memo::Event::Attached, now);
+                self.memos.observe(&attached.meta.id, &self.lives[lid].transcript, now);
                 self.lives[lid].stats.on_attached(&attached);
                 effects.push(Effect::ListSessions);
             }
@@ -1856,9 +1877,29 @@ impl Model {
                     }
                     _ => {}
                 }
+                // What the agent cards' answers hear of it (as it was before
+                // this event: a driver's echo is one while idle).
+                let heard = self.lives[lid]
+                    .active
+                    .as_ref()
+                    .map(|a| a.session_id.clone())
+                    .map(|s| (s, crate::deliver::heard(&event, &raw, &self.lives[lid].transcript)));
                 // With what it says beyond its typed form (a prompt's
                 // outcome, SynapsCLI #437: the receipt takes its word).
                 self.lives[lid].transcript.apply_with(&event, &ts, &meta);
+                if let Some((sid, heard)) = heard {
+                    let now = std::time::Instant::now();
+                    if let Some(h) = heard {
+                        self.memos.on(&sid, h, now);
+                    }
+                    // The view after it, but not after a `Dequeued`: the
+                    // digest that says what the cancel left comes next (and
+                    // the history after it), and until then the view still
+                    // shows the withdrawn answer in the slot (§3.4 d4).
+                    if !matches!(heard, Some(cards_spec::memo::Event::Dequeued { .. })) {
+                        self.memos.observe(&sid, &self.lives[lid].transcript, now);
+                    }
+                }
                 let l = &mut self.lives[lid];
                 if !l.answered.is_empty() {
                     let pending = l.transcript.pending_prompts();
@@ -1870,6 +1911,9 @@ impl Model {
                     effects.push(Effect::Resync(attach_seq));
                 } else {
                     self.lives[lid].stats.on_history(&update);
+                    if let Some(a) = self.lives[lid].active.as_ref() {
+                        self.memos.observe(&a.session_id, &self.lives[lid].transcript, std::time::Instant::now());
+                    }
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.lives[lid].current(attach_seq) => {
@@ -1939,8 +1983,12 @@ impl Model {
                 if answer || matches!(&error, Error::Refused { command: None, .. }) {
                     self.lives[lid].answered.clear();
                 }
-                if refused_input(&error) {
-                    self.lives[lid].give_back_oldest(&mut effects);
+                if refused_input(&error) && self.lives[lid].give_back_oldest(&mut effects) {
+                    // A card's answer: not sent (§3.5), Retry.
+                    if let Some(a) = self.lives[lid].active.as_ref() {
+                        let reason = error.to_string();
+                        self.memos.on(&a.session_id, cards_spec::memo::Event::Refused { reason: &reason }, std::time::Instant::now());
+                    }
                 }
                 self.lives[lid].last_error = Some(error.to_string());
             }
