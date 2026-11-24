@@ -146,6 +146,9 @@ pub(crate) fn verb(name: &str) -> SharedString {
         "subagent_collect" => "Collect",
         "todo_write" => "Todos",
         "activate_tools" => "Activate",
+        // An agent card's call drawn as a tool row: one this desk can't
+        // read (synaps-cards design §6.3), or a close.
+        "cards_ui" | "cards:ui" => "Ask",
         n if n.starts_with("ext__") => "Tool",
         // Anything else: its first word (Shady #23 L6), so it fits the
         // column: `subagent_steer` → "Steer", `load_skill` → "Load".

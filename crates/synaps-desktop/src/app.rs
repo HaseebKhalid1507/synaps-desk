@@ -8415,6 +8415,18 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
             r.result_more = lines.len().saturating_sub(RESULT_LINES);
             r.result = lines.iter().take(RESULT_LINES).copied().collect::<Vec<_>>().join("\n").into();
             r.card = turns::Card::of(t, r.preview.as_deref(), &r.arg, input.as_ref());
+            // A card's close (synaps-cards design §2.3): the card it
+            // closed, by its question, not by an id.
+            if let Some(synaps_client::cards::CardRow::Close(c)) = item.card.as_deref() {
+                let verb = SharedString::new_static("Close");
+                r.card.verb = verb.clone();
+                r.card.word = verb.clone();
+                r.card.key = verb;
+                r.card.full = Some(r.name.clone());
+                r.card.target = format!("«{}»", c.doc.question).into();
+                r.card.path = None;
+                r.arg = r.card.target.clone();
+            }
         }
         ItemKind::Thinking => {
             r.text = item.text.clone().into();
