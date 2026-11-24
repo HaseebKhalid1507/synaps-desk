@@ -84,6 +84,8 @@ pub mod label {
     pub const NEW: &str = "+  N E W";
     pub const NEEDS_YOU: &str = "N E E D S   Y O U";
     pub const NEED_YOU: &str = "N E E D   Y O U";
+    /// An agent card's head ([`crate::ask`]).
+    pub const QUESTION: &str = "Q U E S T I O N";
     pub const JUMP: &str = "J U M P";
     pub const SYSTEMS: &str = "S Y S T E M S";
     pub const CONTEXT: &str = "C O N T E X T";

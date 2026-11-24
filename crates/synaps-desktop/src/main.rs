@@ -33,6 +33,7 @@
 
 mod agent_surface;
 mod app;
+mod ask;
 mod authorize;
 mod beat;
 mod bench;

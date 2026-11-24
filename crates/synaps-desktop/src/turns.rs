@@ -325,6 +325,14 @@ pub(crate) enum Kind {
     /// card, collapsing once answered, or a one-line receipt
     /// ([`crate::authorize`]).
     Prompt,
+    /// An agent card (synaps-cards design §6.1): its `cards_ui` call's row,
+    /// a message of the agent's own, never inside a run (a run never folds
+    /// a question away). Open, the card; answered, skipped, closed or
+    /// replaced, its receipt ([`crate::ask`]).
+    Ask,
+    /// A user message that answers a card: the user's turn, drawn as one
+    /// slim line, not the message's two ([`crate::ask`]).
+    Answer,
 }
 
 /// A day line's row id: its item's, with this bit (item ids count up from 1).
@@ -453,6 +461,16 @@ pub(crate) fn build(
         }
         let row = |kind, gap, who| Disp { item: i, id: it.id, rev: it.rev, kind, gap, who };
         match it.kind {
+            ItemKind::User if crate::ask::answers(it) => {
+                out.push(row(Kind::Answer, if i == 0 { Gap::First } else { Gap::Turn }, Who::You));
+                agent = false;
+                i += 1;
+            }
+            ItemKind::Tool if crate::ask::asks(it) => {
+                out.push(row(Kind::Ask, gap(i), if agent { Who::None } else { Who::Agent }));
+                agent = true;
+                i += 1;
+            }
             ItemKind::User => {
                 out.push(row(Kind::User, if i == 0 { Gap::First } else { Gap::Turn }, Who::You));
                 agent = false;
@@ -468,7 +486,8 @@ pub(crate) fn build(
                 let mut end = i;
                 let (mut tools, mut done) = (0, true);
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                while let Some(x) = items.get(end).filter(|x| matches!(x.kind, ItemKind::Thinking | ItemKind::Tool)) {
+                while let Some(x) = items.get(end).filter(|x| matches!(x.kind, ItemKind::Thinking | ItemKind::Tool) && !crate::ask::asks(x))
+                {
                     // A run that crosses midnight is two: the day line between.
                     if end > start && days.starts_day(day(end)) {
                         break;
@@ -567,6 +586,8 @@ pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str
             let row = match d.kind {
                 Kind::Prose => m.body_line,
                 Kind::Summary { .. } => m.summary,
+                // Level with the card's head line, under its slot's top.
+                Kind::Ask => return Some((label::AGENT, p.agent, crate::ask::label_top(m))),
                 _ => m.row,
             };
             Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
@@ -1009,6 +1030,14 @@ impl Card {
             // path; the rest says in the meta or the well's header.
             (_, Some(path)) if file && preview.is_none_or(|pv| pv.title.is_empty()) => tilde(path, false),
             ("bash", _) => tilde(arg, false),
+            // A card this desk can't draw (synaps-cards design §6.3): what
+            // it asks, so it can be answered in text: on one line,
+            // sanitized and cut as a card's text is (its input was never
+            // validated). With nothing of it left, its input, sanitized.
+            ("cards_ui" | "cards:ui", _) => match field("question").map(crate::ask::question_line).filter(|q| !q.is_empty()) {
+                Some(q) => format!("«{q}»"),
+                None => crate::ask::shown(&tilde(arg, true), cards_spec::Lines::Single),
+            },
             _ => tilde(arg, true),
         };
         let is_path = file && !target.contains(" +") && !target.contains('\n') && !target.starts_with('{');
@@ -1571,6 +1600,8 @@ impl AppView {
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
             Kind::Day => day_line(d, &p, &m),
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
+            Kind::Ask => self.render_ask(item, d.id, &p, &m),
+            Kind::Answer => self.render_answer(item, d.id, &p, &m),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
         // its slice, the first and last its edges. The slice (fill,
@@ -1640,7 +1671,7 @@ impl AppView {
         // streaming row's bottom-left in the gutter; lit while deltas come,
         // decaying once they stop. Touches no text.
         // Not on a day line over it (they share the item).
-        let head = (!matches!(d.kind, Kind::Day | Kind::Prompt)
+        let head = (!matches!(d.kind, Kind::Day | Kind::Prompt | Kind::Ask)
             && d.item + 1 == items.len()
             && matches!(item.kind, ItemKind::Assistant | ItemKind::Thinking))
         .then(|| {
@@ -2174,7 +2205,13 @@ impl AppView {
                 .child(w)
         });
         let fold = has_body.then(|| glyph::turn(fx.col(self.panes.cur.id).turn(id, open), p.dim_t));
-        let verb_text = if think { SharedString::new_static("Think") } else { crate::cards::verb(&row.name) };
+        let verb_text = if think {
+            SharedString::new_static("Think")
+        } else if matches!(item.card.as_deref(), Some(synaps_client::cards::CardRow::Close(_))) {
+            SharedString::new_static("Close")
+        } else {
+            crate::cards::verb(&row.name)
+        };
         // The verb column (§3): 56 px, wider for a longer word; the verb is
         // never cut, the target gives way (the finish gate of #23, item 11).
         let verb = div()
@@ -2823,6 +2860,8 @@ mod tests {
                 Kind::Work => "work",
                 Kind::Day => "day",
                 Kind::Prompt => "prompt",
+                Kind::Ask => "ask",
+                Kind::Answer => "answer",
             })
             .collect()
     }

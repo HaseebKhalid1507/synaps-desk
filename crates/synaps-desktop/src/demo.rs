@@ -22,6 +22,15 @@ pub(crate) const IDLE_CPU: &str = "20261113-161706-a1b9";
 pub(crate) const FLAKY: &str = "20261113-033001-c3d9";
 /// A session from before message times: its history has none.
 pub(crate) const LEGACY: &str = "20261111-201530-0a6e";
+/// A session whose agent asked agent cards (synaps-cards design §6.1),
+/// one in each state: `--offline --session 20261124-101500-cd01`, and the
+/// card tests. Not in the session list (the rail's tests count it).
+pub(crate) const ASKS: &str = "20261124-101500-cd01";
+/// A session whose agent waits on an open form card: prefilled fields, a
+/// long field over lines, a check, a long label and an optional field's
+/// placeholder. `--offline --session 20261124-101600-cd02`, for its stills
+/// and a card test; not in the session list either.
+pub(crate) const ASK_FORM: &str = "20261124-101600-cd02";
 
 /// Message times (`_synaps_at`) on a demo history, as the host records
 /// them: from the local wall time in the session's id on, `step` seconds
@@ -529,6 +538,12 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     if id == SID {
         return attach_sid(attach_seq);
     }
+    if id == ASKS {
+        return attach_asks(attach_seq, ASKS, asks(), "Tokens onto Postgres");
+    }
+    if id == ASK_FORM {
+        return attach_asks(attach_seq, ASK_FORM, ask_form(), "Token backfill plan");
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };
     let seed = id.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
@@ -634,6 +649,143 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
         }
     }
     out
+}
+
+/// A `cards_ui` call and the result the `cards` extension writes for it,
+/// card id `card` (cards-spec's envelope: the digest of the doc it drew).
+fn asked(out: &mut Vec<Value>, tool: &str, card: &str, text: Option<&str>, input: Value) {
+    asked_as(out, tool, card, text, input.clone(), &input);
+}
+
+/// [`asked`], the call's input `input` and the doc the extension drew
+/// `drawn`'s: a newer extension's card, whose input this catalog refuses.
+fn asked_as(out: &mut Vec<Value>, tool: &str, card: &str, text: Option<&str>, input: Value, drawn: &Value) {
+    use cards_spec::{CardId, Envelope, Input, parse_input};
+    let Ok(Input::Create { doc, wait }) = parse_input(drawn) else { return };
+    let Some(id) = CardId::parse(card) else { return };
+    let mut lines = vec![Envelope::showing(id, &doc, wait).to_string()];
+    lines.extend(doc.options.iter().enumerate().map(|(i, o)| format!("  {}. {}", i + 1, o.label)));
+    lines.push(format!("Its answer will come as a user message starting \"[card {card}]\", values as JSON on the next line."));
+    lines.push(
+        if wait {
+            "You can't continue without it: end your turn now; the answer starts your next turn."
+        } else {
+            "The user may also just reply in text. Keep working meanwhile."
+        }
+        .into(),
+    );
+    let mut blocks: Vec<Value> = text.map(|t| json!({"type": "text", "text": t})).into_iter().collect();
+    blocks.push(json!({"type": "tool_use", "id": tool, "name": "cards_ui", "input": input}));
+    out.push(json!({"role": "assistant", "content": blocks}));
+    out.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": lines.join("\n")}]}));
+}
+
+/// The message a desk sends answering card `card` of `input` (cards-spec's
+/// answer message: two lines, the summary and the values).
+fn answered(card: &str, input: &Value, values: Option<Value>, change: bool) -> Value {
+    use cards_spec::{CardId, Input, Reply, message, parse_answer, parse_input};
+    let (Ok(Input::Create { doc, .. }), Some(id)) = (parse_input(input), CardId::parse(card)) else { return json!({}) };
+    let reply = match values.map(|v| parse_answer(&doc, &v)) {
+        None => Reply::Skip,
+        Some(Ok(a)) if change => Reply::Change(a),
+        Some(Ok(a)) => Reply::Answer(a),
+        Some(Err(_)) => return json!({}),
+    };
+    json!({"role": "user", "content": message::build(&id, &doc, &reply)})
+}
+
+/// [`ASKS`]'s history: a migration the agent settles by asking. Its cards,
+/// in order: answered (a pick), changed (a form answered twice), skipped,
+/// closed by the agent, replaced (its id bound again across an extension
+/// restart), open (a multi pick), and last open with the agent waiting.
+/// Between the close and the replaced one, a card from a newer catalog,
+/// which this desk draws as a tool row (synaps-cards design §6.3) and the
+/// user answers in text.
+fn asks() -> Vec<Value> {
+    let mut out = vec![json!({"role": "user", "content": "Move relay-gateway's tokens off the file store. Ask me what you need to."})];
+    let store = json!({"question": "Where should the tokens live?", "detail": "The file store loses writes when two refreshes race.",
+        "options": [{"label": "Postgres", "hint": "already runs the sessions table"}, {"label": "Redis", "hint": "fast, but one more service"},
+            "Keep the file store"],
+        "default": "Postgres"});
+    asked(&mut out, "toolu_a1", "c4f9x2a", Some("One decision before I start."), store.clone());
+    out.push(answered("c4f9x2a", &store, Some(json!({"choice": "Postgres"})), false));
+    let window = json!({"question": "When can it cut over?", "fields": [
+        {"id": "day", "label": "Cut-over day", "value": "Friday"},
+        {"id": "backfill", "label": "Backfill the old tokens first", "type": "check", "value": true},
+        {"id": "oncall", "label": "Note for on-call", "type": "long", "optional": true, "placeholder": "Anything they should watch"}]});
+    asked(&mut out, "toolu_a2", "c81kq0z", Some("Postgres it is. Reading the store and its callers."), window.clone());
+    out.push(answered("c81kq0z", &window, Some(json!({"fields": {"day": "Friday", "backfill": true, "oncall": ""}})), false));
+    out.push(answered(
+        "c81kq0z",
+        &window,
+        Some(json!({"fields": {"day": "Monday", "backfill": true, "oncall": "Watch p99 on /refresh"}})),
+        true,
+    ));
+    let rename = json!({"question": "Rename TokenStore to Vault while I'm in there?", "options": ["Yes", "No"], "default": "No"});
+    asked(&mut out, "toolu_a3", "c2m7d0q", Some("Monday, with a backfill."), rename.clone());
+    out.push(answered("c2m7d0q", &rename, None, false));
+    let schema = json!({"question": "Which schema should the table go in?", "options": ["public", "relay", "auth"], "default": "relay"});
+    asked(&mut out, "toolu_a4", "c9t3w1e", Some("Keeping the name. Writing the migration."), schema);
+    out.push(json!({"role": "assistant", "content": [
+        {"type": "text", "text": "Found it: `config/db.toml` puts gateway tables in `relay`. No need to ask."},
+        {"type": "tool_use", "id": "toolu_r1", "name": "read", "input": {"path": format!("{CWD}/config/db.toml")}},
+        {"type": "tool_use", "id": "toolu_a5", "name": "cards_ui", "input": {"close": "c9t3w1e"}}]}));
+    out.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_r1", "content": "1\t[gateway]\n2\tschema = \"relay\"\n3\tpool = 16"},
+        {"type": "tool_result", "tool_use_id": "toolu_a5", "content": "Card c9t3w1e closed (cards/1)."}]}));
+    let report = json!({"question": "How should the migration report read?", "options": ["A table", "A paragraph"]});
+    let mut newer = report.clone();
+    newer["layout"] = json!("compact");
+    asked_as(&mut out, "toolu_a9", "c3v8n5b", Some("The migration report next."), newer, &report);
+    out.push(json!({"role": "user", "content": "A table."}));
+    let index = json!({"question": "Index tokens by session or by user?", "options": ["Session", "User"], "default": "Session"});
+    asked(&mut out, "toolu_a6", "c5h8k2v", Some("One more about lookups."), index.clone());
+    out.push(answered("c5h8k2v", &index, Some(json!({"choice": "Session"})), false));
+    // The extension restarted and drew the same id again.
+    let tests = json!({"question": "Which suites should pass before the cut-over?", "multi": true,
+        "options": [{"label": "Unit", "hint": "2 min"}, {"label": "Integration", "hint": "9 min"},
+            {"label": "Load test", "hint": "40 min, staging only"}, "Chaos"],
+        "default": ["Unit", "Integration"]});
+    asked(&mut out, "toolu_a7", "c5h8k2v", Some("The migration is written. Before I wire the backfill:"), tests);
+    let ship = json!({"question": "Run the migration on staging now?", "wait": true,
+        "detail": "It locks the tokens table for about 40 seconds.\nRefreshes queue meanwhile; none are lost.",
+        "options": [{"label": "Run it now"}, {"label": "Wait for the low-traffic window", "hint": "after 22:00"}, "Don't run it"],
+        "default": "Wait for the low-traffic window"});
+    asked(&mut out, "toolu_a8", "c0p6r4n", Some("Ready for staging."), ship);
+    out
+}
+
+/// [`ASK_FORM`]'s history: the agent waits on one form, its options and
+/// its fields prefilled.
+fn ask_form() -> Vec<Value> {
+    let mut out = vec![json!({"role": "user", "content": "Plan the token backfill with me before you run anything."})];
+    let plan = json!({"question": "How should the backfill run?", "wait": true,
+        "detail": "About 2.4 million tokens. The file store stays readable until the cut-over.",
+        "options": [{"label": "In batches", "hint": "a pause between each"}, {"label": "All at once", "hint": "locks the table for about 3 minutes"}],
+        "default": "In batches",
+        "fields": [
+            {"id": "batch", "label": "Batch size", "value": "10000"},
+            {"id": "window", "label": "Run window (local time), and the latest it may roll back by", "value": "22:00 to 23:30, rolled back by 23:45"},
+            {"id": "verify", "label": "Compare row counts after every batch", "type": "check", "value": true},
+            {"id": "notes", "label": "Notes for on-call", "type": "long",
+                "value": "Page #relay-oncall if a batch takes over a minute.\nThe dashboards are under Relay / Tokens."},
+            {"id": "ticket", "label": "Ticket", "optional": true, "placeholder": "RELAY-1234"}]});
+    asked(&mut out, "toolu_f1", "c2b7m9q", Some("Before the backfill, the plan:"), plan);
+    out
+}
+
+fn attach_asks(attach_seq: u64, id: &str, mut msgs: Vec<Value>, title: &str) -> Vec<Event> {
+    stamp(&mut msgs, id, 30, None);
+    let attached = json!({"type": "attached", "client": 2,
+        "meta": {"id": id, "name": "token-store", "title": title, "model": "anthropic/claude-opus-4-1", "cwd": CWD,
+            "lifecycle": "live", "busy": false, "awaiting_input": 0},
+        "view": {"model": "anthropic/claude-opus-4-1", "thinking_level": "medium", "reasoning_level": "medium", "context_window": 200000},
+        "conversation": {"header": {"title": title}, "messages_len": msgs.len(), "api_messages": msgs, "cost": 1.12},
+        "streaming": false, "pending_prompts": [], "client_input": "shared", "input_owner": 2});
+    match decode_frame(&attached.to_string()) {
+        Ok(DaemonFrame::Attached(a)) => vec![Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false }],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
