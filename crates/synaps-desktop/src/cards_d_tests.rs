@@ -681,3 +681,49 @@ fn every_box_and_button_is_square(cx: &mut TestAppContext) {
     settle(cx, w, 8);
     square(cx, "Settings");
 }
+
+/// No outline on the message box (Haseeb, as on the cards in #71): the
+/// composer's box paints its `user` fill and no border, focused or not;
+/// what says it is yours, the bar, is at its left edge as tall as it.
+/// Read off the painted quads of the `--offline` demo at 1920 × 1080.
+#[gpui_kit::test]
+fn the_message_box_reads_by_its_fill_alone(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1920., 1080.), crate::theme::Panels::default().text_size);
+    settle(cx, w, 8);
+    let user = cx.update(|cx| crate::theme::palette(cx).user);
+    let check = |cx: &mut TestAppContext, what: &str| {
+        let frame = VisualTestContext::from_window(w, cx).debug_bounds("composer-frame 0").expect("the composer");
+        let bar = VisualTestContext::from_window(w, cx).debug_bounds("composer-bar").expect("its bar");
+        assert!(bar.origin == frame.origin && bar.size.height == frame.size.height, "{what}: the bar {bar:?} on the box's edge {frame:?}");
+        cx.update_window(w, |_, window, _| {
+            let s = window.scale_factor();
+            let near = |a: gpui_kit::ScaledPixels, b: gpui_kit::Pixels| (a.0 - f32::from(b) * s).abs() < 0.5;
+            let quads: Vec<_> = window
+                .painted_quads()
+                .into_iter()
+                .filter(|q| {
+                    near(q.bounds.origin.x, frame.origin.x)
+                        && near(q.bounds.origin.y, frame.origin.y)
+                        && near(q.bounds.size.width, frame.size.width)
+                        && near(q.bounds.size.height, frame.size.height)
+                })
+                .collect();
+            assert!(quads.iter().any(|q| q.background.as_solid() == Some(user)), "{what}: the box's fill is `user`");
+            for q in &quads {
+                let b = &q.border_widths;
+                assert!([b.top, b.right, b.bottom, b.left].iter().all(|w| w.0 == 0.), "{what}: an outline on the box: {b:?}");
+            }
+        })
+        .expect("the window");
+    };
+    check(cx, "unfocused");
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composer.update(cx, |s, cx| s.focus(window, cx)))).expect("the window");
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert!(
+        cx.update_window(w, |_, window, cx| gpui_kit::Focusable::focus_handle(view.read(cx).composer.read(cx), cx).is_focused(window))
+            .unwrap(),
+        "focused"
+    );
+    check(cx, "focused");
+}

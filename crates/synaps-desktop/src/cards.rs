@@ -433,6 +433,103 @@ mod tests {
         }
     }
 
+    /// The message box's frame went too (Haseeb: no outline on the
+    /// composer, as on the cards): its room is padding in a layer of its
+    /// own ([`crate::app::composer_box`]). Laid out at 25 to 250 %, in every
+    /// form, the box is as wide and as tall as main's framed one; its text
+    /// and its foot, the composer's top as the palette reads it, the bar,
+    /// the top edge's pass and Handoff's light (part way down) all lie
+    /// where they lay on main, as wide and as tall.
+    #[gpui_kit::test]
+    fn the_composer_keeps_its_framed_geometry_at_every_scale(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::component::v_flex;
+        use gpui_kit::{
+            Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _, Window, div, px, relative,
+        };
+        const FORMS: [crate::fit::Form; 3] = [crate::fit::Form::Full, crate::fit::Form::Short, crate::fit::Form::Cramped];
+        struct Boxes(crate::theme::Metrics);
+        impl Render for Boxes {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let m = &self.0;
+                let mut col = v_flex().w(px(701.));
+                for (k, form) in FORMS.into_iter().enumerate() {
+                    let d = crate::fit::Composer::of(m, form);
+                    let s = |what: &str| -> String { format!("{what} {k}") };
+                    let mark = |what: &str| {
+                        let id = s(what);
+                        div().debug_selector(move || id)
+                    };
+                    let body = |who: &str| {
+                        [
+                            mark(&format!("{who} text")).h(px(3. * m.body_line)),
+                            mark(&format!("{who} foot")).mt(px(d.row_gap.unwrap_or(0.))).h(px(d.button)),
+                        ]
+                    };
+                    let edges = |who: &str, at: f32| {
+                        [
+                            mark(&format!("{who} bar")).absolute().left(px(at)).top(px(at)).bottom(px(at)).w(px(2.)),
+                            mark(&format!("{who} edge")).absolute().left(px(at)).right(px(at)).top(px(at)).h(px(1.)),
+                            div()
+                                .absolute()
+                                .left(px(at))
+                                .top(px(at))
+                                .bottom(px(24. + at))
+                                .w(px(2.))
+                                .child(mark(&format!("{who} light")).absolute().left_0().top(relative(0.4)).w(px(2.)).h(px(24.))),
+                            mark(&format!("{who} top")).absolute().inset_0(),
+                        ]
+                    };
+                    // Main's (7135205): the frame, the padding in it, what
+                    // is drawn over the frame a pixel out, the top's
+                    // measure at its inset 0.
+                    let old = v_flex()
+                        .px(px(m.pad_x - 1.))
+                        .pt(px(d.pad_top))
+                        .pb(px(d.pad_bottom))
+                        .relative()
+                        .border_1()
+                        .children(edges("old", -1.))
+                        .children(body("old"));
+                    let new = crate::app::composer_box(
+                        window.scale_factor(),
+                        (m.pad_x - 1., d.pad_top, d.pad_bottom),
+                        edges("new", -1.).into_iter().chain(body("new")).map(IntoElement::into_any_element),
+                    );
+                    col = col
+                        .child(old.debug_selector(move || format!("old box {k}")))
+                        .child(new.debug_selector(move || format!("new box {k}")));
+                }
+                col
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Boxes(crate::theme::Metrics::at(crate::theme::DEFAULT_TEXT)));
+        for scale in [1., 1.25, 1.5, 1.75, 2., 2.5, 0.5, 0.25] {
+            cx.simulate_scale_factor_change(scale);
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let dev = |v: Pixels| (f32::from(v) * scale).round() as i32;
+            for (k, form) in FORMS.into_iter().enumerate() {
+                // A part's offset in its box and its size, in device px.
+                let mut at = |who: &str, what: &str| {
+                    let b = cx.debug_bounds(format!("{who} box {k}").leak()).unwrap_or_else(|| panic!("{scale}: {who} box {k}"));
+                    let e = cx.debug_bounds(format!("{who} {what} {k}").leak()).unwrap_or_else(|| panic!("{scale}: {who} {what} {k}"));
+                    let (x0, y0) = (dev(b.origin.x), dev(b.origin.y));
+                    [
+                        dev(b.size.width),
+                        dev(b.size.height),
+                        dev(e.origin.x) - x0,
+                        dev(e.origin.y) - y0,
+                        dev(e.size.width),
+                        dev(e.size.height),
+                    ]
+                };
+                for what in ["text", "foot", "top", "bar", "edge", "light"] {
+                    assert_eq!(at("new", what), at("old", what), "{scale} {form:?}: its {what}, as main's");
+                }
+            }
+        }
+    }
+
     #[test]
     fn verbs_are_plain_words() {
         assert_eq!(verb("bash").as_ref(), "Run");

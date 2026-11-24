@@ -8081,7 +8081,7 @@ impl AppView {
         let top_edge = if turn_runs {
             None
         } else if segment < 1. && crate::motion::Level::current(cx) == crate::motion::Level::Full {
-            Some(crate::motion::pass(fx, segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.edge))
+            Some(crate::motion::pass(fx, segment, crate::motion::mix(p.you, p.ink, HANDOFF_LIT), p.user))
         } else {
             None
         };
@@ -8227,62 +8227,76 @@ impl AppView {
                     .child(send.ml(px(24.))),
             )
         };
+        // Drawn on its edge, over where the frame was (a pixel out of the
+        // padding, as main drew them over the frame): the user's bar, the
+        // focused pane's composer only (split.md §6: one is lit; it, not
+        // the outline, a constant `edge`, always said which is yours), the
+        // top edge's pass and Handoff in's 24 px light down the bar.
+        let ours = !self.panes.split() || self.panes.cur.id == self.panes.focused;
+        let at = self.panes.cur.composer_top.clone();
+        let body = [
+            Some(canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).absolute().inset_0().into_any_element()),
+            ours.then(|| {
+                div()
+                    .debug_selector(|| "composer-bar".into())
+                    .absolute()
+                    .left(px(-1.))
+                    .top(px(-1.))
+                    .bottom(px(-1.))
+                    .w(px(2.))
+                    .bg(bar)
+                    .into_any_element()
+            }),
+            top_edge.map(|e| div().absolute().left(px(-1.)).right(px(-1.)).top(px(-1.)).h(px(1.)).child(e).into_any_element()),
+            // Handoff in: a 24 px light travels down it.
+            (segment < 1.).then(|| {
+                div()
+                    .absolute()
+                    .left(px(-1.))
+                    .top(px(-1.))
+                    .bottom(px(23.))
+                    .w(px(2.))
+                    .child(
+                        div()
+                            .debug_selector(|| "handoff-in".into())
+                            .absolute()
+                            .left_0()
+                            .top(relative(segment))
+                            .w(px(2.))
+                            .h(px(24.))
+                            .bg(segment_color),
+                    )
+                    .into_any_element()
+            }),
+            // The kit sizes its own text: the step is set on it.
+            Some(inner.into_any_element()),
+        ];
         column(
             lay,
-            v_flex()
+            // The frame sits inside the inset (design.md §1.1).
+            composer_box(window.scale_factor(), (m.pad_x - 1., dims.pad_top, dims.pad_bottom), body.into_iter().flatten())
                 .debug_selector(move || format!("composer-frame {pane_ix}"))
-                // The frame sits inside the inset (design.md §1.1).
-                .px(px(m.pad_x - 1.))
-                .pt(px(dims.pad_top))
-                .pb(px(dims.pad_bottom))
                 .bg(p.user)
-                .relative()
-                .border_1()
-                .border_color(p.edge)
-                .child({
-                    let at = self.panes.cur.composer_top.clone();
-                    canvas(move |b, _, _| at.set(f32::from(b.origin.y)), |_, _, _, _| {}).absolute().inset_0()
-                })
-                // The user's bar over the left border: the focused pane's
-                // composer only (split.md §6: one is lit).
-                .when(!self.panes.split() || self.panes.cur.id == self.panes.focused, |d| {
-                    d.child(
-                        div()
-                            .debug_selector(|| "composer-bar".into())
-                            .absolute()
-                            .left(px(-1.))
-                            .top(px(-1.))
-                            .bottom(px(-1.))
-                            .w(px(2.))
-                            .bg(bar),
-                    )
-                })
-                .children(top_edge.map(|e| div().absolute().left(px(-1.)).right(px(-1.)).top(px(-1.)).h(px(1.)).child(e)))
-                // Handoff in: a 24 px light travels down it.
-                .when(segment < 1., |d| {
-                    d.child(
-                        div().absolute().left(px(-1.)).top(px(-1.)).bottom(px(23.)).w(px(2.)).child(
-                            div()
-                                .debug_selector(|| "handoff-in".into())
-                                .absolute()
-                                .left_0()
-                                .top(relative(segment))
-                                .w(px(2.))
-                                .h(px(24.))
-                                .bg(segment_color),
-                        ),
-                    )
-                })
                 .text_px(m.body)
                 .line_height(px(m.body_line))
-                .text_color(p.ink)
-                // The kit sizes its own text: the step is set on it.
-                .child(inner),
+                .text_color(p.ink),
         )
         .flex_none()
         .pt(px(self.top_drawn(dims.top)))
         .pb(px(bottom))
     }
+}
+
+/// The composer's box (no outline, Haseeb: the message box reads by its
+/// fill alone, as the cards do since #71): the old frame's 1 px is padding
+/// in a layer of its own ([`crate::cards::frame_room`]), the text's padding
+/// (`pad`: its sides, top and bottom) inside it, as the frame and its
+/// padding were laid out, so nothing in the box moved when the frame went,
+/// at any scale. `body` is placed in the inner layer, which is where the
+/// frame's padding box was: what is drawn over the edge (the bar, the top
+/// edge's pass, Handoff's light) a pixel out of it, as on main.
+pub(crate) fn composer_box(scale: f32, pad: (f32, f32, f32), body: impl IntoIterator<Item = AnyElement>) -> Div {
+    v_flex().p(px(crate::cards::frame_room(scale))).child(v_flex().relative().px(px(pad.0)).pt(px(pad.1)).pb(px(pad.2)).children(body))
 }
 
 /// The kit's horizontal padding of a medium input's text, drawn whatever
