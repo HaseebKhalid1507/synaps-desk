@@ -224,6 +224,22 @@ fn a_click_on_a_stale_binding_or_an_unsettled_view_sends_nothing() {
     replace(&mut m, 1, S, more);
     assert!(m.lives[LiveId::FIRST].transcript.history_settled());
     assert_eq!(m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now()), Err(CHANGED.into()));
+    // The history lands with the painted call holding another card, still
+    // open (the live rows drew it before the history said what it is): the
+    // click names a card the fold no longer holds for that call.
+    let mut m = one();
+    let p = painted(&m, LiveId::FIRST);
+    let mut asked = ask();
+    asked["question"] = json!("Which approach, for the lexer?");
+    let mut rewritten = history();
+    rewritten[1]["content"][1]["input"] = asked.clone();
+    rewritten[2]["content"][0]["content"] = json!(showing("c7n2k4d", &asked));
+    ev(&mut m, 1, S, digest(&rewritten, None));
+    replace(&mut m, 1, S, rewritten);
+    let t = &m.lives[LiveId::FIRST].transcript;
+    assert!(t.history_settled());
+    assert!(t.cards().card("t1").is_some_and(|c| c.answerable()), "the call's card is open");
+    assert_eq!(m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now()), Err(CHANGED.into()));
 }
 
 /// No answering during a known compaction (§3.4): the card says so, and
