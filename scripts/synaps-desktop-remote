@@ -1,0 +1,96 @@
+#!/bin/bash
+# synaps-desktop-remote [host]   (default: avante)
+# Runs Synaps Desktop here, attached to the Synaps daemon on <host>, through an SSH-forwarded
+# Unix socket. The tunnel lives exactly as long as the app. The local socket is 0600 inside
+# $XDG_RUNTIME_DIR, so no other user on this machine can ride it. The app is told how to read
+# small things from <host> (SYNAPS_DESKTOP_HOST_READ, SYNAPS_DESKTOP_HOST): the reads below.
+#
+# synaps-desktop-remote --read <host> <what> <args...>
+# Small, non-secret reads from <host>, printed on stdout. What a read names is picked out ON
+# <host>: nothing else leaves it. Every argument is a plain word ([A-Za-z0-9._-]), so no shell
+# on either side reads anything into it.
+#   config-key <profile|-> <key>   the lines of the profile's Synaps config that set <key>
+#                                  (`<key> = ...`), as Synaps finds the file. A key that looks
+#                                  secret (provider.*, auth.*, server.*, *token*, *secret*,
+#                                  *password*, *api_key*) is refused.
+#   cli <pid> <profile|-> <read>   the daemon's own CLI (/proc/<pid>/exe; <pid> must be this
+#                                  user's daemon process) running one read from this list:
+#                                    auth-list   `auth list --json` (labels, no secrets)
+# Exit 64: not a read this takes; 65: a secret key; 66: <pid> is not this user's daemon;
+# 255: ssh failed.
+set -euo pipefail
+
+plain() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+secret() {
+  case "$1" in
+    provider.* | auth.* | server.* | *token* | *secret* | *password* | *api_key* | *apikey*) return 0 ;;
+  esac
+  return 1
+}
+usage() { echo "synaps-desktop-remote: $1" >&2; exit 64; }
+
+if [ "${1:-}" = --read ]; then
+  shift
+  [ $# -ge 2 ] || usage "usage: --read <host> <what> <args...>"
+  host=$1; shift
+  plain "$host" || usage "--read: the host is not a plain name"
+  for a in "$@"; do plain "$a" || usage "--read takes plain words only"; done
+  case "$1" in
+    config-key)
+      [ $# -eq 3 ] || usage "usage: --read <host> config-key <profile|-> <key>"
+      if secret "$3"; then echo "synaps-desktop-remote: refused: $3 looks like a secret" >&2; exit 65; fi
+      ;;
+    cli)
+      [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || usage "usage: --read <host> cli <pid> <profile|-> <read>"
+      case "$4" in auth-list) ;; *) usage "cli: no read named $4" ;; esac
+      ;;
+    *) usage "no read named $1" ;;
+  esac
+  # The same checks again on <host>, then the read.
+  exec ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$host" bash -s -- "$@" <<'REMOTE'
+set -euo pipefail
+for a in "$@"; do [[ "$a" =~ ^[A-Za-z0-9._-]+$ ]] || exit 64; done
+base="${SYNAPS_BASE_DIR:-$HOME/.synaps-cli}"
+case "$1" in
+  config-key)
+    [ $# -eq 3 ] || exit 64
+    case "$3" in provider.* | auth.* | server.* | *token* | *secret* | *password* | *api_key* | *apikey*) exit 65 ;; esac
+    # The profile's file when there is one, else the base one (Synaps' resolve_read_path).
+    f="$base/config"
+    if [ "$2" != - ] && [[ "$2" != .* ]] && [ -e "$base/$2/config" ]; then f="$base/$2/config"; fi
+    [ -e "$f" ] || exit 0
+    grep -E "^[[:space:]]*${3//./\\.}[[:space:]]*=" "$f" || true
+    ;;
+  cli)
+    [ $# -eq 4 ] && [[ "$2" =~ ^[0-9]+$ ]] || exit 64
+    case "$4" in auth-list) ;; *) exit 64 ;; esac
+    [ -O "/proc/$2" ] || exit 66
+    tr '\0' '\n' < "/proc/$2/cmdline" | grep -qx daemon || exit 66
+    if [ "$3" = - ]; then unset SYNAPS_PROFILE; else export SYNAPS_PROFILE="$3"; fi
+    case "$4" in
+      auth-list) exec "/proc/$2/exe" auth list --json < /dev/null ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  *) exit 64 ;;
+esac
+REMOTE
+fi
+
+host="${1:-avante}"
+plain "$host" || { echo "synaps-desktop-remote: the host is not a plain name" >&2; exit 64; }
+sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/synaps-$host.sock"
+remote="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'echo $HOME')/.synaps-cli/run/daemon.sock"
+rm -f "$sock"
+ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o StreamLocalBindMask=0177 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L "$sock:$remote" "$host" &
+tunnel=$!
+trap 'kill "$tunnel" 2>/dev/null; rm -f "$sock"' EXIT
+for _ in $(seq 1 100); do
+  [ -S "$sock" ] && break
+  kill -0 "$tunnel" 2>/dev/null || { echo "synaps-desktop-remote: ssh tunnel to $host failed" >&2; exit 1; }
+  sleep 0.1
+done
+[ -S "$sock" ] || { echo "synaps-desktop-remote: tunnel socket never appeared" >&2; exit 1; }
+bin="${SYNAPS_DESKTOP_BIN:-$HOME/.local/bin/synaps-desktop}"; bin="${bin/#~/$HOME}"
+SYNAPS_DESKTOP_HOST_READ="$(readlink -f "${BASH_SOURCE[0]}")" SYNAPS_DESKTOP_HOST="$host" "$bin" --socket "$sock"
