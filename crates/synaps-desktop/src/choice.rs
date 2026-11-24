@@ -82,8 +82,11 @@ pub(crate) struct Target {
     pub current: String,
     /// The list is on its way.
     pub loading: bool,
-    /// Why nothing can be picked, or what the list lacks.
+    /// Why nothing can be picked (offline, not connected).
     pub note: Option<String>,
+    /// What the list lacks (no favourites, logins not checked), as the
+    /// last list read said: a later read without one clears it.
+    pub notice: Option<String>,
     /// Asked for, waiting for the daemon (its index).
     pub pending: Option<usize>,
     /// The daemon's refusal of the last ask: the value's index and why.
@@ -150,10 +153,7 @@ impl Target {
                         self.names.push((key(m), m.provider.clone()));
                     }
                 }
-                // What the list lacks (no favourites, logins not checked).
-                if o.notice.is_some() {
-                    self.note = o.notice.clone();
-                }
+                self.notice = o.notice.clone();
                 let browsing = browsing.filter(|p| self.all.iter().any(|m| m.2 == *p));
                 self.show(browsing.as_deref());
             }
@@ -222,7 +222,7 @@ impl Target {
             it.confirm = Some("REFUSED".into());
             out.push(it);
         }
-        if let Some(n) = self.note.as_ref().or(self.off.as_ref()) {
+        if let Some(n) = self.note.as_ref().or(self.notice.as_ref()).or(self.off.as_ref()) {
             out.push(Item::new(NOTE, cut(n)).off(n.clone()));
         }
         if self.loading {
@@ -468,6 +468,7 @@ impl AppView {
             current,
             loading: false,
             note: None,
+            notice: None,
             pending: None,
             refused: None,
             off,
@@ -725,6 +726,7 @@ mod tests {
             current: current.into(),
             loading: false,
             note: None,
+            notice: None,
             pending: None,
             refused: None,
             off: None,
@@ -810,6 +812,24 @@ mod tests {
         assert!(labels[0].starts_with("model change blocked"), "{labels:?}");
         t.show(t.provider(items[4].act).as_deref());
         assert_eq!(t.values, [("b:llm:y".to_string(), "b:llm:y".to_string())], "the second LLM's own");
+    }
+
+    /// A menu opened from a cached list with a warning, then a fresh read
+    /// without one: the warning goes. A note that is not the list's
+    /// (offline) stays.
+    #[test]
+    fn a_successful_refresh_clears_the_cached_warning() {
+        let warned = List { notice: Some("logins not checked: synaps auth list failed (exit 1)".into()), ..opts() };
+        let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
+        t.fill(Some(&warned));
+        assert!(t.items()[0].label.starts_with("logins not checked"));
+        t.fill(Some(&opts()));
+        assert_eq!(t.notice, None);
+        assert!(!t.items().iter().any(|i| i.label.starts_with("logins not checked")), "the warning's row went");
+        t.note = Some("offline: no daemon to ask".into());
+        t.fill(Some(&warned));
+        t.fill(Some(&opts()));
+        assert_eq!(t.items()[0].label.as_ref(), "offline: no daemon to ask");
     }
 
     /// From the keyboard (Ctrl+P, "Change thinking…"), the menu opens on
