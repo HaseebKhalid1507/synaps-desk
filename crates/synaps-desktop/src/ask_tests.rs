@@ -23,10 +23,15 @@ type Window = (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_
 
 /// The demo's window, `h` px tall, showing [`crate::demo::ASKS`].
 fn asks(cx: &mut TestAppContext, h: f32) -> Window {
+    session(cx, h, crate::demo::ASKS)
+}
+
+/// The demo's window, `h` px tall, showing its session `id`.
+fn session(cx: &mut TestAppContext, h: f32, id: &str) -> Window {
     let (w, view, events) = open_at(cx, (1440., h), crate::theme::Panels::default().text_size);
     view.update(cx, |v, cx| {
         v.client = None;
-        let open = crate::app::Open::Attach { session_id: crate::demo::ASKS.into(), fallback: None, open: false };
+        let open = crate::app::Open::Attach { session_id: id.into(), fallback: None, open: false };
         v.open_tab(open, crate::tabs::Place::Current);
         cx.notify();
     });
@@ -489,4 +494,29 @@ fn what_a_card_draws_is_sanitized(cx: &mut TestAppContext) {
     assert!(!targets[1].1.is_empty() && !targets[1].1.starts_with('«'), "nothing of its question left: its input, {:?}", targets[1].1);
     assert_eq!(targets[2].1.chars().count(), cards_spec::QUESTION_MAX + 2, "cut to the spec's bound: {:?}", targets[2].1);
     assert!(targets[2].1.ends_with("…»"));
+}
+
+/// An open form draws whole: its options (the agent's default
+/// `suggested`), every field with its prefill, a long one over its lines,
+/// the check, an empty optional field with its placeholder; `NEEDS YOU`,
+/// the agent waiting; a footer that says how to answer.
+#[gpui_kit::test]
+fn an_open_form_draws_its_fields_and_prefills(cx: &mut TestAppContext) {
+    let (w, view, _events) = session(cx, 900., crate::demo::ASK_FORM);
+    let card = rows(cx, &view).into_iter().find(|r| r.kind == Kind::Ask).expect("the form");
+    let a = ask(&card);
+    assert_eq!((a.state, a.wait, a.doc.options.len(), a.doc.fields.len()), (State::Open, true, 2, 5));
+    show(cx, w, &view, card.ix);
+    let id = card.id;
+    assert!(has(cx, w, format!("ask-card {id}")));
+    assert!(has(cx, w, format!("ask-needs {id}")));
+    for f in ["batch", "window", "verify", "notes", "ticket"] {
+        assert!(has(cx, w, format!("ask-field {id} {f}")), "field {f}");
+    }
+    for n in 1..=2 {
+        assert!(has(cx, w, format!("ask-option {id} {n}")), "option {n}");
+    }
+    assert!(has(cx, w, format!("ask-suggested {id} 1")));
+    assert!(!has(cx, w, format!("ask-suggested {id} 2")));
+    assert!(has(cx, w, format!("ask-footer {id}")));
 }

@@ -26,6 +26,11 @@ pub(crate) const LEGACY: &str = "20261111-201530-0a6e";
 /// one in each state: `--offline --session 20261124-101500-cd01`, and the
 /// card tests. Not in the session list (the rail's tests count it).
 pub(crate) const ASKS: &str = "20261124-101500-cd01";
+/// A session whose agent waits on an open form card: prefilled fields, a
+/// long field over lines, a check, a long label and an optional field's
+/// placeholder. `--offline --session 20261124-101600-cd02`, for its stills
+/// and a card test; not in the session list either.
+pub(crate) const ASK_FORM: &str = "20261124-101600-cd02";
 
 /// Message times (`_synaps_at`) on a demo history, as the host records
 /// them: from the local wall time in the session's id on, `step` seconds
@@ -534,7 +539,10 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
         return attach_sid(attach_seq);
     }
     if id == ASKS {
-        return attach_asks(attach_seq);
+        return attach_asks(attach_seq, ASKS, asks(), "Tokens onto Postgres");
+    }
+    if id == ASK_FORM {
+        return attach_asks(attach_seq, ASK_FORM, ask_form(), "Token backfill plan");
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };
@@ -747,14 +755,32 @@ fn asks() -> Vec<Value> {
     out
 }
 
-fn attach_asks(attach_seq: u64) -> Vec<Event> {
-    let mut msgs = asks();
-    stamp(&mut msgs, ASKS, 30, None);
+/// [`ASK_FORM`]'s history: the agent waits on one form, its options and
+/// its fields prefilled.
+fn ask_form() -> Vec<Value> {
+    let mut out = vec![json!({"role": "user", "content": "Plan the token backfill with me before you run anything."})];
+    let plan = json!({"question": "How should the backfill run?", "wait": true,
+        "detail": "About 2.4 million tokens. The file store stays readable until the cut-over.",
+        "options": [{"label": "In batches", "hint": "a pause between each"}, {"label": "All at once", "hint": "locks the table for about 3 minutes"}],
+        "default": "In batches",
+        "fields": [
+            {"id": "batch", "label": "Batch size", "value": "10000"},
+            {"id": "window", "label": "Run window (local time), and the latest it may roll back by", "value": "22:00 to 23:30, rolled back by 23:45"},
+            {"id": "verify", "label": "Compare row counts after every batch", "type": "check", "value": true},
+            {"id": "notes", "label": "Notes for on-call", "type": "long",
+                "value": "Page #relay-oncall if a batch takes over a minute.\nThe dashboards are under Relay / Tokens."},
+            {"id": "ticket", "label": "Ticket", "optional": true, "placeholder": "RELAY-1234"}]});
+    asked(&mut out, "toolu_f1", "c2b7m9q", Some("Before the backfill, the plan:"), plan);
+    out
+}
+
+fn attach_asks(attach_seq: u64, id: &str, mut msgs: Vec<Value>, title: &str) -> Vec<Event> {
+    stamp(&mut msgs, id, 30, None);
     let attached = json!({"type": "attached", "client": 2,
-        "meta": {"id": ASKS, "name": "token-store", "title": "Tokens onto Postgres", "model": "anthropic/claude-opus-4-1", "cwd": CWD,
+        "meta": {"id": id, "name": "token-store", "title": title, "model": "anthropic/claude-opus-4-1", "cwd": CWD,
             "lifecycle": "live", "busy": false, "awaiting_input": 0},
         "view": {"model": "anthropic/claude-opus-4-1", "thinking_level": "medium", "reasoning_level": "medium", "context_window": 200000},
-        "conversation": {"header": {"title": "Tokens onto Postgres"}, "messages_len": msgs.len(), "api_messages": msgs, "cost": 1.12},
+        "conversation": {"header": {"title": title}, "messages_len": msgs.len(), "api_messages": msgs, "cost": 1.12},
         "streaming": false, "pending_prompts": [], "client_input": "shared", "input_owner": 2});
     match decode_frame(&attached.to_string()) {
         Ok(DaemonFrame::Attached(a)) => vec![Event::Attached { attach_seq, attached: a, mode: AttachMode::Mirror, reconnect: false }],
