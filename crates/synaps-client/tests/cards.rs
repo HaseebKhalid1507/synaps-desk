@@ -6,6 +6,7 @@
 //! writes them (`cards_spec::Envelope`), answers as a desk sends them
 //! (`cards_spec::message::build`).
 
+use cards_spec::fold::{Event, events, fold};
 use cards_spec::{CardId, Envelope, Input, Reply, message, parse_answer, parse_input};
 use serde_json::{Value, json};
 use synaps_client::cards::{CardRow, State};
@@ -434,4 +435,159 @@ fn a_close_names_the_card_it_closed_not_a_later_one_of_its_id() {
     assert_eq!(kinds, [false, true, false], "the second row is the close");
     let states: Vec<_> = cards(&t).iter().filter(|(_, c)| matches!(c, CardRow::Ask(_))).map(|(_, c)| state(c).0).collect();
     assert_eq!(states, [State::Closed, State::Open]);
+}
+
+/// Event `e` as the live stream sends it: a call (its start, then its
+/// input whole), a result, a turn started by a user message.
+fn live(t: &mut Transcript, e: &Event) {
+    match e {
+        Event::Call { tool_id, name, input } => {
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": name, "tool_id": tool_id})));
+            t.apply(&llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": name, "tool_id": tool_id, "input": input})));
+        }
+        Event::Result { tool_id, text } => t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool_id, "result": text}))),
+        Event::User { text } => t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": text}))),
+    }
+}
+
+/// `h`'s first message attached, then the rest of it live, event by event.
+fn lived(h: &[Value]) -> Transcript {
+    let mut t = attach(&h[..1]);
+    t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": null})));
+    for e in events(&h[1..]) {
+        live(&mut t, &e);
+    }
+    t
+}
+
+/// Each card drawn, in row order: its question and state.
+fn drawn(t: &Transcript) -> Vec<(String, State)> {
+    cards(t)
+        .into_iter()
+        .filter_map(|(_, c)| match c {
+            CardRow::Ask(a) => Some((a.doc.question.clone(), a.state)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What `cards_spec::fold` draws of `evs`: each card that is one, in call
+/// order, its question and state.
+fn folded(evs: &[Event]) -> Vec<(String, State)> {
+    fold(evs)
+        .cards()
+        .iter()
+        .filter(|c| c.state != State::Plain)
+        .filter_map(|c| c.doc.as_ref().map(|d| (d.question.clone(), c.state)))
+        .collect()
+}
+
+/// Each close's row, in row order: the question of the card it closed.
+fn closes(t: &Transcript) -> Vec<String> {
+    cards(t)
+        .into_iter()
+        .filter_map(|(_, c)| match c {
+            CardRow::Close(c) => Some(c.doc.question.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The live turn folds in the order its events came, not in its rows'
+/// order: results need not come in call order. Two card calls bound to one
+/// card id (§1.5), their results in either order; a close, and a card bound
+/// to its id between its call and its result. Each draws as
+/// `cards_spec::fold` reads the same events in the same order.
+#[test]
+fn the_live_turn_folds_in_the_order_its_events_came() {
+    let branch = || json!({"question": "Which branch?", "options": ["main", "dev"]});
+    let call = |tool: &str, input: Value| Event::Call { tool_id: tool.into(), name: "cards_ui".into(), input };
+    let result = |tool: &str, text: String| Event::Result { tool_id: tool.into(), text };
+    let mut h = vec![user("go")];
+    h.extend(asked("t0", A, ship()));
+    let (ship_q, ask_q, branch_q) = ("Ship it?".to_string(), "Which approach?".to_string(), "Which branch?".to_string());
+    let cases = [
+        // In call order: the later call's card holds the id.
+        (
+            vec![call("tA", ask()), call("tB", branch()), result("tA", showing(B, &ask())), result("tB", showing(B, &branch()))],
+            vec![(ship_q.clone(), State::Open), (ask_q.clone(), State::Replaced), (branch_q.clone(), State::Open)],
+            Vec::<String>::new(),
+        ),
+        // The other way round: the earlier call's result came last, so its
+        // card holds the id.
+        (
+            vec![call("tA", ask()), call("tB", branch()), result("tB", showing(B, &branch())), result("tA", showing(B, &ask()))],
+            vec![(ship_q.clone(), State::Open), (ask_q, State::Open), (branch_q.clone(), State::Replaced)],
+            Vec::new(),
+        ),
+        // A close of `A`, and a card bound to `A` before the close's result:
+        // the close closes that card, the history's is replaced by it.
+        (
+            vec![
+                call("tC", json!({"close": A})),
+                call("tD", branch()),
+                result("tD", showing(A, &branch())),
+                result("tC", format!("Card {A} closed (cards/1).")),
+            ],
+            vec![(ship_q, State::Replaced), (branch_q.clone(), State::Closed)],
+            vec![branch_q],
+        ),
+    ];
+    for (i, (steps, want, closed)) in cases.into_iter().enumerate() {
+        let mut t = attach(&h);
+        t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": h.len(), "trigger": "user", "user_text": null})));
+        for e in &steps {
+            live(&mut t, e);
+        }
+        let mut all = events(&h);
+        all.extend(steps);
+        assert_eq!(folded(&all), want, "case {i}: the shared fold");
+        assert_eq!(drawn(&t), want, "case {i}: the live rows");
+        assert_eq!(closes(&t), closed, "case {i}: the closes");
+    }
+}
+
+/// A close that closed a card says so for good: a later call of its tool
+/// id (a provider may use one again, §2.2), another tool's or a second
+/// close, takes the id, not the receipt. A close still waiting for its
+/// result when its id is taken never closed anything: a plain row. The
+/// same over the history and live.
+#[test]
+fn a_completed_close_keeps_its_row_when_its_tool_id_is_used_again() {
+    let closed = |card: &str| format!("Card {card} closed (cards/1).");
+    let (ask_q, ship_q) = ("Which approach?".to_string(), "Ship it?".to_string());
+    // A completed close, then a bash call with its tool id.
+    let mut other = vec![user("go")];
+    other.extend(asked("t1", A, ask()));
+    other.push(call("tc", "cards_ui", json!({"close": A})));
+    other.push(result("tc", &closed(A)));
+    other.push(call("tc", "bash", json!({"command": "ls"})));
+    other.push(result("tc", "a"));
+    // Two completed closes with one tool id.
+    let mut twice = vec![user("go")];
+    twice.extend(asked("t1", A, ask()));
+    twice.extend(asked("t2", B, ship()));
+    twice.push(call("tc", "cards_ui", json!({"close": A})));
+    twice.push(result("tc", &closed(A)));
+    twice.push(call("tc", "cards_ui", json!({"close": B})));
+    twice.push(result("tc", &closed(B)));
+    // A close still waiting when a bash call takes its tool id.
+    let mut pending = vec![user("go")];
+    pending.extend(asked("t1", A, ask()));
+    pending.push(call("tc", "cards_ui", json!({"close": A})));
+    pending.push(call("tc", "bash", json!({"command": "ls"})));
+    pending.push(result("tc", &closed(A)));
+    let cases = [
+        ("a close, then another tool", other, vec![(ask_q.clone(), State::Closed)], vec![ask_q.clone()]),
+        ("two closes", twice, vec![(ask_q.clone(), State::Closed), (ship_q.clone(), State::Closed)], vec![ask_q.clone(), ship_q]),
+        ("a close taken over", pending, vec![(ask_q, State::Open)], Vec::new()),
+    ];
+    for (what, h, want, named) in cases {
+        for (path, t) in [("history", attach(&h)), ("live", lived(&h))] {
+            assert_eq!(drawn(&t), want, "{what}, {path}: the cards");
+            assert_eq!(closes(&t), named, "{what}, {path}: the closes");
+            let calls = t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "tc")).count();
+            assert_eq!(calls, h.iter().filter(|m| m["content"][0]["id"] == "tc").count(), "{what}, {path}: a row per call");
+        }
+    }
 }

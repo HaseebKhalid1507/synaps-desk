@@ -409,3 +409,84 @@ fn a_card_between_two_calls_splits_their_run() {
     assert_eq!(rows[3].gap, crate::turns::Gap::Part, "the card is a part of the turn");
     assert_eq!(rows[4].gap, crate::turns::Gap::Part, "the run after it starts anew");
 }
+
+/// What a card draws is sanitized for display (synaps-cards §5.2): an
+/// answer's values are validated, never rewritten, so a bidi override, a
+/// tab, a line break or an invisible in a note or a field stays in the
+/// reply and never reaches the receipt or the answer's row. And a call
+/// this desk can't read says its question on one line, sanitized and cut
+/// to the spec's bound, or, nothing of it left, its input, sanitized.
+#[gpui_kit::test]
+fn what_a_card_draws_is_sanitized(cx: &mut TestAppContext) {
+    let (w, view, _events) = asks(cx, 900.);
+    view.update(cx, |v, _| v.model.transcript.set_busy(true));
+    let input = json!({"question": "Who signs off on the cut-over?",
+        "options": [{"label": "Ana", "note": "Why her?"}, "Ben"],
+        "fields": [{"id": "name", "label": "Their handle"}, {"id": "why", "label": "Context", "type": "long", "optional": true}]});
+    let mut events = vec![
+        llm(json!({"kind": "llm", "llm": "response_start"})),
+        llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": "toolu_signoff", "input": input})),
+        llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_signoff", "result": showing("c7bidi0", &input)})),
+    ];
+    for (id, question) in [
+        ("toolu_bidi", "safe\u{202e}evil\u{202c}".to_string()),
+        ("toolu_blank", "\u{202e}\u{200b}".to_string()),
+        ("toolu_long", "x".repeat(300)),
+    ] {
+        events.push(llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": id,
+            "input": {"question": question, "options": ["A", "B"]}})));
+        events.push(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "cards_ui: refused"})));
+    }
+    live(cx, &view, events);
+    settle(cx, w, 8);
+    // Another desk answers, every value as it was typed.
+    let doc = match cards_spec::parse_input(&input).unwrap() {
+        cards_spec::Input::Create { doc, .. } => doc,
+        cards_spec::Input::Close(_) => unreachable!(),
+    };
+    let values = json!({"choice": "Ana", "note": "her\u{202e}eh\u{202c}\u{200b}",
+        "fields": {"name": "left\u{202e}right\u{202c}", "why": "one\ttwo\nthree\u{ad}\u{feff}"}});
+    let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &values).expect("valid values"));
+    let text = cards_spec::message::build(&cards_spec::CardId::parse("c7bidi0").unwrap(), &doc, &reply);
+    live(
+        cx,
+        &view,
+        vec![
+            llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+            json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": text}),
+        ],
+    );
+    settle(cx, w, 8);
+    let hostile = |s: &str| s.chars().any(|c| c.is_control() || cards_spec::sanitize::is_invisible(c));
+    let all = rows(cx, &view);
+    let card = all.iter().rfind(|r| r.kind == Kind::Ask).expect("the card");
+    let a = ask(card);
+    assert_eq!(a.state, State::Answered);
+    // The reply is what was sent.
+    let Some(synaps_client::cards::Reply::Answer(sent)) = a.reply.as_ref() else { panic!("its answer: {:?}", a.reply) };
+    assert!(sent.note.as_deref().is_some_and(hostile), "the note as it was sent");
+    // What the receipt and the answer's row draw of it: one clean line.
+    let said = crate::ask::summary(&a.doc, a.reply.as_ref().unwrap()).expect("what was answered");
+    assert_eq!(said, "Ana · “hereh” · Their handle: leftright · Context: one two three");
+    show(cx, w, &view, card.ix);
+    assert!(has(cx, w, format!("ask-said {}", card.id)));
+    let answer = all.last().expect("the answer's row");
+    let Some(CardRow::Answer(an)) = &answer.card else { panic!("the answer's row: {:?}", answer.card) };
+    assert_eq!(crate::ask::summary(&an.doc, &an.reply).as_deref(), Some(said.as_str()));
+    show(cx, w, &view, answer.ix);
+    assert!(has(cx, w, format!("ask-answer {}", answer.id)));
+    // The calls this desk can't read: tool rows, their targets clean.
+    let targets = view.read_with(cx, |v, _| {
+        let items = v.model.transcript.items();
+        ["toolu_bidi", "toolu_blank", "toolu_long"].map(|id| {
+            let ix = items.iter().position(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == id)).expect("the call");
+            (items[ix].card.is_none(), v.rows[ix].card.target.to_string())
+        })
+    });
+    assert!(targets.iter().all(|(plain, t)| *plain && !hostile(t.as_str())), "{targets:?}");
+    assert_eq!(targets[0].1, "«safeevil»");
+    assert!(!targets[1].1.is_empty() && !targets[1].1.starts_with('«'), "nothing of its question left: its input, {:?}", targets[1].1);
+    assert_eq!(targets[2].1.chars().count(), cards_spec::QUESTION_MAX + 2, "cut to the spec's bound: {:?}", targets[2].1);
+    assert!(targets[2].1.ends_with("…»"));
+}
