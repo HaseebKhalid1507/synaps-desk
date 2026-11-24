@@ -409,7 +409,10 @@ fn an_option_that_asks_for_a_note_opens_it(cx: &mut TestAppContext) {
     })
     .unwrap();
     settle(cx, w, 8);
-    // Send came with the note: it arms from its own first frame.
+    // Send came with the note: it arms from its own first frame, not the
+    // options' (Shady #81 P2-3).
+    click(cx, w, &view, format!("ask-send {id}"));
+    assert!(sends(cx, &view).is_empty(), "Send, new, not armed yet");
     arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-send {id}"));
     assert_eq!(
