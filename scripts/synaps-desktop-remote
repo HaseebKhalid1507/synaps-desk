@@ -1,5 +1,5 @@
 #!/bin/bash
-# synaps-desktop-remote [host]   (default: avante)
+# synaps-desktop-remote [host]   (default: avante; SYNAPS_PROFILE=<name>: that profile's daemon)
 # Runs Synaps Desktop here, attached to the Synaps daemon on <host>, through an SSH-forwarded
 # Unix socket. The tunnel lives exactly as long as the app. The local socket is 0600 inside
 # $XDG_RUNTIME_DIR, so no other user on this machine can ride it. The app is told how to read
@@ -79,8 +79,10 @@ fi
 
 host="${1:-avante}"
 plain "$host" || { echo "synaps-desktop-remote: the host is not a plain name" >&2; exit 64; }
-sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/synaps-$host.sock"
-remote="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'echo $HOME')/.synaps-cli/run/daemon.sock"
+profile="${SYNAPS_PROFILE:-}"
+[ -z "$profile" ] || plain "$profile" || { echo "synaps-desktop-remote: SYNAPS_PROFILE is not a plain name" >&2; exit 64; }
+sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/synaps-$host${profile:+-$profile}.sock"
+remote="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'echo $HOME')/.synaps-cli/run/daemon${profile:+-$profile}.sock"
 rm -f "$sock"
 ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o StreamLocalBindMask=0177 \
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L "$sock:$remote" "$host" &
