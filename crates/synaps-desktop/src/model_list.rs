@@ -636,7 +636,9 @@ fn run<S: Sink>(mut c: Command, what: &str, sink: S, within: Duration) -> Result
     }
 }
 
-/// `out` into `sink` until its end, the sink's `Err` or (Unix) `deadline`.
+/// `out` into `sink` until its end, the sink's `Err` or `deadline` (on
+/// Unix while it waits; elsewhere between reads, the job's kill ending a
+/// read that waits).
 /// Each block is cleared once given.
 fn pump<S: Sink>(mut out: ChildStdout, sink: &mut S, deadline: Instant) -> Result<(), Stop> {
     let mut buf = [0u8; 8192];
@@ -646,7 +648,9 @@ fn pump<S: Sink>(mut out: ChildStdout, sink: &mut S, deadline: Instant) -> Resul
             return Err(Stop::Late);
         }
         #[cfg(not(unix))]
-        let _ = deadline;
+        if Instant::now() >= deadline {
+            return Err(Stop::Late);
+        }
         let n = match out.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
