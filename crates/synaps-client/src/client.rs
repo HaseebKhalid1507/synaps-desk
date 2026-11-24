@@ -256,6 +256,16 @@ pub enum Command {
         prompt_id: u64,
         value: Option<String>,
     },
+    /// An agent-card action (`SessionCommand::SurfaceAction`), only on
+    /// connection `connection`, the one whose snapshot its card was drawn
+    /// from (agent-ui §3.8), and only to a daemon that lists
+    /// `agent_surfaces`. Otherwise it is dropped, never sent, and refused
+    /// back (`Error::Refused { command: "surface_action" }`). See
+    /// [`Client::surface_action_on`].
+    SurfaceActionOn {
+        connection: u64,
+        action: crate::protocol::SurfaceAction,
+    },
     /// Re-fetch the whole history (`Query{Messages}`) → `HistoryUpdate::Replace`.
     Resync,
     /// `SavedSessions` on the control connection → `Event::SavedSessions`.
@@ -326,6 +336,7 @@ impl Command {
             Command::Steer { .. } => "steer",
             Command::Cancel => "cancel",
             Command::Answer { .. } | Command::AnswerOn { .. } => "answer",
+            Command::SurfaceActionOn { .. } => "surface_action",
             Command::Resync => "query",
             Command::SavedSessions { .. } => "saved_sessions",
             Command::CatalogPage { .. } => "catalog_page",
@@ -365,6 +376,10 @@ impl std::fmt::Debug for Command {
                 .field("prompt_id", prompt_id)
                 .field("value", &format_args!("<redacted>"))
                 .finish(),
+            // `SurfaceAction`'s own `Debug` redacts its values.
+            Command::SurfaceActionOn { connection, action } => {
+                f.debug_struct("SurfaceActionOn").field("connection", connection).field("action", action).finish()
+            }
             Command::SavedSessions { named_only, limit } => {
                 f.debug_struct("SavedSessions").field("named_only", named_only).field("limit", limit).finish()
             }
@@ -1002,6 +1017,19 @@ impl Client {
         self.send(Command::AnswerOn { connection, prompt_id, value })
     }
 
+    /// Answer, skip or revise an agent card drawn from `connection`'s
+    /// snapshot or events (`Attached::connection`), the twin of
+    /// [`Client::answer_on`] (agent-ui §3.8): an action is only ever sent on
+    /// the connection its card was reconciled against. It is dropped, never
+    /// sent, and comes back as `Error::Refused { command: "surface_action" }`
+    /// if the session has reconnected since, or if the daemon doesn't list
+    /// [`crate::protocol::FEATURE_AGENT_SURFACES`] (§2.1; none does yet).
+    /// The reply is a `SessionEvent::SurfaceResult`; what to do with it is
+    /// [`crate::surface::outbox`]'s.
+    pub fn surface_action_on(&self, connection: u64, action: crate::protocol::SurfaceAction) -> Result<(), ClientClosed> {
+        self.send(Command::SurfaceActionOn { connection, action })
+    }
+
     /// Re-fetch the whole history: an `Event::History` with a `Replace`.
     pub fn resync(&self) -> Result<(), ClientClosed> {
         self.send(Command::Resync)
@@ -1107,6 +1135,12 @@ impl SessionRef<'_> {
     /// ([`Client::answer_on`]).
     pub fn answer_on(&self, connection: u64, prompt_id: u64, value: Option<String>) -> Result<(), ClientClosed> {
         self.send(Command::AnswerOn { connection, prompt_id, value })
+    }
+
+    /// An agent-card action on a card that came on `connection` of this
+    /// attachment ([`Client::surface_action_on`]).
+    pub fn surface_action_on(&self, connection: u64, action: crate::protocol::SurfaceAction) -> Result<(), ClientClosed> {
+        self.send(Command::SurfaceActionOn { connection, action })
     }
 
     /// Re-fetch the whole history ([`Client::resync`]).
@@ -1795,6 +1829,21 @@ fn is_worker_handle(h: &str) -> bool {
     h.strip_prefix("sa_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether an agent-card action whose card was drawn on connection
+/// `drawn_on` may go on `connection`, to a daemon whose `Welcome` listed
+/// `features`: only on the connection its card was reconciled against
+/// (agent-ui §3.8), only to a daemon that takes it (§2.1). `Err`: why it
+/// is not sent.
+fn surface_action_gate(drawn_on: u64, connection: u64, features: &[String]) -> Result<(), &'static str> {
+    if drawn_on != connection {
+        return Err("the card was drawn on an earlier connection; not sent");
+    }
+    if !features.iter().any(|f| f == FEATURE_AGENT_SURFACES) {
+        return Err("this daemon takes no agent-card actions (no agent_surfaces feature); not sent");
+    }
+    Ok(())
+}
+
 /// The engine commands still in flight as the connection or the
 /// attachment ends: each answered (a cancel `Err(why)` with where to look,
 /// a slash command [`CommandReply::Unknown`]: it may have run), never left
@@ -1998,6 +2047,15 @@ async fn session_loop(
                                 reason: "the prompt was raised on an earlier connection; not sent".into(),
                             });
                             continue;
+                        }
+                        Command::SurfaceActionOn { connection: c, action } => {
+                            match surface_action_gate(c, connection, &conn.welcome.features) {
+                                Ok(()) => SessionCommand::SurfaceAction(action),
+                                Err(reason) => {
+                                    emit_error(&events, Some(attach_seq), Error::Refused { command: Some(name.into()), reason: reason.into() });
+                                    continue;
+                                }
+                            }
                         }
                         Command::Resync if mirror.is_some() && resync.is_none() => {
                             resync = Some(None);
@@ -2336,6 +2394,37 @@ async fn session_loop(
         if without_session(&mut cmds, &events, attach_seq, tokio::time::sleep(delay)).await.is_none() {
             return detached(session_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod surface_action_tests {
+    use super::*;
+
+    /// A card action goes only on the connection its card came on, and
+    /// only to a daemon that lists `agent_surfaces` (agent-ui §2.1, §3.8);
+    /// the command's name and `Debug` are the daemon's, its values redacted.
+    #[test]
+    fn a_card_action_is_sent_only_where_it_may_be() {
+        let with = vec!["session_page".to_string(), FEATURE_AGENT_SURFACES.to_string()];
+        let without = vec!["session_page".to_string()];
+        assert_eq!(surface_action_gate(3, 3, &with), Ok(()));
+        assert!(surface_action_gate(2, 3, &with).unwrap_err().contains("earlier connection"));
+        assert!(surface_action_gate(3, 3, &without).unwrap_err().contains("agent_surfaces"));
+        assert!(surface_action_gate(3, 3, &[]).is_err(), "an older daemon lists nothing");
+        let action = SurfaceAction {
+            surface_id: "s_3f2a91c0d4e2a871".into(),
+            contract: "c1:dd88bb46e6b36d702d326c325b6b5c61".into(),
+            action_id: "5b0c".repeat(8),
+            expect_rev: 0,
+            epoch: 4,
+            verb: crate::surface::Verb::Answer,
+            values: Some(serde_json::json!({"choice": "a secret plan"})),
+        };
+        let cmd = Command::SurfaceActionOn { connection: 3, action };
+        assert_eq!(cmd.name(), "surface_action");
+        let shown = format!("{cmd:?}");
+        assert!(!shown.contains("secret") && shown.contains("<redacted>"), "{shown}");
     }
 }
 

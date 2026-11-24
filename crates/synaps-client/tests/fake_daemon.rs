@@ -91,6 +91,8 @@ struct Opts {
     /// With `pages`: before each page reply, a req-less `Error` that is not
     /// the page's; a `before` of `"bad"` is answered `malformed frame`.
     noise: bool,
+    /// `Welcome.features` lists `agent_surfaces` (no daemon does yet).
+    surfaces: bool,
 }
 
 /// The fake's saved sessions, newest first: five rows, the third named.
@@ -141,6 +143,9 @@ fn welcome(opts: Opts) -> Value {
     let mut features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
     if opts.pages {
         features.push("session_page");
+    }
+    if opts.surfaces {
+        features.push(synaps_client::FEATURE_AGENT_SURFACES);
     }
     json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
            "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"},
@@ -1174,6 +1179,99 @@ async fn answers_for_an_earlier_connection_are_never_sent() {
     // the daemon sees: the stale "y" never reached it.
     client.answer_on(second, 1, Some("n".into())).unwrap();
     assert_eq!(again.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 1, "value": "n"}));
+    client.shutdown().unwrap();
+    assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
+}
+
+/// An agent card's action as D3 will commit it, under `action_id`.
+fn card_action(action_id: &str) -> synaps_client::protocol::SurfaceAction {
+    synaps_client::protocol::SurfaceAction {
+        surface_id: "s_3f2a91c0d4e2a871".into(),
+        contract: "c1:dd88bb46e6b36d702d326c325b6b5c61".into(),
+        action_id: action_id.into(),
+        expect_rev: 0,
+        epoch: 4,
+        verb: synaps_client::surface::Verb::Answer,
+        values: Some(json!({"choice": "Leave it"})),
+    }
+}
+
+/// That action's frame, as the daemon reads it (§2.4).
+fn card_action_cmd(action_id: &str) -> Value {
+    json!({"cmd": "surface_action", "surface_id": "s_3f2a91c0d4e2a871", "contract": "c1:dd88bb46e6b36d702d326c325b6b5c61",
+           "action_id": action_id, "expect_rev": 0, "epoch": 4, "verb": "answer", "values": {"choice": "Leave it"}})
+}
+
+/// Two commits' ids: the old card's and the new connection's.
+const OLD_ID: &str = "9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e";
+const NEW_ID: &str = "5b0c5b0c5b0c5b0c5b0c5b0c5b0c5b0c";
+
+fn card_action_refused(e: &Event) -> Option<String> {
+    match e {
+        Event::Error { error: Error::Refused { command: Some(c), reason }, .. } if c == "surface_action" => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+/// Shady #75 O3, through the real send loop: a daemon whose `Welcome`
+/// doesn't list `agent_surfaces` (every daemon today) is never written a
+/// `surface_action` frame. The action comes back refused, and the next
+/// command the daemon reads is the one sent after it.
+#[tokio::test]
+async fn a_card_action_is_never_written_to_a_daemon_without_the_feature() {
+    let mut fake = Fake::start("card-off").await;
+    let (client, events) = fake.client();
+    client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = fake.next_attach().await;
+    conn.send(attached_frame(2)).await;
+    let connection = wait(&events, "attached", |e| match e {
+        Event::Attached { attached, .. } => Some(attached.connection),
+        _ => None,
+    })
+    .await;
+    client.surface_action_on(connection, card_action(NEW_ID)).unwrap();
+    let why = wait(&events, "refused", card_action_refused).await;
+    assert!(why.contains("agent_surfaces"), "{why}");
+    client.answer_on(connection, 1, Some("y".into())).unwrap();
+    assert_eq!(conn.recv_cmd().await, json!({"cmd": "answer", "prompt_id": 1, "value": "y"}), "no surface_action before it");
+    client.shutdown().unwrap();
+    assert_eq!(conn.recv_cmd().await, json!({"cmd": "detach", "client": 2}));
+}
+
+/// Shady #75 O3: to a daemon that lists `agent_surfaces`, the action is
+/// written on its card's connection, unchanged. After a reconnect, an
+/// action for a card drawn on the old connection is refused and never
+/// written; the new connection's own action is the first command the
+/// daemon reads there.
+#[tokio::test]
+async fn a_card_action_is_written_only_on_its_cards_connection() {
+    let mut fake = Fake::start_with("card-on", Opts { surfaces: true, ..Opts::default() }).await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = fake.next_attach().await;
+    conn.send(attached_frame(2)).await;
+    let first = wait(&events, "attached", |e| match e {
+        Event::Attached { attached, .. } => Some(attached.connection),
+        _ => None,
+    })
+    .await;
+    client.surface_action_on(first, card_action(OLD_ID)).unwrap();
+    assert_eq!(conn.recv_cmd().await, card_action_cmd(OLD_ID));
+    drop(conn);
+    wait(&events, "reattaching", |e| matches!(e, Event::Reattaching { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
+    let mut again = fake.next_attach().await;
+    again.send(attached_frame(3)).await;
+    let second = wait(&events, "re-attached", |e| match e {
+        Event::Attached { attached, reconnect: true, .. } => Some(attached.connection),
+        _ => None,
+    })
+    .await;
+    assert!(second > first, "{first} then {second}");
+    client.surface_action_on(first, card_action(OLD_ID)).unwrap();
+    let why = wait(&events, "refused after the reconnect", card_action_refused).await;
+    assert!(why.contains("earlier connection"), "{why}");
+    client.surface_action_on(second, card_action(NEW_ID)).unwrap();
+    assert_eq!(again.recv_cmd().await, card_action_cmd(NEW_ID), "the old card's action never reached it");
     client.shutdown().unwrap();
     assert_eq!(again.recv_cmd().await, json!({"cmd": "detach", "client": 3}));
 }

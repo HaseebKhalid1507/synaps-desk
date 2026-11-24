@@ -123,7 +123,8 @@ impl Identity {
                 instance: self.instance.clone(),
                 history: self.history,
                 tail_items: self.tail_items,
-                capabilities: Capabilities { tool_queue: true, owner_reason_input: true },
+                // `surfaces: 0`: no agent cards (D1); omitted on the wire.
+                capabilities: Capabilities { tool_queue: true, owner_reason_input: true, surfaces: crate::protocol::SURFACES_CATALOG },
                 name: Some(self.name.clone()),
             },
             // Only a default: created sessions get an explicit
