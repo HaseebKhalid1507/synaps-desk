@@ -515,9 +515,21 @@ impl AppView {
                                 }
                             }
                         };
+                        // An optional field says so: it may be left empty.
+                        let optional = f.optional.then(|| {
+                            let fid = f.id.clone();
+                            div().flex_none().debug_selector(move || format!("ask-optional {id} {fid}")).child("· optional")
+                        });
                         v_flex()
                             .gap(px((4. * r).round()))
-                            .child(div().text_px(m.meta).text_color(p.dim_t).child(shown(&f.label, Lines::Single)))
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .text_px(m.meta)
+                                    .text_color(p.dim_t)
+                                    .child(div().min_w_0().child(shown(&f.label, Lines::Single)))
+                                    .children(optional),
+                            )
                             .child(field)
                             .into_any_element()
                     }
@@ -634,11 +646,15 @@ pub(crate) fn parts(doc: &CardDoc, reply: &Reply) -> Vec<String> {
     out
 }
 
+/// A receipt that opens: its hover group (its chevron brightens).
+const RECEIPT: &str = "ask-receipt";
+
 /// The card's receipt: its head line, the question → the answer, the state
 /// word at its end. `word` and `tone`: the state as the memo says it while
 /// an answer of this desk's is on its way (else the fold's). `open`: the
 /// whole answer under it, a line each ([`parts`]).
 pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &Palette, m: &Metrics) -> Div {
+    let at = |d: Div| if look.opens { d.group(RECEIPT) } else { d };
     let (mark, mark_color) = match look.tone {
         Tone::Fold => receipt_mark(a, p),
         Tone::Out => (Glyph::Needs, p.acc),
@@ -654,6 +670,7 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &P
         Tone::Lost => p.warn,
     };
     v_flex()
+        .map(at)
         .w_full()
         .bg(p.card_d)
         .px(px(pad_x(m)))
@@ -708,7 +725,15 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &P
                         .text_color(word_color)
                         .debug_selector(move || format!("ask-state {id} {word}"))
                         .child(word),
-                ),
+                )
+                .when(look.opens, |d| {
+                    let g = if look.open { Glyph::FoldOpen } else { Glyph::Fold };
+                    let open = look.open;
+                    d.child(
+                        crate::glyph::reveal(g, RECEIPT, RECEIPT, true, p.dim_t, p.ink)
+                            .debug_selector(move || format!("ask-opens {id} {}", if open { "open" } else { "shut" })),
+                    )
+                }),
         )
         .when(!whole.is_empty(), |d| {
             d.child(
@@ -778,6 +803,9 @@ pub(crate) struct Look {
     pub(crate) tone: Tone,
     /// The whole answer shown under it.
     pub(crate) open: bool,
+    /// A click opens or closes it: a chevron after its state says so,
+    /// brighter under the pointer.
+    pub(crate) opens: bool,
 }
 
 /// A receipt's tone: the fold's, on its way (the accent), or not
@@ -818,6 +846,7 @@ impl AppView {
                     Tone::Out
                 },
                 open,
+                opens: false,
             };
             let mut out = receipt(a, Some(&e.reply), look, id, p, m);
             if lost && let Some(painted) = Painted::of(a) {
@@ -880,7 +909,7 @@ impl AppView {
         let tool = a.tool_id.clone();
         let reply = a.reply.as_ref();
         let opens = session.is_some() && reply.is_some_and(|r| !parts(&a.doc, r).is_empty());
-        let r = receipt(a, reply, Look { open, ..Look::default() }, id, p, m);
+        let r = receipt(a, reply, Look { open, opens, ..Look::default() }, id, p, m);
         if opens {
             r.id(("ask-receipt", id))
                 .cursor_pointer()

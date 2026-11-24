@@ -326,6 +326,11 @@ fn a_prefilled_form_is_one_click_send(cx: &mut TestAppContext) {
     let (id, ix) = card(cx, &view, "How should the backfill run?");
     show(cx, w, &view, ix);
     assert!(has(cx, w, format!("ask-picked {id} 1")), "the default, picked");
+    // The optional field says so; the others don't (Shady #81 r2, polish).
+    assert!(has(cx, w, format!("ask-optional {id} ticket")), "Ticket: optional");
+    for f in ["batch", "window", "notes"] {
+        assert!(!has(cx, w, format!("ask-optional {id} {f}")), "{f}: required");
+    }
     arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-send {id}"));
     let s = sends(cx, &view);
@@ -605,10 +610,14 @@ fn a_receipt_opens_to_the_whole_answer(cx: &mut TestAppContext) {
     show(cx, w, &view, first.1);
     let id = first.0;
     assert!(!has(cx, w, format!("ask-whole {id}")));
+    // Its chevron says a click opens it (Shady #81 r2, polish).
+    assert!(has(cx, w, format!("ask-opens {id} shut")), "a closed chevron");
     click(cx, w, &view, format!("ask-receipt {id}"));
     assert!(has(cx, w, format!("ask-whole {id}")), "opened");
+    assert!(has(cx, w, format!("ask-opens {id} open")), "an open chevron");
     click(cx, w, &view, format!("ask-receipt {id}"));
     assert!(!has(cx, w, format!("ask-whole {id}")), "closed");
+    assert!(has(cx, w, format!("ask-opens {id} shut")), "closed again");
 }
 
 /// Shady #81 P2-3: a card's controls arm from the first frame they are
