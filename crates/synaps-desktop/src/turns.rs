@@ -1972,7 +1972,6 @@ impl AppView {
             .px(px(g.pad))
             .gap(px(g.gap))
             .items_center()
-            .rounded(px(g.row_radius))
             .font_family(fonts::MONO)
             .text_px(m.mono)
             .cursor_pointer()
@@ -2197,7 +2196,6 @@ impl AppView {
             .px(px(g.pad))
             .gap(px(g.gap))
             .items_center()
-            .rounded(px(g.row_radius))
             .when_some(wash, |d, w| d.bg(w))
             .when(has_body && wash.is_none(), |d| d.cursor_pointer().hover(|d| d.bg(p.hover)))
             .when(has_body && wash.is_some(), |d| d.cursor_pointer())
@@ -2256,7 +2254,9 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A worker's spawn row (polish.md §2.4): one row, the worker's state
+    /// A worker's spawn row (polish.md §2.4): one row on its run's card
+    /// (`card_d`, as a tool's row: Haseeb; the worker's own fill is its
+    /// chip's), the worker's state
     /// in the gutter (not the call's), `spawn`, its name and task, its facts
     /// (the clock ticks while it runs here: [`crate::tray::ticked`]) and
     /// OPEN ↗; under it while it runs its step (↳, `sub_status_t`), once
@@ -2345,7 +2345,6 @@ impl AppView {
                 .gap(px(6.))
                 .items_center()
                 .group("wopen")
-                .rounded(px(4.))
                 .border_1()
                 .border_color(p.line)
                 .bg(p.card_d)
@@ -2420,14 +2419,7 @@ impl AppView {
             })
         };
         // The whole of it is the hover's: its box reaches into the gutter.
-        let block = v_flex()
-            .relative()
-            .rounded(px(d.row_radius))
-            .font_family(fonts::MONO)
-            .text_px(m.mono)
-            .line_height(px(m.mono_line))
-            .child(head)
-            .children(under);
+        let block = v_flex().relative().font_family(fonts::MONO).text_px(m.mono).line_height(px(m.mono_line)).child(head).children(under);
         let Some(who) = who else {
             // Its handle names a later worker now: nothing of that one's here.
             if let Some(id) = v.id.filter(|_| v.watchable && !current && self.model.lives[self.panes.cur.live].watch.focus().is_none()) {
@@ -2533,7 +2525,7 @@ impl AppView {
 }
 
 /// An opened call's body (cards4/proposal.md §3): under its row on
-/// `well_d`, square ([`crate::cards::Geo::well_radius`]), no frame, indented to the verb column (36 px from
+/// `well_d`, square, no frame, indented to the verb column (36 px from
 /// the row's edge), to the card's inner edge. An edit's lines full width on
 /// their washes, the sign hanging in an 18 px column; a read's with the
 /// file's own numbers right-aligned in a 30 px column; any other output as
@@ -2578,7 +2570,6 @@ fn well(row: &RowCache, failed: bool, id: u64, streamed: &[(usize, f32, f32, Rc<
         .mr(px(g.pad))
         .mt(px(1.))
         .mb(px((8. * m.r).round()))
-        .rounded(px(g.well_radius))
         .overflow_hidden()
         .bg(p.well_d)
         .text_color(p.res)

@@ -1,5 +1,7 @@
 //! Cards D (cards4/proposal.md §1–§4): a run of tool calls is one
-//! square card (Haseeb, #23 r7) on `card_d`, read by its fill alone (no
+//! square card (Haseeb, #23 r7; square everywhere since: no box or
+//! button in the app has a radius, only true circles, a status dot or
+//! disc, are round) on `card_d`, read by its fill alone (no
 //! outline: Haseeb, 07:18 "remove border outlines from tool boxes"); each call is
 //! one quiet 34 px row inside it (a life glyph, the verb in Sans, the
 //! target in mono, the facts right in small grey Sans, a state word, the
@@ -34,35 +36,13 @@ pub(crate) struct Geo {
     /// A body's indent from the row's edge: the verb column.
     pub indent: f32,
     pub chevron: f32,
-    /// The corners of a card (a run's, the authorize card): square, as
-    /// every radius here (Haseeb, #23 r7). Buttons, the checkbox, dots and
-    /// the lattice keep their own.
-    pub radius: f32,
-    /// A row's inside a card (its hover's wash).
-    pub row_radius: f32,
-    /// A well's: a call's body (its diff, its output), the authorize
-    /// card's command box.
-    pub well_radius: f32,
 }
 
 impl Geo {
     pub(crate) fn of(m: &Metrics) -> Self {
         let px = |v: f32| (v * m.r).round();
         let (pad, gap, glyph) = (px(10.), px(10.), crate::glyph::LIFE);
-        Geo {
-            inset: 3.,
-            edge: 1.,
-            row: px(34.),
-            pad,
-            gap,
-            glyph,
-            verb: px(56.),
-            indent: pad + glyph + gap,
-            chevron: 10.,
-            radius: 0.,
-            row_radius: 0.,
-            well_radius: 0.,
-        }
+        Geo { inset: 3., edge: 1., row: px(34.), pad, gap, glyph, verb: px(56.), indent: pad + glyph + gap, chevron: 10. }
     }
 }
 
@@ -100,8 +80,8 @@ pub(crate) fn mark_edges(mut out: Vec<Disp>) -> Vec<Disp> {
     out
 }
 
-/// A card's slice for one list row (§3): `card_d`, no outline; its top
-/// edge and corners on its first row, its bottom on its last. Down both
+/// A card's slice for one list row (§3): `card_d`, square, no outline; its
+/// top edge on its first row, its bottom on its last. Down both
 /// sides and on those edges, two paddings: the old hairline's 1 px and the
 /// 3 px inset, in two layers so each is snapped to device pixels on its own
 /// as the border and the inset were (Shady #71 P2: one 4 px padding is 6
@@ -111,11 +91,18 @@ pub(crate) fn mark_edges(mut out: Vec<Disp>) -> Vec<Disp> {
 /// window's. Its rows sit where they sat in the outlined card at every
 /// scale.
 pub(crate) fn slab(top: bool, bottom: bool, body: impl IntoElement, p: &Palette, g: Geo, scale: f32) -> Div {
-    let r = px(g.radius);
     let edge = if g.edge > 0. { g.edge.max(1. / scale) } else { 0. };
     let pad = |d: Div, w: f32| d.px(px(w)).when(top, |d| d.pt(px(w))).when(bottom, |d| d.pb(px(w)));
-    let fill = div().w_full().bg(p.card_d).when(top, |d| d.rounded_tl(r).rounded_tr(r)).when(bottom, |d| d.rounded_bl(r).rounded_br(r));
-    pad(fill, edge).child(pad(div(), g.inset).child(body))
+    pad(div().w_full().bg(p.card_d), edge).child(pad(div(), g.inset).child(body))
+}
+
+/// Where a 1 px frame was, padding now (no outlines, Haseeb): its room at
+/// `scale`, a device pixel at least, as a border is snapped (Shady #71
+/// P3). Padded in a layer of its own, apart from the padding inside it, as
+/// the frame was laid out (P2): one padding of 1 + 10 is 19 device px at
+/// 175 %, a frame and its 10 were 2 + 18.
+pub(crate) fn frame_room(scale: f32) -> f32 {
+    1f32.max(1. / scale)
 }
 
 /// An opened summary: its row, the `line` rule under it where its card's
@@ -126,7 +113,8 @@ pub(crate) fn opened(row: impl IntoElement, id: u64, p: &Palette, g: Geo) -> Div
     v_flex().child(row).child(div().h(px(g.edge)).bg(p.line).debug_selector(move || format!("run-rule {id}"))).pb(px(g.inset))
 }
 
-/// A fact's separator (§3): a 3 px dot in `dim` at 55 %, centred.
+/// A fact's separator (§3): a 3 px dot (a true circle) in `dim` at 55 %,
+/// centred.
 pub(crate) fn dot(p: &Palette) -> Div {
     div().flex_none().size(px(3.)).rounded(px(1.5)).bg(crate::motion::mix(p.card_d, p.dim_t, 0.55))
 }
@@ -400,6 +388,144 @@ mod tests {
             assert_eq!(opened, boxes("old opened card".into(), "old opened row".into()), "{scale}: opened, as main's");
             if scale >= 1. {
                 assert_eq!(opened, folded, "{scale}: opened, as tall as folded");
+            }
+        }
+    }
+
+    /// A worker chip's frame went (no outlines) and its room is padding in
+    /// a layer of its own ([`super::frame_room`]): laid out at 25 to 250 %,
+    /// what is in the chip sits where it sat in the framed chip, as wide and
+    /// as tall (Shady #71's lesson: one 1 + 10 padding is 19 device px at
+    /// 175 %, the frame and its 10 were 2 + 18).
+    #[gpui_kit::test]
+    fn a_chip_keeps_its_framed_geometry_at_every_scale(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::component::{h_flex, v_flex};
+        use gpui_kit::{Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _, Window, div, px};
+        struct Chips;
+        impl Render for Chips {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let body = |s: &'static str| div().flex_1().min_w_0().h(px(10.)).debug_selector(move || s.into());
+                // Main's chip (7135205): a 1 px frame, then 12 and 10.
+                let old = h_flex().w(px(301.)).h(px(27.)).border_1().pl(px(12.)).pr(px(10.)).child(body("old body"));
+                let new = h_flex()
+                    .w(px(301.))
+                    .h(px(27.))
+                    .px(px(super::frame_room(window.scale_factor())))
+                    .child(h_flex().flex_1().min_w_0().h_full().pl(px(12.)).pr(px(10.)).child(body("new body")));
+                v_flex().child(old.debug_selector(|| "old chip".into())).child(new.debug_selector(|| "new chip".into()))
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Chips);
+        for scale in [1., 1.25, 1.5, 1.75, 2., 2.5, 0.5, 0.25] {
+            cx.simulate_scale_factor_change(scale);
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let dev = |v: Pixels| (f32::from(v) * scale).round() as i32;
+            // The chip's size, and its body's offset in it and size, in device px.
+            let mut boxes = |chip: &'static str, body: &'static str| {
+                let c = cx.debug_bounds(chip).unwrap_or_else(|| panic!("{scale}: {chip} drawn"));
+                let b = cx.debug_bounds(body).unwrap_or_else(|| panic!("{scale}: {body} drawn"));
+                let (x0, y0) = (dev(c.origin.x), dev(c.origin.y));
+                [dev(c.size.width), dev(c.size.height), dev(b.origin.x) - x0, dev(b.origin.y) - y0, dev(b.size.width), dev(b.size.height)]
+            };
+            let old = boxes("old chip", "old body");
+            assert_eq!(boxes("new chip", "new body"), old, "{scale}: as the framed chip");
+        }
+    }
+
+    /// The message box's frame went too (Haseeb: no outline on the
+    /// composer, as on the cards): its room is padding in a layer of its
+    /// own ([`crate::app::composer_box`]). Laid out at 25 to 250 %, in every
+    /// form, the box is as wide and as tall as main's framed one; its text
+    /// and its foot, the composer's top as the palette reads it, the bar,
+    /// the top edge's pass and Handoff's light (part way down) all lie
+    /// where they lay on main, as wide and as tall.
+    #[gpui_kit::test]
+    fn the_composer_keeps_its_framed_geometry_at_every_scale(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::component::v_flex;
+        use gpui_kit::{
+            Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _, Window, div, px, relative,
+        };
+        const FORMS: [crate::fit::Form; 3] = [crate::fit::Form::Full, crate::fit::Form::Short, crate::fit::Form::Cramped];
+        struct Boxes(crate::theme::Metrics);
+        impl Render for Boxes {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let m = &self.0;
+                let mut col = v_flex().w(px(701.));
+                for (k, form) in FORMS.into_iter().enumerate() {
+                    let d = crate::fit::Composer::of(m, form);
+                    let s = |what: &str| -> String { format!("{what} {k}") };
+                    let mark = |what: &str| {
+                        let id = s(what);
+                        div().debug_selector(move || id)
+                    };
+                    let body = |who: &str| {
+                        [
+                            mark(&format!("{who} text")).h(px(3. * m.body_line)),
+                            mark(&format!("{who} foot")).mt(px(d.row_gap.unwrap_or(0.))).h(px(d.button)),
+                        ]
+                    };
+                    let edges = |who: &str, at: f32| {
+                        [
+                            mark(&format!("{who} bar")).absolute().left(px(at)).top(px(at)).bottom(px(at)).w(px(2.)),
+                            mark(&format!("{who} edge")).absolute().left(px(at)).right(px(at)).top(px(at)).h(px(1.)),
+                            div()
+                                .absolute()
+                                .left(px(at))
+                                .top(px(at))
+                                .bottom(px(24. + at))
+                                .w(px(2.))
+                                .child(mark(&format!("{who} light")).absolute().left_0().top(relative(0.4)).w(px(2.)).h(px(24.))),
+                            mark(&format!("{who} top")).absolute().inset_0(),
+                        ]
+                    };
+                    // Main's (7135205): the frame, the padding in it, what
+                    // is drawn over the frame a pixel out, the top's
+                    // measure at its inset 0.
+                    let old = v_flex()
+                        .px(px(m.pad_x - 1.))
+                        .pt(px(d.pad_top))
+                        .pb(px(d.pad_bottom))
+                        .relative()
+                        .border_1()
+                        .children(edges("old", -1.))
+                        .children(body("old"));
+                    let new = crate::app::composer_box(
+                        window.scale_factor(),
+                        (m.pad_x - 1., d.pad_top, d.pad_bottom),
+                        edges("new", -1.).into_iter().chain(body("new")).map(IntoElement::into_any_element),
+                    );
+                    col = col
+                        .child(old.debug_selector(move || format!("old box {k}")))
+                        .child(new.debug_selector(move || format!("new box {k}")));
+                }
+                col
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Boxes(crate::theme::Metrics::at(crate::theme::DEFAULT_TEXT)));
+        for scale in [1., 1.25, 1.5, 1.75, 2., 2.5, 0.5, 0.25] {
+            cx.simulate_scale_factor_change(scale);
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let dev = |v: Pixels| (f32::from(v) * scale).round() as i32;
+            for (k, form) in FORMS.into_iter().enumerate() {
+                // A part's offset in its box and its size, in device px.
+                let mut at = |who: &str, what: &str| {
+                    let b = cx.debug_bounds(format!("{who} box {k}").leak()).unwrap_or_else(|| panic!("{scale}: {who} box {k}"));
+                    let e = cx.debug_bounds(format!("{who} {what} {k}").leak()).unwrap_or_else(|| panic!("{scale}: {who} {what} {k}"));
+                    let (x0, y0) = (dev(b.origin.x), dev(b.origin.y));
+                    [
+                        dev(b.size.width),
+                        dev(b.size.height),
+                        dev(e.origin.x) - x0,
+                        dev(e.origin.y) - y0,
+                        dev(e.size.width),
+                        dev(e.size.height),
+                    ]
+                };
+                for what in ["text", "foot", "top", "bar", "edge", "light"] {
+                    assert_eq!(at("new", what), at("old", what), "{scale} {form:?}: its {what}, as main's");
+                }
             }
         }
     }
