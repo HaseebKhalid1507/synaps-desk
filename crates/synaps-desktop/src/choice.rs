@@ -226,7 +226,7 @@ impl Target {
             out.push(Item::new(NOTE, cut(n)).off(n.clone()));
         }
         if self.loading {
-            out.push(Item::new(NOTE, "asking the daemon…").off("the session's list is on its way"));
+            out.push(Item::new(NOTE, "reading the favourites…").off("the starred models and their logins are on their way"));
         }
         // With other providers' rows below: whose models these are.
         if let Some(p) = self.shown.as_ref().filter(|_| !self.providers.is_empty()) {
