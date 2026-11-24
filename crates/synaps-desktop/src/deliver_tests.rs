@@ -513,3 +513,145 @@ fn a_detach_gives_a_composer_its_text_and_keeps_the_cards() {
     );
     assert_eq!(m.memos.get_state(S, CARD), Some(State::Sending));
 }
+
+/// The card store `lid` draws for call `tool` now.
+fn painted_at(m: &Model, lid: LiveId, tool: &str) -> Painted {
+    let c = m.lives[lid].transcript.cards().card(tool).expect("the card");
+    Painted { tool_id: c.tool_id.clone(), id: c.id.clone().unwrap(), doc: Arc::new(c.doc.clone().unwrap()), wait: c.wait }
+}
+
+/// `label` picked on the card asked `input`.
+fn pick_in(input: &Value, label: &str) -> Reply {
+    let Ok(cards_spec::Input::Create { doc, .. }) = cards_spec::parse_input(input) else { panic!() };
+    Reply::Answer(cards_spec::parse_answer(&doc, &json!({"choice": label})).unwrap())
+}
+
+/// The agent calls card `tool` asking `input` live, and its result binds
+/// `card`: the stream's events, no digest and no history after them.
+fn ask_live(m: &mut Model, tool: &str, card: &str, input: &Value) {
+    let llm = |v: Value| json!({"ev": "stream", "event": v});
+    ev(m, 1, S, llm(json!({"kind": "llm", "llm": "response_start"})));
+    ev(m, 1, S, llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": tool})));
+    ev(m, 1, S, llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": tool, "input": input})));
+    ev(m, 1, S, llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": showing(card, input)})));
+}
+
+/// Shady #81 P2-1: the history matches its digest, but the card is the
+/// live turn's alone (its call and its result streamed; no digest, no
+/// history since). It draws, and a click, Skip included, sends nothing:
+/// the history hasn't confirmed its binding. The history lands with it:
+/// exactly one click sends.
+#[test]
+fn a_live_only_binding_sends_nothing_until_the_history_has_it() {
+    let before = history()[..1].to_vec();
+    let mut m = Model::new(ConnState::Connecting);
+    attach(&mut m, LiveId::FIRST, 1, S, &before);
+    ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user"}));
+    ask_live(&mut m, "t1", CARD, &ask());
+    let t = &m.lives[LiveId::FIRST].transcript;
+    assert!(t.history_settled(), "the old history still matches its digest");
+    assert!(t.cards().card("t1").is_some_and(|c| c.answerable()), "the live card draws, open");
+    let p = painted(&m, LiveId::FIRST);
+    assert!(m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now()).is_err(), "a click on a live-only binding");
+    assert!(m.press_card(LiveId::FIRST, &p, Reply::Skip, Instant::now()).is_err(), "Skip on it");
+    assert!(m.memos.get_state(S, CARD).is_none(), "nothing went");
+    // The round's history: the call and its result, as drawn.
+    let landed = history()[..3].to_vec();
+    ev(&mut m, 1, S, digest(&landed, None));
+    replace(&mut m, 1, S, landed);
+    let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+    assert_eq!(out.text, answer("Refactor the parser"));
+    assert_eq!(m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now()), Err(OUT.into()), "exactly one");
+}
+
+/// Shady #81 P2-1, the reused id: the extension restarted and a live call
+/// binds the card's id again (another question). Before the history has
+/// it, neither card answers: the first is replaced, the second is the live
+/// turn's alone. A history that binds the id elsewhere leaves the painted
+/// click dead; the matching history lets it send once.
+#[test]
+fn a_live_rebind_of_the_id_answers_only_once_the_history_has_it() {
+    let other = json!({"question": "Which branch?", "options": ["main", "dev"]});
+    let mut m = one();
+    let first = painted(&m, LiveId::FIRST);
+    ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "and the branch?"}));
+    ask_live(&mut m, "t2", CARD, &other);
+    let second = painted_at(&m, LiveId::FIRST, "t2");
+    assert!(m.lives[LiveId::FIRST].transcript.history_settled());
+    assert_eq!(m.press_card(LiveId::FIRST, &first, pick("Refactor the parser"), Instant::now()), Err(CHANGED.into()), "replaced live");
+    assert!(m.press_card(LiveId::FIRST, &second, pick_in(&other, "main"), Instant::now()).is_err(), "live only");
+    assert!(m.memos.get_state(S, CARD).is_none(), "nothing went");
+    // A history where the call bound another id: the painted card isn't it.
+    let mut elsewhere = history();
+    elsewhere.push(json!({"role": "user", "content": "and the branch?"}));
+    elsewhere.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "cards_ui", "input": other}]}));
+    let bound_elsewhere = showing("c9z9z9z", &other);
+    elsewhere.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": bound_elsewhere}]}));
+    ev(&mut m, 1, S, digest(&elsewhere, None));
+    replace(&mut m, 1, S, elsewhere.clone());
+    assert!(m.press_card(LiveId::FIRST, &second, pick_in(&other, "main"), Instant::now()).is_err(), "bound elsewhere");
+    // The history as the live turn drew it: one click sends.
+    let mut landed = elsewhere;
+    landed[6] = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": showing(CARD, &other)}]});
+    ev(&mut m, 1, S, digest(&landed, None));
+    replace(&mut m, 1, S, landed);
+    let out = m.press_card(LiveId::FIRST, &second, pick_in(&other, "main"), Instant::now()).expect("sent");
+    m.card_sent(LiveId::FIRST, out);
+    assert!(m.press_card(LiveId::FIRST, &second, pick_in(&other, "dev"), Instant::now()).is_err(), "exactly one");
+}
+
+/// Shady #81 P2-2: busy, the answer is steered and the engine takes it in
+/// (`SteeringDelivered`); the `Conversation` that clears the slot comes
+/// with the persisted history still the old one (the round's checkpoint
+/// comes later). It stays answered: no Resend and nothing sent again,
+/// whatever comes meanwhile (an unrelated event, the clock), until the
+/// history lands with it. With ours in the slot first, and without.
+#[test]
+fn a_delivered_answer_stays_answered_until_its_history_lands() {
+    for slot in [true, false] {
+        let mut m = one();
+        ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
+        let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+        assert!(out.busy, "a steer while busy");
+        ev(&mut m, 1, S, json!({"ev": "steered", "text": out.text, "delivered": true}));
+        if slot {
+            ev(&mut m, 1, S, digest(&history(), Some(&out.text)));
+        }
+        assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::Queued), "slot {slot}");
+        ev(&mut m, 1, S, json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": out.text}}));
+        assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::InChat), "slot {slot}: delivered");
+        ev(&mut m, 1, S, digest(&history(), None));
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "slot {slot}: the old history, the slot cleared");
+        ev(&mut m, 1, S, json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": "Refactoring."}}));
+        m.tick_cards(Instant::now() + Duration::from_secs(30));
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "slot {slot}: an event, the clock");
+        let p = painted(&m, LiveId::FIRST);
+        assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "slot {slot}: no Resend");
+        assert!(m.resend_card(LiveId::FIRST, &p, Instant::now()).is_err(), "slot {slot}: nothing sent again");
+        // The round's checkpoint: the history with it.
+        let mut after = with(&["go on"]);
+        after.push(json!({"role": "user", "content": out.text}));
+        ev(&mut m, 1, S, digest(&after, None));
+        replace(&mut m, 1, S, after);
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "slot {slot}: landed");
+    }
+}
+
+/// Shady #81 P2-2, the other side: the daemon restarts after the delivery
+/// and before its checkpoint, and the reattach's history doesn't have it.
+/// That one may be lost: not confirmed, with Resend.
+#[test]
+fn a_restart_between_the_delivery_and_its_checkpoint_is_not_confirmed() {
+    let mut m = one();
+    ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
+    let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+    ev(&mut m, 1, S, json!({"ev": "steered", "text": out.text, "delivered": true}));
+    ev(&mut m, 1, S, json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": out.text}}));
+    ev(&mut m, 1, S, digest(&history(), None));
+    attach_with(&mut m, LiveId::FIRST, 1, S, &history(), |_| {}, true);
+    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::Unconfirmed, Some(Cause::Lost(Trigger::Attached).line()))));
+    let p = painted(&m, LiveId::FIRST);
+    assert!(m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()));
+    let again = m.resend_card(LiveId::FIRST, &p, Instant::now()).expect("Resend sends");
+    assert_eq!(again.text, out.text);
+}

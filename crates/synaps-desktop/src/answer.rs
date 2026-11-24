@@ -13,9 +13,12 @@
 //! - **Retry** on an answer not sent, **Resend** on one the desk couldn't
 //!   confirm (F16, F17, F20, F22): a human's click, never automatic.
 //!
-//! Every control acts only once armed ([`crate::app::ARM`] after the card
-//! was first drawn in its pane): a click that lands as the card arrives
-//! and shifts the layout does nothing (§7's negative test). What a click
+//! Every control acts only once armed ([`crate::app::ARM`] after it was
+//! first painted in view in its pane, actionable: [`crate::ask::probe`]):
+//! a click that lands as the card arrives and shifts the layout does
+//! nothing (§7's negative test), nor one on a control that comes into view
+//! (scrolled in, bound, confirmed) under a pointer already there (Shady
+//! #81 P2-3). What a click
 //! sends is checked on the click, not as painted ([`crate::deliver`]):
 //! the window may send, the history is settled, the card is the one
 //! painted. If not, nothing goes and the card's line says why.
@@ -169,10 +172,12 @@ impl AppView {
         l.active.as_ref().map(|a| a.session_id.clone())
     }
 
-    /// Row `row`'s controls may act: drawn in the pane acted on at least
+    /// Control `what` of the card `painted` (row `row`) may act: first
+    /// painted in view, actionable, in the pane acted on at least
     /// [`crate::app::ARM`] ago.
-    fn ask_armed(&self, row: u64) -> bool {
-        let shown = self.panes.cur.ask_shown.borrow().get(&row).copied();
+    fn ask_armed(&self, row: u64, painted: &Painted, what: &str) -> bool {
+        let key = (row, crate::ask::control(&painted.id, what));
+        let shown = self.panes.cur.ask_shown.borrow().get(&key).copied();
         shown.is_some_and(|at| crate::app::arm_now().saturating_duration_since(at) >= crate::app::ARM)
     }
 
@@ -184,7 +189,7 @@ impl AppView {
     /// A click on option `label` of the card `painted` (row `row`): a quick
     /// card's answer, or a pick.
     pub(crate) fn ask_pick(&mut self, row: u64, painted: &Painted, label: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else {
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, &format!("option {label}"))) else {
             log::debug!(target: "synaps_desktop::card", "card {}: a click before it armed, nothing sent", painted.id);
             return;
         };
@@ -231,7 +236,7 @@ impl AppView {
     /// A click on field `id` of the card `painted`: a check ticks; a text
     /// field opens to type in, its prefill in it.
     pub(crate) fn ask_field(&mut self, row: u64, painted: &Painted, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else { return };
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, &format!("field {id}"))) else { return };
         let doc = painted.doc.clone();
         let Some(f) = doc.field(id) else { return };
         let now = self.draft(&session, painted).value(&doc, id, cx);
@@ -299,7 +304,7 @@ impl AppView {
 
     /// Send on the card `painted`: its draft's answer, once whole.
     pub(crate) fn ask_submit(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else { return };
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "send")) else { return };
         let reply = self.draft(&session, painted).reply(&painted.doc, cx);
         match reply {
             Ok(reply) => self.ask_send(&session, row, painted, reply, cx),
@@ -313,7 +318,7 @@ impl AppView {
 
     /// Skip on the card `painted` (F7): `[card <id> skipped]`.
     pub(crate) fn ask_skip(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else { return };
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "skip")) else { return };
         self.ask_send(&session, row, painted, Reply::Skip, cx);
     }
 
@@ -337,7 +342,7 @@ impl AppView {
 
     /// Retry on the card `painted`'s answer, not sent.
     pub(crate) fn ask_retry(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else { return };
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "retry")) else { return };
         let live = self.panes.cur.live;
         match self.model.retry_card(live, painted, Instant::now()) {
             Ok(out) => self.send_card(live, out, cx),
@@ -349,7 +354,7 @@ impl AppView {
     /// Resend on the card `painted`'s answer, unconfirmed: checked again on
     /// the click (§3.5).
     pub(crate) fn ask_resend(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
-        let Some(session) = self.card_session().filter(|_| self.ask_armed(row)) else { return };
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "resend")) else { return };
         let live = self.panes.cur.live;
         match self.model.resend_card(live, painted, Instant::now()) {
             Ok(out) => self.send_card(live, out, cx),

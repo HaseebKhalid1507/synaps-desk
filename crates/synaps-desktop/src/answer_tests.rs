@@ -121,11 +121,14 @@ fn show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix:
     settle(cx, w, 8);
 }
 
-/// The card's arm (`crate::app::ARM` from its row's first draw): run out,
-/// or a fifth of the way.
+/// The card's arm (`crate::app::ARM` from the first frame each of its
+/// controls is painted in view): run out for every control drawn so far,
+/// or a fifth of the way for the first drawn (less for the rest).
 fn arm(cx: &mut TestAppContext, view: &Entity<AppView>, row: u64, armed: bool) {
-    let at = view.read_with(cx, |v, _| v.panes.cur.ask_shown.borrow().get(&row).copied()).expect("the card was drawn");
-    crate::app::pin_arm_clock(Some(if armed { at + crate::app::ARM } else { at + crate::app::ARM / 5 }));
+    let shown: Vec<Instant> =
+        view.read_with(cx, |v, _| v.panes.cur.ask_shown.borrow().iter().filter(|((r, _), _)| *r == row).map(|(_, at)| *at).collect());
+    let at = if armed { shown.iter().max().map(|t| *t + crate::app::ARM) } else { shown.iter().min().map(|t| *t + crate::app::ARM / 5) };
+    crate::app::pin_arm_clock(Some(at.expect("the card's controls were drawn")));
 }
 
 fn sends(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<Outgoing> {
@@ -185,7 +188,8 @@ fn llm(v: Value) -> Value {
 }
 
 /// The agent asks `input` live as card `card` (call `tool`), and waits:
-/// its turn ends.
+/// its turn ends, and its history lands (the round's checkpoint): the
+/// card's binding is the history's (Shady #81 P2-1).
 fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, card: &str, input: Value) {
     heard(
         cx,
@@ -201,7 +205,35 @@ fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
             json!({"ev": "idle"}),
         ],
     );
+    land(cx, w, view, asked_messages(tool, card, &input, None));
     play(cx, w, view);
+}
+
+/// The history of a turn that asked `input` as card `card` (call `tool`),
+/// then said `after`.
+fn asked_messages(tool: &str, card: &str, input: &Value, after: Option<&str>) -> Vec<Value> {
+    let mut out = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_ui", "input": input}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": showing(card, input)}]}),
+    ];
+    if let Some(a) = after {
+        out.push(json!({"role": "assistant", "content": [{"type": "text", "text": a}]}));
+    }
+    out
+}
+
+/// The history after what the view holds lands: `messages`, appended (as
+/// the client hands a round's checkpoint over).
+fn land(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+    let (seq, sid) = attachment(cx, view);
+    view.update(cx, |v, cx| {
+        let base_len = v.model.lives[v.panes.cur.live].transcript.history_len();
+        let update = synaps_client::HistoryUpdate::Append { base_len, messages };
+        v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
 }
 
 /// What just came plays out: its rows arrive and grow to their height.
@@ -377,6 +409,8 @@ fn an_option_that_asks_for_a_note_opens_it(cx: &mut TestAppContext) {
     })
     .unwrap();
     settle(cx, w, 8);
+    // Send came with the note: it arms from its own first frame.
+    arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-send {id}"));
     assert_eq!(
         sends(cx, &view).iter().map(|o| o.text.clone()).collect::<Vec<_>>(),
@@ -478,6 +512,8 @@ fn not_sent_says_why_and_retry_sends_it(cx: &mut TestAppContext) {
     assert!(has(cx, w, format!("ask-state {id} not sent")));
     assert!(has(cx, w, format!("ask-retry {id}")));
     view.update(cx, |v, _| v.client = client);
+    // Retry came with the receipt: it arms from its own first frame.
+    arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-retry {id}"));
     let s = sends(cx, &view);
     assert_eq!(s.len(), 2);
@@ -502,6 +538,8 @@ fn unconfirmed_offers_resend(cx: &mut TestAppContext) {
     settle(cx, w, 8);
     assert!(has(cx, w, format!("ask-state {id} not confirmed")));
     assert!(has(cx, w, format!("ask-cause {id}")));
+    // Resend came with the receipt: it arms from its own first frame.
+    arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-resend {id}"));
     let s = sends(cx, &view);
     assert_eq!(s.len(), 2);
@@ -568,4 +606,106 @@ fn a_receipt_opens_to_the_whole_answer(cx: &mut TestAppContext) {
     assert!(has(cx, w, format!("ask-whole {id}")), "opened");
     click(cx, w, &view, format!("ask-receipt {id}"));
     assert!(!has(cx, w, format!("ask-whole {id}")), "closed");
+}
+
+/// Shady #81 P2-3: a card's controls arm from the first frame they are
+/// drawn in view, actionable; not from when its row was first built. Asked
+/// live, it reads `asking…` (nothing to click) longer than the arm; its
+/// result binds it and the history lands: a click on the first frame its
+/// options are drawn sends nothing. After the arm, one click sends once.
+#[gpui_kit::test]
+fn a_bound_cards_options_arm_from_their_first_frame(cx: &mut TestAppContext) {
+    let t0 = Instant::now();
+    crate::app::pin_arm_clock(Some(t0));
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    let input = json!({"question": "Squash the commits?", "options": ["Squash", "Keep them"]});
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": "go"}),
+            llm(json!({"kind": "llm", "llm": "response_start"})),
+            llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": "toolu_sq"})),
+            llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": "toolu_sq", "input": input})),
+        ],
+    );
+    play(cx, w, &view);
+    let (id, _) = card(cx, &view, "Squash the commits?");
+    assert!(has(cx, w, format!("ask-state {id} asking…")), "drawn, unbound");
+    crate::app::pin_arm_clock(Some(t0 + crate::app::ARM * 3));
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_sq", "result": showing("c5qu4sh", &input)})),
+            llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+        ],
+    );
+    land(cx, w, &view, asked_messages("toolu_sq", "c5qu4sh", &input, None));
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-option {id} 1")), "bound: its options drawn");
+    click(cx, w, &view, format!("ask-option {id} 1"));
+    assert!(sends(cx, &view).is_empty(), "a click as its options first show sends nothing");
+    crate::app::pin_arm_clock(Some(t0 + crate::app::ARM * 4 + Duration::from_millis(1)));
+    click(cx, w, &view, format!("ask-option {id} 1"));
+    let s = sends(cx, &view);
+    assert_eq!(s.iter().map(|o| o.text.clone()).collect::<Vec<_>>(), vec![message("c5qu4sh", &input, json!({"choice": "Squash"}))]);
+    crate::app::pin_arm_clock(None);
+}
+
+/// Shady #81 P2-3, off screen: the list builds a row above the view to
+/// measure it (GPUI's overdraw), and paints one whose controls its edge
+/// clips; neither shows them. Revealed past the arm since, a click on
+/// their first frame in view sends nothing; after the arm, one click
+/// sends once.
+#[gpui_kit::test]
+fn a_cards_options_measured_or_clipped_off_screen_arm_once_in_view(cx: &mut TestAppContext) {
+    let t0 = Instant::now();
+    crate::app::pin_arm_clock(Some(t0));
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    // Scrolled back: the card comes in far under the view.
+    show(cx, w, &view, 0);
+    let input = json!({"question": "Squash the commits?", "options": ["Squash", "Keep them"]});
+    let after = (1..=60).map(|n| format!("Step {n} of the plan, in a line of its own.")).collect::<Vec<_>>().join("\n\n");
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": "go"}),
+            llm(json!({"kind": "llm", "llm": "response_start"})),
+            llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": "toolu_sq"})),
+            llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": "toolu_sq", "input": input})),
+            llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_sq", "result": showing("c5qu4sh", &input)})),
+            llm(json!({"kind": "llm", "llm": "response_start"})),
+            llm(json!({"kind": "llm", "llm": "text", "text": after})),
+            llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+        ],
+    );
+    land(cx, w, &view, asked_messages("toolu_sq", "c5qu4sh", &input, Some(&after)));
+    play(cx, w, &view);
+    let (id, ix) = card(cx, &view, "Squash the commits?");
+    // The row under it at the top: the card is built above the view.
+    show(cx, w, &view, ix + 1);
+    assert!(!has(cx, w, format!("ask-card {id}")), "not drawn");
+    // Its last few pixels in view: drawn, its options clipped.
+    view.update(cx, |v, cx| {
+        v.list.scroll_by(px(-6.));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert!(view.read_with(cx, |v, _| v.list.bounds_for_item(ix).is_some()), "its foot drawn");
+    crate::app::pin_arm_clock(Some(t0 + crate::app::ARM * 3));
+    show(cx, w, &view, ix);
+    click(cx, w, &view, format!("ask-option {id} 1"));
+    assert!(sends(cx, &view).is_empty(), "a click as its options first show sends nothing");
+    crate::app::pin_arm_clock(Some(t0 + crate::app::ARM * 4 + Duration::from_millis(1)));
+    click(cx, w, &view, format!("ask-option {id} 1"));
+    assert_eq!(sends(cx, &view).len(), 1, "after the arm, one click sends once");
+    crate::app::pin_arm_clock(None);
 }

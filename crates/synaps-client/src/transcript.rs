@@ -539,10 +539,22 @@ impl Transcript {
     }
 
     /// The agent cards' fold, as the rows draw them: the history's, then
-    /// the live turn's on top ([`crate::cards`]). What an answer is sent
-    /// against, and what the card memo follows (synaps-cards §3.5).
+    /// the live turn's on top ([`crate::cards`]). What the card memo
+    /// follows (synaps-cards §3.5); a click is checked on it too (no
+    /// replacement or close heard since), and on the history's alone
+    /// ([`Transcript::history_cards`]).
     pub fn cards(&self) -> &cards_spec::fold::Fold {
         &self.card_fold
+    }
+
+    /// The agent cards' fold of the history alone, without the live turn:
+    /// the bindings the history confirms. A click answers a card only
+    /// while this holds it as it was drawn, on a settled history
+    /// ([`Transcript::history_settled`]): the live rows draw a card before
+    /// the history has it, and the history wins when it lands (Shady #81
+    /// P2-1).
+    pub fn history_cards(&self) -> &cards_spec::fold::Fold {
+        self.cards.fold()
     }
 
     /// The history folded is the one the latest `Conversation` digest

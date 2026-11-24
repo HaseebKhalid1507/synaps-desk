@@ -118,6 +118,11 @@ impl HistoryCards {
         !self.called
     }
 
+    /// The fold of the history alone.
+    pub(crate) fn fold(&self) -> &Fold {
+        &self.fold
+    }
+
     /// Read event `e`, drawn on `row` (a result's: none).
     fn push(&mut self, e: &Event, row: Option<u64>) {
         // The tool id of a close this result may close.

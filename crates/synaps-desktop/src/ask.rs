@@ -207,6 +207,39 @@ pub(crate) fn how_click(doc: &CardDoc) -> &'static str {
     }
 }
 
+/// When each control of each card was first painted in view, actionable,
+/// in a pane: by row, and the control's key ([`control`]).
+pub(crate) type Shown = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(u64, String), std::time::Instant>>>;
+
+/// The key of control `what` (`option <label>`, `field <id>`, `send`,
+/// `skip`, `retry`, `resend`) of card `card`: a card bound again is a new
+/// card, whose controls arm again.
+pub(crate) fn control(card: &cards_spec::CardId, what: &str) -> String {
+    format!("{card} {what}")
+}
+
+/// A probe on control `key` of row `row` (a child of the control, which
+/// must be positioned): the first frame that paints any of it inside its
+/// clip, the list's view (and a growing row's mask), stamps `shown`; the
+/// control acts [`crate::app::ARM`] after (Shady #81 P2-3). Not when the
+/// row is built: GPUI builds rows above and under the view to measure
+/// them (its overdraw) and paints none of them; nor a frame whose clip
+/// leaves none of the control in view.
+pub(crate) fn probe(shown: &Shown, row: u64, key: String) -> impl IntoElement {
+    let shown = shown.clone();
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let seen = bounds.intersect(&window.content_mask().bounds);
+            if seen.size.width > px(0.) && seen.size.height > px(0.) {
+                shown.borrow_mut().entry((row, key)).or_insert_with(crate::app::arm_now);
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 /// The card's buttons, square and outline-free: a ghost on the card (Skip,
 /// Retry) or the accent's fill (Send, Resend). Hovered a step on, pressed
 /// down [`crate::motion::PRESS`]; disabled, flat and dim.
@@ -374,7 +407,8 @@ impl AppView {
                 let row = match act.filter(|_| can) {
                     Some(x) => {
                         let (pane, painted, label) = (x.pane, x.painted.clone(), o.label.clone());
-                        row.cursor_pointer()
+                        row.child(probe(&self.panes.cur.ask_shown, id, control(&x.painted.id, &format!("option {label}"))))
+                            .cursor_pointer()
                             .hover(|d| d.bg(p.hover))
                             // Pressed: the accent's soft fill, down a pixel.
                             .active(|s| s.bg(p.acc_soft).top(px(crate::motion::PRESS)))
@@ -399,9 +433,11 @@ impl AppView {
                 let fid = f.id.clone();
                 let listen = act.filter(|_| can).map(|x| {
                     let (pane, painted, fid) = (x.pane, x.painted.clone(), f.id.clone());
-                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    let key = control(&painted.id, &format!("field {fid}"));
+                    let l = cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.in_pane(pane, |this| this.ask_field(id, &painted, &fid, window, cx));
-                    })
+                    });
+                    (l, key)
                 });
                 let value = draft.and_then(|d| d.value(doc, &f.id, cx)).unwrap_or_else(|| f.value.clone());
                 let value: AnyElement = match (&f.kind, &value) {
@@ -423,7 +459,12 @@ impl AppView {
                             )
                             .child(div().text_px(m.card_title).text_color(p.prose_t).child(shown(&f.label, Lines::Single)));
                         match listen {
-                            Some(l) => row.cursor_pointer().on_click(l).into_any_element(),
+                            Some((l, key)) => row
+                                .relative()
+                                .child(probe(&self.panes.cur.ask_shown, id, key))
+                                .cursor_pointer()
+                                .on_click(l)
+                                .into_any_element(),
                             None => row.into_any_element(),
                         }
                     }
@@ -463,7 +504,13 @@ impl AppView {
                                     .text_color(color)
                                     .children(text.split('\n').map(|l| div().min_h(px(m.mono_line)).child(l.to_string())));
                                 match listen {
-                                    Some(l) => w.cursor_text().hover(|d| d.bg(p.hover)).on_click(l).into_any_element(),
+                                    Some((l, key)) => w
+                                        .relative()
+                                        .child(probe(&self.panes.cur.ask_shown, id, key))
+                                        .cursor_text()
+                                        .hover(|d| d.bg(p.hover))
+                                        .on_click(l)
+                                        .into_any_element(),
                                     None => w.into_any_element(),
                                 }
                             }
@@ -499,19 +546,25 @@ impl AppView {
             let buttons = act.map(|x| {
                 let skip = {
                     let (pane, painted) = (x.pane, x.painted.clone());
+                    let key = control(&painted.id, "skip");
                     button("ask-skip", id, "Skip", false, can, p, m).when(can, |b| {
-                        b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.in_pane(pane, |this| this.ask_skip(id, &painted, cx));
                         }))
                     })
                 };
                 let send = sends.then(|| {
                     let (pane, painted) = (x.pane, x.painted.clone());
-                    button("ask-send", id, "Send", true, can && ready, p, m).when(can && ready, |b| {
-                        b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.in_pane(pane, |this| this.ask_submit(id, &painted, cx));
-                        }))
-                    })
+                    // Armed from its first frame on an actionable card, lit or
+                    // not: a form made whole is the user's own doing.
+                    let key = control(&painted.id, "send");
+                    button("ask-send", id, "Send", true, can && ready, p, m)
+                        .when(can, |b| b.child(probe(&self.panes.cur.ask_shown, id, key)))
+                        .when(can && ready, |b| {
+                            b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.in_pane(pane, |this| this.ask_submit(id, &painted, cx));
+                            }))
+                        })
                 });
                 h_flex().flex_none().gap(px(8.)).child(skip).children(send)
             });
@@ -744,8 +797,6 @@ impl AppView {
     /// Resend or Retry; else the fold's receipt, which a click opens.
     pub(crate) fn render_ask(&self, item: &Item, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
         let Some(CardRow::Ask(a)) = item.card.as_deref() else { return div().into_any_element() };
-        // First drawn here: its controls arm from now.
-        self.panes.cur.ask_shown.borrow_mut().entry(id).or_insert_with(crate::app::arm_now);
         let pane = self.panes.cur.id;
         let session = self.card_session();
         let l = &self.model.lives[self.panes.cur.live];
@@ -781,8 +832,9 @@ impl AppView {
                         }
                     });
                 let (name, label) = if resend { ("ask-resend", "Resend") } else { ("ask-retry", "Retry") };
+                let key = control(&painted.id, if resend { "resend" } else { "retry" });
                 let btn = button(name, id, label, resend, can, p, m).when(can, |b| {
-                    b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.in_pane(
                             pane,
                             |this| if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) },
@@ -816,6 +868,9 @@ impl AppView {
                 let why = match l.input_gate() {
                     Err(e) => Some(read_only(e, l)),
                     Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
+                    // The live turn's alone: its controls wait for the
+                    // history to confirm its binding (Shady #81 P2-1).
+                    Ok(()) if !painted.confirmed(&l.transcript) => Some(crate::deliver::CONFIRMING.to_string()),
                     Ok(()) => None,
                 };
                 Act { painted, pane, can: why.is_none(), line: why.or(said) }
