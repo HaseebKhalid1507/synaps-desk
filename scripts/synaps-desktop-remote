@@ -1,5 +1,5 @@
 #!/bin/bash
-# synaps-desktop-remote [host]   (default: avante; SYNAPS_PROFILE=<name>: that profile's daemon)
+# synaps-desktop-remote [host [desktop args...]]   (default: avante; SYNAPS_PROFILE=<name>: that profile's daemon)
 # Runs Synaps Desktop here, attached to the Synaps daemon on <host>, through an SSH-forwarded
 # Unix socket. The tunnel lives exactly as long as the app. The local socket is 0600 inside
 # $XDG_RUNTIME_DIR, so no other user on this machine can ride it. The app is told how to read
@@ -78,6 +78,7 @@ REMOTE
 fi
 
 host="${1:-avante}"
+[ $# -eq 0 ] || shift
 plain "$host" || { echo "synaps-desktop-remote: the host is not a plain name" >&2; exit 64; }
 profile="${SYNAPS_PROFILE:-}"
 [ -z "$profile" ] || plain "$profile" || { echo "synaps-desktop-remote: SYNAPS_PROFILE is not a plain name" >&2; exit 64; }
@@ -95,4 +96,4 @@ for _ in $(seq 1 100); do
 done
 [ -S "$sock" ] || { echo "synaps-desktop-remote: tunnel socket never appeared" >&2; exit 1; }
 bin="${SYNAPS_DESKTOP_BIN:-$HOME/.local/bin/synaps-desktop}"; bin="${bin/#~/$HOME}"
-SYNAPS_DESKTOP_HOST_READ="$(readlink -f "${BASH_SOURCE[0]}")" SYNAPS_DESKTOP_HOST="$host" "$bin" --socket "$sock"
+SYNAPS_DESKTOP_HOST_READ="$(readlink -f "${BASH_SOURCE[0]}")" SYNAPS_DESKTOP_HOST="$host" "$bin" --socket "$sock" "$@"
