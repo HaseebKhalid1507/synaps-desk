@@ -461,14 +461,16 @@ async fn next_slot(events: &async_channel::Receiver<Event>, marker: &str) -> Opt
 /// (the actor takes the snapshot and broadcasts the join in one step): a
 /// reply waits for its join, and a join before its reply is its place all
 /// the same. A reply whose join didn't come before another notice is read
-/// again; a digest after the notice says the slot itself. (The reply and
-/// the join come on two sockets: a short wait has the reply in first
-/// where the order is the point.)
+/// again, and so is one out at a notice whose join came before it; a
+/// digest after the notice says the slot itself. A probe that fails
+/// leaves it unknown, and the app's `resync` (its "Check again") reads it
+/// again. (The reply and the join come on two sockets: a short wait has
+/// one in first where the order is the point.)
 #[tokio::test]
 async fn a_lag_notice_reads_the_slot_again_from_an_observer() {
     let mut fake = Fake::start("slot").await;
     let (client, events) = fake.client();
-    client.attach(SID, AttachMode::Mirror).unwrap();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
     let conn = attached(&mut fake, &events, 2).await;
     let lag = |n: u64| json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")});
     let joined = |c: u64| json!({"ev": "client_joined", "client": c, "kind": "attach", "name": "tester", "mode": "observe"});
@@ -513,6 +515,28 @@ async fn a_lag_notice_reads_the_slot_again_from_an_observer() {
     settle().await;
     conn.event(38, note("a digest")).await;
     assert_eq!(next_slot(&events, "a digest").await, None, "the digest's word stands");
+
+    // Out at a notice, its join before it: from before that gap.
+    conn.event(u64::MAX, lag(7)).await;
+    let p = fake.next_attach().await;
+    conn.event(39, joined(14)).await;
+    conn.event(u64::MAX, lag(8)).await;
+    settle().await;
+    observed(p, 14, Some("E")).await;
+    observed(fake.next_attach().await, 15, None).await;
+    conn.event(40, joined(15)).await;
+    assert_eq!(next_slot(&events, "-").await.map(|s| s.0), Some(None), "read again, never the one from before");
+
+    // A probe that fails: unknown until the app asks again.
+    conn.event(u64::MAX, lag(9)).await;
+    let p = fake.next_attach().await;
+    p.send(json!({"type": "refused", "reason": {"reason": "unknown_session"}, "message": "no live session"})).await;
+    drop(p);
+    settle().await;
+    client.on(seq).resync().unwrap();
+    observed(fake.next_attach().await, 16, Some("F")).await;
+    conn.event(41, joined(16)).await;
+    assert_eq!(next_slot(&events, "-").await, Some((Some("F".into()), Some(16))), "asked again, read again");
     client.shutdown().unwrap();
 }
 
