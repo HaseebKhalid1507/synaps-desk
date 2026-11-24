@@ -40,10 +40,31 @@
 //! slot (a `Conversation`) before the round's history comes, so for a
 //! while the settled view is the old history, without it, and the memo
 //! would read that as a daemon that lost it (Shady #81 P2-2), offering a
-//! Resend that would put it in twice. So until the history shows it, each
-//! answer taken in is read on top of the view the memo follows, the way
-//! the live rows carry a submitted one; only a reattach (the daemon may
-//! have restarted without saving it) lets the history say it is gone.
+//! Resend that would put it in twice. So each answer taken in is read on
+//! top of the view the memo follows, the way the live rows carry a
+//! submitted one, until a history that is the daemon's word on it after
+//! the delivery settles it:
+//! - one that shows it, whenever it comes: in the chat, by the history;
+//! - the first settled one after the turn that took it in ended, which
+//!   doesn't: the turn ended without it (a failed turn's repair, say).
+//!   Not confirmed, its cause the turn's end ([`Memos::cause`]), with
+//!   Resend. The end is its `Idle`, which comes once the turn's last
+//!   history is saved, its digest sent before it (SynapsCLI `189a5a19`,
+//!   `agent-engine/src/session/actor.rs`: the end `:4104-4133`, a failure
+//!   `:4136-4146` and `:4160-4166`, a compaction `:4389-4391`,
+//!   `announce_idle` `:1261-1275`). Settled after it, the history is at
+//!   least the turn's last;
+//! - a reattach: the daemon may have restarted without saving it, and its
+//!   history says so.
+//!
+//! Before the turn's end no history says it is gone: the slot's clearing
+//! comes with the old one (`actor.rs:3840-3844`), and the round's
+//! checkpoint, the first history with it (`runtime/helpers.rs:136-158`,
+//! then `runtime/stream.rs:1118-1120`), may be a fetch away. Meanwhile
+//! the card says "answered", which is what the engine said: it is in the
+//! conversation the agent reads, and acts on this turn. "checking…" would
+//! read as unknown for the rest of the turn, and the memo's checking
+//! state gives up on a settled view in 10 s, a check that isn't this one.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -51,7 +72,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cards_spec::fold::{Card, Event as Folded, Fold};
-use cards_spec::memo::{Cause, Entry, Event as Heard, Memo, Resend, State, View};
+use cards_spec::memo::{Cause, Entry, Event as Heard, Memo, Resend, State, Trigger, View};
 use cards_spec::{CardDoc, CardId, Reply};
 use synaps_client::Transcript;
 use synaps_client::cards::Ask;
@@ -167,14 +188,26 @@ pub(crate) const COMPACTING: &str = "Compacting · answer when it's done";
 pub(crate) const CHANGED: &str = "This card changed: the chat no longer asks it so";
 pub(crate) const OUT: &str = "Its answer is on its way";
 
+/// An answer the engine took in, until a history settles it (the
+/// module's "Taken in"): its entry's card, and whether the turn that took
+/// it in has ended since (an `Idle`).
+#[derive(Debug)]
+struct Taken {
+    card: CardId,
+    ended: bool,
+}
+
 /// The window's card memos, by session id.
 #[derive(Debug, Default)]
 pub(crate) struct Memos {
     by: HashMap<String, Memo>,
     /// By session, the entries whose answer the engine took in
     /// (`SteeringDelivered`, or a compaction's restored steer) since the
-    /// last attach, until the history shows it (the module's "Taken in").
-    taken: HashMap<String, Vec<CardId>>,
+    /// last attach, until a history settles it (the module's "Taken in").
+    taken: HashMap<String, Vec<Taken>>,
+    /// By session, the entries whose answer was taken in and the turn's
+    /// end didn't save: unconfirmed, they say so ([`Memos::cause`]).
+    missed: HashMap<String, Vec<CardId>>,
     /// Bumped whenever an entry changes: cards drawn from it are measured
     /// again.
     changes: u64,
@@ -212,25 +245,46 @@ impl Memos {
             self.by.remove(session);
             self.taken.remove(session);
         }
+        self.tidy(session);
+    }
+
+    /// Forget what the turn's end missed for each entry of `session` that
+    /// moved on (sent again, or gone).
+    fn tidy(&mut self, session: &str) {
+        let Some(missed) = self.missed.get_mut(session) else { return };
+        let m = self.by.get(session);
+        missed.retain(|id| m.and_then(|m| m.get(id)).is_some_and(|e| matches!(e.state, State::InChat | State::Unconfirmed)));
+        if missed.is_empty() {
+            self.missed.remove(session);
+        }
     }
 
     /// An event of `session`'s attachment. An attach ends what was taken
     /// in: its history is the daemon's word now, and one that lost an
-    /// answer (a restart before the save) shows it.
+    /// answer (a restart before the save) shows it. An `Idle` ends the
+    /// turn that took each in: the next settled history is that turn's.
     pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
         if ev == Heard::Attached {
             self.taken.remove(session);
         }
         self.with(session, |m| m.on(ev, now));
-        if let Heard::Delivered { text } = ev
-            && let Some(m) = self.by.get(session)
-        {
-            for e in m.entries().iter().filter(|e| e.state == State::InChat && e.text == text) {
-                let taken = self.taken.entry(session.to_string()).or_default();
-                if !taken.contains(&e.card) {
-                    taken.push(e.card.clone());
+        match ev {
+            Heard::Delivered { text } => {
+                let Some(m) = self.by.get(session) else { return };
+                for e in m.entries().iter().filter(|e| e.state == State::InChat && e.text == text) {
+                    let taken = self.taken.entry(session.to_string()).or_default();
+                    match taken.iter_mut().find(|k| k.card == e.card) {
+                        Some(k) => k.ended = false,
+                        None => taken.push(Taken { card: e.card.clone(), ended: false }),
+                    }
                 }
             }
+            Heard::Idle => {
+                for k in self.taken.get_mut(session).into_iter().flatten() {
+                    k.ended = true;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -243,18 +297,63 @@ impl Memos {
         self.with(session, |m| m.observe(&view, now));
     }
 
-    /// Forget each answer taken in that the history shows now, or that no
-    /// entry holds in the chat any more.
+    /// Settle each answer taken in on `t`, the module's "Taken in": the
+    /// history shows it, or its turn ended and the history, settled,
+    /// doesn't (missed). Forget it too once no entry holds it in the chat.
     fn prune(&mut self, session: &str, t: &Transcript) {
         let Some(taken) = self.taken.get_mut(session) else { return };
         let m = self.by.get(session);
-        taken.retain(|id| {
-            let e = m.and_then(|m| m.get(id)).filter(|e| e.state == State::InChat);
-            e.is_some_and(|e| !t.history_cards().bound(id).is_some_and(|c| shows(e, c)))
+        let settled = t.history_settled();
+        let mut missed = Vec::new();
+        taken.retain(|k| {
+            let Some(e) = m.and_then(|m| m.get(&k.card)).filter(|e| e.state == State::InChat) else { return false };
+            if t.history_cards().bound(&k.card).is_some_and(|c| shows(e, c)) {
+                return false;
+            }
+            if k.ended && settled {
+                missed.push(k.card.clone());
+                return false;
+            }
+            true
         });
         if taken.is_empty() {
             self.taken.remove(session);
         }
+        for id in missed {
+            let v = self.missed.entry(session.to_string()).or_default();
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        }
+    }
+
+    /// Why `session`'s entry `e` is unconfirmed or not sent: its own
+    /// cause, but for an answer taken in that its turn's end didn't save,
+    /// which the memo reads as a history that lost it (a reconnect's
+    /// cause): the turn's end, "it didn't reach the chat".
+    pub(crate) fn cause(&self, session: &str, e: &Entry) -> Option<Cause> {
+        let missed = self.missed.get(session).is_some_and(|v| v.contains(&e.card));
+        if missed && e.state == State::Unconfirmed && e.cause == Some(Cause::Lost(Trigger::Attached)) {
+            return Some(Cause::Lost(Trigger::Idle));
+        }
+        e.cause.clone()
+    }
+
+    /// What a card in the memo says of its answer, as §3.5's table words
+    /// it: the state word on its receipt line, and (unconfirmed, not
+    /// sent) the cause line under it.
+    pub(crate) fn words(&self, session: &str, e: &Entry) -> (&'static str, Option<String>) {
+        let word = match e.state {
+            State::Sending => "sending…",
+            State::Queued => "queued · the agent reads it at its next step",
+            State::Held => "held · it goes in after the agent's next turn",
+            State::Checking => "checking…",
+            State::InChat => return ("answered", None),
+            State::Unconfirmed => "not confirmed",
+            State::NotSent => "not sent",
+        };
+        let cause = matches!(e.state, State::Unconfirmed | State::NotSent).then(|| self.cause(session, e)).flatten();
+        (word, cause.as_ref().map(Cause::line))
     }
 
     /// The fold `session`'s memo follows: `t`'s, and on top each answer
@@ -262,7 +361,7 @@ impl Memos {
     fn fold<'a>(&self, session: &str, t: &'a Transcript) -> Cow<'a, Fold> {
         let mut fold = Cow::Borrowed(t.cards());
         let (Some(taken), Some(m)) = (self.taken.get(session), self.by.get(session)) else { return fold };
-        for e in taken.iter().filter_map(|id| m.get(id)).filter(|e| e.state == State::InChat) {
+        for e in taken.iter().filter_map(|k| m.get(&k.card)).filter(|e| e.state == State::InChat) {
             if !fold.bound(&e.card).is_some_and(|c| shows(e, c)) {
                 fold.to_mut().apply(&Folded::User { text: e.text.clone() });
             }
@@ -289,6 +388,7 @@ impl Memos {
         if m.entries().is_empty() {
             self.by.remove(session);
         }
+        self.tidy(session);
         text
     }
 
@@ -318,21 +418,6 @@ impl Memos {
     /// Whether Resend shows on `card` (with the window's `input_gate()`).
     pub(crate) fn may_resend(&self, session: &str, card: &CardId, fold: &Fold) -> bool {
         self.by.get(session).is_some_and(|m| m.may_resend(card, fold))
-    }
-}
-
-/// What a card in the memo says of its answer, as §3.5's table words it:
-/// the state word on its receipt line, and (unconfirmed, not sent) the
-/// cause line under it.
-pub(crate) fn words(e: &Entry) -> (&'static str, Option<String>) {
-    match e.state {
-        State::Sending => ("sending…", None),
-        State::Queued => ("queued · the agent reads it at its next step", None),
-        State::Held => ("held · it goes in after the agent's next turn", None),
-        State::Checking => ("checking…", None),
-        State::InChat => ("answered", None),
-        State::Unconfirmed => ("not confirmed", e.cause.as_ref().map(Cause::line)),
-        State::NotSent => ("not sent", e.cause.as_ref().map(Cause::line)),
     }
 }
 

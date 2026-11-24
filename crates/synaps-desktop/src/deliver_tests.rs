@@ -133,10 +133,11 @@ fn press(m: &mut Model, lid: LiveId, label: &str) -> Outgoing {
     out
 }
 
-/// The answer's state on `sid`'s card, and its cause line.
+/// The answer's state on `sid`'s card, and its cause line as the card
+/// says it.
 fn state(m: &Model, lid: LiveId, sid: &str) -> Option<(State, Option<String>)> {
     let c = m.lives[lid].transcript.cards().card("t1")?;
-    m.memos.entry(sid, c).map(|e| (e.state, e.cause.as_ref().map(Cause::line)))
+    m.memos.entry(sid, c).map(|e| (e.state, m.memos.cause(sid, e).as_ref().map(Cause::line)))
 }
 
 fn one() -> Model {
@@ -650,6 +651,12 @@ fn a_delivered_answer_stays_answered_until_its_history_lands() {
         ev(&mut m, 1, S, json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": "Refactoring."}}));
         m.tick_cards(Instant::now() + Duration::from_secs(30));
         assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "slot {slot}: an event, the clock");
+        // The same history again, a resync's and a digest's: no word on it
+        // after the delivery (Shady #81 round 2).
+        replace(&mut m, 1, S, history());
+        ev(&mut m, 1, S, digest(&history(), None));
+        m.tick_cards(Instant::now() + Duration::from_secs(60));
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "slot {slot}: the old history again");
         let p = painted(&m, LiveId::FIRST);
         assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "slot {slot}: no Resend");
         assert!(m.resend_card(LiveId::FIRST, &p, Instant::now()).is_err(), "slot {slot}: nothing sent again");
@@ -679,4 +686,119 @@ fn a_restart_between_the_delivery_and_its_checkpoint_is_not_confirmed() {
     assert!(m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()));
     let again = m.resend_card(LiveId::FIRST, &p, Instant::now()).expect("Resend sends");
     assert_eq!(again.text, out.text);
+}
+
+/// An answer steered while busy that the engine takes in
+/// (`SteeringDelivered`), the slot cleared on the old history: `out`.
+fn delivered(m: &mut Model) -> Outgoing {
+    ev(m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
+    let out = press(m, LiveId::FIRST, "Refactor the parser");
+    ev(m, 1, S, json!({"ev": "steered", "text": out.text, "delivered": true}));
+    ev(m, 1, S, json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": out.text}}));
+    ev(m, 1, S, digest(&history(), None));
+    assert_eq!(state(m, LiveId::FIRST, S), Some((State::InChat, None)), "taken in");
+    out
+}
+
+/// The turn ends: its stream's `Done`, then its last digest (`end`).
+fn turn_ends(m: &mut Model, end: &[Value]) {
+    ev(m, 1, S, json!({"ev": "stream", "event": {"kind": "session", "session": "done"}}));
+    ev(m, 1, S, digest(end, None));
+}
+
+/// Shady #81 round 2, P2-2's other edge: the engine took the answer in
+/// and the turn ended without it in the history (a failed turn's repair,
+/// say). Before the turn's end no history says it is gone, a new one
+/// included; the first settled one after it (`Idle`, which the daemon
+/// sends once the turn's last history is saved) is the daemon's word:
+/// not confirmed, the turn's end its cause, with Resend, which sends it
+/// again. The turn's history lands before the `Idle`, and after it.
+#[test]
+fn a_delivered_answer_the_turns_end_didnt_save_is_not_confirmed() {
+    for landed_first in [true, false] {
+        let mut m = one();
+        let out = delivered(&mut m);
+        let end = with(&["go on"]);
+        turn_ends(&mut m, &end);
+        if landed_first {
+            replace(&mut m, 1, S, end.clone());
+            assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{landed_first}: the turn not over");
+        }
+        ev(&mut m, 1, S, json!({"ev": "idle"}));
+        if !landed_first {
+            assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{landed_first}: its history coming");
+            replace(&mut m, 1, S, end);
+        }
+        let lost = Some(Cause::Lost(Trigger::Idle).line());
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::Unconfirmed, lost)), "{landed_first}");
+        let p = painted(&m, LiveId::FIRST);
+        assert!(m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{landed_first}: Resend");
+        let again = m.resend_card(LiveId::FIRST, &p, Instant::now()).expect("Resend sends");
+        assert_eq!((again.text, again.busy), (out.text, false), "{landed_first}: a Submit, the turn over");
+        assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::Sending));
+    }
+}
+
+/// The other side: the turn's end saved it. Answered, by the history,
+/// never offered again: with its round's checkpoint before the end, and
+/// with only the turn's last history.
+#[test]
+fn a_delivered_answer_the_turns_end_saved_is_answered() {
+    for checkpoint in [true, false] {
+        let mut m = one();
+        let out = delivered(&mut m);
+        let mut round = with(&["go on"]);
+        round.push(json!({"role": "user", "content": out.text}));
+        if checkpoint {
+            ev(&mut m, 1, S, digest(&round, None));
+            replace(&mut m, 1, S, round.clone());
+            assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{checkpoint}: the round's checkpoint");
+        }
+        let mut end = round;
+        end.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Refactoring it."}]}));
+        turn_ends(&mut m, &end);
+        ev(&mut m, 1, S, json!({"ev": "idle"}));
+        replace(&mut m, 1, S, end);
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{checkpoint}: the turn's end");
+        let p = painted(&m, LiveId::FIRST);
+        assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{checkpoint}: no Resend");
+        assert!(m.resend_card(LiveId::FIRST, &p, Instant::now()).is_err(), "{checkpoint}: nothing sent again");
+    }
+}
+
+/// Taken in, then the turn's end compacts (auto): the compacted history
+/// is the daemon's word after the delivery. While the compaction runs and
+/// its history comes, answered. The card and its answer in its kept
+/// tail: answered. The card summarized away: its entry goes with it,
+/// never not confirmed nor offered again.
+#[test]
+fn a_delivered_answer_then_a_compaction() {
+    for kept in [true, false] {
+        let mut m = one();
+        let out = delivered(&mut m);
+        let mut end = with(&["go on"]);
+        end.push(json!({"role": "user", "content": out.text}));
+        end.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Refactoring it."}]}));
+        turn_ends(&mut m, &end);
+        ev(&mut m, 1, S, json!({"ev": "compaction_started", "source": "auto", "disclosure": ""}));
+        let applied = json!({"ev": "compaction_applied", "previous_session_id": S, "session_id": "j2", "chains_advanced": [], "msg_count": 4});
+        ev(&mut m, 1, S, applied);
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{kept}: compacting");
+        let mut compacted = vec![
+            json!({"role": "user", "content": "<context-summary>parser work</context-summary>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        compacted.extend(if kept { end[1..].to_vec() } else { end[end.len() - 2..].to_vec() });
+        ev(&mut m, 1, S, digest(&compacted, None));
+        ev(&mut m, 1, S, json!({"ev": "idle"}));
+        assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{kept}: its history coming");
+        replace(&mut m, 1, S, compacted);
+        if kept {
+            assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{kept}: answered");
+            let p = painted(&m, LiveId::FIRST);
+            assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{kept}: no Resend");
+        } else {
+            assert!(m.memos.get_state(S, CARD).is_none(), "{kept}: the card is gone, and its entry");
+        }
+    }
 }

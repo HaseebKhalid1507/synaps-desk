@@ -771,7 +771,7 @@ fn read_only(gate: &str, l: &crate::live::Live) -> String {
 }
 
 /// How a receipt reads: the fold's state, or an answer of this desk's on
-/// its way (the memo's, [`crate::deliver::words`]).
+/// its way (the memo's, [`crate::deliver::Memos::words`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Look {
     pub(crate) word: Option<&'static str>,
@@ -801,12 +801,12 @@ impl AppView {
         let session = self.card_session();
         let l = &self.model.lives[self.panes.cur.live];
         let fold = session.as_ref().and_then(|_| l.transcript.cards().card(&a.tool_id)).filter(|c| c.id == a.id);
-        let entry = session.as_deref().zip(fold).and_then(|(s, c)| self.model.memos.entry(s, c));
+        let entry = session.as_deref().zip(fold).and_then(|(s, c)| Some((s, self.model.memos.entry(s, c)?)));
         let open = session.as_ref().is_some_and(|s| self.card_open.contains(&(s.clone(), a.tool_id.clone())));
         let said = session.as_ref().and_then(|s| self.card_drafts.get(&(s.clone(), a.tool_id.clone()))).and_then(|d| d.said.clone());
         // An answer of this desk's on its way, or not confirmed.
-        if let Some(e) = entry.filter(|e| e.state != MemoState::InChat || whole(a)) {
-            let (word, cause) = crate::deliver::words(e);
+        if let Some((s, e)) = entry.filter(|(_, e)| e.state != MemoState::InChat || whole(a)) {
+            let (word, cause) = self.model.memos.words(s, e);
             let lost = matches!(e.state, MemoState::Unconfirmed | MemoState::NotSent);
             let look = Look {
                 word: Some(word),
