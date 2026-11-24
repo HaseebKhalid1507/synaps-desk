@@ -60,6 +60,9 @@ pub(crate) struct AppSettings {
     /// pane, as before them. (The tests' views start off, `Default`, or
     /// on with the `split-on-tests` feature: Shady #59 M1.)
     pub split: bool,
+    /// Where the model picker's favourites and logins come from
+    /// (`pickers.source`, [`crate::model_list::Source`]).
+    pub pickers: crate::model_list::Source,
 }
 
 impl AppSettings {
@@ -71,6 +74,7 @@ impl AppSettings {
             usage_range: get("usage_range").and_then(|r| Range::parse(&r)).unwrap_or_default(),
             usage_host: get("usage_host").filter(|h| h != "all"),
             split: split_env().unwrap_or_else(|| path.is_none_or(theme::load_split)),
+            pickers: crate::model_list::Source::parse(path.and_then(|p| theme::load_value(p, crate::model_list::SETTING)).as_ref()),
         }
     }
 }

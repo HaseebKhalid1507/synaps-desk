@@ -1,25 +1,27 @@
 //! The composer foot's model and thinking pickers: a click on the model
 //! name or the thinking level (or "Change model…" / "Change thinking…" in
-//! the palette) opens the app's menu ([`crate::menu`]) over it, listing what
-//! this session takes; a pick is `Set` on that session only. The daemon
-//! lists the choices (`SessionQuery::ModelOptions`, feature
-//! `model_options`); the label changes when the daemon's `setting_changed`
-//! says so, never on the pick. A refusal shows in the open menu (and on the
-//! composer's note line if it has closed).
+//! the palette) opens the app's menu ([`crate::menu`]) over it; a pick is
+//! `Set` on that session only, and the daemon decides: the label changes
+//! when its `setting_changed` says so, never on the pick, and a refusal
+//! shows in the open menu (and on the composer's note line if it has
+//! closed). A model change that clamps the thinking level says so there.
 //!
-//! An older daemon has no list: the model menu shows the current model and
-//! says so; the thinking menu lists the levels the settings page offers
-//! ([`crate::settings::THINKING`]; the daemon refuses what the model lacks).
+//! The models are the TUI's starred ones with a login, and the session's
+//! own, always ([`crate::model_list`], read off the UI thread); the levels
+//! are the settings page's ([`crate::settings::THINKING`]: the daemon
+//! refuses what the model lacks). No daemon query lists them: any daemon
+//! that takes `Set` will do.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
 use gpui_kit::*;
-use synaps_client::{ModelOptions, Setting};
+use synaps_client::Setting;
 
 use crate::app::AppView;
 use crate::menu::{At, How, Item, Key, Menu, Phase};
+use crate::model_list::{List, Listed};
 use crate::pane::{PANES_MAX, PaneId};
 use crate::stats::same_model_id;
 use crate::theme::Palette;
@@ -78,7 +80,7 @@ pub(crate) struct Target {
     pub values: Vec<(String, String)>,
     /// The session's value now, as the daemon last said.
     pub current: String,
-    /// The daemon's list is on its way.
+    /// The list is on its way.
     pub loading: bool,
     /// Why nothing can be picked, or what the list lacks.
     pub note: Option<String>,
@@ -90,8 +92,8 @@ pub(crate) struct Target {
     pub off: Option<String>,
     /// More models than shown.
     pub more: usize,
-    /// A model menu: every model the daemon listed (id, label, provider
-    /// key). One provider's are the values; the others are rows of their own.
+    /// A model menu: every model listed (id, label, provider key). One
+    /// provider's are the values; the others are rows of their own.
     pub all: Vec<(String, String, String)>,
     /// The providers' names by key (a row says the name).
     pub names: Vec<(String, String)>,
@@ -124,42 +126,42 @@ impl Target {
         self.values.iter().position(|(v, _)| self.is_current(v))
     }
 
-    /// The values from the daemon's answer (`None`: it has none: an older
-    /// daemon, or it could not answer). The current value is always one.
-    /// A model menu shows the current model's provider's models, or the
-    /// provider the user went to, while the answer still lists it.
-    pub fn fill(&mut self, options: Option<&ModelOptions>) {
+    /// The values: a model menu's from `list` (`None`: none yet, or none
+    /// to be had), a thinking menu's the settings page's levels. The
+    /// current value is always one, a model in its provider's section. A
+    /// model menu shows the current model's provider's models, or the
+    /// provider the user went to, while the list still has it.
+    pub fn fill(&mut self, list: Option<&List>) {
         self.loading = false;
-        match (self.kind, options) {
+        match (self.kind, list) {
             (Kind::Model, Some(o)) => {
                 let browsing = self.shown.clone().filter(|p| self.home() != Some(p.as_str()));
-                let key = |m: &synaps_client::ModelOption| {
-                    if m.provider_key.is_empty() { m.provider.clone() } else { m.provider_key.clone() }
-                };
-                self.all = o
-                    .models
+                let key = |m: &Listed| if m.provider_key.is_empty() { m.provider.clone() } else { m.provider_key.clone() };
+                let current = (!self.current.is_empty() && !o.models.iter().any(|m| same_model_id(&m.id, &self.current)))
+                    .then(|| crate::model_list::listed(&self.current));
+                let models: Vec<&Listed> = current.iter().chain(&o.models).collect();
+                self.all = models
                     .iter()
-                    .map(|m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() }, key(m)))
+                    .map(|&m| (m.id.clone(), if m.label.is_empty() { m.id.clone() } else { m.label.clone() }, key(m)))
                     .collect();
                 self.names.clear();
-                for m in &o.models {
+                for &m in &models {
                     if !self.names.iter().any(|(k, _)| *k == key(m)) {
                         self.names.push((key(m), m.provider.clone()));
                     }
                 }
-                // The daemon's word on the list (a block, a broker that did not answer).
+                // What the list lacks (no favourites, logins not checked).
                 if o.notice.is_some() {
                     self.note = o.notice.clone();
                 }
                 let browsing = browsing.filter(|p| self.all.iter().any(|m| m.2 == *p));
                 self.show(browsing.as_deref());
             }
-            (Kind::Thinking, Some(o)) => self.set_values(o.thinking.iter().map(|l| (l.clone(), l.clone())).collect()),
             (Kind::Model, None) => {
                 self.all.clear();
                 self.show(None);
             }
-            (Kind::Thinking, None) => self.set_values(crate::settings::THINKING.iter().map(|l| (l.to_string(), l.to_string())).collect()),
+            (Kind::Thinking, _) => self.set_values(crate::settings::THINKING.iter().map(|l| (l.to_string(), l.to_string())).collect()),
         }
     }
 
@@ -288,8 +290,8 @@ impl Target {
     }
 }
 
-/// A row by what it is, not where: the daemon's list replaces the values
-/// under an open menu, so an index would land on another model.
+/// A row by what it is, not where: a late list replaces the values under
+/// an open menu, so an index would land on another model.
 #[derive(Clone, Debug, PartialEq)]
 enum Row {
     Value(String),
@@ -305,8 +307,10 @@ pub(crate) struct Choices {
     /// Each pane's model and thinking labels as last drawn: where a menu
     /// opened from the keyboard sits.
     pub at: Rc<RefCell<[Slot; PANES_MAX]>>,
-    /// The last list each attachment's daemon gave (shown while it is asked again).
-    cache: Option<(u64, ModelOptions)>,
+    /// The last list read for a daemon (shown while it is read again).
+    cache: Option<(ListKey, List)>,
+    /// A list being read for this daemon.
+    asking: Option<ListKey>,
     /// The open menu's widest box so far: its least width while it is open
     /// (another provider's rows do not narrow it under the pointer).
     pub width: Rc<std::cell::Cell<f32>>,
@@ -427,6 +431,9 @@ pub(crate) fn label(
 /// A pane's labels as last drawn: the model's, the thinking level's.
 pub(crate) type Slot = (Option<Bounds<Pixels>>, Option<Bounds<Pixels>>);
 
+/// Whose list: the daemon's pid and profile (its `Welcome`).
+pub(crate) type ListKey = (u32, Option<String>);
+
 impl AppView {
     /// Open the `kind` picker over this pane's label (`pt`: where the
     /// pointer pressed; `None`: from the keyboard).
@@ -453,7 +460,6 @@ impl AppView {
             Ok(()) if l.transcript.busy() => Some(format!("not while a turn runs: change the {} after it", kind.noun())),
             Ok(()) => None,
         };
-        let supported = self.client.as_ref().is_some_and(|c| c.supports(synaps_client::FEATURE_MODEL_OPTIONS));
         let mut t = Target {
             kind,
             pane,
@@ -471,22 +477,18 @@ impl AppView {
             names: Vec::new(),
             shown: None,
         };
-        let cached = self.choice.cache.as_ref().filter(|c| c.0 == attach_seq).map(|c| c.1.clone());
-        if supported {
-            t.fill(cached.as_ref());
-            t.loading = cached.is_none();
-            if let Some(c) = &self.client
-                && c.on(attach_seq).model_options().is_err()
-            {
-                t.loading = false;
-            }
-        } else {
-            t.fill(None);
-            if kind == Kind::Model {
-                t.note = Some(match &self.client {
-                    Some(_) => "this daemon does not list models: /model provider/id".into(),
-                    None => "offline: no daemon to ask".into(),
-                });
+        t.fill(None);
+        if kind == Kind::Model {
+            let key = self.list_key();
+            if self.client.is_none() {
+                t.note = Some("offline: no daemon to ask".into());
+            } else if let Some(key) = key {
+                let cached = self.choice.cache.as_ref().filter(|c| c.0 == key).map(|c| c.1.clone());
+                t.fill(cached.as_ref());
+                t.loading = cached.is_none();
+                self.choice_read(key, cx);
+            } else {
+                t.note = Some("not connected to a daemon yet: the session's model only".into());
             }
         }
         self.close_menu();
@@ -519,23 +521,57 @@ impl AppView {
         cx.notify();
     }
 
-    /// The daemon's list for `attach_seq` came (or why not).
-    pub(crate) fn choice_options(&mut self, attach_seq: u64, reply: Result<ModelOptions, String>) {
-        if let Ok(o) = &reply {
-            self.choice.cache = Some((attach_seq, o.clone()));
-        }
-        if self.choice.menu.as_ref().is_none_or(|(_, t)| t.attach_seq != attach_seq) {
+    /// The daemon this window is on, as a list's key.
+    fn list_key(&self) -> Option<ListKey> {
+        self.model.daemon.as_ref().map(|d| (d.pid, d.profile.clone()))
+    }
+
+    /// Read the model list for the daemon `key` off the UI thread
+    /// ([`crate::model_list::load`]), unless it is being read.
+    fn choice_read(&mut self, key: ListKey, cx: &mut Context<Self>) {
+        let Some(daemon) = self.model.daemon.clone() else { return };
+        if self.choice.asking.as_ref() == Some(&key) {
             return;
         }
-        self.choice.update(|t| match &reply {
-            Ok(o) => t.fill(Some(o)),
-            Err(e) => {
-                if t.values.is_empty() || t.kind == Kind::Model {
-                    t.fill(None);
+        self.choice.asking = Some(key.clone());
+        let (launch, source) = (self.dash.launch.clone(), self.app_settings.pickers.clone());
+        cx.spawn(async move |this, cx| {
+            let list = cx
+                .background_spawn(async move {
+                    crate::model_list::load(&crate::model_list::Ask {
+                        source,
+                        pid: daemon.pid,
+                        profile: daemon.profile.clone(),
+                        here: crate::views::daemon_here(&launch, &daemon),
+                        base: synaps_client::discovery::base_dir(),
+                        reader: crate::model_list::Reader::from_env(),
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                if v.choice.asking.as_ref() == Some(&key) {
+                    v.choice.asking = None;
                 }
-                t.note = Some(e.clone());
-            }
-        });
+                v.choice_listed(Some(key), list);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The model list read for the daemon `key` (`None`: no daemon): kept,
+    /// and shown if the model menu is open on that daemon.
+    pub(crate) fn choice_listed(&mut self, key: Option<ListKey>, list: List) {
+        if key != self.list_key() {
+            return;
+        }
+        if let Some(k) = key {
+            self.choice.cache = Some((k, list.clone()));
+        }
+        if self.choice.menu.as_ref().is_none_or(|(_, t)| t.kind != Kind::Model) {
+            return;
+        }
+        self.choice.update(|t| t.fill(Some(&list)));
         self.model.view_dirty = true;
     }
 
@@ -676,9 +712,9 @@ mod ui_tests;
 mod tests {
     use super::{Choices, Kind, NOTE, PROVIDER, SHOWN, Target};
     use crate::menu::At;
+    use crate::model_list::{List, Listed};
     use crate::pane::PaneId;
     use gpui_kit::{point, px};
-    use synaps_client::{ModelOption, ModelOptions};
 
     fn target(kind: Kind, current: &str) -> Target {
         Target {
@@ -700,22 +736,19 @@ mod tests {
         }
     }
 
-    fn opts() -> ModelOptions {
-        let m = |id: &str, label: &str, provider: &str| ModelOption {
+    fn opts() -> List {
+        let m = |id: &str, label: &str, provider: &str| Listed {
             id: id.into(),
             label: label.into(),
             provider: provider.into(),
             provider_key: String::new(),
         };
-        ModelOptions {
-            model: "anthropic/claude-opus-5-5".into(),
-            thinking_level: "high".into(),
+        List {
             models: vec![
                 m("openai-codex/gpt-5.5", "GPT-5.5", "OpenAI Codex"),
                 m("anthropic/claude-sonnet-4-6", "Sonnet 4.6", "Anthropic"),
                 m("anthropic/claude-opus-5-5", "Opus 5.5", "Anthropic"),
             ],
-            thinking: vec!["off".into(), "adaptive".into(), "high".into(), "max".into()],
             notice: None,
         }
     }
@@ -743,28 +776,30 @@ mod tests {
         assert_eq!(t.current_ix(), Some(1), "back on the current one");
         let mut t = target(Kind::Thinking, "high");
         t.fill(Some(&opts()));
-        assert_eq!(t.items().iter().filter(|i| i.key == Some("current")).map(|i| i.act).collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            t.items().iter().filter(|i| i.key == Some("current")).map(|i| i.act).collect::<Vec<_>>(),
+            [4],
+            "the settings page's levels"
+        );
     }
 
     /// Sections are the daemon's provider keys, named by its names: two
     /// providers that share a name stay apart; its notice is a note row.
     #[test]
     fn sections_follow_the_daemons_provider_keys_and_notice() {
-        let m = |id: &str, provider: &str, key: &str| ModelOption {
+        let m = |id: &str, provider: &str, key: &str| Listed {
             id: id.into(),
             label: String::new(),
             provider: provider.into(),
             provider_key: key.into(),
         };
-        let o = ModelOptions {
-            model: "anthropic/claude-opus-5-5".into(),
+        let o = List {
             models: vec![
                 m("anthropic/claude-opus-5-5", "Anthropic", "anthropic"),
                 m("a:llm:x", "LLM", "a:llm"),
                 m("b:llm:y", "LLM", "b:llm"),
             ],
             notice: Some("model change blocked: workers require collection/reconciliation".into()),
-            ..ModelOptions::default()
         };
         let mut t = target(Kind::Model, "anthropic/claude-opus-5-5");
         t.fill(Some(&o));
@@ -814,27 +849,26 @@ mod tests {
         c.open(t, at, None);
         assert_eq!(sel(&c).as_deref(), Some("high"));
         c.update(|t| t.fill(Some(&opts())));
-        assert_eq!(sel(&c).as_deref(), Some("high"), "fifth of the fallback levels, third of the daemon's");
+        assert_eq!(sel(&c).as_deref(), Some("high"), "a list changes no level");
     }
 
     /// Google Gemini's and Google AI Studio's models: the same names, two
     /// providers (two routes, two credentials).
-    fn google() -> ModelOptions {
-        let m = |id: &str, label: &str, key: &str, provider: &str| ModelOption {
+    fn google() -> List {
+        let m = |id: &str, label: &str, key: &str, provider: &str| Listed {
             id: id.into(),
             label: label.into(),
             provider: provider.into(),
             provider_key: key.into(),
         };
-        ModelOptions {
-            model: "google-gemini/gemini-2.5-pro".into(),
+        List {
             models: vec![
                 m("google-gemini/gemini-2.5-pro", "Gemini 2.5 Pro", "google-gemini", "Google Gemini"),
                 m("google-gemini/gemini-2.5-flash", "Gemini 2.5 Flash", "google-gemini", "Google Gemini"),
                 m("google/gemini-2.5-flash", "Gemini 2.5 Flash", "google", "Google AI Studio"),
                 m("google/gemini-2.5-pro", "Gemini 2.5 Pro", "google", "Google AI Studio"),
             ],
-            ..ModelOptions::default()
+            ..List::default()
         }
     }
 
@@ -912,8 +946,33 @@ mod tests {
         assert!(t.items().iter().all(|i| i.act != NOTE), "levels: no head");
     }
 
+    /// Favourites as `model_list` lists them: sections by the id's
+    /// provider, rows by the rest. The session's model, not a favourite,
+    /// is one still, first in its provider's section; a bare id is its
+    /// `anthropic/` favourite, not another row.
     #[test]
-    fn an_older_daemon_lists_no_models() {
+    fn favourites_and_the_session_s_own_model() {
+        let favs = List::of(&["anthropic/claude-fable-5-2", "openai-codex/gpt-5.6", "anthropic/claude-opus-5-5"]);
+        let labels = |t: &Target| t.items().iter().map(|i| i.label.to_string()).collect::<Vec<_>>();
+        let mut t = target(Kind::Model, "anthropic/claude-sonnet-5-5");
+        t.fill(Some(&favs));
+        assert_eq!(labels(&t), ["ANTHROPIC", "claude-sonnet-5-5", "claude-fable-5-2", "claude-opus-5-5", "openai-codex · 1"]);
+        assert_eq!(t.current_ix(), Some(0));
+        let mut t = target(Kind::Model, "claude-opus-5-5");
+        t.fill(Some(&favs));
+        let ids: Vec<&str> = t.values.iter().map(|v| v.0.as_str()).collect();
+        assert_eq!(ids, ["anthropic/claude-fable-5-2", "anthropic/claude-opus-5-5"]);
+        assert_eq!(t.current_ix(), Some(1));
+        let mut t = target(Kind::Model, "xai-auth/grok-5");
+        t.fill(Some(&favs));
+        assert_eq!(labels(&t), ["XAI-AUTH", "grok-5", "anthropic · 2", "openai-codex · 1"], "its own section, first");
+        let mut t = target(Kind::Model, "xai-auth/grok-5");
+        t.fill(Some(&List::default()));
+        assert_eq!(labels(&t), ["grok-5"], "no favourites: the session's model alone");
+    }
+
+    #[test]
+    fn no_list_shows_the_session_s_model_and_the_levels() {
         let mut t = target(Kind::Model, "anthropic/claude-opus-4-6");
         t.fill(None);
         assert_eq!(t.values, [("anthropic/claude-opus-4-6".to_string(), "anthropic/claude-opus-4-6".to_string())], "the current one only");
@@ -926,28 +985,32 @@ mod tests {
     fn a_pick_waits_and_a_refusal_says_why() {
         let mut t = target(Kind::Thinking, "high");
         t.fill(Some(&opts()));
-        t.pending = Some(3);
+        t.pending = Some(6);
         let items = t.items();
-        assert_eq!(items[3].key, Some("applying…"), "the label does not change; the row says it is asked");
-        assert!(items.iter().filter(|i| i.act != 3).all(|i| !i.enabled()), "one ask at a time");
+        assert_eq!(
+            (items[6].label.as_ref(), items[6].key),
+            ("max", Some("applying…")),
+            "the label does not change; the row says it is asked"
+        );
+        assert!(items.iter().filter(|i| i.act != 6).all(|i| !i.enabled()), "one ask at a time");
         t.refused = t.pending.take().map(|i| (i, "max is not supported by claude-opus-4-6".to_string()));
         let items = t.items();
         assert_eq!((items[0].act, items[0].confirm.as_deref()), (NOTE, Some("REFUSED")));
         assert!(items[0].label.contains("max is not supported"));
-        assert_eq!(items[3].key, Some("current"), "still the daemon's");
+        assert_eq!((items[5].label.as_ref(), items[5].key), ("high", Some("current")), "still the daemon's");
     }
 
     #[test]
     fn read_only_rows_say_why_and_a_long_list_is_cut() {
         let mut t = target(Kind::Model, "anthropic/m19");
         t.off = Some("read-only: this window observes the session".into());
-        let models = (0..20).map(|i| ModelOption {
+        let models = (0..20).map(|i| Listed {
             id: format!("anthropic/m{i}"),
             label: String::new(),
             provider: "Anthropic".into(),
             provider_key: "anthropic".into(),
         });
-        t.fill(Some(&ModelOptions { models: models.collect(), ..ModelOptions::default() }));
+        t.fill(Some(&List { models: models.collect(), ..List::default() }));
         let items = t.items();
         assert!(items.iter().all(|i| !i.enabled()));
         assert_eq!(t.values.len(), SHOWN);
