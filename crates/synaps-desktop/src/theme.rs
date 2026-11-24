@@ -146,11 +146,8 @@ pub const D_SOFT_OFF: f64 = 1.03;
 /// hover (`hover_agent`) is `hover` turned the same way.
 pub const D_AGENT: f64 = 0.03;
 pub const D_AGENT_MIN: f64 = 0.02;
-/// The worker's hue keeps this far (degrees) off the accent's and the
-/// error colour's: a worker never reads as a waiting row or a failed one.
-pub const AGENT_CLEAR: f64 = 40.;
-/// The worker's hue when none of the theme's own clears the accent and
-/// the error colour ([`agent_sources`]): violet, else teal.
+/// The worker's hue where the theme's worker colours have none, or none
+/// that turns its card in gamut ([`agent_sources`]): violet, else teal.
 pub const AGENT_HUES: [(&str, f64); 2] = [("violet", 305.), ("teal", 200.)];
 /// Under this chroma (OKLab) a colour has no hue to take or to keep off.
 const HUE_CHROMA: f64 = 0.04;
@@ -351,12 +348,6 @@ pub fn hue(c: u32) -> (f64, f64) {
     (b.atan2(a).to_degrees().rem_euclid(360.), a.hypot(b))
 }
 
-/// How far apart two hues are (degrees, 0..=180).
-pub fn hue_apart(x: f64, y: f64) -> f64 {
-    let d = (x - y).abs() % 360.;
-    d.min(360. - d)
-}
-
 /// `ground` turned `k` (OKLab) toward hue `h` at its own luminance: in 8
 /// bits, the nearest that lies between `ground`'s luminance and `other`'s
 /// (so whatever reads on both reads on it). `None` out of gamut.
@@ -395,65 +386,25 @@ fn agent_tint(ground: u32, other: u32, h: f64) -> Option<u32> {
     (0..=10u8).map(|i| D_AGENT - f64::from(i) * 0.001).take_while(|&k| k >= D_AGENT_MIN - 1e-9).find_map(|k| tint(ground, other, h, k))
 }
 
-/// The theme's own colours a worker's hue is taken from, in order
-/// (Haseeb: the worker's colour matches its theme): its worker roles
-/// (`subagent_name`, `tool_subagent`, the rest of the TUI's worker panel),
-/// then its named hues: the markdown's and the labels', then the tools',
-/// then the rest. Never a state's (error, warning, ready, done, streaming)
-/// nor yours (`prompt_fg`, `user_color`, `border_active`).
-pub fn agent_sources(t: &Raw) -> [(&'static str, Option<u32>); 25] {
-    [
-        ("subagent_name", Some(t.subagent_name)),
-        ("tool_subagent", t.tool_subagent),
-        ("subagent_border", Some(t.subagent_border)),
-        ("subagent_status", Some(t.subagent_status)),
-        ("subagent_time", Some(t.subagent_time)),
-        ("heading_color", Some(t.heading_color)),
-        ("tool_label", Some(t.tool_label)),
-        ("claude_label", Some(t.claude_label)),
-        ("code_fg", Some(t.code_fg)),
-        ("table_header_color", Some(t.table_header_color)),
-        ("list_bullet_color", Some(t.list_bullet_color)),
-        ("quote_color", Some(t.quote_color)),
-        ("tool_param", Some(t.tool_param)),
-        ("tool_read", t.tool_read),
-        ("tool_write", t.tool_write),
-        ("tool_edit", t.tool_edit),
-        ("tool_grep", t.tool_grep),
-        ("tool_find", t.tool_find),
-        ("tool_ls", t.tool_ls),
-        ("tool_bash", t.tool_bash),
-        ("tool_ext", t.tool_ext),
-        ("tool_generic", t.tool_generic),
-        ("event_source", t.event_source),
-        ("cost_color", Some(t.cost_color)),
-        ("thinking_color", Some(t.thinking_color)),
-    ]
+/// The theme's own worker colours, the ones the TUI paints a subagent
+/// with (Haseeb: the worker's colour is its theme's), in order: its name's,
+/// then its tool's.
+pub fn agent_sources(t: &Raw) -> [(&'static str, Option<u32>); 2] {
+    [("subagent_name", Some(t.subagent_name)), ("tool_subagent", t.tool_subagent)]
 }
 
-/// A worker's fill and its hover (Haseeb: a worker, not a tool), and the
-/// role its hue came from: `card_d` and `hover` turned toward the first of
-/// the theme's own hues ([`agent_sources`]; one with a hue: chroma
-/// [`HUE_CHROMA`] or more) that is [`AGENT_CLEAR`] off the accent's hue
-/// and the error colour's (a worker is never a waiting row nor a failed
-/// one), each at its own luminance; where none is, violet, else teal
-/// ([`AGENT_HUES`]). Where none of those is clear, the first that is in
-/// gamut; where none is, the card's own.
-pub fn agent(card_d: u32, hover: u32, t: &Raw, you: u32) -> (u32, u32, &'static str) {
-    let taken: Vec<f64> = [you, t.error_color].iter().map(|&c| hue(c)).filter(|h| h.1 >= HUE_CHROMA).map(|h| h.0).collect();
+/// A worker chip's fill and its hover (Haseeb: a worker, not a tool), and
+/// the role its hue came from: `card_d` and `hover` turned toward the
+/// theme's worker colour ([`agent_sources`]: the first with a hue, chroma
+/// [`HUE_CHROMA`] or more, that turns both in gamut), each at its own
+/// luminance, whatever the accent's hue or the error colour's (the theme's
+/// own worker colour, as its TUI draws it). Where none does, violet, else
+/// teal ([`AGENT_HUES`]); where neither does, the card's own.
+pub fn agent(card_d: u32, hover: u32, t: &Raw) -> (u32, u32, &'static str) {
     let own = agent_sources(t).into_iter().filter_map(|(name, c)| c.map(hue).filter(|h| h.1 >= HUE_CHROMA).map(|h| (name, h.0)));
-    let hues: Vec<(&'static str, f64)> = own.chain(AGENT_HUES).collect();
-    for clear in [true, false] {
-        for &(name, h) in &hues {
-            if clear && taken.iter().any(|&t| hue_apart(h, t) < AGENT_CLEAR) {
-                continue;
-            }
-            if let (Some(fill), Some(hi)) = (agent_tint(card_d, hover, h), agent_tint(hover, card_d, h)) {
-                return (fill, hi, name);
-            }
-        }
-    }
-    (card_d, hover, "card_d")
+    own.chain(AGENT_HUES)
+        .find_map(|(name, h)| Some((agent_tint(card_d, hover, h)?, agent_tint(hover, card_d, h)?, name)))
+        .unwrap_or((card_d, hover, "card_d"))
 }
 
 // ── which theme ───────────────────────────────────────────────────────────
@@ -878,7 +829,7 @@ pub fn resolve(t: &Raw, accent: Option<u32>) -> (Roles, Vec<Check>) {
     // the card and its hover turned toward the worker's hue (the theme's
     // own), each at its own luminance, so what reads on the card and its
     // hover reads on them.
-    let (card_agent, hover_agent, _) = agent(card_d, hover, t, you);
+    let (card_agent, hover_agent, _) = agent(card_d, hover, t);
     let run_grounds = [canvas, tool, tool_out, card_d, hover, fail_rest, card_agent, hover_agent];
     // `thinking_colors()`: `thinking_color` lifted toward the answer's colour.
     let think = |f: &mut Floors, role, g: &[u32]| {
@@ -2677,68 +2628,51 @@ mod tests {
     /// the card turned [`D_AGENT`] (OKLab) toward the worker's hue at the
     /// card's own luminance (between the card's and its hover's: a
     /// material, not a step), its hover the card's hover turned the same
-    /// way, in every theme and accent preset; never a waiting or a failed
-    /// row's wash as painted; every text and mark a worker chip draws reads
-    /// on both. Its hue is the theme's own (Haseeb: the colours match the
-    /// themes): the first of [`agent_sources`] clear of the accent and the
-    /// error colour, violet or teal only where the theme has none (its
-    /// hues all one family: amber, phosphor, blood, sunset, forest,
-    /// lavender). Each theme's pair and its source without an accent, as
-    /// the PR's table gives it.
+    /// way, in every theme and accent preset; every text and mark a worker
+    /// chip draws reads on both. Its hue is the theme's worker colour, as
+    /// its TUI paints a subagent (Haseeb: the colours match the themes):
+    /// `subagent_name`, whatever the accent; violet only for phosphor,
+    /// whose green turns its own green card out of gamut. Each theme's pair
+    /// and its source, as the PR's table gives it.
     #[test]
     fn a_worker_reads_as_a_worker() {
         let fills = [
             ("default", "subagent_name", 0x17172e, 0x1e1e36),
             ("night-city", "subagent_name", 0x1b152b, 0x221d34),
-            ("neon-rain", "subagent_status", 0x1c1127, 0x241831),
-            ("amber", "violet", 0x1d131c, 0x251a23),
+            ("neon-rain", "subagent_name", 0x230f1c, 0x2b1625),
+            ("amber", "subagent_name", 0x211300, 0x2a1a03),
             ("phosphor", "violet", 0x0e1719, 0x10201e),
             ("solarized-dark", "subagent_name", 0x063753, 0x0f3c58),
-            ("blood", "violet", 0x1c0e1d, 0x261625),
-            ("ocean", "subagent_border", 0x05162b, 0x0a1e33),
-            ("rose-pine", "subagent_border", 0x1f1529, 0x261b32),
-            ("nord", "subagent_status", 0x1e121f, 0x271927),
-            ("dracula", "claude_label", 0x071a25, 0x0e222d),
-            ("monokai", "tool_label", 0x1d2510, 0x252b17),
-            ("gruvbox", "tool_label", 0x222b1b, 0x283120),
-            ("catppuccin", "tool_label", 0x092233, 0x11293b),
-            ("tokyo-night", "tool_label", 0x151f19, 0x1c2521),
-            ("sunset", "violet", 0x24111f, 0x2e1724),
+            ("blood", "subagent_name", 0x250b0a, 0x2f1312),
+            ("ocean", "subagent_name", 0x001921, 0x002129),
+            ("rose-pine", "subagent_name", 0x27131d, 0x2f1925),
+            ("nord", "subagent_name", 0x091725, 0x111f2d),
+            ("dracula", "subagent_name", 0x1c142a, 0x241c32),
+            ("monokai", "subagent_name", 0x2f1d1c, 0x372323),
+            ("gruvbox", "subagent_name", 0x36251a, 0x3d2a1e),
+            ("catppuccin", "subagent_name", 0x231c38, 0x2a2240),
+            ("tokyo-night", "subagent_name", 0x1e1932, 0x251f39),
+            ("sunset", "subagent_name", 0x2c0f07, 0x36150b),
             ("ice", "subagent_name", 0x031728, 0x081f31),
-            ("forest", "violet", 0x16181b, 0x1c2020),
-            ("lavender", "teal", 0x081927, 0x10202f),
+            ("forest", "subagent_name", 0x091d02, 0x0f2405),
+            ("lavender", "subagent_name", 0x1e112f, 0x251938),
             ("paper", "subagent_name", 0xe7ebfe, 0xdee2fb),
         ];
         assert_eq!(fills.len(), palettes::THEMES.len());
         let between = |c: u32, x: u32, y: u32| (luminance(x).min(luminance(y))..=luminance(x).max(luminance(y))).contains(&luminance(c));
         for ((name, raw), (want_name, want_from, fill, hi)) in palettes::THEMES.iter().zip(fills) {
             assert_eq!(*name, want_name);
-            let (r, _) = resolve(raw, None);
-            assert_eq!((r.card_agent, r.hover_agent), (fill, hi), "{name}: #{:06x} #{:06x}", r.card_agent, r.hover_agent);
-            assert_eq!(agent(r.card_d, r.hover, raw, raw.prompt_fg), (fill, hi, want_from), "{name}: its hue's source");
             for a in std::iter::once(None).chain(PRESETS.iter().map(|p| Some(p.1))) {
                 let (r, _) = resolve(raw, a);
-                // The hue: the theme's first clear of the accent's and the
-                // error colour's (and in gamut: phosphor's green on its own
-                // green card is not), violet or teal only where none is.
-                let taken: Vec<f64> =
-                    [a.unwrap_or(raw.prompt_fg), raw.error_color].map(hue).into_iter().filter(|h| h.1 >= HUE_CHROMA).map(|h| h.0).collect();
-                let clear = |h: f64| {
-                    taken.iter().all(|&t| hue_apart(h, t) >= AGENT_CLEAR)
-                        && agent_tint(r.card_d, r.hover, h).is_some()
-                        && agent_tint(r.hover, r.card_d, h).is_some()
-                };
-                let own: Vec<(&str, f64)> = agent_sources(raw)
-                    .into_iter()
-                    .filter_map(|(n, c)| c.map(hue).filter(|h| h.1 >= HUE_CHROMA).map(|h| (n, h.0)))
-                    .collect();
-                let (_, _, from) = agent(r.card_d, r.hover, raw, a.unwrap_or(raw.prompt_fg));
-                let first = own.iter().find(|o| clear(o.1)).map(|o| o.0);
-                match own.iter().find(|o| o.0 == from) {
-                    Some(&(_, h)) => assert!(clear(h) && first == Some(from), "{name} {a:?}: {from} ({h:.0}°) is the first clear"),
+                // The theme's, the same in every accent.
+                assert_eq!((r.card_agent, r.hover_agent), (fill, hi), "{name} {a:?}: #{:06x} #{:06x}", r.card_agent, r.hover_agent);
+                assert_eq!(agent(r.card_d, r.hover, raw), (fill, hi, want_from), "{name} {a:?}: its hue's source");
+                let gamut = |h: f64| agent_tint(r.card_d, r.hover, h).is_some() && agent_tint(r.hover, r.card_d, h).is_some();
+                match agent_sources(raw).into_iter().find(|s| s.0 == want_from) {
+                    Some((_, c)) => assert!(hue(c.expect("set")).1 >= HUE_CHROMA, "{name}: {want_from} has a hue"),
                     None => assert!(
-                        first.is_none() && AGENT_HUES.iter().any(|f| f.0 == from && clear(f.1)),
-                        "{name} {a:?}: {from}, the last resort, where {first:?} was the theme's own"
+                        agent_sources(raw).iter().all(|(_, c)| c.is_none_or(|c| hue(c).1 < HUE_CHROMA || !gamut(hue(c).0))),
+                        "{name}: {want_from}, where the theme's worker colour would do"
                     ),
                 }
                 for (what, c, card, other) in
@@ -3128,9 +3062,6 @@ mod tests {
             "wash_wait_pk",
             "ask_flush",
             "out_press",
-            // A worker's hue keeps off the accent's.
-            "card_agent",
-            "hover_agent",
         ];
         for (name, raw) in palettes::THEMES {
             let (a, base) = resolve(&raw, None);
