@@ -2185,6 +2185,17 @@ async fn session_loop(
                                     }
                                 }
                             }
+                            // The daemon dropped events for this connection
+                            // and carried on (`protocol::stream_lagged`): a
+                            // checkpoint or a digest may be among them, and
+                            // so may the reply to a query in flight. Ask
+                            // again; the first reply after this notice is
+                            // past the gap (one ordered stream), a second is
+                            // dropped as any reply nobody waits for.
+                            SessionEvent::SystemNotice { text } if mirror.is_some() && crate::protocol::stream_lagged(text) => {
+                                send_query = true;
+                                resync = Some(None);
+                            }
                             // The conversation was swapped: re-fetch even if a
                             // length-only comparison would not notice.
                             SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } if mirror.is_some() && resync.is_none() => {

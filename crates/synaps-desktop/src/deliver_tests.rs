@@ -803,3 +803,131 @@ fn a_delivered_answer_then_a_compaction() {
         }
     }
 }
+
+/// The daemon dropped `n` events for this desk and carried on: its notice,
+/// where they would have been, on its own seq (SynapsCLI `189a5a19`,
+/// `daemon/conn.rs:719-728`).
+fn lagged(m: &mut Model, n: u64) -> Vec<Effect> {
+    let v = json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")});
+    m.apply(Event::session(1, S, u64::MAX, decode_event(&v).unwrap(), Arc::new(v)))
+}
+
+/// The answer's words on `sid`'s card, as the card says them.
+fn words(m: &Model, lid: LiveId, sid: &str) -> (&'static str, Option<String>) {
+    let c = m.lives[lid].transcript.cards().card("t1").expect("the card");
+    m.memos.words(sid, m.memos.entry(sid, c).expect("an entry"))
+}
+
+/// Shady #81 round 3: the daemon dropped events for this desk and carried
+/// on. Among them the round's checkpoint and the turn's `Done`, its last
+/// digest too or not (`last`: it came after the notice), and with `slot`
+/// the digest that cleared ours from the slot; the turn's `Idle` came. The
+/// history held is no word on it, looked at again (another event, the
+/// clock): answered, no Resend, and a click sends nothing and says why.
+/// The history asked for again settles it: with ours (`saved`), answered;
+/// without, not confirmed, the turn's end its cause, with Resend.
+#[test]
+fn dropped_events_hold_a_delivered_answer_until_the_history_asked_for_again() {
+    for slot in [false, true] {
+        for last in [false, true] {
+            for saved in [false, true] {
+                let what = format!("slot {slot}, last {last}, saved {saved}");
+                let mut m = one();
+                ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
+                let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+                ev(&mut m, 1, S, json!({"ev": "steered", "text": out.text, "delivered": true}));
+                ev(&mut m, 1, S, digest(&history(), Some(&out.text)));
+                ev(&mut m, 1, S, json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": out.text}}));
+                if !slot {
+                    ev(&mut m, 1, S, digest(&history(), None));
+                }
+                assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: taken in");
+                let mut end = with(&["go on"]);
+                if saved {
+                    end.push(json!({"role": "user", "content": out.text}));
+                    end.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Refactoring it."}]}));
+                }
+                lagged(&mut m, 7);
+                assert!(!m.lives[LiveId::FIRST].transcript.history_settled(), "{what}: not settled");
+                if last {
+                    ev(&mut m, 1, S, digest(&end, None));
+                }
+                ev(&mut m, 1, S, json!({"ev": "idle"}));
+                assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: the Idle");
+                ev(&mut m, 1, S, json!({"ev": "system_notice", "text": "a note"}));
+                m.tick_cards(Instant::now() + Duration::from_secs(5));
+                assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: the history held, again");
+                assert_eq!(words(&m, LiveId::FIRST, S), ("answered", None), "{what}");
+                let p = painted(&m, LiveId::FIRST);
+                assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{what}: no Resend");
+                assert_eq!(m.resend_card(LiveId::FIRST, &p, Instant::now()), Err(RESYNCING.into()), "{what}: nothing sent, and why");
+                replace(&mut m, 1, S, end);
+                if saved {
+                    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: answered");
+                    assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{what}: no Resend");
+                    assert!(m.resend_card(LiveId::FIRST, &p, Instant::now()).is_err(), "{what}: nothing sent again");
+                } else {
+                    let lost = Some(Cause::Lost(Trigger::Idle).line());
+                    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::Unconfirmed, lost)), "{what}: not confirmed");
+                    assert!(m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{what}: Resend");
+                    let again = m.resend_card(LiveId::FIRST, &p, Instant::now()).expect("Resend sends");
+                    assert_eq!((again.text, again.busy), (out.text, false), "{what}: a Submit, the turn over");
+                }
+            }
+        }
+    }
+}
+
+/// The history asked for again doesn't come. Past the memo's own wait for
+/// a settled view, an answer taken in whose turn ended says the chat
+/// couldn't be checked, not confirmed, with no Resend (nothing decided:
+/// the memo's state is as it was), and the clock stops. When it lands, it
+/// settles as ever.
+#[test]
+fn dropped_events_past_the_wait_say_the_chat_couldnt_be_checked() {
+    let mut m = one();
+    let out = delivered(&mut m);
+    lagged(&mut m, 3);
+    ev(&mut m, 1, S, json!({"ev": "idle"}));
+    assert!(m.memos.timed(), "the clock runs for the gap");
+    m.tick_cards(Instant::now() + Duration::from_secs(9));
+    assert_eq!(words(&m, LiveId::FIRST, S), ("answered", None), "within the wait");
+    m.tick_cards(Instant::now() + Duration::from_secs(11));
+    assert_eq!(words(&m, LiveId::FIRST, S), ("not confirmed", Some(UNCHECKED.to_string())), "past it");
+    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "nothing decided");
+    let p = painted(&m, LiveId::FIRST);
+    assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "no Resend");
+    assert_eq!(m.resend_card(LiveId::FIRST, &p, Instant::now()), Err(UNCHECKED.into()));
+    assert!(!m.memos.timed(), "the clock stops");
+    replace(&mut m, 1, S, with(&["go on"]));
+    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::Unconfirmed, Some(Cause::Lost(Trigger::Idle).line()))));
+    let again = m.resend_card(LiveId::FIRST, &p, Instant::now()).expect("Resend sends");
+    assert_eq!(again.text, out.text);
+}
+
+/// A card nobody answered yet, through a gap: a click sends nothing and
+/// says why (checking; past the wait, couldn't check), a digest after the
+/// notice not ending it. The history asked for again does, or an attach
+/// (its snapshot): then a click answers.
+#[test]
+fn a_click_while_dropped_events_resync_sends_nothing_and_says_why() {
+    for reattach in [false, true] {
+        let mut m = one();
+        lagged(&mut m, 2);
+        let p = painted(&m, LiveId::FIRST);
+        let click = |m: &mut Model| m.press_card(LiveId::FIRST, &p, pick("Refactor the parser"), Instant::now());
+        assert_eq!(click(&mut m), Err(RESYNCING.into()), "{reattach}");
+        assert!(m.memos.get_state(S, CARD).is_none(), "{reattach}: nothing out");
+        m.tick_cards(Instant::now() + Duration::from_secs(11));
+        assert_eq!(click(&mut m), Err(UNCHECKED.into()), "{reattach}: past the wait");
+        ev(&mut m, 1, S, digest(&history(), None));
+        assert_eq!(click(&mut m), Err(UNCHECKED.into()), "{reattach}: a digest alone");
+        if reattach {
+            attach_with(&mut m, LiveId::FIRST, 1, S, &history(), |_| {}, true);
+        } else {
+            replace(&mut m, 1, S, history());
+        }
+        let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+        assert_eq!((out.busy, m.memos.get_state(S, CARD)), (false, Some(State::Sending)), "{reattach}: answered");
+    }
+}

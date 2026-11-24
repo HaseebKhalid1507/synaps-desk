@@ -835,7 +835,10 @@ impl AppView {
         // An answer of this desk's on its way, or not confirmed.
         if let Some((s, e)) = entry.filter(|(_, e)| e.state != MemoState::InChat || whole(a)) {
             let (word, cause) = self.model.memos.words(s, e);
-            let lost = matches!(e.state, MemoState::Unconfirmed | MemoState::NotSent);
+            // Taken in, its turn over, and no settled view since dropped
+            // events: not confirmed, and nothing to offer until one settles.
+            let unchecked = self.model.memos.unchecked(s, e);
+            let lost = matches!(e.state, MemoState::Unconfirmed | MemoState::NotSent) || unchecked;
             let look = Look {
                 word: Some(word),
                 tone: if lost {
@@ -850,7 +853,13 @@ impl AppView {
             };
             let mut out = receipt(a, Some(&e.reply), look, id, p, m);
             if lost && let Some(painted) = Painted::of(a) {
-                let gate = l.input_gate().err().map(str::to_string);
+                // Dropped events: nothing is checked until the history
+                // asked for again lands (`deliver`'s "Dropped events").
+                let gate = l
+                    .input_gate()
+                    .err()
+                    .map(str::to_string)
+                    .or_else(|| l.transcript.resyncing().then(|| self.model.memos.gap(s).to_string()));
                 let resend = e.state == MemoState::Unconfirmed;
                 let can = gate.is_none()
                     && fold.is_some_and(|c| {
@@ -862,13 +871,15 @@ impl AppView {
                     });
                 let (name, label) = if resend { ("ask-resend", "Resend") } else { ("ask-retry", "Retry") };
                 let key = control(&painted.id, if resend { "resend" } else { "retry" });
-                let btn = button(name, id, label, resend, can, p, m).when(can, |b| {
-                    b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.in_pane(
-                            pane,
-                            |this| if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) },
-                        );
-                    }))
+                let btn = (!unchecked).then(|| {
+                    button(name, id, label, resend, can, p, m).when(can, |b| {
+                        b.child(probe(&self.panes.cur.ask_shown, id, key)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(
+                                pane,
+                                |this| if resend { this.ask_resend(id, &painted, cx) } else { this.ask_retry(id, &painted, cx) },
+                            );
+                        }))
+                    })
                 });
                 let why = said.or(gate).or(cause).unwrap_or_default();
                 out = out.child(
@@ -887,7 +898,7 @@ impl AppView {
                                 .child(div().text_color(p.prose_t).debug_selector(move || format!("ask-cause {id}")).child(why))
                                 .when(resend, |d| d.child(div().text_color(p.dim_t).child("If it did arrive, the agent reads it twice."))),
                         )
-                        .child(btn),
+                        .children(btn),
                 );
             }
             return out.into_any_element();
@@ -897,6 +908,10 @@ impl AppView {
                 let why = match l.input_gate() {
                     Err(e) => Some(read_only(e, l)),
                     Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
+                    // Dropped events: the history asked for again first.
+                    Ok(()) if l.transcript.resyncing() => {
+                        Some(session.as_deref().map_or(crate::deliver::RESYNCING, |s| self.model.memos.gap(s)).to_string())
+                    }
                     // The live turn's alone: its controls wait for the
                     // history to confirm its binding (Shady #81 P2-1).
                     Ok(()) if !painted.confirmed(&l.transcript) => Some(crate::deliver::CONFIRMING.to_string()),

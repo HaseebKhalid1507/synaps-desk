@@ -377,6 +377,48 @@ async fn h1_digest_drift_resyncs_the_history() {
     client.shutdown().unwrap();
 }
 
+/// The daemon dropped events for this client and said so where they
+/// would have been ("event stream lagged; N dropped", on its own seq,
+/// SynapsCLI `189a5a19` `daemon/conn.rs:719-728`): the client asks for the
+/// history again at once, as after a swap; and again on a second notice
+/// with that query out, its reply maybe among what was dropped. The first
+/// reply after is the `Replace`; the second is nobody's. A notice that
+/// isn't one asks nothing.
+#[tokio::test]
+async fn a_lag_notice_asks_for_the_history_again() {
+    let mut fake = Fake::start("lag").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    conn.event(u64::MAX, json!({"ev": "system_notice", "text": "event stream lagged; 9 dropped"})).await;
+    let q = conn.recv_cmd().await;
+    assert_eq!((q["cmd"].as_str(), q["query"]["query"].as_str()), (Some("query"), Some("messages")));
+    let id = q["id"].as_u64().unwrap();
+    conn.event(u64::MAX, json!({"ev": "system_notice", "text": "event stream lagged; 4 dropped"})).await;
+    let again = conn.recv_cmd().await;
+    assert_eq!((again["query"]["query"].as_str(), again["id"].as_u64()), (Some("messages"), Some(id)), "asked again");
+    let now = vec![json!({"content": "go", "role": "user"}), json!({"content": [{"text": "done", "type": "text"}], "role": "assistant"})];
+    conn.event(40, json!({"ev": "query_result", "id": id, "value": now})).await;
+    conn.event(41, json!({"ev": "query_result", "id": id, "value": now})).await;
+    conn.event(42, json!({"ev": "system_notice", "text": "a note"})).await;
+    conn.event(43, json!({"ev": "idle"})).await;
+    let mut ups = Vec::new();
+    wait(&events, "idle", |e| match e {
+        Event::History { update, attach_seq, .. } => {
+            ups.push((update.clone(), *attach_seq));
+            None
+        }
+        Event::Session { event: synaps_client::SessionEvent::Idle, .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ups, vec![(HistoryUpdate::Replace { messages: now }, seq)], "one Replace, the second reply nobody's");
+    // Nothing else was asked of the daemon: the next frame is our submit.
+    client.submit("x").unwrap();
+    assert_eq!(conn.recv_cmd().await["cmd"], "submit");
+    client.shutdown().unwrap();
+}
+
 /// H2: a `Refused` addressed to this client is a typed error (so the app
 /// can give the text back); one for another client is not. A daemon
 /// "refused: ..." / reload-drain `Error` frame is a refusal too.

@@ -514,6 +514,11 @@ pub struct Transcript {
     /// client asks for the new history at once, and until it lands the
     /// history held says nothing of the new one.
     swap_pending: bool,
+    /// The daemon dropped events for this attachment
+    /// ([`crate::protocol::stream_lagged`]): the client asks for the
+    /// history again at once, and until it lands what is held may be behind
+    /// what was dropped ([`Transcript::resyncing`]).
+    resyncing: bool,
 }
 
 impl Transcript {
@@ -561,9 +566,24 @@ impl Transcript {
     /// describes, its length and hash (synaps-cards §3.5, "settled view";
     /// [`crate::history::HistoryMirror::matches`]), or no digest came since
     /// the attach's snapshot. After a digest that disagrees the client asks
-    /// for the history again: until it lands, not settled.
+    /// for the history again: until it lands, not settled; nor after the
+    /// daemon said it dropped events ([`Transcript::resyncing`]).
     pub fn history_settled(&self) -> bool {
-        !self.swap_pending && self.digest.as_ref().is_none_or(|d| self.mirror.agrees(d))
+        !self.swap_pending && !self.resyncing && self.digest.as_ref().is_none_or(|d| self.mirror.agrees(d))
+    }
+
+    /// The daemon said it dropped events for this attachment and carried on
+    /// (its "event stream lagged" notice, [`crate::protocol::stream_lagged`]):
+    /// the turn's checkpoint and its last digest may be among them, so the
+    /// history held, and the digest before the notice, are no word on
+    /// anything since. The client asks for the history again at once
+    /// ([`crate::Client`], as after a swap); until that lands (a
+    /// `HistoryUpdate::Replace`), not settled. Everything after the notice
+    /// came after what was dropped (one ordered broadcast), so the history
+    /// that lands then is past the gap. A reattach ends it too (its
+    /// snapshot).
+    pub fn resyncing(&self) -> bool {
+        self.resyncing
     }
 
     /// The steer the engine holds for its next round or turn, by the latest
@@ -1034,6 +1054,7 @@ impl Transcript {
                 // the client's mirror does.
                 self.mirror.replaced(messages, self.digest.as_ref());
                 self.swap_pending = false;
+                self.resyncing = false;
                 self.rebuild(|t| t.replace_history(messages));
             }
         }
@@ -1658,7 +1679,17 @@ impl Transcript {
             // card says where it is (queued, then answered), never its JSON.
             SessionEvent::Steered { text, .. } if cards_spec::message::parse(text).is_some() => {}
             SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
-            SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
+            SessionEvent::SystemNotice { text } => {
+                // Events were dropped here ([`Transcript::resyncing`]): the
+                // digest before them may describe a history they moved past,
+                // and one after them is checked against the history asked
+                // for again. A replay's is a past connection's.
+                if crate::protocol::stream_lagged(text) && !self.replaying {
+                    self.resyncing = true;
+                    self.digest = None;
+                }
+                self.notice(ItemKind::Notice, text.clone())
+            }
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
                 self.deliver_all();

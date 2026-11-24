@@ -65,6 +65,26 @@
 //! conversation the agent reads, and acts on this turn. "checking…" would
 //! read as unknown for the rest of the turn, and the memo's checking
 //! state gives up on a settled view in 10 s, a check that isn't this one.
+//!
+//! **Dropped events.** A desk that falls behind the session's broadcast
+//! isn't cut off: the daemon drops what it missed, says so ("event stream
+//! lagged; N dropped", SynapsCLI `189a5a19`, `daemon/conn.rs:719-728`) and
+//! carries on. The round's checkpoint and the turn's last digest may be
+//! among what it dropped, and the history held would then settle an `Idle`
+//! that survived as the turn's last word without them: "not confirmed",
+//! and a Resend of an answer the daemon kept (Shady #81 round 3). So on
+//! the notice the view stops being settled until the history asked for
+//! again lands ([`synaps_client::Transcript::resyncing`]; the client asks
+//! at once, as after a swap). Meanwhile nothing reconciles (the memo, and
+//! what was taken in, wait for a settled view; an answer taken in still
+//! reads "answered"), and a click sends nothing and says why
+//! ([`RESYNCING`]). After it, the first settled view is past the gap and
+//! decides as above, an `Idle` heard in the gap included. Bounded by the
+//! memo's own wait for a settled view ([`CHECK_WAIT`]): past it the card
+//! says it couldn't check the chat ([`UNCHECKED`]), with no Resend until a
+//! view settles. The history asked for again has no slot; the slot held
+//! is the last digest's, and a digest from before the gap may still hold
+//! an answer the engine took in: never read so ([`Memos::slot`]).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -72,7 +92,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cards_spec::fold::{Card, Event as Folded, Fold};
-use cards_spec::memo::{Cause, Entry, Event as Heard, Memo, Resend, State, Trigger, View};
+use cards_spec::memo::{CHECK_WAIT, Cause, Entry, Event as Heard, Memo, Resend, State, Trigger, View};
 use cards_spec::{CardDoc, CardId, Reply};
 use synaps_client::Transcript;
 use synaps_client::cards::Ask;
@@ -162,13 +182,6 @@ fn shows(e: &Entry, card: &Card) -> bool {
     f[k..].contains(&e.text.as_str())
 }
 
-/// What a transcript shows the memo: `fold` (its own, with what was taken
-/// in on top: [`Memos::observe`]), and on a settled history the slot's
-/// steer and whether a turn streams.
-fn view<'a>(fold: &'a Fold, t: &'a Transcript) -> View<'a> {
-    View { fold, settled: t.history_settled(), queued: t.queued_message(), streaming: t.busy() }
-}
-
 /// An answer ready to go: on attachment `seq`, a `Steer` if `busy`, else
 /// a `Submit` (as the composer's, `DESK:sd/app.rs:4640`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +200,20 @@ pub(crate) const CONFIRMING: &str = "Checking the chat… answer in a moment";
 pub(crate) const COMPACTING: &str = "Compacting · answer when it's done";
 pub(crate) const CHANGED: &str = "This card changed: the chat no longer asks it so";
 pub(crate) const OUT: &str = "Its answer is on its way";
+/// The daemon dropped events and the history asked for again isn't in
+/// (the module's "Dropped events"): a click waits for it.
+pub(crate) const RESYNCING: &str = "Checking the chat… some updates were dropped";
+/// And it hasn't come in [`CHECK_WAIT`].
+pub(crate) const UNCHECKED: &str = "Couldn't check the chat: some updates were dropped, and it hasn't caught up";
+
+/// A session whose events the daemon dropped, until the history asked for
+/// again lands ([`synaps_client::Transcript::resyncing`]): since when (the
+/// first view that showed it), and whether that is [`CHECK_WAIT`] ago.
+#[derive(Clone, Copy, Debug)]
+struct Gap {
+    since: Instant,
+    over: bool,
+}
 
 /// An answer the engine took in, until a history settles it (the
 /// module's "Taken in"): its entry's card, and whether the turn that took
@@ -208,8 +235,11 @@ pub(crate) struct Memos {
     /// By session, the entries whose answer was taken in and the turn's
     /// end didn't save: unconfirmed, they say so ([`Memos::cause`]).
     missed: HashMap<String, Vec<CardId>>,
-    /// Bumped whenever an entry changes: cards drawn from it are measured
-    /// again.
+    /// By session, events the daemon dropped and the history asked for
+    /// again not in yet (the module's "Dropped events").
+    gaps: HashMap<String, Gap>,
+    /// Bumped whenever an entry changes, or what a session's cards say of
+    /// a gap: cards drawn from it are measured again.
     changes: u64,
 }
 
@@ -230,6 +260,25 @@ impl Memos {
     /// a settled view).
     pub(crate) fn timed(&self) -> bool {
         self.by.values().flat_map(Memo::entries).any(|e| matches!(e.state, State::Sending | State::Checking))
+            || self.gaps.values().any(|g| !g.over)
+    }
+
+    /// Why a card of `session` waits while its view resyncs after dropped
+    /// events ([`synaps_client::Transcript::resyncing`]): checking, or past
+    /// [`CHECK_WAIT`], couldn't check.
+    pub(crate) fn gap(&self, session: &str) -> &'static str {
+        if self.gaps.get(session).is_some_and(|g| g.over) { UNCHECKED } else { RESYNCING }
+    }
+
+    /// An answer of `session` the engine took in, its turn ended since, on
+    /// a view resyncing past [`CHECK_WAIT`]: no settled view has said
+    /// whether the turn's end saved it, so the card can't say it is in
+    /// the chat; nor can a Resend be checked. It says so
+    /// ([`Memos::words`]).
+    pub(crate) fn unchecked(&self, session: &str, e: &Entry) -> bool {
+        e.state == State::InChat
+            && self.gaps.get(session).is_some_and(|g| g.over)
+            && self.taken.get(session).is_some_and(|v| v.iter().any(|k| k.card == e.card && k.ended))
     }
 
     /// Run `f` on `session`'s memo, if it has one (an event for a session
@@ -291,10 +340,46 @@ impl Memos {
     /// `session`'s transcript as it stands: its entries follow the fold
     /// (and, on a settled view, the settle rule).
     pub(crate) fn observe(&mut self, session: &str, t: &Transcript, now: Instant) {
+        self.follow_gap(session, t, now);
         self.prune(session, t);
         let fold = self.fold(session, t);
-        let view = view(&fold, t);
+        let view = self.view(session, &fold, t);
         self.with(session, |m| m.observe(&view, now));
+    }
+
+    /// A gap starts with the first view that resyncs, and ends with the
+    /// first that doesn't (the history asked for again, or an attach's).
+    fn follow_gap(&mut self, session: &str, t: &Transcript, now: Instant) {
+        if t.resyncing() {
+            if !self.gaps.contains_key(session) {
+                self.gaps.insert(session.to_string(), Gap { since: now, over: false });
+                self.changes += 1;
+            }
+        } else if self.gaps.remove(session).is_some() {
+            self.changes += 1;
+        }
+    }
+
+    /// What a transcript shows the memo of `session`: `fold` (its own,
+    /// with what was taken in on top: [`Memos::observe`]), and on a
+    /// settled history the slot's steer ([`Memos::slot`]) and whether a
+    /// turn streams.
+    fn view<'a>(&self, session: &str, fold: &'a Fold, t: &'a Transcript) -> View<'a> {
+        View { fold, settled: t.history_settled(), queued: self.slot(session, t), streaming: t.busy() }
+    }
+
+    /// The slot's steer as `t` holds it (the latest digest's), unless it
+    /// is an answer of `session` the engine took in (taken, or missed by
+    /// its turn's end): the slot gave that one up when the engine took it
+    /// (a Resend makes it another entry's), so a digest that still holds
+    /// it is from before, its clearing among events the daemon dropped
+    /// (the module's "Dropped events").
+    fn slot<'a>(&self, session: &str, t: &'a Transcript) -> Option<&'a str> {
+        let q = t.queued_message()?;
+        let Some(m) = self.by.get(session) else { return Some(q) };
+        let taken = self.taken.get(session).into_iter().flatten().map(|k| &k.card);
+        let gone = taken.chain(self.missed.get(session).into_iter().flatten()).filter_map(|c| m.get(c)).any(|e| e.text == q);
+        (!gone).then_some(q)
     }
 
     /// Settle each answer taken in on `t`, the module's "Taken in": the
@@ -343,6 +428,9 @@ impl Memos {
     /// it: the state word on its receipt line, and (unconfirmed, not
     /// sent) the cause line under it.
     pub(crate) fn words(&self, session: &str, e: &Entry) -> (&'static str, Option<String>) {
+        if self.unchecked(session, e) {
+            return ("not confirmed", Some(UNCHECKED.into()));
+        }
         let word = match e.state {
             State::Sending => "sending…",
             State::Queued => "queued · the agent reads it at its next step",
@@ -369,11 +457,15 @@ impl Memos {
         fold
     }
 
-    /// The clock, for every session.
+    /// The clock, for every session: and a gap [`CHECK_WAIT`] long is over.
     pub(crate) fn tick(&mut self, now: Instant) {
         let sessions: Vec<String> = self.by.keys().cloned().collect();
         for s in sessions {
             self.with(&s, |m| m.tick(now));
+        }
+        for g in self.gaps.values_mut().filter(|g| !g.over && now.saturating_duration_since(g.since) >= CHECK_WAIT) {
+            g.over = true;
+            self.changes += 1;
         }
     }
 
@@ -403,7 +495,7 @@ impl Memos {
     pub(crate) fn resend(&mut self, session: &str, card: &CardId, t: &Transcript, now: Instant) -> Resend {
         self.prune(session, t);
         let fold = self.fold(session, t);
-        let view = view(&fold, t);
+        let view = self.view(session, &fold, t);
         let mut out = Resend::No;
         self.with(session, |m| out = m.resend(card, &view, now));
         out
@@ -433,6 +525,11 @@ impl crate::model::Model {
         let (Some(seq), Some(a)) = (l.attachment(), l.active.as_ref()) else {
             return Err("not connected to the session: try again in a moment".into());
         };
+        // Events dropped: nothing is checked on the history held until the
+        // one asked for again lands (the module's "Dropped events").
+        if l.transcript.resyncing() {
+            return Err(self.memos.gap(&a.session_id).into());
+        }
         Ok((seq, a.session_id.clone()))
     }
 

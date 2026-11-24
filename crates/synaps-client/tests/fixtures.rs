@@ -211,6 +211,57 @@ fn attached_with_history_renders() {
     assert!(t.items().iter().any(|i| i.text.contains("```python")));
 }
 
+/// The daemon's "event stream lagged" notice (events dropped for this
+/// client): said as a notice, and not settled until the history asked for
+/// again lands. The digest from before the notice is no word on that
+/// history (here one the gap moved past); a digest after it alone doesn't
+/// settle it, and one the history then outgrew waits for the next. A
+/// replay's notice is a past connection's; an attach's snapshot is fresh.
+#[test]
+fn a_lag_notice_unsettles_until_the_history_asked_for_again() {
+    let ev = |v: serde_json::Value| decode_event(&v).unwrap();
+    let digest = |m: &[serde_json::Value]| {
+        ev(serde_json::json!({"ev": "conversation", "digest": {"messages_len": m.len(), "messages_hash": messages_hash(m)}}))
+    };
+    let lag = |n: u32| ev(serde_json::json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")}));
+    let more = |m: &[serde_json::Value], n: usize| {
+        let mut m = m.to_vec();
+        for i in 0..n {
+            m.push(serde_json::json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("after the gap {i}")}));
+        }
+        m
+    };
+    let a = attached("attached_history.json");
+    let held = a.conversation.api_messages.clone();
+    let mut t = Transcript::new();
+    t.load_attached(&a).unwrap();
+    t.apply(&digest(&held));
+    assert!(t.history_settled() && !t.resyncing());
+    t.apply(&lag(12));
+    assert!(t.resyncing() && !t.history_settled(), "the notice");
+    assert_eq!(t.items().last().map(|i| (i.kind, i.text.as_str())), Some((ItemKind::Notice, "event stream lagged; 12 dropped")));
+    let after = more(&held, 2);
+    t.apply_update(&HistoryUpdate::Replace { messages: after.clone() }).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "the history asked for again, past the digest before the gap");
+    t.apply(&lag(3));
+    t.apply(&digest(&after));
+    assert!(!t.history_settled(), "a digest after the notice alone");
+    let later = more(&after, 2);
+    t.apply_update(&HistoryUpdate::Replace { messages: later.clone() }).unwrap();
+    assert!(!t.resyncing() && !t.history_settled(), "the history outgrew that digest");
+    t.apply(&digest(&later));
+    assert!(t.history_settled(), "its own");
+    t.apply(&lag(1));
+    t.load_attached(&a).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "an attach's snapshot");
+    let mut v: serde_json::Value = serde_json::from_str(fixture("attached_history.json").trim()).unwrap();
+    v["replay"] = serde_json::json!([{"session_id": a.meta.id, "seq": 1, "ts": "t",
+        "event": {"ev": "system_notice", "text": "event stream lagged; 5 dropped"}}]);
+    let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    t.load_attached(&replayed).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "a replay's notice");
+}
+
 /// API 6: a `Digest` attach is refused, not silently rendered empty.
 #[test]
 fn a_digest_attach_is_refused() {

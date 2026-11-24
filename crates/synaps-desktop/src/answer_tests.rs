@@ -721,3 +721,54 @@ fn a_cards_options_measured_or_clipped_off_screen_arm_once_in_view(cx: &mut Test
     assert_eq!(sends(cx, &view).len(), 1, "after the arm, one click sends once");
     crate::app::pin_arm_clock(None);
 }
+
+/// Shady #81 round 3: the daemon dropped events for this desk (its lag
+/// notice). Until the history asked for again lands a card's controls
+/// wait, saying why, and a click sends nothing; then one click answers.
+/// Unconfirmed, and another gap: its Resend waits too, its line saying
+/// why.
+#[gpui_kit::test]
+fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut TestAppContext) {
+    let lag = || vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})];
+    let resynced = |cx: &mut TestAppContext, view: &Entity<AppView>| {
+        let (seq, sid) = attachment(cx, view);
+        let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
+            Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+            other => panic!("{other:?}"),
+        };
+        let update = synaps_client::HistoryUpdate::Replace { messages };
+        view.update(cx, |v, cx| {
+            v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx)
+        });
+    };
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    let (id, ix) = card(cx, &view, SHIP);
+    show(cx, w, &view, ix);
+    arm(cx, &view, id, true);
+    heard(cx, w, &view, lag());
+    assert!(has(cx, w, format!("ask-skip {id} off")), "its controls wait");
+    click(cx, w, &view, format!("ask-option {id} 3"));
+    assert!(sends(cx, &view).is_empty(), "nothing sent");
+    resynced(cx, &view);
+    settle(cx, w, 8);
+    let (id, ix) = card(cx, &view, SHIP);
+    show(cx, w, &view, ix);
+    assert!(has(cx, w, format!("ask-skip {id}")), "the history asked for again: they don't");
+    arm(cx, &view, id, true);
+    click(cx, w, &view, format!("ask-option {id} 3"));
+    assert_eq!(sends(cx, &view).len(), 1, "one click answers");
+    view.update(cx, |v, cx| {
+        v.model.tick_cards(Instant::now() + Duration::from_secs(11));
+        v.cards_moved(cx);
+    });
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-state {id} not confirmed")));
+    assert!(has(cx, w, format!("ask-resend {id}")), "Resend");
+    heard(cx, w, &view, lag());
+    assert!(has(cx, w, format!("ask-resend {id} off")) && !has(cx, w, format!("ask-resend {id}")), "Resend waits");
+    assert!(has(cx, w, format!("ask-cause {id}")), "and says why");
+    resynced(cx, &view);
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-resend {id}")), "then it doesn't");
+    crate::app::pin_arm_clock(None);
+}

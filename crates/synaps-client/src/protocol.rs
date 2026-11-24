@@ -1328,6 +1328,16 @@ impl EventMeta {
     }
 }
 
+/// Whether a `SystemNotice`'s `notice` is the daemon's word that it
+/// dropped events for this connection and carried on: a client that isn't
+/// the session's owner and fell behind its broadcast gets
+/// "event stream lagged; N dropped" where the frames would have been
+/// (SynapsCLI `189a5a19`, `agent-engine/src/daemon/conn.rs:719-728`). An
+/// owner is cut off instead (`Bye{owner_lagged}`).
+pub fn stream_lagged(notice: &str) -> bool {
+    notice.starts_with("event stream lagged")
+}
+
 /// A `compaction_applied`'s `queued_restored` in the raw event `raw`: the
 /// steer held through the compaction, which the daemon appended to the
 /// compacted history (the typed variant keeps its three fields). `None`
