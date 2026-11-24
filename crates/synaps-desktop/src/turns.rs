@@ -1031,8 +1031,13 @@ impl Card {
             (_, Some(path)) if file && preview.is_none_or(|pv| pv.title.is_empty()) => tilde(path, false),
             ("bash", _) => tilde(arg, false),
             // A card this desk can't draw (synaps-cards design §6.3): what
-            // it asks, so it can be answered in text.
-            ("cards_ui" | "cards:ui", _) if field("question").is_some() => format!("«{}»", field("question").unwrap_or_default()),
+            // it asks, so it can be answered in text: on one line,
+            // sanitized and cut as a card's text is (its input was never
+            // validated). With nothing of it left, its input, sanitized.
+            ("cards_ui" | "cards:ui", _) => match field("question").map(crate::ask::question_line).filter(|q| !q.is_empty()) {
+                Some(q) => format!("«{q}»"),
+                None => crate::ask::shown(&tilde(arg, true), cards_spec::Lines::Single),
+            },
             _ => tilde(arg, true),
         };
         let is_path = file && !target.contains(" +") && !target.contains('\n') && !target.starts_with('{');

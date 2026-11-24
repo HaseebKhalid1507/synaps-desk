@@ -8423,7 +8423,7 @@ pub(crate) fn row_cache(item: &Item, ledger: &files::Ledger, subs: &crate::subag
                 r.card.word = verb.clone();
                 r.card.key = verb;
                 r.card.full = Some(r.name.clone());
-                r.card.target = format!("«{}»", c.doc.question).into();
+                r.card.target = format!("«{}»", crate::ask::question_line(&c.doc.question)).into();
                 r.card.path = None;
                 r.arg = r.card.target.clone();
             }

@@ -20,9 +20,14 @@
 //!   user's surface: `↳ answered «Which approach?» → Refactor the parser`,
 //!   never its JSON.
 //!
+//! Every string a card draws goes through the spec's sanitizer first
+//! ([`shown`], §5.2): an answer's values are validated, never rewritten,
+//! so one may hold a bidi control, a tab or an invisible.
+//!
 //! Nothing here takes a click or a key (D2a and D2b answer). A card is a
 //! static row: no frame is asked for, at rest or otherwise.
 
+use cards_spec::Lines;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -42,6 +47,20 @@ pub(crate) fn asks(it: &Item) -> bool {
 /// A user message that answers one ([`crate::turns::Kind::Answer`]).
 pub(crate) fn answers(it: &Item) -> bool {
     it.kind == ItemKind::User && matches!(it.card.as_deref(), Some(CardRow::Answer(_)))
+}
+
+/// `s` as a card draws it: `cards_spec::ui_sanitize`, the display side of
+/// the one sanitizer (synaps-cards §5.2). A doc's strings were normalized
+/// by it, so it changes none of them (it is idempotent); an answer's values
+/// were validated, never rewritten (the reply keeps them as sent).
+pub(crate) fn shown(s: &str, lines: Lines) -> String {
+    cards_spec::ui_sanitize(s, lines)
+}
+
+/// A question as a one-line label ([`shown`]), cut to the spec's bound:
+/// that of a call this desk can't read (§6.3) was never validated.
+pub(crate) fn question_line(q: &str) -> String {
+    cards_spec::sanitize::cut_chars(shown(q, Lines::Single).trim(), cards_spec::QUESTION_MAX)
 }
 
 /// A receipt's or an answer's line: the question takes up to this much of
@@ -111,7 +130,8 @@ pub(crate) fn how(doc: &CardDoc) -> &'static str {
 
 /// What an answer says, in a line: the labels picked (`(none)` for an
 /// empty pick), the note, then `Label: value` for each field; `None` for a
-/// skip.
+/// skip. [`shown`] on one line: a value's line breaks and tabs are spaces,
+/// its controls and invisibles gone.
 pub(crate) fn summary(doc: &CardDoc, reply: &Reply) -> Option<String> {
     let a: &Answer = match reply {
         Reply::Answer(a) | Reply::Change(a) => a,
@@ -137,7 +157,7 @@ pub(crate) fn summary(doc: &CardDoc, reply: &Reply) -> Option<String> {
         };
         parts.push(format!("{label}: {value}"));
     }
-    Some(parts.join(" · ").replace('\n', " "))
+    Some(shown(&parts.join(" · "), Lines::Single))
 }
 
 /// Whether `label` is (one of) the agent's default.
@@ -197,8 +217,9 @@ pub(crate) fn card(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
         .line_height(px(m.card_lead_line))
         .text_color(p.ink)
         .debug_selector(move || format!("ask-question {id}"))
-        .child(doc.question.clone());
+        .child(shown(&doc.question, Lines::Single));
     let detail = doc.detail.as_ref().map(|d| {
+        let d = shown(d, Lines::Multi);
         v_flex()
             .mt(px((4. * r).round()))
             .font_family(fonts::SANS)
@@ -221,7 +242,7 @@ pub(crate) fn card(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
                     .whitespace_nowrap()
                     .text_px(m.meta)
                     .text_color(p.dim_t)
-                    .child(h.clone())
+                    .child(shown(h, Lines::Single))
             });
             let note = o.note.as_ref().map(|_| div().flex_none().text_px(m.meta).text_color(p.dim_t).child("+ a note"));
             h_flex()
@@ -252,7 +273,7 @@ pub(crate) fn card(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
                         .whitespace_nowrap()
                         .text_px(m.card_title)
                         .text_color(p.prose_t)
-                        .child(o.label.clone()),
+                        .child(shown(&o.label, Lines::Single)),
                 )
                 .children(hint)
                 .children(note)
@@ -289,18 +310,18 @@ pub(crate) fn card(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
                                 .justify_center()
                                 .when(on, |d| d.child(div().size(px(6.)).bg(p.acc))),
                         )
-                        .child(div().text_px(m.card_title).text_color(p.prose_t).child(f.label.clone()))
+                        .child(div().text_px(m.card_title).text_color(p.prose_t).child(shown(&f.label, Lines::Single)))
                         .into_any_element()
                 }
                 (_, FieldValue::Text(t)) => {
                     let (text, color) = match (t.is_empty(), &f.placeholder) {
-                        (false, _) => (t.clone(), p.ink),
-                        (true, Some(ph)) => (ph.clone(), p.dim_t),
+                        (false, _) => (shown(t, f.kind.lines()), p.ink),
+                        (true, Some(ph)) => (shown(ph, Lines::Single), p.dim_t),
                         (true, None) => (String::new(), p.dim_t),
                     };
                     v_flex()
                         .gap(px((4. * r).round()))
-                        .child(div().text_px(m.meta).text_color(p.dim_t).child(f.label.clone()))
+                        .child(div().text_px(m.meta).text_color(p.dim_t).child(shown(&f.label, Lines::Single)))
                         .child(
                             div()
                                 .w_full()
@@ -376,7 +397,7 @@ pub(crate) fn receipt(a: &Ask, id: u64, p: &Palette, m: &Metrics) -> Div {
                     .text_ellipsis()
                     .text_color(p.prose_t)
                     .debug_selector(move || format!("ask-question {id}"))
-                    .child(a.doc.question.clone()),
+                    .child(shown(&a.doc.question, Lines::Single)),
             )
             .children(said.map(|s| {
                 h_flex().min_w_0().flex_shrink(1.).gap(px(8.)).child(div().flex_none().text_color(p.dim_t).child("→")).child(
@@ -435,7 +456,7 @@ impl AppView {
                     .overflow_hidden()
                     .text_ellipsis()
                     .text_color(p.dim_u)
-                    .child(format!("«{}»", a.doc.question)),
+                    .child(format!("«{}»", shown(&a.doc.question, Lines::Single))),
             )
             .children(said.map(|s| {
                 h_flex()
