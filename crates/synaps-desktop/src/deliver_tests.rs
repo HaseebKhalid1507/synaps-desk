@@ -781,7 +781,8 @@ fn a_delivered_answer_then_a_compaction() {
         end.push(json!({"role": "assistant", "content": [{"type": "text", "text": "Refactoring it."}]}));
         turn_ends(&mut m, &end);
         ev(&mut m, 1, S, json!({"ev": "compaction_started", "source": "auto", "disclosure": ""}));
-        let applied = json!({"ev": "compaction_applied", "previous_session_id": S, "session_id": "j2", "chains_advanced": [], "msg_count": 4});
+        let applied =
+            json!({"ev": "compaction_applied", "previous_session_id": S, "session_id": "j2", "chains_advanced": [], "msg_count": 4});
         ev(&mut m, 1, S, applied);
         assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{kept}: compacting");
         let mut compacted = vec![
