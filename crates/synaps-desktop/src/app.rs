@@ -893,7 +893,7 @@ pub(crate) struct FoldKeys {
 }
 
 impl FoldKeys {
-    const PAIR: Duration = Duration::from_millis(30);
+    pub(crate) const PAIR: Duration = Duration::from_millis(30);
     /// A key-up this window never saw (the window lost focus while the key
     /// was down) stops counting after this long without a repeat: longer
     /// than the usual first-repeat delays (X11 660 ms, Windows up to 1 s).

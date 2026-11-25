@@ -23,13 +23,16 @@
 //!   fields; Esc goes back to the composer. Any other printable key goes
 //!   to the composer, typed.
 //! - **Only new, bare presses act**, on the card and in its fields alike
-//!   ([`Presses::acts`]): a repeat, a key held from before (the app's
-//!   `FoldKeys` rule), or a chord (Shift+Enter, Ctrl+Enter) does
-//!   nothing. So with Ctrl+J: held, it jumps once. A field's Enter and
-//!   Tab are bindings of its input, which run before any key listener
+//!   ([`Presses::acts`]): a repeat, a key held from before, or a chord
+//!   (Shift+Enter, Ctrl+Enter) does nothing. A press is a key-down after
+//!   that key's key-up ([`Press`]), whether or not the platform says the
+//!   key-down repeats (macOS loses that on Shift+Tab, Esc and the
+//!   arrows). So with Ctrl+J: held, it jumps once. A field's Enter, Esc
+//!   and Tab are bindings of its input, which run before any key listener
 //!   and never say whether the key repeats: Tab has none on an entered
 //!   card (`NoAction`), and comes as a key; an Enter acts at its
-//!   `PressEnter` only once its key-down said ([`FieldEnter`]).
+//!   `PressEnter`, and an Esc at its key-down, only once that key-down
+//!   said ([`FieldKey`]).
 //! - **In a field**, the field keeps its keys: digits, Space and arrows
 //!   edit, and an IME composition owns every key. Enter in a one-line
 //!   field goes forward: it sends a whole form, else moves to the next
@@ -118,33 +121,93 @@ pub(crate) struct Entry {
     pub(crate) seen: Rc<Cell<bool>>,
 }
 
-/// Every key's presses, window-wide ([`FoldKeys`]), as the root's capture
-/// stamps each key-down: whether the last was a new press, not a repeat
-/// or a key still held from before; and whether it may act on an entered
-/// card.
+/// Every key's presses, window-wide ([`Press`]), as the root's capture
+/// stamps each key-down and key-up: whether the last key-down was a new
+/// press, not a repeat or a key still held from before; and whether it
+/// may act on an entered card.
 #[derive(Default)]
 pub(crate) struct Presses {
-    keys: HashMap<String, FoldKeys>,
+    keys: HashMap<String, Press>,
     pub(crate) last: bool,
     /// The last key-down may act on an entered card: a new press, bare.
     pub(crate) acts: bool,
-    /// An Enter in an input, from its action to its `PressEnter`.
-    pub(crate) enter: Option<FieldEnter>,
+    /// An Enter or Esc in an input, from its action to its key-down (and
+    /// an Enter's on to its `PressEnter`).
+    pub(crate) field: Option<FieldKey>,
 }
 
-/// An Enter in an input, between its action and its `PressEnter`. The
-/// input's Enter binding runs before any key listener (GPUI dispatches a
-/// key's bindings first), and its `PressEnter` is an effect, heard once
-/// the whole key-down is through. So: the action says an Enter came, and
-/// whether mid-composition (read then, before anything commits it); its
+/// One key's presses, for an entered card's keys and Ctrl+J (Shady #86
+/// R2-2): a key-down is a new press only if that key went up since its
+/// last key-down, [`FoldKeys::PAIR`] or more before (X11's key-up right
+/// before each repeat), and the key-down does not say it repeats. The
+/// same on every platform. Not [`FoldKeys`]'s macOS rule, which takes a
+/// key-down with no key-up between for a press when it does not say it
+/// repeats (for Cmd+B, whose key-up AppKit drops): GPUI's macOS backend
+/// rebuilds a non-printing key's key-down (Shift+Tab, Esc, the arrows)
+/// that went through the input context's `doCommandBySelector:` with
+/// `is_held: false`, so a held Shift+Tab would go round the card.
+///
+/// One exception, for that dropped key-up: after a Cmd chord of the key
+/// (Cmd+2, a tab), a key-down that types text (`2`, Enter, Tab, Space:
+/// one that never goes through that callback, so it says when it
+/// repeats) is a press. Else the `2` that answers a card after Cmd+2
+/// would be lost. A key-up this window never saw (it was let go in
+/// another window) costs the next press of that key, once.
+#[derive(Debug, Default)]
+struct Press {
+    down: Option<Instant>,
+    up: Option<Instant>,
+    /// The last key-down was a Cmd chord: its key-up may never come.
+    cmd: bool,
+}
+
+impl Press {
+    /// The key went down at `now` (`held`: it says it repeats; `cmd`: with
+    /// Cmd; `text`: it types text): `true` for a new press.
+    fn press(&mut self, now: Instant, held: bool, cmd: bool, text: bool) -> bool {
+        let new = !held
+            && match (self.down, self.up) {
+                (None, _) => true,
+                (Some(_), Some(up)) => now.saturating_duration_since(up) >= FoldKeys::PAIR,
+                (Some(_), None) => self.cmd && text,
+            };
+        self.down = Some(now);
+        self.up = None;
+        self.cmd = cmd;
+        new
+    }
+
+    fn release(&mut self, now: Instant) {
+        if self.down.is_some() {
+            self.up = Some(now);
+        }
+    }
+}
+
+/// An Enter or an Esc in an input, between its action and its key-down.
+/// The input's binding runs before any key listener (GPUI dispatches a
+/// key's bindings first), and its action ends an IME composition (Esc)
+/// or emits `PressEnter`, an effect heard once the whole key-down is
+/// through (Enter). So: the action says the key came, and whether
+/// mid-composition (read then, before the input ends or commits it); its
 /// own key-down, as [`Presses::down`] stamps it, whether it acts. An
-/// entered card's field goes forward only on that
-/// ([`AppView::ask_field_enter`]); an Enter whose key-down never came (an
-/// action dispatched alone) or was another's acts on nothing.
+/// entered card's field goes forward ([`AppView::ask_field_enter`]) or
+/// back to the composer ([`AppView::ask_field_escape`]) only on that; a
+/// key whose key-down never came (an action dispatched alone, or one the
+/// input kept) or was another's acts on nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FieldEnter {
+pub(crate) struct FieldKey {
+    /// `"enter"` or `"escape"`.
+    pub(crate) key: &'static str,
     pub(crate) composing: bool,
     pub(crate) acts: Option<bool>,
+}
+
+impl FieldKey {
+    /// `key`'s, as it acts: a new, bare press, with no composition.
+    fn acting(key: &'static str) -> Self {
+        Self { key, composing: false, acts: Some(true) }
+    }
 }
 
 /// A key a card takes: no modifier, but Shift on Tab (Shift+Tab). A chord
@@ -157,13 +220,14 @@ fn bare(ks: &Keystroke) -> bool {
 
 impl Presses {
     /// Key `ks` went down at `now` (`held`: the platform says it is a
-    /// repeat). A pending Enter's key-down says whether it acts; any other
-    /// key-down ends it.
+    /// repeat). A pending Enter's or Esc's key-down says whether it acts;
+    /// any other key-down ends it.
     pub(crate) fn down(&mut self, ks: &Keystroke, now: Instant, held: bool) {
-        self.last = self.keys.entry(ks.key.clone()).or_default().press(now, held);
+        let (cmd, text) = (ks.modifiers.platform, ks.key_char.is_some());
+        self.last = self.keys.entry(ks.key.clone()).or_default().press(now, held, cmd, text);
         self.acts = self.last && bare(ks);
         let acts = self.acts;
-        self.enter = self.enter.take().filter(|e| ks.key == "enter" && e.acts.is_none()).map(|e| FieldEnter { acts: Some(acts), ..e });
+        self.field = self.field.take().filter(|f| ks.key == f.key && f.acts.is_none()).map(|f| FieldKey { acts: Some(acts), ..f });
     }
 
     pub(crate) fn up(&mut self, key: &str, now: Instant) {
@@ -755,26 +819,44 @@ impl AppView {
         self.ask_tab(m.shift, window, cx);
     }
 
-    /// Esc in one of the entered card's inputs (the input's own, captured):
-    /// back to the composer. An IME composition keeps it.
+    /// Esc in one of the entered card's inputs, at its key-down: after the
+    /// input's `Escape` (which ends an IME composition) and the root's
+    /// stamp ([`FieldKey`]). Back to the composer, only on a new, bare
+    /// press whose action met no composition (Shady #86 R2-1): the Esc
+    /// that ended one, its repeats and an Esc held from before do
+    /// nothing, and nothing else hears them. An Esc the input kept (its
+    /// own menu, say) never comes here.
     fn ask_field_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(esc) = self.ask_presses.field.take_if(|f| f.key == "escape") else { return };
         let holds = self.panes.cur.ask.entry.as_ref().is_some_and(|e| self.ask_field_focused(e, window, cx).is_some());
-        if holds && !self.ask_composing(window, cx) {
-            cx.stop_propagation();
-            self.leave_ask(true, window, cx);
+        if !holds {
+            return;
         }
+        cx.stop_propagation();
+        if esc != FieldKey::acting("escape") || self.ask_composing(window, cx) {
+            log::debug!(target: "synaps_desktop::card", "field Esc {esc:?}: not a new, bare press, or a composition's");
+            return;
+        }
+        self.leave_ask(true, window, cx);
+    }
+
+    /// An input's Enter or Esc (`key`), as its action comes: pending, till
+    /// its key-down says whether it acts ([`FieldKey`]).
+    fn ask_field_key(&mut self, key: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let composing = self.ask_composing(window, cx);
+        self.ask_presses.field = Some(FieldKey { key, composing, acts: None });
     }
 
     /// Enter in a one-line input of row `row`'s card (its `PressEnter`),
     /// the card entered and painted: forward. A whole form is sent; else
     /// the next stop. Only an Enter whose own key-down was a new, bare
-    /// press, and not an IME composition's ([`FieldEnter`]): a repeat, an
+    /// press, and not an IME composition's ([`FieldKey`]): a repeat, an
     /// Enter held from before the keys came here, or Shift or Ctrl+Enter
     /// sends nothing and moves nothing.
     pub(crate) fn ask_field_enter(&mut self, row: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let enter = self.ask_presses.enter.take();
+        let enter = self.ask_presses.field.take();
         let Some((s, r, painted)) = self.ask_target().filter(|(_, r, _)| *r == row) else { return };
-        if enter != Some(FieldEnter { composing: false, acts: Some(true) }) {
+        if enter != Some(FieldKey::acting("enter")) {
             log::debug!(target: "synaps_desktop::card", "field Enter {enter:?}: not a new, bare press");
             return;
         }
@@ -849,25 +931,65 @@ impl AppView {
         });
         d.children(focus)
             .children(gone)
-            // An Enter in an input, as its action comes, before its key-down
-            // and its `PressEnter` ([`FieldEnter`]); whether mid-composition
-            // is read now, as the platform may commit the composition before
-            // its `PressEnter`.
+            // An Enter or an Esc in an input, as its action comes, before its
+            // key-down ([`FieldKey`]); whether mid-composition is read now,
+            // as the input ends a composition at its Esc, and the platform
+            // may commit one before an Enter's `PressEnter`.
             .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::Enter, window, cx| {
-                this.in_pane(pane, |this| {
-                    let composing = this.ask_composing(window, cx);
-                    this.ask_presses.enter = Some(FieldEnter { composing, acts: None });
-                });
-            }))
-            // Tab and Shift+Tab on the entered card, its body or an input:
-            // keys, after the root stamped them.
-            .capture_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "tab" {
-                    this.in_pane(pane, |this| this.ask_tab_key(&ev.keystroke, window, cx));
-                }
+                this.in_pane(pane, |this| this.ask_field_key("enter", window, cx));
             }))
             .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::Escape, window, cx| {
-                this.in_pane(pane, |this| this.ask_field_escape(window, cx));
+                this.in_pane(pane, |this| this.ask_field_key("escape", window, cx));
             }))
+            // Tab and Shift+Tab on the entered card, its body or an input,
+            // and Esc in an input: keys, after the root stamped them.
+            .capture_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                match ev.keystroke.key.as_str() {
+                    "tab" => this.in_pane(pane, |this| this.ask_tab_key(&ev.keystroke, window, cx)),
+                    "escape" => this.in_pane(pane, |this| this.ask_field_escape(window, cx)),
+                    _ => None,
+                };
+            }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::Press;
+
+    /// [`Press`]: a key-down is a press after the key's key-up, 30 ms or
+    /// more before, and not when it says it repeats; never without a
+    /// key-up between, however long after (a repeat that lost its held
+    /// bit), unless the last key-down was a Cmd chord (its key-up AppKit
+    /// drops) and this one types text.
+    #[test]
+    fn a_press_is_a_key_down_after_its_key_up() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut k = Press::default();
+        assert!(k.press(t0, false, false, false), "the first key-down");
+        for n in [10, 1_200, 3_600_000] {
+            assert!(!k.press(ms(n), false, false, false), "no key-up between: a repeat, {n} ms on, held bit or not");
+        }
+        let at = 3_600_000;
+        k.release(ms(at));
+        assert!(!k.press(ms(at + 29), false, false, false), "29 ms after its key-up: X11's repeat");
+        k.release(ms(at + 30));
+        assert!(k.press(ms(at + 60), false, false, false), "30 ms after: a press");
+        k.release(ms(at + 100));
+        assert!(!k.press(ms(at + 200), true, false, false), "held: a repeat, after a key-up too");
+
+        let mut two = Press::default();
+        assert!(two.press(t0, false, true, false), "Cmd+2");
+        assert!(two.press(ms(50), false, false, true), "then 2, its key-up lost under Cmd: a press");
+        assert!(!two.press(ms(80), false, false, true), "and its next key-down, no key-up between: a repeat");
+        let mut held = Press::default();
+        held.press(t0, false, true, false);
+        assert!(!held.press(ms(50), true, false, true), "after Cmd+2, a 2 that says it repeats: a repeat");
+        let mut esc = Press::default();
+        esc.press(t0, false, true, false);
+        assert!(!esc.press(ms(50), false, false, false), "after Cmd+Esc, an Esc with no text and no key-up: a repeat");
     }
 }

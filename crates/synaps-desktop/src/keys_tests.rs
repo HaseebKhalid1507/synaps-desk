@@ -6,8 +6,10 @@
 //! answer inside a batch), each sending nothing; and the keys never
 //! resolve a prompt, nor does Esc deny one (§5.1). And D3's way in,
 //! [`AppView::enter_card`]: one card, by its binding. Held keys act once
-//! at every way in (Shady #86): an Enter in a field or a note, Ctrl+J,
-//! Tab; and Tab goes round the note a pick opens.
+//! at every way in (Shady #86): an Enter or Esc in a field or a note,
+//! Ctrl+J, Tab; a repeat that lost its held bit (macOS's Shift+Tab, Esc
+//! and arrows) acts no more than one that says it; and Tab goes round
+//! the note a pick opens.
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`): exactly one `Submit` or `Steer`, its text and
@@ -46,6 +48,22 @@ fn down(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
 fn repeat(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let keystroke = keystroke(cx, k);
     let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke, is_held: true, prefer_character_input: false });
+    cx.update_window(w, |_, window, cx| {
+        window.dispatch_event(ev, cx);
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    settle(cx, w, 8);
+}
+
+/// `k` goes down again while held, as GPUI's macOS backend sends a held
+/// non-printing key (Shift+Tab, Esc, ↓) back from the input context's
+/// `doCommandBySelector:`: rebuilt with `is_held: false`, no text, and no
+/// key-up since its last key-down (Shady #86 R2-2).
+fn lost(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+    let mut keystroke = keystroke(cx, k);
+    keystroke.key_char = None;
+    let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false });
     cx.update_window(w, |_, window, cx| {
         window.dispatch_event(ev, cx);
     })
@@ -1176,4 +1194,138 @@ fn card_keys_and_the_chord_read_one_input_clock(cx: &mut TestAppContext) {
         let sent = if press { vec![message("c9kclck", &input, json!({"choice": "main"}))] } else { vec![] };
         assert_eq!(texts(cx, &view), sent, "{gap:?} after the key-up");
     }
+}
+
+/// Shady #86 R2-1: Esc in a field goes back to the composer on a new press
+/// only, as on the card. An Esc held from before the keys came to the
+/// field (its repeats reach it) leaves nothing. Nor does the Esc that
+/// ends an IME composition (the input's own `Escape` ends it, before its
+/// key-down), nor its repeats: held, or one that lost its held bit (no
+/// key-up between, past `FoldKeys::STALE`). Let go and pressed again, Esc
+/// leaves, the draft kept; the prompt stays pending throughout.
+#[gpui_kit::test]
+fn a_held_esc_in_a_field_leaves_nothing(cx: &mut TestAppContext) {
+    let input = json!({"question": "Who reviews?", "wait": true, "fields": [{"id": "who", "label": "Reviewer", "value": "Ana"}]});
+    let (w, view, id, _events) = asked(cx, "toolu_hx", "c4hesc0", &input);
+    prompt(cx, w, &view);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id), "Ctrl+J again: the card");
+    press(cx, w, "tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hx"), "who");
+    for n in 1..=2 {
+        repeat(cx, w, "escape");
+        assert!(entered(cx, w, id), "repeat {n}: an Esc held from before leaves nothing");
+        assert_eq!(keys_in(cx, w, &view, "toolu_hx"), "who", "repeat {n}");
+    }
+    up(cx, w, "escape");
+    crate::app::next_press();
+    let e = view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        v.card_drafts[&(sid, "toolu_hx".to_string())].lines["who"].clone()
+    });
+    cx.update_window(w, |_, window, cx| e.update(cx, |s, cx| s.replace_and_mark_text_in_range(None, "あ", None, window, cx)))
+        .expect("the window");
+    settle(cx, w, 8);
+    down(cx, w, "escape");
+    settle(cx, w, 8);
+    assert!(entered(cx, w, id), "the Esc that ends a composition leaves nothing");
+    assert_eq!(field_value(cx, &view, "toolu_hx", "who"), "Anaあ", "the composition, ended");
+    repeat(cx, w, "escape");
+    assert!(entered(cx, w, id), "its repeat, held");
+    crate::app::advance_input_clock(std::time::Duration::from_millis(1200));
+    lost(cx, w, "escape");
+    assert!(entered(cx, w, id), "its repeat with no held bit, 1.2 s on");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hx"), "who");
+    up(cx, w, "escape");
+    crate::app::next_press();
+    press(cx, w, "escape");
+    assert!(!entered(cx, w, id), "let go and pressed again: Esc leaves");
+    assert_eq!(keys_at(cx, w, &view), (true, false), "to the composer, never the window");
+    assert_eq!(field_value(cx, &view, "toolu_hx", "who"), "Anaあ", "the draft kept");
+    prompt_pending(cx, &view, "Esc in a field");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// Shady #86 R2-2: a press is a key-down after that key's key-up, whatever
+/// the key-down says. GPUI's macOS backend can send a held Shift+Tab's
+/// repeats with no held bit ([`lost`]): it still moves one stop, from a
+/// field and from the card, however far apart its repeats come (the old
+/// rule took one past `FoldKeys::STALE` for a press here, and every one
+/// on macOS). Let go and pressed again, it moves.
+#[gpui_kit::test]
+fn a_held_shift_tab_without_its_held_bit_moves_one_stop(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let input = json!({"question": "Who reviews the migration?", "wait": true, "fields": [
+        {"id": "who", "label": "Reviewer"}, {"id": "when", "label": "When"}]});
+    let (w, view, _id, _events) = asked(cx, "toolu_hl", "c5hlost", &input);
+    press(cx, w, "ctrl-j");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hl"), "who");
+    press(cx, w, "tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hl"), "when");
+    for (from, to) in [("when", "who"), ("who", "body")] {
+        assert_eq!(keys_in(cx, w, &view, "toolu_hl"), from);
+        down(cx, w, "shift-tab");
+        settle(cx, w, 8);
+        assert_eq!(keys_in(cx, w, &view, "toolu_hl"), to, "a press: one stop back");
+        for gap in [0, 30, 90, 1200, 2000] {
+            crate::app::advance_input_clock(Duration::from_millis(gap));
+            lost(cx, w, "shift-tab");
+            assert_eq!(keys_in(cx, w, &view, "toolu_hl"), to, "from {from}: a repeat with no held bit, {gap} ms on, moves nothing");
+        }
+        up(cx, w, "shift-tab");
+        crate::app::next_press();
+    }
+    press(cx, w, "shift-tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hl"), "when", "let go and pressed again: round to the last field");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// R2-2 on the card: a held ↓ whose repeats lost their held bit moves the
+/// highlight once; let go and pressed again, once more, and Enter takes
+/// the option it is on.
+#[gpui_kit::test]
+fn a_held_arrow_without_its_held_bit_moves_once(cx: &mut TestAppContext) {
+    let input = json!({"question": "Which branch?", "wait": true, "options": ["main", "release", "hotfix", "next"], "default": "main"});
+    let (w, view, id, _events) = asked(cx, "toolu_ha", "c6harrw", &input);
+    let hi = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.cur.ask.entry.as_ref().and_then(|e| e.hi));
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    assert_eq!(hi(cx), Some(0), "on the default");
+    down(cx, w, "down");
+    settle(cx, w, 8);
+    assert_eq!(hi(cx), Some(1), "a press: one down");
+    for gap in [0, 90, 1200, 2000] {
+        crate::app::advance_input_clock(std::time::Duration::from_millis(gap));
+        lost(cx, w, "down");
+        assert_eq!(hi(cx), Some(1), "a repeat with no held bit, {gap} ms on, moves nothing");
+    }
+    up(cx, w, "down");
+    crate::app::next_press();
+    press(cx, w, "down");
+    assert_eq!(hi(cx), Some(2), "let go and pressed again: one more");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c6harrw", &input, json!({"choice": "hotfix"}))]);
+}
+
+/// R2-2's one exception: AppKit drops the key-up of a key let go while
+/// Cmd is held. After Cmd+2 (a tab, on macOS) with no key-up seen, `2` on
+/// the entered card is still a new press (it types text, so it says when
+/// it repeats): it answers.
+#[gpui_kit::test]
+fn a_key_up_lost_under_cmd_costs_no_press(cx: &mut TestAppContext) {
+    let input = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"], "default": "main"});
+    let (w, view, id, _events) = asked(cx, "toolu_hc", "c7hcmd2", &input);
+    let ks = keystroke(cx, "cmd-2");
+    let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke: ks, is_held: false, prefer_character_input: false });
+    cx.update_window(w, |_, window, cx| {
+        window.dispatch_event(ev, cx);
+    })
+    .expect("the window");
+    settle(cx, w, 8);
+    crate::app::next_press();
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    press(cx, w, "2");
+    assert_eq!(texts(cx, &view), vec![message("c7hcmd2", &input, json!({"choice": "release"}))]);
 }
