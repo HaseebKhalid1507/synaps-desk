@@ -4127,7 +4127,14 @@ impl AppView {
                     } else if shown && let Some((_, Some(s))) = vis {
                         v.model.rail_gen += 1;
                         v.model.view_dirty = true;
-                        v.attach_tab(s, None);
+                        // The same session restored in an earlier pane is
+                        // on this store, its attach sent already: one
+                        // attachment (§5 ¶4). Another would detach the one
+                        // just sent, for a second of the same session.
+                        let l = &v.model.lives[v.panes.cur.live];
+                        if !(l.wanted.is_some() && l.is_wanted(&s)) {
+                            v.attach_tab(s, None);
+                        }
                     }
                 });
             }
