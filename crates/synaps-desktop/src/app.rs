@@ -2177,6 +2177,8 @@ pub struct AppView {
     lists_seen: u64,
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
     pub(crate) tab_cache: Lru<String, TabCache>,
+    /// The clock the attach gates read ([`AppView::gate_now`]).
+    executor: BackgroundExecutor,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
     /// Ctrl+Alt+← / →'s presses ([`OnceKey::MovePane`]).
@@ -2266,7 +2268,7 @@ pub struct AppView {
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
-    /// Open agent cards across sessions (D3): a jump's landing.
+    /// Open agent cards across sessions (D3): a jump's landing, the OS told.
     pub(crate) lookout: crate::presence::Lookout,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
@@ -2710,18 +2712,24 @@ impl AppView {
         }
         // M3: a fold still waiting to be saved is written when the window
         // closes (the last one quits on Linux and Windows) or the app quits.
-        subs.push(cx.on_release(|this, _| {
+        // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
+        // waits for Linux's bus task to close them, within GPUI's shutdown
+        // allowance.
+        subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            let gone = crate::presence::window_gone(this, cx);
+            crate::notify::closing(gone, cx);
         }));
-        subs.push(cx.on_app_quit(|this, _| {
+        subs.push(cx.on_app_quit(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            async {}
+            let gone = crate::presence::window_gone(this, cx);
+            async move { gone.wait().await }
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
@@ -2735,6 +2743,7 @@ impl AppView {
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
+            executor: cx.background_executor().clone(),
             composer,
             pane_subs,
             find_input,
@@ -2750,7 +2759,7 @@ impl AppView {
             allow_all_focus,
             visible: window.is_visible(),
         };
-        match (client, synthetic) {
+        let mut v = match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
@@ -2773,7 +2782,10 @@ impl AppView {
                 v
             }
             (None, None) => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
-        }
+        };
+        // A card's notification clicked: this window, that card (D3).
+        crate::presence::listen(&mut v, window, cx);
+        v
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
@@ -2877,6 +2889,7 @@ impl AppView {
             save_job: Arc::default(),
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
+            executor: i.executor,
             tab_keys: FoldKeys::default(),
             move_keys: FoldKeys::default(),
             pane_yield: None,
@@ -3035,7 +3048,7 @@ impl AppView {
         // waits on it.
         self.cards_moved(cx);
         self.arm_card_tick(cx);
-        // Open cards across sessions: the rail, the tabs (D3).
+        // Open cards across sessions: the rail, the tabs, the OS (D3).
         self.sync_presence(cx);
         // An idle daemon's poll changes nothing: no frame, unless
         // the rail's ages have a new minute to show.
@@ -3952,7 +3965,7 @@ impl AppView {
         let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
         self.panes.cur.attach_wait = None;
         let restoring = self.model.tabs.current().is_some_and(|t| self.model.tabs.restoring(t.id));
-        if restoring || (self.client.is_some() && self.panes.cur.gate.switch(Instant::now())) {
+        if restoring || (self.client.is_some() && self.panes.cur.gate.switch(self.gate_now())) {
             self.model.showing(self.panes.cur.live, &session);
             // A restored tab attaches once a list has its session (`start_tabs`).
             if !restoring {
@@ -3961,6 +3974,15 @@ impl AppView {
             return;
         }
         self.attach_now(session, fallback, open);
+    }
+
+    /// The attach gate's clock: the executor's, which its timer
+    /// ([`AppView::arm_attach`]) runs on. In the app that is the monotonic
+    /// clock; in a test it is the test's, which moves only when the test
+    /// moves it, so whether a switch waits, and when its attach goes, never
+    /// rests on how long the machine took between two switches.
+    fn gate_now(&self) -> Instant {
+        self.executor.now()
     }
 
     /// More than one store may hold an attachment (split panes): an attach
@@ -4005,7 +4027,7 @@ impl AppView {
         }
         let (at, id) = (self.panes.cur.gate.due(), self.panes.cur.id);
         self.panes.cur.attach_due = Some(cx.spawn(async move |this, cx| {
-            if let Some(left) = at.map(|t| t.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero()) {
+            if let Some(left) = at.map(|t| t.saturating_duration_since(cx.background_executor().now())).filter(|d| !d.is_zero()) {
                 cx.background_executor().timer(left).await;
             }
             let _ = this.update(cx, |v, cx| v.in_pane(id, |v| v.attach_waited(cx)));
@@ -4016,7 +4038,7 @@ impl AppView {
     /// its tab is still the visible one.
     fn attach_waited(&mut self, cx: &mut Context<Self>) {
         self.panes.cur.attach_due = None;
-        if !self.panes.cur.gate.ready(Instant::now()) {
+        if !self.panes.cur.gate.ready(self.gate_now()) {
             return self.arm_attach(cx);
         }
         if let Some((s, fallback, open)) = self.panes.cur.attach_wait.take()
@@ -4031,7 +4053,7 @@ impl AppView {
     /// A tab key, or Ctrl / Cmd, went up: a waiting attach is due
     /// [`crate::tabs::AttachGate::GAP`] from now.
     fn tab_key_up(&mut self, cx: &mut Context<Self>) {
-        self.panes.cur.gate.key_up(Instant::now());
+        self.panes.cur.gate.key_up(self.gate_now());
         if self.panes.cur.attach_wait.is_some() {
             self.arm_attach(cx);
         }
@@ -4323,7 +4345,7 @@ impl AppView {
     /// never on its auto-repeats (a held Ctrl+T is not a burst of new
     /// sessions): their key-down decides ([`OnceKey`]).
     pub(crate) fn tab_key(&mut self, key: TabKey, cx: &mut Context<Self>) {
-        self.panes.cur.gate.key_down(Instant::now());
+        self.panes.cur.gate.key_down(self.gate_now());
         if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) {
             self.once = Some(OnceKey::Tab(key));
             cx.propagate();
@@ -8595,6 +8617,7 @@ struct Inputs {
     focus: FocusHandle,
     allow_all_focus: FocusHandle,
     visible: bool,
+    executor: BackgroundExecutor,
 }
 
 /// A pane's rectangle and the frame's look ([`AppView::pane_main`]).
@@ -9141,7 +9164,7 @@ impl AppView {
             self.panes.cur.jump_card = None;
             self.reveal_card(window, cx);
         }
-        // Ctrl+Shift+J, WAITING, a tab dot: its card (D3).
+        // Ctrl+Shift+J, WAITING, a notification, a tab dot: its card (D3).
         self.land_card(window, cx);
         // Seen every frame while attached, shown or not: a card that comes
         // back (from a worker's view, Settings) is not new; another

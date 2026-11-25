@@ -1,7 +1,7 @@
 //! Never miss a waiting card (synaps-cards `docs/design.md` v1.2, §6.1's
-//! presence and §7's F10; the D3 row of §9.3; F12's OS notifications come
-//! on top, apart): which open sessions have an agent card nobody has
-//! answered, and what the window does with that.
+//! presence and §7's F10–F12; the D3 row of §9.3): which open sessions
+//! have an agent card nobody has answered, and what the window does with
+//! that.
 //!
 //! **The model** ([`Presence`]): every open card of every session this
 //! window holds, oldest first, each a **wait** card (the agent ended its
@@ -13,10 +13,10 @@
 //! needs you). The sessions it reads (§6.1, "attached sessions"):
 //! - every attachment (the session each pane shows): **live**, current.
 //!   Only these are NEEDS YOU or ASKED: the rail, the tab's state, the top
-//!   bar's count and a filled tab dot.
+//!   bar's count, a filled tab dot, and the OS notification.
 //! - every other session open in a tab: **as last seen**, the tab cache's
 //!   transcript, unverified. Its card is drawn as last seen (a hollow,
-//!   dimmed dot; "last seen" in WAITING), never counted;
+//!   dimmed dot; "last seen" in WAITING), never counted, never notified;
 //!   opening the tab attaches it again, and the attach says whether the
 //!   card still waits (a jump lands only if it does).
 //!
@@ -28,19 +28,34 @@
 //! says nothing of its cards (F11, §8 #1).
 //!
 //! **What reads it:** the rail's NEEDS YOU and ASKED ([`crate::model::Model::fact`]),
-//! the tab dot ([`AppView::tab_dot`]), the palette's WAITING group and
-//! Ctrl+Shift+J ([`AppView::jump_waiting`]). Nothing here moves: no frame is asked for, a dot or a badge is drawn
+//! the tab dot ([`AppView::tab_dot`]), the palette's WAITING group,
+//! Ctrl+Shift+J ([`AppView::jump_waiting`]) and the OS notification.
+//! Nothing here moves: no frame is asked for, a dot or a badge is drawn
 //! still (0 frames idle at every motion level). It is derived again only
 //! when a fold, the memos or the set of sessions moved.
+//!
+//! **The OS notification** (F12, [`crate::notify`]): one per wait card
+//! that came live, after its session's attach ([`Arrivals`]: decided at
+//! the event that brought it, in event order), while the window is away
+//! or that session isn't the one on screen. Never one an attach or a
+//! history replacement brought (it was there before), never an open
+//! (ASKED) card, never twice for one binding while its session is open
+//! here, whatever its card does meanwhile (an answer on its way, then not
+//! sent; a history that drops it and brings it back). Taken down when its
+//! card resolves, or its window goes ([`window_gone`]). Its click is
+//! checked against what the window holds as it comes ([`AppView::still_open`]):
+//! if the card still waits, the window comes up and lands on it, as
+//! Ctrl+Shift+J does; a stale one does nothing. `notify.cards` (`false` or `"off"`) in the settings file
+//! turns them off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use cards_spec::{CardId, Lines};
+use cards_spec::CardId;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::*;
-use synaps_client::Transcript;
 use synaps_client::cards::{CardRow, State};
+use synaps_client::{Event, HistoryUpdate, Transcript};
 
 use crate::app::AppView;
 use crate::tabs::Kind as TabKind;
@@ -78,6 +93,10 @@ pub(crate) struct Open {
 impl Open {
     pub(crate) fn key(&self) -> Key {
         Key { session: self.session.clone(), tool_id: self.tool_id.clone(), card: self.card.clone() }
+    }
+
+    fn is(&self, k: &Key) -> bool {
+        self.session == k.session && self.tool_id == k.tool_id && self.card == k.card
     }
 
     /// Oldest first; no time after a time; then by session and call, so
@@ -165,6 +184,11 @@ impl Presence {
     pub fn get(&self, session: &str, tool_id: &str) -> Option<&Open> {
         self.cards.iter().find(|c| c.session == session && c.tool_id == tool_id)
     }
+
+    /// Whether binding `k` is open here (live, or as last seen).
+    pub fn holds(&self, k: &Key) -> bool {
+        self.cards.iter().any(|c| c.is(k))
+    }
 }
 
 /// Whether this desk's answer to `c` is on its way or in (its memo; one
@@ -219,6 +243,133 @@ pub(crate) fn open_cards(session: &str, t: &Transcript, live: bool, answered: im
         .collect()
 }
 
+/// What an event says of the wait cards it brings to its attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Look {
+    /// They were there before: an attach's snapshot, or a history
+    /// replaced (a resync, `/resume`, a compaction).
+    Baseline,
+    /// They came now: a live event, or messages appended to the history.
+    Live,
+}
+
+impl Look {
+    /// What `ev` brings, and to which attachment.
+    pub(crate) fn of(ev: &Event) -> Option<(Look, u64)> {
+        match ev {
+            Event::Attached { attach_seq, .. } => Some((Look::Baseline, *attach_seq)),
+            Event::Session { attach_seq, .. } => Some((Look::Live, *attach_seq)),
+            Event::History { attach_seq, update: HistoryUpdate::Append { .. }, .. } => Some((Look::Live, *attach_seq)),
+            Event::History { attach_seq, .. } => Some((Look::Baseline, *attach_seq)),
+            _ => None,
+        }
+    }
+}
+
+/// Bindings remembered once they are no longer open, at most (the oldest
+/// forgotten first). One still open in its session's fold is never
+/// forgotten while its session is held; a session this window no longer
+/// holds is forgotten whole.
+pub(crate) const SEEN_MAX: usize = 4096;
+
+/// F12's provenance, at the event boundary ([`crate::model::Model::apply`]):
+/// every bound wait card a session's events bring is seen once per
+/// binding. One the attach's snapshot or a replaced history brought is
+/// the baseline (there before: never told); one that comes after, live,
+/// in event order, is an arrival (the window decides, after the batch,
+/// whether to tell the OS). Seen stays seen while the session is open in
+/// this window: a card answered and then not sent, or dropped by a
+/// history and brought back, is never new again.
+///
+/// The bound (Shady #83 R2-6): a binding open in its session's fold at
+/// that session's last look is kept, however many there are (they are
+/// the fold's own cards, already in memory). Only bindings no longer open
+/// are bounded, [`SEEN_MAX`] of them, the oldest to stop being open
+/// forgotten first; so an open card is never news again. The one
+/// exception, by that bound: a binding that left its fold, stayed out
+/// while [`SEEN_MAX`] others left theirs, and then comes back is told
+/// again.
+#[derive(Debug)]
+pub(crate) struct Arrivals {
+    seen: HashSet<Key>,
+    /// Each held session's bindings open at its last look: never forgotten.
+    open: HashMap<String, HashSet<Key>>,
+    /// Seen bindings no longer open, in the order they stopped being: the
+    /// oldest forgotten past `cap`.
+    left: VecDeque<Key>,
+    cap: usize,
+    came: Vec<Key>,
+    /// Each session's fold revision at its last live look: unchanged,
+    /// nothing is read.
+    looked: HashMap<String, u64>,
+}
+
+impl Default for Arrivals {
+    fn default() -> Self {
+        Self::with_cap(SEEN_MAX)
+    }
+}
+
+impl Arrivals {
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self { seen: HashSet::new(), open: HashMap::new(), left: VecDeque::new(), cap, came: Vec::new(), looked: HashMap::new() }
+    }
+
+    /// `session`'s fold `t`, as event `how` left it.
+    pub(crate) fn look(&mut self, how: Look, session: &str, t: &Transcript) {
+        let rev = t.cards_rev();
+        match self.looked.get_mut(session) {
+            Some(r) if how == Look::Live && *r == rev => return,
+            Some(r) => *r = rev,
+            None => {
+                self.looked.insert(session.to_string(), rev);
+            }
+        }
+        let mut now: HashSet<Key> = HashSet::new();
+        for c in t.cards().cards().iter().filter(|c| c.wait && c.state == State::Open) {
+            let Some(card) = c.id.clone() else { continue };
+            let k = Key { session: session.to_string(), tool_id: c.tool_id.clone(), card };
+            if self.seen.insert(k.clone()) && how == Look::Live {
+                self.came.push(k.clone());
+            }
+            now.insert(k);
+        }
+        let before = self.open.insert(session.to_string(), now).unwrap_or_default();
+        let now = &self.open[session];
+        // Back in the fold: no longer bounded.
+        if self.left.iter().any(|k| k.session == session && now.contains(k)) {
+            self.left.retain(|k| !now.contains(k));
+        }
+        // Out of it: bounded from now on.
+        self.left.extend(before.into_iter().filter(|k| !now.contains(k)));
+        while self.left.len() > self.cap {
+            if let Some(k) = self.left.pop_front() {
+                self.seen.remove(&k);
+            }
+        }
+    }
+
+    /// The arrivals since the last take, in event order.
+    pub(crate) fn take(&mut self) -> Vec<Key> {
+        std::mem::take(&mut self.came)
+    }
+
+    /// Only the sessions this window still `held`: the rest forgotten (an
+    /// attach brings them back as the baseline).
+    pub(crate) fn keep(&mut self, held: impl Fn(&str) -> bool) {
+        self.seen.retain(|k| held(&k.session));
+        self.open.retain(|s, _| held(s));
+        self.left.retain(|k| held(&k.session));
+        self.came.retain(|k| held(&k.session));
+        self.looked.retain(|s, _| held(s));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seen(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 /// A jump's landing: the binding to bring into view once its session is
 /// on screen and its row is built ([`AppView::land_card`]).
 #[derive(Clone, Debug)]
@@ -235,13 +386,14 @@ pub(crate) const LAND_WAIT: Duration = Duration::from_secs(10);
 /// revision), the memos' changes, and the sessions held.
 type Derived = (Vec<(bool, u64)>, u64, Vec<String>);
 
-/// The window's lookout for open cards: the landing on its way and what
-/// the presence was last derived from. (D2b's
+/// The window's lookout for open cards: the landing on its way, the
+/// notifications up, and what the presence was last derived from. (D2b's
 /// `crate::waiting` is Ctrl+J's order; [`Presence::listed`] is this
 /// window's over every open session.)
 #[derive(Debug, Default)]
 pub(crate) struct Lookout {
     pub land: Option<Land>,
+    pub notes: crate::notify::Notes,
     /// The last card a jump landed on ([`AppView::card_landed`] enters
     /// it, if it is still open there).
     pub landed: Option<Key>,
@@ -252,14 +404,10 @@ pub(crate) struct Lookout {
     pub derivations: u64,
 }
 
-/// A session's name in a WAITING row: at most this long.
-const LABEL_MAX: usize = 48;
-
-/// A session's name as a WAITING row says it: one line, sanitized,
-/// bounded; "a session" if nothing is left.
-pub(crate) fn label(s: &str) -> String {
-    let l = cards_spec::sanitize::cut_chars(crate::ask::shown(s, Lines::Single).trim(), LABEL_MAX);
-    if l.trim().is_empty() { "a session".into() } else { l }
+/// `notify.cards` in the settings file: `false` or `"off"` turns the OS
+/// notifications off.
+pub(crate) fn quiet(v: Option<&serde_json::Value>) -> bool {
+    matches!(v, Some(serde_json::Value::Bool(false))) || v.and_then(serde_json::Value::as_str) == Some("off")
 }
 
 /// Ctrl+Shift+J (Ctrl on macOS too, as Ctrl+J).
@@ -298,10 +446,12 @@ pub(crate) fn dot_colors(p: &Palette) -> (Hsla, Hsla) {
 }
 
 impl AppView {
-    /// The presence as the window holds it now. After every batch of
-    /// events, and as a frame begins (tabs closed, a pane's switch).
-    /// Nothing is read again while no fold, memo or held session moved.
-    pub(crate) fn sync_presence(&mut self, _cx: &mut Context<Self>) {
+    /// The presence as the window holds it now, then what the OS is told:
+    /// the arrivals' notifications, and those of cards no longer open
+    /// taken down. After every batch of events, and as a frame begins
+    /// (tabs closed, a pane's switch). Nothing is read again while no
+    /// fold, memo or held session moved.
+    pub(crate) fn sync_presence(&mut self, cx: &mut Context<Self>) {
         let m = &self.model;
         let mut live: Vec<(String, crate::live::LiveId)> = Vec::new();
         for id in m.lives.ids() {
@@ -335,11 +485,45 @@ impl AppView {
                     cards.extend(open_cards(s, &c.transcript, false, |c| answered(&m.memos, s, c)));
                 }
             }
+            let held: HashSet<String> = held.iter().map(|s| s.to_string()).collect();
             self.lookout.derived = now;
+            self.model.arrivals.keep(|s| held.contains(s));
             if self.model.presence.set(cards) {
                 self.model.view_dirty = true;
             }
+            let p = &self.model.presence;
+            self.lookout.notes.reconcile(|k| p.holds(k), cx);
         }
+        // What came live since: told, unless nobody's away from it.
+        let came = self.model.arrivals.take();
+        if came.is_empty() {
+            return;
+        }
+        let shown = self.shown_session();
+        for k in came {
+            let Some(c) = self.model.presence.cards().iter().find(|c| c.live && c.is(&k)).cloned() else { continue };
+            let watched = self.window_active && shown.as_deref() == Some(c.session.as_str());
+            if !self.app_settings.quiet && !watched {
+                self.post_card(&c, cx);
+            }
+        }
+    }
+
+    /// The session on screen in the focused pane (not a view, not a
+    /// worker's): the one a card in it is seen in.
+    fn shown_session(&self) -> Option<String> {
+        let me = self.panes.focused;
+        let (live, tabs) = if self.panes.cur.id == me {
+            (self.panes.cur.live, &self.model.tabs)
+        } else {
+            let p = self.panes.get(me)?;
+            (p.live, &p.parked.tabs)
+        };
+        let l = &self.model.lives[live];
+        if tabs.view().is_some() || l.watch.focus().is_some() {
+            return None;
+        }
+        l.active.as_ref().map(|a| a.session_id.clone())
     }
 
     /// What a card's session is called where it isn't in front: its listed
@@ -350,6 +534,36 @@ impl AppView {
             Some(t) => t.to_string(),
             None => self.session_label(s),
         }
+    }
+
+    /// The OS told of wait card `c` (F12), its text through the
+    /// notification's boundary ([`crate::notify::note`]).
+    pub(crate) fn post_card(&mut self, c: &Open, cx: &mut Context<Self>) {
+        let n = crate::notify::note(&c.key(), &self.who(&c.session), &c.question);
+        log::info!(target: "synaps_desktop::card", "notify {}: {} waits on {}", n.tag, n.title, c.tool_id);
+        self.lookout.notes.post(c.key(), n, cx);
+    }
+
+    /// A click on notification `tag`: whether it is this window's. Its
+    /// card is checked as it is now, not as the presence last said
+    /// ([`AppView::still_open`]: a press or a closed tab since need no
+    /// frame to count). Still waiting, the window shows it and comes up,
+    /// and lands on it as Ctrl+Shift+J does; else (answered, on its way,
+    /// closed, its tab closed) it is taken down and nothing moves: no
+    /// window raised, no pane, tab or scroll changed.
+    pub(crate) fn notification_clicked(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(k) = self.lookout.notes.card(tag).cloned() else { return false };
+        if !self.still_open(&k) {
+            log::info!(target: "synaps_desktop::card", "notification {tag}: its card no longer waits");
+            self.lookout.notes.retire(tag, cx);
+            return true;
+        }
+        // The jump checks that same binding; raised only once it has
+        // somewhere to go.
+        if self.go_to_card(k, window, cx) {
+            window.activate_window();
+        }
+        true
     }
 
     /// Ctrl+Shift+J: the first waiting card ([`Presence::listed`]'s order)
@@ -466,15 +680,15 @@ impl AppView {
     }
 
     /// **The D2b seam** (Shady #83 P2-7). A jump (Ctrl+Shift+J, the
-    /// palette's WAITING, the tab dot, the top bar's JUMP) landed on
-    /// binding `k`, checked open, its row in view: that card is entered
-    /// ([`AppView::enter_card`]: the binding checked again, its card mode
-    /// with its pane's batch, its keys live from its first paint), so the
-    /// next key answers it. Never a prompt (§5.1). Once this frame is
-    /// drawn (a landing is read as a pane's frame begins): the entry
-    /// focuses and asks for the frame that paints it, as a key's would.
-    /// Recorded either way; a binding no longer open there is not entered,
-    /// and the keys stay where they were.
+    /// palette's WAITING, a notification, the tab dot, the top bar's JUMP)
+    /// landed on binding `k`, checked open, its row in view: that card is
+    /// entered ([`AppView::enter_card`]: the binding checked again, its
+    /// card mode with its pane's batch, its keys live from its first
+    /// paint), so the next key answers it. Never a prompt (§5.1). Once this
+    /// frame is drawn (a landing is read as a pane's frame begins): the
+    /// entry focuses and asks for the frame that paints it, as a key's
+    /// would. Recorded either way; a binding no longer open there is not
+    /// entered, and the keys stay where they were.
     pub(crate) fn card_landed(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
         self.lookout.landed = Some(k.clone());
         let binding = crate::ask_keys::Binding { tool_id: k.tool_id, card: k.card };
@@ -581,7 +795,7 @@ impl AppView {
                     (false, true) => "last seen · waited on you",
                     (false, false) => "last seen · asked",
                 };
-                let mut meta = vec![label(&self.who(&c.session)), what.into()];
+                let mut meta = vec![crate::notify::label(&self.who(&c.session)), what.into()];
                 meta.extend(c.at.map(|t| crate::named::relative(&crate::demo::rfc3339(t / 1000), now)).filter(|a| !a.is_empty()));
                 e.meta = meta.join(" · ").into();
                 e.lead = match (c.live, c.wait) {
@@ -597,11 +811,12 @@ impl AppView {
     }
 }
 
-/// `SYNAPS_DESK_PANES=d3` or `d3:palette` (D3's stills,
+/// `SYNAPS_DESK_PANES=d3`, `d3:palette` or `d3:notify` (D3's stills,
 /// `--offline` with `SYNAPS_DEMO_CARDS=1`): the three card sessions opened
 /// in tabs one after the other, then the first tab shown again, so each
 /// is a background tab as last seen (its dot; the rail's NEEDS YOU and
-/// ASKED); then the palette's GO TO (WAITING first).
+/// ASKED); then the palette's GO TO (WAITING first), or the OS told of the
+/// oldest wait card as a card that came would be.
 pub(crate) async fn scene(view: &WeakEntity<AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, how: &str) {
     let act = |cx: &mut AsyncWindowContext, f: &dyn Fn(&mut AppView, &mut Window, &mut Context<AppView>)| {
         let _ = view.update_in(cx, |v, window, cx| {
@@ -619,8 +834,14 @@ pub(crate) async fn scene(view: &WeakEntity<AppView>, cx: &mut AsyncWindowContex
     }
     act(cx, &|v, _, _| v.focus_tab(0));
     sleep(1.5).await;
-    if how == "d3:palette" {
-        act(cx, &|v, window, cx| v.open_palette(crate::palette::Mode::GoTo, window, cx));
+    match how {
+        "d3:palette" => act(cx, &|v, window, cx| v.open_palette(crate::palette::Mode::GoTo, window, cx)),
+        "d3:notify" => act(cx, &|v, _, cx| {
+            if let Some(c) = v.model.presence.next().cloned() {
+                v.post_card(&c, cx);
+            }
+        }),
+        _ => {}
     }
     eprintln!("D3 scene {how} done");
 }
@@ -628,6 +849,56 @@ pub(crate) async fn scene(view: &WeakEntity<AppView>, cx: &mut AsyncWindowContex
 /// "1 card", "3 cards".
 fn plural(n: usize) -> String {
     if n == 1 { "1 card".into() } else { format!("{n} cards") }
+}
+
+/// The windows a notification's click may be for: GPUI calls one
+/// callback per process (the last registered), so it asks each window in
+/// turn whose tag it is.
+#[derive(Default)]
+struct Clickers(Vec<(AnyWindowHandle, WeakEntity<AppView>)>);
+
+impl Global for Clickers {}
+
+/// The notifications' clicks come to `view`'s window: GPUI's (macOS,
+/// Windows), through the one process-wide callback; its own transport's
+/// (Linux), from its channel.
+pub(crate) fn listen(view: &mut AppView, window: &Window, cx: &mut Context<AppView>) {
+    let first = !cx.has_global::<Clickers>();
+    let me = cx.weak_entity();
+    cx.default_global::<Clickers>().0.push((window.window_handle(), me));
+    if first {
+        cx.on_system_notification_response(|r, cx| {
+            let windows = cx.global::<Clickers>().0.clone();
+            for (handle, view) in windows {
+                let Some(view) = view.upgrade() else { continue };
+                let mine = handle.update(cx, |_, window, cx| view.update(cx, |v, cx| v.notification_clicked(&r.tag, window, cx)));
+                if mine.unwrap_or(false) {
+                    break;
+                }
+            }
+            cx.global_mut::<Clickers>().0.retain(|(_, v)| v.upgrade().is_some());
+        });
+    }
+    if let Some(rx) = view.lookout.notes.take_clicks() {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(tag) = rx.recv().await {
+                if this.update_in(cx, |v, window, cx| v.notification_clicked(&tag, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+/// `view`'s window is going (released, or the app quitting): the
+/// notifications it posted taken down with it, nothing it queued shown
+/// after (Shady #83 R2-3), and its place among the click routes dropped.
+pub(crate) fn window_gone(view: &mut AppView, cx: &mut App) -> crate::notify::Gone {
+    if cx.has_global::<Clickers>() {
+        cx.global_mut::<Clickers>().0.retain(|(_, v)| v.upgrade().is_some());
+    }
+    view.lookout.notes.teardown(cx)
 }
 
 #[cfg(test)]

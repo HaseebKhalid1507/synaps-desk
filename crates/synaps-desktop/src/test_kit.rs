@@ -18,6 +18,8 @@ mod ask_tests;
 mod cards_d_tests;
 #[path = "entry_tests.rs"]
 mod entry_tests;
+#[path = "gate_clock_tests.rs"]
+mod gate_clock_tests;
 #[path = "hang_tests.rs"]
 mod hang_tests;
 #[path = "held_tests.rs"]
