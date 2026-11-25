@@ -502,6 +502,9 @@ pub struct Transcript {
     card_fold: cards_spec::fold::Fold,
     /// The fold's revision ([`Transcript::cards_rev`]).
     card_rev: u64,
+    /// The times of the rows that ask a card, hashed (0: none read):
+    /// [`Transcript::sync_card_times`].
+    card_times: u64,
     /// The length and hash of the history folded ([`Transcript::history_settled`]).
     mirror: crate::history::HistoryMirror,
     /// The latest `Conversation` digest since the attach (`None`: the
@@ -557,10 +560,12 @@ impl Transcript {
         &self.card_fold
     }
 
-    /// Changes whenever the cards of [`Transcript::cards`] change, and is
-    /// never the same for two transcripts' folds (one counter for the
-    /// process): what is built from the cards is built again only when
-    /// this moves.
+    /// Moves whenever the cards of [`Transcript::cards`] change, or the
+    /// times of the rows that ask them ([`Item::at`], as the history
+    /// settled them): what is built from the cards and their times is
+    /// built again only when this moves. One counter for the process, so
+    /// a revision this moved to is no other transcript's (two that never
+    /// moved, empty or cloned, share theirs).
     pub fn cards_rev(&self) -> u64 {
         self.card_rev
     }
@@ -1068,6 +1073,7 @@ impl Transcript {
         }
         self.sync_cards();
         self.keep_revs(carry);
+        self.sync_card_times();
         // The rows, the history's and the replay's, are all back.
         self.rebuilding = false;
         self.prune_past_gate();
@@ -1141,6 +1147,7 @@ impl Transcript {
         // are its own live ones, whatever swap came before it (a resume of
         // the same journal has no replacement to consume the flag).
         self.keep_revs(true);
+        self.sync_card_times();
     }
 
     /// Rebuild from a whole history (resync, rewrite, clear, compaction).
@@ -1165,6 +1172,7 @@ impl Transcript {
         }
         self.sync_cards();
         self.keep_revs(!swapped);
+        self.sync_card_times();
     }
 
     /// Fold a whole history from empty, interleaving `notes` by anchor.
@@ -1422,6 +1430,32 @@ impl Transcript {
         }
         for ix in changed {
             self.touch(ix);
+        }
+        self.sync_card_times();
+    }
+
+    /// The times of the rows that ask a card ([`Item::at`]), once the
+    /// history settled them (a time carried or filled by
+    /// [`Transcript::keep_revs`]): the waiting order reads them, so a
+    /// change moves [`Transcript::cards_rev`] as the cards' own do. Only
+    /// the rows read, and none while no row draws a card.
+    fn sync_card_times(&mut self) {
+        if self.card_rows == 0 {
+            if self.card_times != 0 {
+                self.card_times = 0;
+                self.card_rev = next_card_rev();
+            }
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for i in self.items.iter().filter(|i| matches!(i.card.as_deref(), Some(crate::cards::CardRow::Ask(_)))) {
+            (i.tool.as_ref().map(|t| t.tool_id.as_str()), i.at.as_deref()).hash(&mut h);
+        }
+        let times = h.finish().max(1);
+        if times != self.card_times {
+            self.card_times = times;
+            self.card_rev = next_card_rev();
         }
     }
 

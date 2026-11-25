@@ -20,7 +20,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 use synaps_client::protocol::{SessionMeta, decode_event};
-use synaps_client::{Event, Transcript};
+use synaps_client::{Event, HistoryUpdate, Transcript};
 
 use super::*;
 // `super`'s `gpui_kit::*` brings the kit's `test` too: the std one here.
@@ -393,11 +393,90 @@ fn heard(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ev
     settle(cx, w, 8);
 }
 
+/// `events` decoded as the client hands them over, on attachment `seq`.
+fn session_events(seq: u64, sid: &str, events: Vec<Value>) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|e| {
+            let ev = decode_event(&e).unwrap_or_else(|err| panic!("{err}: {e}"));
+            Event::session(seq, sid.to_string(), 0, ev, Arc::new(e))
+        })
+        .collect()
+}
+
+/// The history's messages of card `card` asked by call `tool`: the call
+/// and its result.
+fn card_messages(tool: &str, card: &str, input: &Value) -> (Vec<Value>, String) {
+    let (doc, wait) = match cards_spec::parse_input(input).unwrap() {
+        cards_spec::Input::Create { doc, wait } => (doc, wait),
+        cards_spec::Input::Close(_) => unreachable!(),
+    };
+    let result = format!(
+        "{}\nIts answer will come as a user message starting \"[card {card}]\".",
+        cards_spec::Envelope::showing(cards_spec::CardId::parse(card).unwrap(), &doc, wait)
+    );
+    let messages = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_ui", "input": input}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": result}]}),
+    ];
+    (messages, result)
+}
+
+/// A turn on attachment `seq` that asks `input` as card `card` (call
+/// `tool`) and ends, as the daemon streams it, then its history appended
+/// after the first `base_len` messages.
+fn card_turn(seq: u64, sid: &str, base_len: usize, tool: &str, card: &str, input: &Value) -> Vec<Event> {
+    let (messages, result) = card_messages(tool, card, input);
+    let llm = |v: Value| json!({"ev": "stream", "event": v});
+    let mut out = session_events(
+        seq,
+        sid,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": "go"}),
+            llm(json!({"kind": "llm", "llm": "response_start"})),
+            llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": tool})),
+            llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": tool, "input": input})),
+            llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": result})),
+            llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+        ],
+    );
+    out.push(Event::History { attach_seq: seq, session_id: sid.to_string(), seq: 0, update: HistoryUpdate::Append { base_len, messages } });
+    out
+}
+
+/// The attachment on screen: its seq and session.
+fn here(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, String) {
+    view.read_with(cx, |v, _| {
+        let l = &v.model.lives[v.panes.cur.live];
+        (l.attachment().expect("attached"), l.active.as_ref().unwrap().session_id.clone())
+    })
+}
+
+fn batch(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, events: Vec<Event>) {
+    view.update(cx, |v, cx| v.apply_batch(events, cx));
+    cx.run_until_parked();
+    play(cx, w, view);
+}
+
+/// The agent asks `input` live as card `card` (call `tool`) on the
+/// attachment on screen, and its turn ends; the round's history lands.
+fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, card: &str, input: Value) {
+    let (seq, sid) = here(cx, view);
+    let base_len = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    batch(cx, w, view, card_turn(seq, &sid, base_len, tool, card, &input));
+}
+
 fn landed(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<(String, String)> {
     view.read_with(cx, |v, _| v.lookout.landed.as_ref().map(|k| (k.session.clone(), k.tool_id.clone())))
 }
 
 const SHIP: &str = "Run the migration on staging now?";
+
+fn wait_card(q: &str) -> Value {
+    json!({"question": q, "wait": true, "options": ["Yes", "No"]})
+}
 
 /// The window's first tab on screen, `ASKS` (a wait card and an open one)
 /// in a background tab, as last seen.
@@ -640,6 +719,270 @@ fn ctrl_shift_j_leaves_a_composition_to_the_ime(cx: &mut TestAppContext) {
     play(cx, w, &view);
     assert_eq!(shown(cx, &view).as_deref(), Some(ASKS), "committed: the card");
     assert_eq!(landed(cx, &view), Some((ASKS.into(), "toolu_a8".into())));
+}
+
+/// Where everything is: the focused pane, then each pane's session, tab
+/// and scroll (following the tail, or its top: a list that follows moves
+/// with what comes); a landing on its way, and the last one.
+fn places(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, _| {
+        let mut out = format!("focused {:?};", v.panes.focused);
+        for p in v.panes.iter() {
+            let tabs = if p.id == v.panes.cur.id { &v.model.tabs } else { &p.parked.tabs };
+            let session = v.model.lives[p.live].active.as_ref().map(|a| a.session_id.clone());
+            let top = p.list.logical_scroll_top();
+            let scroll =
+                if p.list.is_following_tail() { "the tail".to_string() } else { format!("top {} {:?}", top.item_ix, top.offset_in_item) };
+            out += &format!(" pane {:?}: {session:?} tab {:?} {scroll};", p.id, tabs.current().map(|t| t.id));
+        }
+        out + &format!(" land {:?} landed {:?}", v.lookout.land.as_ref().map(|l| l.key.clone()), v.lookout.landed)
+    })
+}
+
+/// A left click at `at`, dispatched now (no frame after it).
+fn press_at(window: &mut Window, cx: &mut App, at: Point<Pixels>) {
+    window.dispatch_event(
+        gpui_kit::PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }),
+        cx,
+    );
+    let (button, click_count, modifiers) = (MouseButton::Left, 1, Modifiers::default());
+    window.dispatch_event(
+        gpui_kit::PlatformInput::MouseDown(MouseDownEvent { button, position: at, modifiers, click_count, first_mouse: false }),
+        cx,
+    );
+    window.dispatch_event(gpui_kit::PlatformInput::MouseUp(MouseUpEvent { button, position: at, modifiers, click_count }), cx);
+}
+
+/// Key `k` down, dispatched now (no frame after it).
+fn chord_now(window: &mut Window, cx: &mut App, k: &str) {
+    let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.platform_info().os).expect("a keystroke");
+    let down = gpui_kit::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false };
+    window.dispatch_event(gpui_kit::PlatformInput::KeyDown(down), cx);
+}
+
+/// Shady #83 R2-4: the composition guard is one policy over every text
+/// field of the window ([`AppView::text_fields`]), D2a's card fields
+/// too. In a split pane, a form's line field, its long field, and another
+/// card's note, each composing in turn: Ctrl+Shift+J moves nothing (pane,
+/// session, tab, scroll, landing), the composition stays, nothing is sent.
+#[gpui_kit::test]
+fn ctrl_shift_j_leaves_a_card_fields_composition_to_the_ime(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.app_settings.split = true;
+    });
+    // ASKS in the first pane (its wait card older than any here); the
+    // form's session in a second, focused.
+    open_tab(cx, w, &view, ASKS);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
+    play(cx, w, &view);
+    open_tab(cx, w, &view, ASK_FORM);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.iter().count(), 2, "split");
+        assert!(v.model.presence.of(ASKS).wait > 0 && v.model.presence.of(ASK_FORM).wait > 0, "both live");
+    });
+    assert_eq!(shown(cx, &view).as_deref(), Some(ASK_FORM));
+    let (f1, seen) = row(cx, &view, "toolu_f1").expect("the form's row");
+    assert!(seen);
+    arm(cx, &view, f1);
+    let composing =
+        |cx: &mut TestAppContext| cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.composing_now(window, cx))).unwrap();
+    let marked =
+        |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App) -> bool| cx.update_window(w, |_, window, cx| f(window, cx)).unwrap();
+    let draft = |cx: &mut TestAppContext, tool: &str| {
+        let key = (ASK_FORM.to_string(), tool.to_string());
+        view.read_with(cx, move |v, _| {
+            let d = &v.card_drafts[&key];
+            (d.note.clone(), d.lines.values().cloned().collect::<Vec<_>>(), d.longs.values().cloned().collect::<Vec<_>>())
+        })
+    };
+    // The line field, then the long one.
+    click(cx, w, format!("ask-field {f1} batch"));
+    let line = draft(cx, "toolu_f1").1.pop().expect("its line field");
+    click(cx, w, format!("ask-field {f1} notes"));
+    let long = draft(cx, "toolu_f1").2.pop().expect("its long field");
+    // Another card's note (an option that asks for one).
+    let input = json!({"question": "Ship it?", "wait": true, "options": ["Yes", {"label": "Not yet", "note": "What's missing?"}]});
+    ask_live(cx, w, &view, "toolu_n1", "c7n1aaa", input);
+    let (n1, seen) = row(cx, &view, "toolu_n1").expect("its row");
+    assert!(seen);
+    arm(cx, &view, n1);
+    click(cx, w, format!("ask-option {n1} 2"));
+    let note = draft(cx, "toolu_n1").0.expect("its note");
+    type Kind<'a> =
+        (&'a str, &'a dyn Fn(&mut Window, &mut App), &'a dyn Fn(&mut Window, &mut App) -> bool, &'a dyn Fn(&mut Window, &mut App));
+    let compose_line = |window: &mut Window, cx: &mut App| {
+        window.focus(&line.focus_handle(cx), cx);
+        line.update(cx, |s, cx| EntityInputHandler::replace_and_mark_text_in_range(s, None, "か", None, window, cx));
+    };
+    let line_marked = |window: &mut Window, cx: &mut App| line.update(cx, |s, cx| s.marked_text_range(window, cx)).is_some();
+    let commit_line = |window: &mut Window, cx: &mut App| line.update(cx, |s, cx| EntityInputHandler::unmark_text(s, window, cx));
+    let compose_long = |window: &mut Window, cx: &mut App| {
+        window.focus(&long.focus_handle(cx), cx);
+        long.update(cx, |s, cx| EntityInputHandler::replace_and_mark_text_in_range(s, None, "き", None, window, cx));
+    };
+    let long_marked = |window: &mut Window, cx: &mut App| long.update(cx, |s, cx| s.marked_text_range(window, cx)).is_some();
+    let commit_long = |window: &mut Window, cx: &mut App| long.update(cx, |s, cx| EntityInputHandler::unmark_text(s, window, cx));
+    let compose_note = |window: &mut Window, cx: &mut App| {
+        window.focus(&note.focus_handle(cx), cx);
+        note.update(cx, |s, cx| EntityInputHandler::replace_and_mark_text_in_range(s, None, "く", None, window, cx));
+    };
+    let note_marked = |window: &mut Window, cx: &mut App| note.update(cx, |s, cx| s.marked_text_range(window, cx)).is_some();
+    let commit_note = |window: &mut Window, cx: &mut App| note.update(cx, |s, cx| EntityInputHandler::unmark_text(s, window, cx));
+    let kinds: [Kind; 3] = [
+        ("line", &compose_line, &line_marked, &commit_line),
+        ("long", &compose_long, &long_marked, &commit_long),
+        ("note", &compose_note, &note_marked, &commit_note),
+    ];
+    for (name, compose, is_marked, commit) in kinds {
+        cx.update_window(w, |_, window, cx| compose(window, cx)).unwrap();
+        settle(cx, w, 8);
+        assert!(composing(cx), "the {name} field composes");
+        let before = places(cx, &view);
+        key(cx, w, "ctrl-shift-j");
+        play(cx, w, &view);
+        assert_eq!(places(cx, &view), before, "the {name} field composing: nothing moves");
+        assert!(marked(cx, is_marked), "the {name} field's composition stays");
+        assert!(sends(cx, &view).is_empty(), "nothing sent");
+        cx.update_window(w, |_, window, cx| commit(window, cx)).unwrap();
+        settle(cx, w, 8);
+        assert!(!composing(cx));
+    }
+    // Committed: the jump is the keys'.
+    let before = places(cx, &view);
+    key(cx, w, "ctrl-shift-j");
+    play(cx, w, &view);
+    assert_ne!(places(cx, &view), before, "committed: it jumps");
+    crate::app::pin_arm_clock(None);
+}
+
+/// Shady #83 R2-5: a jump checks its card where it lives, now, before
+/// anything moves; never the presence (derived after a batch, or as a
+/// frame begins). A real press answers the only waiting card and, in the
+/// same turn (no frame, no batch between), the jump (`by_dot`: the tab's
+/// dot, else Ctrl+Shift+J's [`AppView::jump_waiting`], then the key):
+/// nothing moves, nothing lands.
+fn press_then_jump(cx: &mut TestAppContext, by_dot: bool) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    let tab = view.read_with(cx, |v, _| v.model.tabs.current().map(|t| t.id).expect("a tab"));
+    ask_live(cx, w, &view, "toolu_p1", "c7p1aaa", wait_card(SHIP));
+    assert_eq!(view.read_with(cx, |v, _| v.model.presence.cards().len()), 1, "one card waits, its own");
+    let (id, seen) = row(cx, &view, "toolu_p1").expect("its row");
+    assert!(seen);
+    arm(cx, &view, id);
+    let (option, dot) = (center(cx, w, format!("ask-option {id} 1")), center(cx, w, format!("tab {tab} dot")));
+    let before = places(cx, &view);
+    cx.update_window(w, |_, window, cx| {
+        press_at(window, cx, option);
+        if by_dot {
+            press_at(window, cx, dot);
+        } else {
+            // The jump itself (a key's dispatch draws a window that waits
+            // for a frame first: GPUI's), then the key.
+            assert!(!view.update(cx, |v, cx| v.jump_waiting(window, cx)), "no card waits now");
+            chord_now(window, cx, "ctrl-shift-j");
+        }
+        let v = view.read(cx);
+        assert_eq!(v.card_sends.len(), 1, "the press sent its answer");
+        assert!(v.lookout.land.is_none(), "checked now: no landing asked");
+    })
+    .unwrap();
+    play(cx, w, &view);
+    assert_eq!(places(cx, &view), before, "nothing moves");
+    crate::app::pin_arm_clock(None);
+}
+
+#[gpui_kit::test]
+fn ctrl_shift_j_after_a_press_with_no_frame_between_moves_nothing(cx: &mut TestAppContext) {
+    press_then_jump(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_tab_dot_after_a_press_with_no_frame_between_moves_nothing(cx: &mut TestAppContext) {
+    press_then_jump(cx, true);
+}
+
+/// Shady #83 R2-5, the held target: the tab of the session on screen
+/// closed and, in the same turn, the palette's WAITING row for its card
+/// picked (the palette's rows are the presence's, from before), then
+/// Ctrl+Shift+J: its tab never comes back, nothing lands.
+#[gpui_kit::test]
+fn a_jump_to_a_tab_just_closed_moves_nothing(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASKS);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(crate::palette::Mode::GoTo, window, cx))).unwrap();
+    settle(cx, w, 8);
+    let first = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().map(|e| e.act.clone())));
+    assert!(matches!(&first, Some(crate::palette::Act::Card(s, t)) if s == ASKS && t == "toolu_a8"), "WAITING's first row: {first:?}");
+    let ix = view.read_with(cx, |v, _| v.model.tabs.find(ASKS)).expect("its tab");
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_tab(ix);
+            v.palette_pick(window, cx);
+        });
+        chord_now(window, cx, "ctrl-shift-j");
+        assert!(view.read(cx).lookout.land.is_none(), "checked now, no landing asked");
+    })
+    .unwrap();
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.model.tabs.find(ASKS), None, "never opened again");
+        assert!(v.lookout.land.is_none() && v.lookout.landed.is_none(), "nothing landed");
+    });
+    assert_ne!(shown(cx, &view).as_deref(), Some(ASKS), "never attached again");
+}
+
+/// Shady #83 R2-7: the presence is derived again when a row's time alone
+/// changes. A replaced history that only fills a wait card's missing time
+/// (the fold the same) reorders WAITING and Ctrl+Shift+J's next.
+#[gpui_kit::test]
+fn a_time_alone_reorders_the_waiting_cards(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    let base: Vec<Value> = match crate::demo::attach(ASK_OPEN, 1).remove(0) {
+        Event::Attached { attached, .. } => attached.conversation.api_messages,
+        _ => unreachable!(),
+    };
+    let (untimed, _) = card_messages("toolu_t1", "c7t1aaa", &wait_card("Untimed?"));
+    let (mut timed, _) = card_messages("toolu_t2", "c7t2aaa", &wait_card("Timed?"));
+    for m in &mut timed {
+        m["_synaps_at"] = json!("2026-11-24T10:40:00Z");
+    }
+    let history = |first: Option<&str>| {
+        let mut h = base.clone();
+        let mut u = untimed.clone();
+        if let Some(at) = first {
+            for m in &mut u {
+                m["_synaps_at"] = json!(at);
+            }
+        }
+        h.extend(u);
+        h.extend(timed.clone());
+        h
+    };
+    let (seq, sid) = here(cx, &view);
+    let replace =
+        |messages| vec![Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update: HistoryUpdate::Replace { messages } }];
+    let waits = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.model.presence.listed().filter(|c| c.wait).map(|c| c.tool_id.clone()).collect::<Vec<_>>())
+    };
+    batch(cx, w, &view, replace(history(None)));
+    assert_eq!(waits(cx), ["toolu_t2", "toolu_t1"], "no time: last");
+    let (fold, rev) = view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        (t.cards().cards().to_vec(), t.cards_rev())
+    });
+    batch(cx, w, &view, replace(history(Some("2026-11-24T10:20:00Z"))));
+    view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        assert_eq!(t.cards().cards(), fold.as_slice(), "the same cards");
+        assert_ne!(t.cards_rev(), rev, "its time moved the revision");
+    });
+    assert_eq!(waits(cx), ["toolu_t1", "toolu_t2"], "its time filled: first");
 }
 
 /// Ctrl+P: WAITING first, each open card a row (live wait cards, live open

@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use cards_spec::{CardId, Lines};
+use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::*;
 use synaps_client::Transcript;
 use synaps_client::cards::{CardRow, State};
@@ -229,8 +230,8 @@ pub(crate) struct Land {
 pub(crate) const LAND_WAIT: Duration = Duration::from_secs(10);
 
 /// What a presence was derived from: each source's (live, fold
-/// revision), the memos' changes, and how many sessions are held.
-type Derived = (Vec<(bool, u64)>, u64, usize);
+/// revision), the memos' changes, and the sessions held.
+type Derived = (Vec<(bool, u64)>, u64, Vec<String>);
 
 /// The window's lookout for open cards: the landing on its way and what
 /// the presence was last derived from. (D2b's
@@ -320,7 +321,7 @@ impl AppView {
         }
         let mut key: Vec<(bool, u64)> = live.iter().map(|(_, id)| (true, m.lives[*id].transcript.cards_rev())).collect();
         key.extend(cached.iter().filter_map(|s| self.tab_cache.peek(*s)).map(|c| (false, c.transcript.cards_rev())));
-        let now = Some((key, m.memos.changes(), held.len()));
+        let now = Some((key, m.memos.changes(), held.iter().map(|s| s.to_string()).collect()));
         if now != self.lookout.derived {
             self.lookout.derivations += 1;
             let mut cards = Vec::new();
@@ -349,21 +350,54 @@ impl AppView {
         }
     }
 
-    /// Ctrl+Shift+J: the first waiting card ([`Presence::next`]). Whether
-    /// there was one.
+    /// Ctrl+Shift+J: the first waiting card ([`Presence::listed`]'s order)
+    /// that still waits now ([`AppView::still_open`]), the presence first
+    /// derived again from what the window holds now. Whether there was one.
     pub(crate) fn jump_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(c) = self.model.presence.next().map(|c| (c.session.clone(), c.tool_id.clone())) else { return false };
-        self.go_to_card(c.0, c.1, window, cx);
-        true
+        self.sync_presence(cx);
+        let next = self.model.presence.listed().find(|c| self.still_open(&c.key())).map(|c| (c.session.clone(), c.tool_id.clone()));
+        let Some((session, tool_id)) = next else { return false };
+        self.go_to_card(session, tool_id, window, cx)
+    }
+
+    /// Whether binding `k` waits now, read where it lives, never from the
+    /// presence (derived after a batch or as a frame begins: a press, an
+    /// answer sent or a tab closed since isn't in it yet): its session
+    /// still in a tab here (any pane's); its card open in that session's
+    /// fold (its attachment's, else its tab's cache, as last seen), bound
+    /// as it was; and no answer of this desk's on its way or in.
+    pub(crate) fn still_open(&self, k: &Key) -> bool {
+        let m = &self.model;
+        let held = m
+            .tabs
+            .iter()
+            .chain(self.panes.rest.iter().flat_map(|p| p.parked.tabs.iter()))
+            .any(|t| t.kind == TabKind::Session && t.session.as_deref() == Some(k.session.as_str()));
+        let open = |t: &Transcript| {
+            t.cards().card(&k.tool_id).is_some_and(|c| {
+                c.state == State::Open && c.id.as_ref() == Some(&k.card) && c.doc.is_some() && !answered(&m.memos, &k.session, c)
+            })
+        };
+        held && match m.lives.on(&k.session) {
+            Some(l) => open(&l.transcript),
+            None => self.tab_cache.peek(k.session.as_str()).is_some_and(|c| open(&c.transcript)),
+        }
     }
 
     /// Card `tool_id` of `session`, an open card here, on screen: its pane
     /// focused (another pane's), its tab shown (a background one, out of a
     /// view or a worker's); then its row in view once built and the card
-    /// confirmed ([`AppView::land_card`]). Never opens or attaches a
-    /// session the window no longer holds. Whether it went.
+    /// confirmed ([`AppView::land_card`]). Checked first, before anything
+    /// moves: the binding the jump was offered (the presence's) must
+    /// still wait now ([`AppView::still_open`]); else nothing moves. Never
+    /// opens or attaches a session the window no longer holds. Whether it
+    /// went.
     pub(crate) fn go_to_card(&mut self, session: String, tool_id: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(key) = self.model.presence.get(&session, &tool_id).map(Open::key) else { return false };
+        if !self.still_open(&key) {
+            log::info!(target: "synaps_desktop::card", "card {}: no longer waits: no jump", key.card.as_str());
+            return false;
+        }
         let here = self.model.lives[self.panes.cur.live].is_active(&session) && self.panes.cur.id == self.panes.focused;
         if !here && !self.focus_session(&session) {
             match self.model.tabs.find(&session) {
@@ -438,25 +472,35 @@ impl AppView {
         self.lookout.landed = Some(k);
     }
 
-    /// Whether a text field with the keys is composing (an IME's marked
-    /// text): the composer, the find, palette, rename, colour, settings
-    /// and secret fields. A global chord leaves the keys to the IME then.
-    pub(crate) fn composing_now(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Every text field of the window, one list: each pane's composer and
+    /// secret field, the overlays' (find, palette, rename, colour, the
+    /// settings' find and value) and every card's note, line and long
+    /// fields (D2a's drafts, any pane's). What a global chord asks
+    /// ([`AppView::composing_now`]).
+    pub(crate) fn text_fields(&self) -> (Vec<&Entity<InputState>>, Vec<&Entity<TextareaState>>) {
+        let mut lines =
+            vec![&self.find_input, &self.palette_input, &self.name_input, &self.hex_input, &self.settings_find, &self.settings_input];
+        let mut areas = Vec::new();
+        for p in self.panes.iter() {
+            areas.push(&p.composer);
+            lines.push(&p.secret_input);
+        }
+        for d in self.card_drafts.values() {
+            lines.extend(d.note.iter().chain(d.lines.values()));
+            areas.extend(d.longs.values());
+        }
+        (lines, areas)
+    }
+
+    /// Whether the text field with the keys is composing (an IME's marked
+    /// text), whichever of [`AppView::text_fields`] it is. A global chord
+    /// leaves the keys to the IME then.
+    pub(crate) fn composing_now(&self, window: &mut Window, cx: &mut App) -> bool {
         fn marked<T: EntityInputHandler + Focusable>(e: &Entity<T>, window: &mut Window, cx: &mut App) -> bool {
             e.read(cx).focus_handle(cx).is_focused(window) && e.update(cx, |s, cx| s.marked_text_range(window, cx)).is_some()
         }
-        marked(&self.panes.cur.composer, window, cx)
-            || [
-                &self.find_input,
-                &self.palette_input,
-                &self.name_input,
-                &self.hex_input,
-                &self.settings_find,
-                &self.settings_input,
-                &self.panes.cur.secret_input,
-            ]
-            .into_iter()
-            .any(|i| marked(i, window, cx))
+        let (lines, areas) = self.text_fields();
+        lines.into_iter().any(|e| marked(e, window, cx)) || areas.into_iter().any(|e| marked(e, window, cx))
     }
 
     /// A session tab's dot (§6.1), still, 6 px: filled in the needs-you
