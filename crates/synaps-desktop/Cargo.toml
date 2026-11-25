@@ -55,7 +55,16 @@ zbus = { version = "6.2", default-features = false, features = ["proxy", "defaul
 futures-lite = "2.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# The card-choices file, this user's only (`src/recall_win.rs`): its DACL
+# at creation (Authorization: SDDL; FileSystem: CreateFileW).
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # GPUI's headless test window (`TestAppContext`) for the UI tests

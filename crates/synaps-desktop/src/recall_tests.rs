@@ -1,7 +1,7 @@
 //! The memory of card choices without a window ([`super`]): what "the same
 //! question" is, what a choice is kept as, the store's cap, the file (its
-//! format, an unreadable one, atomic and ordered writes, a Forget no save
-//! undoes), off reading and writing nothing, and a card's
+//! format, an unreadable one, atomic and ordered writes, this user's only,
+//! a Forget no save undoes), off reading and writing nothing, and a card's
 //! recall fixed at first sight, for as long as it is open.
 
 use std::path::PathBuf;
@@ -238,8 +238,8 @@ fn an_unreadable_file_starts_empty_and_says_why() {
 }
 
 /// A write is whole or nothing (a temporary file renamed over it, none
-/// left behind), never an older snapshot over a newer one; a removal
-/// removes it.
+/// left behind), this user's only, never an older snapshot over a newer
+/// one; a removal removes it.
 #[test]
 fn writes_are_atomic_and_in_order() {
     let d = dir("writes");
@@ -267,6 +267,71 @@ fn writes_are_atomic_and_in_order() {
     remove(&path, generation()).unwrap();
     assert!(!path.exists(), "removed");
     remove(&path, generation()).unwrap();
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// Unix: the temporary file is created, never opened: a link left where it
+/// goes is replaced, never followed, and what it points at is untouched.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_temporary_files_place_is_never_followed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = dir("link");
+    let path = d.join(super::FILE);
+    let victim = d.join("victim");
+    std::fs::write(&victim, "untouched").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let g = generation();
+    let tmp = path.with_extension(format!("json.{}.{g}.tmp", std::process::id()));
+    std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+    assert!(save(&path, g, "{\"version\": 1, \"choices\": []}\n", &go()).unwrap());
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    assert_eq!(std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// Windows (Shady #93 P2-3): in a folder open to Everyone, inherited by
+/// what is created there, the temporary file and the file a save leaves
+/// both carry a protected DACL of one entry, the current user's SID, full
+/// access; nothing inherited. A file made there as std makes one (as the
+/// save did before) inherits Everyone: the check tells them apart.
+#[cfg(windows)]
+#[test]
+fn on_windows_the_file_is_this_users_only() {
+    use super::win::{Descriptor, acl, private_sddl, user_sid};
+    let d = dir("acl");
+    let sid = user_sid().expect("this user's SID");
+    acl::set_dacl(&d, &format!("D:P(A;OICI;FA;;;WD)(A;OICI;FA;;;{sid})")).expect("an open folder");
+    // A DACL as SDDL: its flags (`P`: protected) and its entries.
+    let parts = |s: &str| -> (String, String) {
+        let s = s.strip_prefix("D:").unwrap_or_else(|| panic!("a DACL: {s}"));
+        let at = s.find('(').unwrap_or(s.len());
+        (s[..at].to_string(), s[at..].to_string())
+    };
+    // The entries wanted, as Windows writes them back: `(A;;FA;;;<sid>)`.
+    let want = parts(&acl::sddl_of(Descriptor::of(&private_sddl().unwrap()).unwrap().0).unwrap()).1;
+    assert_eq!(want.matches('(').count(), 1, "{want}");
+    assert!(want.ends_with(&format!(";{sid})")), "{want}");
+    let private = |p: &std::path::Path| {
+        let got = acl::dacl(p).unwrap();
+        let (flags, aces) = parts(&got);
+        flags.contains('P') && aces == want
+    };
+    let plain = d.join("plain.json");
+    std::fs::write(&plain, "{}").unwrap();
+    let inherited = acl::dacl(&plain).unwrap();
+    assert!(inherited.contains(";WD)"), "std's file inherits the folder's Everyone: {inherited}");
+    assert!(!private(&plain), "the check tells it apart: {inherited}");
+    let tmp = d.join("t.json.tmp");
+    drop(super::create_private(&tmp).expect("created"));
+    assert!(private(&tmp), "the temporary file, as created: {}", acl::dacl(&tmp).unwrap());
+    assert!(super::create_private(&tmp).is_err(), "created new, never an existing file opened");
+    let path = d.join(super::FILE);
+    std::fs::write(&path, "an older file, inherited").unwrap();
+    assert!(save(&path, generation(), "{\"version\": 1, \"choices\": []}\n", &go()).unwrap());
+    assert!(private(&path), "the file, renamed over the older one: {}", acl::dacl(&path).unwrap());
     let _ = std::fs::remove_dir_all(d);
 }
 

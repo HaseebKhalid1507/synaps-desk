@@ -37,11 +37,12 @@
 //! - **Where.** `card-choices.json`, next to `settings.json` ([`path`]):
 //!   at most [`CAP`] questions, the least recently answered dropped
 //!   first. Read once at launch (and when the setting is turned on);
-//!   written whole, atomically (a temporary file, synced, renamed), off
-//!   the UI thread and never from a frame. A file that doesn't parse is
-//!   left for the next write to replace: the desk starts empty and the
-//!   log says why. Two desk processes write whole files: the last write
-//!   wins.
+//!   written whole, atomically (a new temporary file, synced, renamed),
+//!   off the UI thread and never from a frame; this user's only from its
+//!   creation ([`create_private`]: mode 0600, or on Windows a protected
+//!   DACL of the user's SID alone). A file that doesn't parse is left for
+//!   the next write to replace: the desk starts empty and the log says
+//!   why. Two desk processes write whole files: the last write wins.
 //! - **The setting** `cards.remember` (Settings, THIS APP: "Remember card
 //!   choices", on unless `false` or `"off"`): off, the file is neither
 //!   read nor written, a save not begun is dropped, and a card first seen
@@ -280,8 +281,9 @@ pub(crate) fn accept_forget(path: &Path) -> u64 {
 
 /// Write snapshot `generation` to `path` (true), unless memory was turned
 /// off before it began (`stop`), a Forget came after it, or a newer
-/// snapshot is there (false). Atomic: a temporary file of this process
-/// beside it, synced, renamed over it (and on Unix the folder synced); the temporary file
+/// snapshot is there (false). Atomic: a new temporary file of this
+/// process beside it, this user's only ([`create_private`]), synced,
+/// renamed over it (and on Unix the folder synced); the temporary file
 /// never outlives a failure. One write at a time. Off the UI thread
 /// ([`AppView::save_recall`]).
 pub(crate) fn save(path: &Path, generation: u64, text: &str, stop: &AtomicBool) -> std::io::Result<bool> {
@@ -301,12 +303,10 @@ pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicB
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("json.{}.{generation}.tmp", std::process::id()));
+    // One left by a crash goes first: the new one is created, never opened.
+    let _ = std::fs::remove_file(&tmp);
     let done = (|| {
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        let mut f = o.open(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
         drop(f);
@@ -343,6 +343,30 @@ pub(crate) fn remove(path: &Path, generation: u64) -> std::io::Result<()> {
     written.insert(path.to_path_buf(), generation);
     Ok(())
 }
+
+/// A new file at `path`, this user's only, created (never an existing
+/// file opened, nor a link followed): on Unix mode 0600; on Windows a
+/// protected DACL with one entry, the current user's SID, full access
+/// (nothing inherited from the folder), set as it is created
+/// (`recall_win.rs`). No such file, no write.
+pub(crate) fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        win::create_private(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        o.open(path)
+    }
+}
+
+#[cfg(windows)]
+#[path = "recall_win.rs"]
+pub(crate) mod win;
 
 /// A drawn card, as what it recalled is kept: its session, call and id
 /// (its binding).
