@@ -396,6 +396,9 @@ pub struct Model {
     /// The agent cards' answers this window sent, by session
     /// ([`crate::deliver`]).
     pub(crate) memos: crate::deliver::Memos,
+    /// The open agent cards of the sessions this window holds (D3,
+    /// [`crate::presence`]): NEEDS YOU and ASKED ([`Model::fact`]).
+    pub(crate) presence: crate::presence::Presence,
     pub named: Named,
     /// The favourite sessions (desktop only, per daemon): the rail's
     /// FAVOURITES. Never sent to the daemon.
@@ -482,6 +485,7 @@ impl Model {
             epoch: 0,
             left: Vec::new(),
             memos: Default::default(),
+            presence: Default::default(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             favs: Default::default(),
             tabs: Tabs::default(),
@@ -712,16 +716,21 @@ impl Model {
     /// window's click): what the counts, the chips, the ticker and JUMP go
     /// by, so none of them changes while an attach is on its way. The
     /// attached one is read from its own transcript (answered prompts, a
-    /// turn that just ended), which runs ahead of the 3-second poll.
+    /// turn that just ended), which runs ahead of the 3-second poll. An
+    /// agent card waiting is NEEDS YOU too; one open, ASKED, once the turn
+    /// is over (its open cards: [`crate::presence`]).
     pub fn fact(&self, s: &SessionMeta) -> State {
         let (needs, busy) = match self.lives.on(&s.id) {
             Some(l) => (!l.transcript.pending_prompts().is_empty(), l.transcript.busy()),
             None => (s.awaiting_input > 0, s.busy),
         };
-        if needs {
+        let cards = self.presence.of(&s.id);
+        if needs || cards.wait > 0 {
             State::NeedsYou
         } else if busy {
             State::Running
+        } else if cards.asked > 0 {
+            State::Asked
         } else if self.workers(s) > 0 {
             State::Workers
         } else if s.locked_by.is_some() {

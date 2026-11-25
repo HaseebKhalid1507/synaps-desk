@@ -31,6 +31,10 @@ pub(crate) const ASKS: &str = "20261124-101500-cd01";
 /// placeholder. `--offline --session 20261124-101600-cd02`, for its stills
 /// and a card test; not in the session list either.
 pub(crate) const ASK_FORM: &str = "20261124-101600-cd02";
+/// A session whose agent asked a card it does not wait on, and worked on
+/// (ASKED, D3): `--offline --session 20261124-101700-cd03`; not in the
+/// session list either. `SYNAPS_DEMO_CARDS=1` lists the three (stills).
+pub(crate) const ASK_OPEN: &str = "20261124-101700-cd03";
 
 /// Message times (`_synaps_at`) on a demo history, as the host records
 /// them: from the local wall time in the session's id on, `step` seconds
@@ -120,6 +124,15 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             "cwd": "/home/you/work/runtime", "cost_usd": 0.58, "lifecycle": "parked", "messages": 19, "state_since": ago(900),
             "created_at": ago(2600)}),
     ];
+    let mut rows = rows.to_vec();
+    if std::env::var("SYNAPS_DEMO_CARDS").as_deref() == Ok("1") {
+        for (id, title, at) in
+            [(ASKS, "Tokens onto Postgres", 60), (ASK_FORM, "Token backfill plan", 45), (ASK_OPEN, "Relay log levels", 20)]
+        {
+            rows.push(json!({"id": id, "name": "token-store", "title": title, "model": opus, "cwd": CWD, "lifecycle": "live",
+                "messages": 8, "cost_usd": 1.12, "state_since": ago(at / 2), "created_at": ago(at)}));
+        }
+    }
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
 }
 
@@ -544,6 +557,9 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     if id == ASK_FORM {
         return attach_asks(attach_seq, ASK_FORM, ask_form(), "Token backfill plan");
     }
+    if id == ASK_OPEN {
+        return attach_asks(attach_seq, ASK_OPEN, ask_open(), "Relay log levels");
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };
     let seed = id.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
@@ -792,6 +808,19 @@ fn ask_form() -> Vec<Value> {
                 "value": "Page #relay-oncall if a batch takes over a minute.\nThe dashboards are under Relay / Tokens."},
             {"id": "ticket", "label": "Ticket", "optional": true, "placeholder": "RELAY-1234"}]});
     asked(&mut out, "toolu_f1", "c2b7m9q", Some("Before the backfill, the plan:"), plan);
+    out
+}
+
+/// [`ASK_OPEN`]'s history: the agent asks without waiting, and goes on.
+fn ask_open() -> Vec<Value> {
+    let mut out = vec![json!({"role": "user", "content": "Tidy the relay's logging while I'm away."})];
+    let level = json!({"question": "Which level should the backfill log at?",
+        "options": [{"label": "info", "hint": "a line per batch"}, {"label": "debug", "hint": "every row it moves"}],
+        "default": "info"});
+    asked(&mut out, "toolu_o1", "c7k2g4v", Some("One thing while I work:"), level);
+    out.push(
+        json!({"role": "assistant", "content": [{"type": "text", "text": "Going with info for now; I'll switch if you pick debug."}]}),
+    );
     out
 }
 
