@@ -6,12 +6,12 @@
 //! would send); a change while the first answer is on its way (none) or
 //! not confirmed (it replaces it); a closed card, or one gone from the
 //! history, takes none; a change from the other pane; the later answer
-//! wins; Keep, Esc and the answer already given send nothing; Tab on a
-//! form's receipt opens nothing; a change never resolves a permission
-//! prompt (§5.1). A change of an answer taken in, or not confirmed,
-//! stays on its way when that answer's history lands after it is sent,
-//! through a gap too, and a later answer of another desk's still wins
-//! (Shady #94 P2-1).
+//! wins; Keep, Esc and the answer already given send nothing (a
+//! multi-select's picks as a set, Shady #94 P2-2); Tab on a form's
+//! receipt opens nothing; a change never resolves a permission prompt
+//! (§5.1). A change of an answer taken in, or not confirmed, stays on its
+//! way when that answer's history lands after it is sent, through a gap
+//! too, and a later answer of another desk's still wins (Shady #94 P2-1).
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`). Keys go in as new presses (`keys_tests::press`,
@@ -781,5 +781,51 @@ fn a_change_of_an_answer_not_confirmed_keeps_its_way_and_a_later_one_wins(cx: &m
     assert!(has(cx, w, format!("ask-state {row} changed")), "the card shows C");
     assert!(!has(cx, w, format!("ask-resend {row}")), "no Resend of B over it");
     assert_eq!(sends(cx, &view).len(), 2);
+    crate::app::pin_arm_clock(None);
+}
+
+const SUITES: &str = "Which suites gate the cut-over?";
+
+/// Shady #94 P2-2: a multi-select answer from the chat lists its picks in
+/// its own order (`Load`, `Unit`), the draft in the doc's. Reopened and
+/// sent untouched, by Send and by Enter, and with a pick ticked off and
+/// on again, it is the answer shown: nothing sent, the receipt as it was.
+/// A pick added is a change: one `Submit`.
+#[gpui_kit::test]
+fn an_untouched_multi_select_answer_sends_nothing(cx: &mut TestAppContext) {
+    let input = json!({"question": SUITES, "multi": true, "options": ["Unit", "Integration", "Load"]});
+    let (w, view, row, _events) = answered(cx, "toolu_cm", "c9multi", &input, json!({"choice": ["Load", "Unit"]}));
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-change {row}"));
+    assert!(changing(cx, w, row));
+    assert!(has(cx, w, format!("ask-picked {row} 1")) && has(cx, w, format!("ask-picked {row} 3")), "Load and Unit, picked");
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-send {row}"));
+    assert!(sends(cx, &view).is_empty(), "Send, untouched: nothing");
+    assert!(has(cx, w, format!("ask-state {row} answered")) && !changing(cx, w, row), "as it was");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "enter");
+    assert!(changing(cx, w, row), "Enter reopens it");
+    press(cx, w, "enter");
+    assert!(sends(cx, &view).is_empty(), "Enter, untouched: nothing");
+    assert!(has(cx, w, format!("ask-state {row} answered")) && !changing(cx, w, row));
+    press(cx, w, "ctrl-j");
+    press(cx, w, "enter");
+    press(cx, w, "1");
+    assert!(!has(cx, w, format!("ask-picked {row} 1")), "Unit off");
+    press(cx, w, "1");
+    assert!(has(cx, w, format!("ask-picked {row} 1")), "and on again");
+    press(cx, w, "enter");
+    assert!(sends(cx, &view).is_empty(), "the same picks: nothing");
+    assert!(has(cx, w, format!("ask-state {row} answered")) && !changing(cx, w, row));
+    press(cx, w, "ctrl-j");
+    press(cx, w, "enter");
+    press(cx, w, "2");
+    press(cx, w, "enter");
+    assert_eq!(
+        texts(cx, &view),
+        vec![changed("c9multi", &input, json!({"choice": ["Unit", "Integration", "Load"]}))],
+        "a pick added: a change"
+    );
     crate::app::pin_arm_clock(None);
 }

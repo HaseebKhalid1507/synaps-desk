@@ -42,10 +42,10 @@
 //! answers ends a keyboard batch, and the keys go back to the composer
 //! ([`AppView::clicked_an_answer`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
-use cards_spec::{CardDoc, Choice, FieldKind, FieldValue, Mode, Reply};
+use cards_spec::{Answer, CardDoc, Choice, FieldKind, FieldValue, Mode, Reply};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::*;
 use serde_json::{Map, Value, json};
@@ -150,10 +150,23 @@ impl Draft {
 }
 
 /// Whether `new` says what `shown` says: the same values, or both a skip.
+/// Read as the card shows them (Shady #94 P2-2): a multi-select's picks
+/// as a set (a draft lists them in the doc's order, an answer read from
+/// the chat in its own, and nothing on the card sets an order), and the
+/// fields by id.
 fn same(shown: &Reply, new: &Reply) -> bool {
     match (shown, new) {
         (Reply::Skip, Reply::Skip) => true,
-        (Reply::Answer(a) | Reply::Change(a), Reply::Answer(b) | Reply::Change(b)) => a == b,
+        (Reply::Answer(a) | Reply::Change(a), Reply::Answer(b) | Reply::Change(b)) => {
+            let picks = match (&a.choice, &b.choice) {
+                (Some(Choice::Many(x)), Some(Choice::Many(y))) => x.iter().collect::<BTreeSet<_>>() == y.iter().collect::<BTreeSet<_>>(),
+                (x, y) => x == y,
+            };
+            fn fields(a: &Answer) -> Option<BTreeMap<&str, &FieldValue>> {
+                a.fields.as_ref().map(|f| f.iter().map(|(id, v)| (id.as_str(), v)).collect())
+            }
+            picks && a.note == b.note && fields(a) == fields(b)
+        }
         _ => false,
     }
 }
