@@ -6,7 +6,8 @@
 //! these tests use are copied here as they are there, but for the waits:
 //! those are `test_waits`' (#74), shared with `split_tests`, never a copy
 //! (Shady #62 r5 R5-1: a copy kept the busy channel's way past the
-//! backstop that #74 closed).
+//! backstop that #74 closed). At the end, one restore test on the same
+//! harness (fix/restored-panes-hang).
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -1261,4 +1262,58 @@ fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
         let _ = client.shutdown();
     }
     assert!(fails.is_empty(), "{fails:#?}");
+}
+
+// ── fix/restored-panes-hang ─────────────────────────────────────────────
+
+/// Split panes step 5 (architecture §5 ¶4): the same session saved in two
+/// panes restores on one store with one attach. The second pane's turn
+/// at the first list finds its store asked for the session already, and
+/// sends nothing. Before, it detached the first pane's attach and sent
+/// another: the client says `Detached` for the first, and when that
+/// first attach reached the daemon before its detach, `split_tests`'
+/// twin test answered it and waited for the live one to the backstop
+/// (about 2 % of runs under load).
+#[gpui_kit::test]
+fn the_same_session_in_two_restored_panes_attaches_once(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 1280., 800.);
+    let (path, attaches) = start("restore-once");
+    let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::desktop())).expect("a client thread");
+    test_waits::until(&events, "connected", |e| matches!(e, Event::Status(synaps_client::Status::Connected { .. })));
+    let saved = |s: &str| crate::tabs::Saved { sessions: vec![s.to_string()], active: Some(0), ..Default::default() };
+    let layout = crate::theme::Layout {
+        focused: 0,
+        tree: crate::theme::LayoutNode::Split {
+            axis: crate::split::Axis::Row,
+            ratios: vec![0.3, 0.7],
+            kids: vec![crate::theme::LayoutNode::Pane(0), crate::theme::LayoutNode::Pane(1)],
+        },
+        panes: vec![saved(A), saved(A)],
+    };
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        v.client = Some(client.clone());
+        v.model.tabs = crate::tabs::Tabs::default();
+        v.reconcile(None);
+        v.restore_layout = Some(layout);
+        cx.notify();
+    });
+    frame(cx, window);
+    // The first list: both panes' tabs confirmed in one pass.
+    let metas: Vec<synaps_client::protocol::SessionMeta> =
+        [A, B].iter().map(|id| serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live"})).expect("a session")).collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+    let mut a = test_waits::next_attach(cx, window, &attaches, "A's attach");
+    a.send(attached(A, None));
+    // The client's events up to the attach: none detaches. A detach of
+    // the first attach comes before anything of a second.
+    test_waits::until(&events, "A attached", |e| {
+        assert!(!matches!(e, Event::Detached { .. }), "the restore detached an attachment it had sent: {e:?}");
+        matches!(e, Event::Attached { .. })
+    });
+    assert!(attaches.recv_timeout(Duration::from_millis(300)).is_err(), "one attach at the daemon");
+    drop(a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
 }
