@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
-          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/faster' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -95,7 +95,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/faster' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux system packages
         if: runner.os == 'Linux'
         run: |

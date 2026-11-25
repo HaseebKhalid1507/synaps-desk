@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests
-          save-if: ${{ (github.ref == 'refs/heads/main' || github.head_ref == 'ci/faster') && inputs.lane == 'workspace' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.lane == 'workspace' }}
       - name: Linux system packages
         if: runner.os == 'Linux'
         run: |
