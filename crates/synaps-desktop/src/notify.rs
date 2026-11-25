@@ -77,6 +77,7 @@ pub(crate) fn note(k: &Key, session: &str, question: &str) -> Note {
 
 /// A Linux notification's body: escaped for a server that reads it as
 /// markup (`body-markup`), as it is for one that doesn't.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn xdg_body(body: &str, markup: bool) -> String {
     if !markup {
         return body.to_string();
@@ -209,11 +210,13 @@ impl Notes {
 /// What the XDG service shows of a window's: each tag's server id,
 /// oldest first, at most [`NOTES_MAX`] (the bus task's memory; pure, so
 /// it is tested without a bus).
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     up: VecDeque<(String, u32)>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl Shown {
     /// The id `tag` is up as (a new `Notify` replaces it).
     pub(crate) fn id(&self, tag: &str) -> Option<u32> {
