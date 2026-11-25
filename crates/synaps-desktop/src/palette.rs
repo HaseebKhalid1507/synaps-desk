@@ -102,8 +102,9 @@ pub(crate) enum Act {
     App(AppAct),
     /// An engine slash command ([`ENGINE`]).
     Engine(&'static str),
-    /// An open agent card: its session and its call's tool id (D3).
-    Card(String, String),
+    /// An open agent card: the binding its row shows (session, call, card
+    /// id; D3), the one a pick goes to.
+    Card(crate::presence::Key),
 }
 
 /// A row's lead glyph: a session's state, a worker's, or none.
@@ -971,8 +972,8 @@ impl AppView {
                 }
             }
             Act::App(a) => self.app_act(a, window, cx),
-            Act::Card(session, tool_id) => {
-                self.go_to_card(session, tool_id, window, cx);
+            Act::Card(key) => {
+                self.go_to_card(key, window, cx);
             }
             Act::Engine(name) => {
                 self.run_command(name, arg);

@@ -906,6 +906,66 @@ fn a_tab_dot_after_a_press_with_no_frame_between_moves_nothing(cx: &mut TestAppC
     press_then_jump(cx, true);
 }
 
+/// Shady #83 R3 (R2-5's rest): a WAITING row and a tab dot go to the
+/// binding they showed (session, call, card id), never to whatever card
+/// the call holds when the click lands. Painted; then the call bound
+/// again to another card (a replaced history: the presence, derived
+/// after the batch, holds the replacement) and, in the same turn (no
+/// frame between), the row picked or the dot clicked: nothing moves,
+/// the replacement isn't landed on.
+fn rebound_then_jump(cx: &mut TestAppContext, by_dot: bool) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    let tab = view.read_with(cx, |v, _| v.model.tabs.current().map(|t| t.id).expect("a tab"));
+    let (seq, sid) = here(cx, &view);
+    let base: Vec<Value> = match crate::demo::attach(&sid, 1).remove(0) {
+        Event::Attached { attached, .. } => attached.conversation.api_messages,
+        _ => unreachable!(),
+    };
+    let bound = |card: &str, q: &str| {
+        let mut messages = base.clone();
+        messages.extend(card_messages("toolu_r1", card, &wait_card(q)).0);
+        vec![Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update: HistoryUpdate::Replace { messages } }]
+    };
+    let key = |card: &str| Key { session: sid.clone(), tool_id: "toolu_r1".into(), card: CardId::parse(card).unwrap() };
+    let waiting = |v: &AppView| v.model.presence.listed().map(Open::key).collect::<Vec<_>>();
+    batch(cx, w, &view, bound("c7r1aaa", SHIP));
+    assert_eq!(view.read_with(cx, |v, _| waiting(v)), [key("c7r1aaa")], "one card waits");
+    let dot = center(cx, w, format!("tab {tab} dot"));
+    if !by_dot {
+        cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(crate::palette::Mode::GoTo, window, cx))).unwrap();
+        settle(cx, w, 8);
+        let first = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().map(|e| e.act.clone())));
+        assert_eq!(first, Some(crate::palette::Act::Card(key("c7r1aaa"))), "WAITING's row shows its binding");
+    }
+    let before = places(cx, &view);
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| v.apply_batch(bound("c7r1bbb", "Rebuilt from the replica?"), cx));
+        assert_eq!(waiting(view.read(cx)), [key("c7r1bbb")], "the call bound again: the replacement waits");
+        if by_dot {
+            press_at(window, cx, dot);
+        } else {
+            view.update(cx, |v, cx| v.palette_pick(window, cx));
+        }
+        assert!(view.read(cx).lookout.land.is_none(), "the binding shown no longer waits: no landing asked");
+    })
+    .unwrap();
+    play(cx, w, &view);
+    assert_eq!(places(cx, &view), before, "nothing moves");
+    assert_eq!(landed(cx, &view), None, "the replacement never landed on");
+    assert_eq!(view.read_with(cx, |v, _| waiting(v)), [key("c7r1bbb")], "the replacement still waits");
+}
+
+#[gpui_kit::test]
+fn a_waiting_row_goes_to_the_binding_it_showed(cx: &mut TestAppContext) {
+    rebound_then_jump(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_tab_dot_goes_to_the_binding_it_showed(cx: &mut TestAppContext) {
+    rebound_then_jump(cx, true);
+}
+
 /// Shady #83 R2-5, the held target: the tab of the session on screen
 /// closed and, in the same turn, the palette's WAITING row for its card
 /// picked (the palette's rows are the presence's, from before), then
@@ -918,7 +978,10 @@ fn a_jump_to_a_tab_just_closed_moves_nothing(cx: &mut TestAppContext) {
     cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(crate::palette::Mode::GoTo, window, cx))).unwrap();
     settle(cx, w, 8);
     let first = view.read_with(cx, |v, _| v.palette.as_ref().and_then(|p| p.selected().map(|e| e.act.clone())));
-    assert!(matches!(&first, Some(crate::palette::Act::Card(s, t)) if s == ASKS && t == "toolu_a8"), "WAITING's first row: {first:?}");
+    assert!(
+        matches!(&first, Some(crate::palette::Act::Card(k)) if k.session == ASKS && k.tool_id == "toolu_a8"),
+        "WAITING's first row: {first:?}"
+    );
     let ix = view.read_with(cx, |v, _| v.model.tabs.find(ASKS)).expect("its tab");
     cx.update_window(w, |_, window, cx| {
         view.update(cx, |v, cx| {
@@ -1000,7 +1063,7 @@ fn the_palette_lists_waiting_cards_first(cx: &mut TestAppContext) {
         .take_while(|e| e.group == crate::palette::Group::Waiting)
         .map(|e| {
             let tool = match &e.act {
-                crate::palette::Act::Card(_, t) => t.as_str(),
+                crate::palette::Act::Card(k) => k.tool_id.as_str(),
                 _ => "",
             };
             (e.title.as_ref(), tool, e.meta.as_ref())
@@ -1022,8 +1085,8 @@ fn the_palette_lists_waiting_cards_first(cx: &mut TestAppContext) {
     let pick = goto[1].act.clone();
     cx.update_window(w, |_, win, cx| {
         view.update(cx, |v, cx| {
-            if let crate::palette::Act::Card(s, t) = pick {
-                v.go_to_card(s, t, win, cx);
+            if let crate::palette::Act::Card(k) = pick {
+                v.go_to_card(k, win, cx);
             }
         })
     })
@@ -1072,9 +1135,9 @@ fn dots_and_badges_draw_no_idle_frames(cx: &mut TestAppContext) {
 fn a_landing_that_cannot_happen_is_dropped(cx: &mut TestAppContext) {
     let (w, view) = open(cx);
     let sid = shown(cx, &view).expect("attached");
-    let went = cx.update_window(w, |_, win, cx| view.update(cx, |v, cx| v.go_to_card(sid.clone(), "toolu_none".into(), win, cx))).unwrap();
-    assert!(!went, "no such open card: nowhere");
     let gone = Key { session: sid.clone(), tool_id: "toolu_none".into(), card: CardId::parse("c000000").unwrap() };
+    let went = cx.update_window(w, |_, win, cx| view.update(cx, |v, cx| v.go_to_card(gone.clone(), win, cx))).unwrap();
+    assert!(!went, "no such open card: nowhere");
     view.update(cx, |v, cx| {
         v.lookout.land = Some(Land { key: gone.clone(), at: Instant::now() });
         cx.notify();

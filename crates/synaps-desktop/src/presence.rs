@@ -160,6 +160,8 @@ impl Presence {
         self.listed().next()
     }
 
+    /// Call `tool_id`'s open card in `session`, if one is (the tests').
+    #[cfg(test)]
     pub fn get(&self, session: &str, tool_id: &str) -> Option<&Open> {
         self.cards.iter().find(|c| c.session == session && c.tool_id == tool_id)
     }
@@ -355,9 +357,8 @@ impl AppView {
     /// derived again from what the window holds now. Whether there was one.
     pub(crate) fn jump_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.sync_presence(cx);
-        let next = self.model.presence.listed().find(|c| self.still_open(&c.key())).map(|c| (c.session.clone(), c.tool_id.clone()));
-        let Some((session, tool_id)) = next else { return false };
-        self.go_to_card(session, tool_id, window, cx)
+        let Some(key) = self.model.presence.listed().map(Open::key).find(|k| self.still_open(k)) else { return false };
+        self.go_to_card(key, window, cx)
     }
 
     /// Whether binding `k` waits now, read where it lives, never from the
@@ -384,16 +385,18 @@ impl AppView {
         }
     }
 
-    /// Card `tool_id` of `session`, an open card here, on screen: its pane
-    /// focused (another pane's), its tab shown (a background one, out of a
-    /// view or a worker's); then its row in view once built and the card
-    /// confirmed ([`AppView::land_card`]). Checked first, before anything
-    /// moves: the binding the jump was offered (the presence's) must
-    /// still wait now ([`AppView::still_open`]); else nothing moves. Never
-    /// opens or attaches a session the window no longer holds. Whether it
-    /// went.
-    pub(crate) fn go_to_card(&mut self, session: String, tool_id: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(key) = self.model.presence.get(&session, &tool_id).map(Open::key) else { return false };
+    /// Binding `key`, an open card here, on screen: its pane focused
+    /// (another pane's), its tab shown (a background one, out of a view or
+    /// a worker's); then its row in view once built and the card confirmed
+    /// ([`AppView::land_card`]). `key` is the binding the jump showed (the
+    /// WAITING row's, the dot's, as painted; Ctrl+Shift+J's, checked as
+    /// it presses), never looked up again: its call bound since to
+    /// another card is another card, never this jump's. Checked first,
+    /// before anything moves: exactly that binding must still wait now
+    /// ([`AppView::still_open`]); else nothing moves. Never opens or
+    /// attaches a session the window no longer holds. Whether it went.
+    pub(crate) fn go_to_card(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let session = key.session.clone();
         if !self.still_open(&key) {
             log::info!(target: "synaps_desktop::card", "card {}: no longer waits: no jump", key.card.as_str());
             return false;
@@ -527,8 +530,8 @@ impl AppView {
         } else {
             return None;
         };
-        let card = self.model.presence.listed().find(|c| c.session == s).map(|c| c.tool_id.clone());
-        let session = s.to_string();
+        // The binding it shows, as painted: the one a click goes to.
+        let card = self.model.presence.listed().find(|c| c.session == s).map(Open::key);
         Some(
             div()
                 .id(("tab-dot", tab as usize))
@@ -543,8 +546,8 @@ impl AppView {
                 .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    if let Some(tool_id) = card.clone() {
-                        this.go_to_card(session.clone(), tool_id, window, cx);
+                    if let Some(k) = card.clone() {
+                        this.go_to_card(k, window, cx);
                     }
                 }))
                 .into_any_element(),
@@ -561,7 +564,7 @@ impl AppView {
             .listed()
             .enumerate()
             .map(|(i, c)| {
-                let mut e = Entry::new(Group::Waiting, Act::Card(c.session.clone(), c.tool_id.clone()), c.question.clone());
+                let mut e = Entry::new(Group::Waiting, Act::Card(c.key()), c.question.clone());
                 let what = match (c.live, c.wait) {
                     (true, true) => "needs you",
                     (true, false) => "asked",
