@@ -242,8 +242,8 @@ type Derived = (Vec<(bool, u64)>, u64, Vec<String>);
 #[derive(Debug, Default)]
 pub(crate) struct Lookout {
     pub land: Option<Land>,
-    /// The last card a jump landed on: where keyboard entry takes over
-    /// ([`AppView::card_landed`]).
+    /// The last card a jump landed on ([`AppView::card_landed`] enters
+    /// it, if it is still open there).
     pub landed: Option<Key>,
     /// Each source's (live, fold revision), the memos' changes, and the
     /// sessions held: unchanged, the presence is as it was.
@@ -465,14 +465,22 @@ impl AppView {
         cx.notify();
     }
 
-    /// **The D2b seam.** A jump (Ctrl+Shift+J, the palette's WAITING, the
-    /// tab dot) landed on binding `k`, checked open, its
-    /// row in view. D2b's targeted entry (`enter_card(session, binding)`:
-    /// it checks the binding again and enters its card mode, so the next
-    /// key answers it) is wired here once D2b is on main; until then the
-    /// landing is recorded and the keys stay where they were.
-    pub(crate) fn card_landed(&mut self, k: Key, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.lookout.landed = Some(k);
+    /// **The D2b seam** (Shady #83 P2-7). A jump (Ctrl+Shift+J, the
+    /// palette's WAITING, the tab dot, the top bar's JUMP) landed on
+    /// binding `k`, checked open, its row in view: that card is entered
+    /// ([`AppView::enter_card`]: the binding checked again, its card mode
+    /// with its pane's batch, its keys live from its first paint), so the
+    /// next key answers it. Never a prompt (§5.1). Once this frame is
+    /// drawn (a landing is read as a pane's frame begins): the entry
+    /// focuses and asks for the frame that paints it, as a key's would.
+    /// Recorded either way; a binding no longer open there is not entered,
+    /// and the keys stay where they were.
+    pub(crate) fn card_landed(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
+        self.lookout.landed = Some(k.clone());
+        let binding = crate::ask_keys::Binding { tool_id: k.tool_id, card: k.card };
+        cx.defer_in(window, move |this, window, cx| {
+            this.enter_card(&k.session, &binding, window, cx);
+        });
     }
 
     /// Every text field of the window, one list: each pane's composer and
@@ -496,8 +504,10 @@ impl AppView {
     }
 
     /// Whether the text field with the keys is composing (an IME's marked
-    /// text), whichever of [`AppView::text_fields`] it is. A global chord
-    /// leaves the keys to the IME then.
+    /// text), whichever of [`AppView::text_fields`] it is. The window's one
+    /// rule for "an IME composition owns every key" (§6.1): Ctrl+Shift+J
+    /// and Ctrl+J leave the keys to the IME then, and an entered agent
+    /// card's keys in its fields act on nothing.
     pub(crate) fn composing_now(&self, window: &mut Window, cx: &mut App) -> bool {
         fn marked<T: EntityInputHandler + Focusable>(e: &Entity<T>, window: &mut Window, cx: &mut App) -> bool {
             e.read(cx).focus_handle(cx).is_focused(window) && e.update(cx, |s, cx| s.marked_text_range(window, cx)).is_some()

@@ -2727,6 +2727,9 @@ impl AppView {
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
         // A worker's view polls only while the window shows.
         subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
+        // Every key-down, before any binding: an agent card's keys act on
+        // new presses only, a key held from before entry too (Shady #86 R3-1).
+        subs.push(Self::intercept_keys(window, cx));
         crate::views::view_fallbacks(cx.weak_entity(), window.window_handle(), cx);
         let me = cx.weak_entity();
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
@@ -10170,12 +10173,15 @@ impl Render for AppView {
                 let now = input_now();
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, now, ev.is_held);
-                // Every key: an entered agent card's act on new presses only.
+                // Every key: an entered agent card's act on new presses only
+                // (stamped before its bindings ran: `Presses::intercept`).
                 this.ask_presses.down(&ev.keystroke, now, ev.is_held);
-                // Ctrl+Shift+J: the first waiting card in any open session (D3);
-                // not while a field composes (the IME's keys).
+                // Ctrl+Shift+J: the first waiting card in any open session (D3),
+                // entered (`card_landed`); on a new press only, as Ctrl+J (a
+                // repeat X11 never says is one: `Presses`); not while a field
+                // composes (the IME's keys).
                 if crate::presence::is_jump(&ev.keystroke)
-                    && !ev.is_held
+                    && this.ask_presses.last
                     && !this.composing_now(window, cx)
                     && this.jump_waiting(window, cx)
                 {
@@ -10189,7 +10195,7 @@ impl Render for AppView {
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
-                    && !this.ime_composing(window, cx)
+                    && !this.composing_now(window, cx)
                     && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
                         || this.waiting_pane().is_some()
                         || this.ask_waits()

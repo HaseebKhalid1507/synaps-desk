@@ -29,13 +29,13 @@ use super::settle;
 use crate::app::AppView;
 use crate::deliver::Outgoing;
 
-fn keystroke(cx: &mut TestAppContext, k: &str) -> gpui_kit::Keystroke {
+pub(super) fn keystroke(cx: &mut TestAppContext, k: &str) -> gpui_kit::Keystroke {
     gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke").with_simulated_ime()
 }
 
 /// `k` goes down, as a new press: what nothing takes is typed into the
 /// focused input, as the platform does (`Window::dispatch_keystroke`).
-fn down(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+pub(super) fn down(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let ks = keystroke(cx, k);
     cx.update_window(w, |_, window, cx| {
         window.dispatch_keystroke(ks, cx);
@@ -45,7 +45,7 @@ fn down(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
 }
 
 /// `k` goes down again while held: the platform's repeat (`is_held`).
-fn repeat(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+pub(super) fn repeat(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let keystroke = keystroke(cx, k);
     let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke, is_held: true, prefer_character_input: false });
     cx.update_window(w, |_, window, cx| {
@@ -60,7 +60,7 @@ fn repeat(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
 /// non-printing key (Shift+Tab, Esc, ↓) back from the input context's
 /// `doCommandBySelector:`: rebuilt with `is_held: false`, no text, and no
 /// key-up since its last key-down (Shady #86 R2-2).
-fn lost(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+pub(super) fn lost(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let mut keystroke = keystroke(cx, k);
     keystroke.key_char = None;
     let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false });
@@ -72,7 +72,7 @@ fn lost(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     settle(cx, w, 8);
 }
 
-fn up(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+pub(super) fn up(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let keystroke = keystroke(cx, k);
     cx.update_window(w, |_, window, cx| {
         window.dispatch_event(gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }), cx);
@@ -84,7 +84,7 @@ fn up(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
 /// A new press of `k`: down and up, the frames it asks for, then the
 /// input clock past a repeat's 30 ms ([`crate::app::next_press`]): the
 /// next press of it is new, whatever the frames between cost.
-fn press(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
+pub(super) fn press(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     down(cx, w, k);
     up(cx, w, k);
     settle(cx, w, 8);
@@ -135,17 +135,17 @@ fn typing(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
 }
 
 /// Card row `id` is entered: the keys are its (its ring is drawn).
-fn entered(cx: &mut TestAppContext, w: AnyWindowHandle, id: u64) -> bool {
+pub(super) fn entered(cx: &mut TestAppContext, w: AnyWindowHandle, id: u64) -> bool {
     has(cx, w, format!("ask-keys {id}"))
 }
 
-fn composer_text(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+pub(super) fn composer_text(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
     view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().to_string())
 }
 
 /// Who has the keys: the composer, or the window's own focus (where the
 /// authorize card's Allow and Deny keys are live).
-fn keys_at(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (bool, bool) {
+pub(super) fn keys_at(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> (bool, bool) {
     cx.update_window(w, |_, window, cx| {
         let v = view.read(cx);
         (v.panes.cur.composer.read(cx).focus_handle(cx).is_focused(window), v.focus.is_focused(window))
@@ -154,7 +154,7 @@ fn keys_at(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) 
 }
 
 /// §7's start: the window active (in use), the composer with the keys.
-fn at_rest(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn at_rest(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     cx.update_window(w, |_, window, cx| {
         window.activate_window();
         view.update(cx, |v, cx| v.panes.cur.composer.update(cx, |s, cx| s.focus(window, cx)))
@@ -165,11 +165,11 @@ fn at_rest(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) 
     assert_eq!(keys_at(cx, w, view), (true, false), "the composer has the keys");
 }
 
-fn texts(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
+pub(super) fn texts(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
     sends(cx, view).into_iter().map(|o| o.text).collect()
 }
 
-fn ship_input() -> Value {
+pub(super) fn ship_input() -> Value {
     json!({"question": SHIP, "wait": true,
         "detail": "It locks the tokens table for about 40 seconds.\nRefreshes queue meanwhile; none are lost.",
         "options": [{"label": "Run it now"}, {"label": "Wait for the low-traffic window", "hint": "after 22:00"}, "Don't run it"],
@@ -185,11 +185,11 @@ fn suites_input() -> Value {
         "default": ["Unit", "Integration"]})
 }
 
-type Asked = (AnyWindowHandle, Entity<AppView>, u64, async_channel::Receiver<synaps_client::Event>);
+pub(super) type Asked = (AnyWindowHandle, Entity<AppView>, u64, async_channel::Receiver<synaps_client::Event>);
 
 /// A quiet session (its turns over, no card) whose agent asks `input`
 /// live as card `card`, and waits.
-fn asked(cx: &mut TestAppContext, tool: &str, card_id: &str, input: &Value) -> Asked {
+pub(super) fn asked(cx: &mut TestAppContext, tool: &str, card_id: &str, input: &Value) -> Asked {
     let (w, view, events) = open(cx, crate::demo::IDLE_CPU);
     ask_live(cx, w, &view, tool, card_id, input.clone());
     let q = input["question"].as_str().expect("a question").to_string();
@@ -199,7 +199,7 @@ fn asked(cx: &mut TestAppContext, tool: &str, card_id: &str, input: &Value) -> A
 }
 
 /// The draft input of field `field` of call `tool` on screen: its value.
-fn field_value(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, field: &str) -> String {
+pub(super) fn field_value(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, field: &str) -> String {
     view.read_with(cx, |v, cx| {
         let sid = v.card_session().expect("attached");
         v.card_drafts[&(sid, tool.to_string())].lines[field].read(cx).value().to_string()
@@ -227,7 +227,7 @@ fn card_here(cx: &mut TestAppContext, view: &Entity<AppView>, question: &str) ->
 }
 
 /// A confirm prompt pending on the session on screen.
-fn prompt(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn prompt(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     heard(
         cx,
         w,
@@ -239,7 +239,7 @@ fn prompt(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
 }
 
 /// The prompt is still pending, unanswered, and no answer to it went.
-fn prompt_pending(cx: &mut TestAppContext, view: &Entity<AppView>, what: &str) {
+pub(super) fn prompt_pending(cx: &mut TestAppContext, view: &Entity<AppView>, what: &str) {
     view.read_with(cx, |v, _| {
         let l = &v.model.lives[v.panes.cur.live];
         assert!(l.transcript.pending_prompts().iter().any(|p| p.id == 7), "{what}: the prompt is still pending");
@@ -897,8 +897,9 @@ fn ctrl_j_mid_composition_is_the_imes(cx: &mut TestAppContext) {
 }
 
 /// Where the keys are on the card of call `tool`: `body` (the pane's card
-/// focus), `note`, a text field's id; else `elsewhere`.
-fn keys_in(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str) -> String {
+/// focus), `note`, a text field's id (a line or a long one); else
+/// `elsewhere`.
+pub(super) fn keys_in(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str) -> String {
     cx.update_window(w, |_, window, cx| {
         let v = view.read(cx);
         if v.panes.cur.ask.focus.as_ref().is_some_and(|f| f.is_focused(window)) {
@@ -908,8 +909,9 @@ fn keys_in(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
         if d.note.as_ref().is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window)) {
             return "note".to_string();
         }
-        let line = d.lines.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window));
-        line.map(|(id, _)| id.clone()).unwrap_or_else(|| "elsewhere".to_string())
+        let line = d.lines.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window)).map(|(id, _)| id);
+        let long = d.longs.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window)).map(|(id, _)| id);
+        line.or(long).cloned().unwrap_or_else(|| "elsewhere".to_string())
     })
     .expect("the window")
 }
@@ -1328,4 +1330,199 @@ fn a_key_up_lost_under_cmd_costs_no_press(cx: &mut TestAppContext) {
     assert!(entered(cx, w, id));
     press(cx, w, "2");
     assert_eq!(texts(cx, &view), vec![message("c7hcmd2", &input, json!({"choice": "release"}))]);
+}
+
+/// The highlight on the entered card, if one.
+fn hi(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<usize> {
+    view.read_with(cx, |v, _| v.panes.cur.ask.entry.as_ref().and_then(|e| e.hi))
+}
+
+/// Shady #86 R3-1, after the keys reach card `id` (default highlighted:
+/// option 1) with ↓ held from where an input's `MoveDown` took it (the
+/// root's capture never heard that key-down): its repeats that lost their
+/// held bit ([`lost`], macOS's), or say it, move nothing and send nothing,
+/// however far apart. Let go, within 30 ms (X11's repeat) still nothing;
+/// past it, a press moves one, and Enter takes that option.
+fn held_down_moves_nothing(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, from: &str, card: (&str, &Value)) {
+    use std::time::Duration;
+    assert_eq!(hi(cx, view), Some(0), "{from}: on the default");
+    for gap in [0, 90, 1200] {
+        crate::app::advance_input_clock(Duration::from_millis(gap));
+        lost(cx, w, "down");
+        assert_eq!(hi(cx, view), Some(0), "{from}: ↓ held from before, a repeat with no held bit {gap} ms on, moves nothing");
+    }
+    repeat(cx, w, "down");
+    assert_eq!(hi(cx, view), Some(0), "{from}: one that says it repeats");
+    assert!(sends(cx, view).is_empty(), "{from}: nothing sent");
+    up(cx, w, "down");
+    down(cx, w, "down");
+    settle(cx, w, 8);
+    assert_eq!(hi(cx, view), Some(0), "{from}: within 30 ms of its key-up, a repeat");
+    up(cx, w, "down");
+    crate::app::next_press();
+    press(cx, w, "down");
+    assert_eq!(hi(cx, view), Some(1), "{from}: let go, 30 ms, pressed: one down");
+    press(cx, w, "enter");
+    let (id, input) = card;
+    assert_eq!(texts(cx, view), vec![message(id, input, json!({"choice": "release"}))], "{from}");
+}
+
+/// Four options, the first the default: a held ↓ that moved shows.
+fn branch_input() -> Value {
+    json!({"question": "Which branch?", "wait": true, "options": ["main", "release", "hotfix", "next"], "default": "main"})
+}
+
+/// R3-1, Shady's sequence: ↓ goes down in the composer (its `MoveDown`
+/// takes it) and stays down; `chord` (Ctrl+J, or D3's Ctrl+Shift+J)
+/// enters the card; then ↓'s repeats.
+fn down_held_in_the_composer(cx: &mut TestAppContext, chord: &str) {
+    let input = branch_input();
+    let (w, view, id, _events) = asked(cx, "toolu_hd", "c3hdown", &input);
+    down(cx, w, "down");
+    settle(cx, w, 8);
+    assert_eq!(keys_at(cx, w, &view), (true, false), "the composer took the ↓");
+    press(cx, w, chord);
+    play(cx, w, &view);
+    assert!(entered(cx, w, id), "{chord}: the card");
+    held_down_moves_nothing(cx, w, &view, chord, ("c3hdown", &input));
+}
+
+#[gpui_kit::test]
+fn a_down_held_in_the_composer_never_moves_the_card_ctrl_j_enters(cx: &mut TestAppContext) {
+    down_held_in_the_composer(cx, "ctrl-j");
+}
+
+#[gpui_kit::test]
+fn a_down_held_in_the_composer_never_moves_the_card_ctrl_shift_j_enters(cx: &mut TestAppContext) {
+    down_held_in_the_composer(cx, "ctrl-shift-j");
+}
+
+/// R3-1 from a long card field (a textarea: its `MoveDown` takes ↓ as the
+/// composer's does): another card's long field, the keys put there by a
+/// click, ↓ held; Ctrl+J enters the card that waits.
+#[gpui_kit::test]
+fn a_down_held_in_a_long_field_never_moves_the_card_ctrl_j_enters(cx: &mut TestAppContext) {
+    let input = branch_input();
+    let (w, view, id, _events) = asked(cx, "toolu_lq", "c4lquik", &input);
+    let form =
+        json!({"question": "Anything for on-call?", "fields": [{"id": "why", "label": "Context", "type": "long", "optional": true}]});
+    ask_live(cx, w, &view, "toolu_lf", "c4lform", form);
+    let (f, _) = card(cx, &view, "Anything for on-call?");
+    arm(cx, &view, f, true);
+    click(cx, w, &view, format!("ask-field {f} why"));
+    assert_eq!(keys_in(cx, w, &view, "toolu_lf"), "why", "the long field has the keys");
+    down(cx, w, "down");
+    settle(cx, w, 8);
+    assert_eq!(keys_in(cx, w, &view, "toolu_lf"), "why", "its MoveDown took the ↓");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id), "the card that waits");
+    held_down_moves_nothing(cx, w, &view, "a long field, then Ctrl+J", ("c4lquik", &input));
+    crate::app::pin_arm_clock(None);
+}
+
+/// R3-1 inside one card: a form's long field has the keys (Tab), ↓ held
+/// there, then Shift+Tab back to the card: ↓'s repeats move nothing.
+#[gpui_kit::test]
+fn a_down_held_in_the_entered_forms_long_field_never_moves_its_highlight(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let input = json!({"question": "Roll it out?", "wait": true, "options": ["Now", "Later", "Never"], "default": "Now",
+        "fields": [{"id": "why", "label": "Why", "type": "long", "optional": true}]});
+    let (w, view, id, _events) = asked(cx, "toolu_lt", "c4ltabs", &input);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    assert_eq!(keys_in(cx, w, &view, "toolu_lt"), "body");
+    press(cx, w, "tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_lt"), "why");
+    down(cx, w, "down");
+    settle(cx, w, 8);
+    press(cx, w, "shift-tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_lt"), "body");
+    assert_eq!(hi(cx, &view), Some(0), "on the default");
+    for gap in [0, 90, 1200] {
+        crate::app::advance_input_clock(Duration::from_millis(gap));
+        lost(cx, w, "down");
+        assert_eq!(hi(cx, &view), Some(0), "↓ held from the long field, a repeat with no held bit {gap} ms on, moves nothing");
+    }
+    up(cx, w, "down");
+    crate::app::next_press();
+    press(cx, w, "down");
+    assert_eq!(hi(cx, &view), Some(1), "let go, 30 ms, pressed: one down");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// Shady #86 P3-1: Cmd history, then a key-down that types text and lost
+/// its repeat bit (no key-up since: AppKit's callback can send one, mid
+/// IME composition or under an IME source), then the guards. Cmd+1 in the
+/// composer (its key-up dropped, as AppKit does), Ctrl+J, `1`: the card
+/// itself has no input handler, so that `1` said whether it repeats, and
+/// the exception takes it for a press: it answers. Once: the next `1`, no
+/// key-up between, is a repeat on the batch's next card. In a field after
+/// Cmd+2, `2` edits (digits never act there); after Cmd+Enter, an Enter
+/// mid-composition sends nothing (the field's token). Composition ended,
+/// let go and pressed, Enter sends the form.
+#[gpui_kit::test]
+fn a_cmd_chord_then_text_without_its_held_bit_acts_only_where_it_may(cx: &mut TestAppContext) {
+    let first = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"]});
+    let (w, view, q1, _events) = asked(cx, "toolu_c1", "c6cmda1", &first);
+    let second = json!({"question": "Which tag?", "wait": true, "options": ["v1", "v2"]});
+    ask_live(cx, w, &view, "toolu_c2", "c6cmda2", second.clone());
+    let form = json!({"question": "Who reviews?", "fields": [{"id": "who", "label": "Reviewer"}]});
+    ask_live(cx, w, &view, "toolu_c3", "c6cmda3", form.clone());
+    let (q2, _) = card(cx, &view, "Which tag?");
+    at_rest(cx, w, &view);
+    let cmd = |cx: &mut TestAppContext, k: &str| {
+        let ks = keystroke(cx, k);
+        let ev = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent { keystroke: ks, is_held: false, prefer_character_input: false });
+        cx.update_window(w, |_, window, cx| {
+            window.dispatch_event(ev, cx);
+        })
+        .expect("the window");
+        settle(cx, w, 8);
+    };
+    cmd(cx, "cmd-1");
+    crate::app::next_press();
+    press(cx, w, "ctrl-j");
+    // The oldest card, above the view now: brought into view, painted.
+    play(cx, w, &view);
+    assert!(entered(cx, w, q1));
+    down(cx, w, "1");
+    settle(cx, w, 8);
+    assert_eq!(texts(cx, &view), vec![message("c6cmda1", &first, json!({"choice": "main"}))], "after Cmd+1, on the card: a press");
+    play(cx, w, &view);
+    assert!(entered(cx, w, q2), "the batch's next card");
+    down(cx, w, "1");
+    settle(cx, w, 8);
+    assert_eq!(texts(cx, &view).len(), 1, "the exception is spent: no key-up since, a repeat");
+    up(cx, w, "1");
+    crate::app::next_press();
+    press(cx, w, "2");
+    assert_eq!(texts(cx, &view).len(), 2, "let go and pressed: it answers");
+    play(cx, w, &view);
+    assert_eq!(keys_in(cx, w, &view, "toolu_c3"), "who", "the form's field to fill");
+    cmd(cx, "cmd-2");
+    down(cx, w, "2");
+    settle(cx, w, 8);
+    assert_eq!(field_value(cx, &view, "toolu_c3", "who"), "2", "in a field, after Cmd+2: `2` edits");
+    assert_eq!(texts(cx, &view).len(), 2, "and acts on nothing");
+    let e = view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        v.card_drafts[&(sid, "toolu_c3".to_string())].lines["who"].clone()
+    });
+    cx.update_window(w, |_, window, cx| e.update(cx, |s, cx| s.replace_and_mark_text_in_range(None, "あ", None, window, cx)))
+        .expect("the window");
+    settle(cx, w, 8);
+    cmd(cx, "cmd-enter");
+    down(cx, w, "enter");
+    settle(cx, w, 8);
+    assert_eq!(texts(cx, &view).len(), 2, "after Cmd+Enter, an Enter mid-composition: the IME's");
+    assert_eq!(keys_in(cx, w, &view, "toolu_c3"), "who", "the field keeps the keys");
+    cx.update_window(w, |_, window, cx| e.update(cx, |s, cx| s.unmark_text(window, cx))).expect("the window");
+    settle(cx, w, 8);
+    let who = field_value(cx, &view, "toolu_c3", "who");
+    assert!(who.starts_with('2'), "{who:?}");
+    up(cx, w, "enter");
+    crate::app::next_press();
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view)[2], message("c6cmda3", &form, json!({"fields": {"who": who}})), "one Submit of the form");
+    assert_eq!(texts(cx, &view).len(), 3);
 }

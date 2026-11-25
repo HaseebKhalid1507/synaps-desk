@@ -55,7 +55,6 @@ pub(crate) fn batch<K>(items: Vec<Waiting<K>>, place: usize) -> Vec<K> {
 /// The batch a targeted entry freezes (D3's: Ctrl+Shift+J, a Waiting row,
 /// a tab dot, a notification): the card named, `first`, then the rest of
 /// [`batch`] at `place`, so its pane's other cards still follow in order.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn batch_from<K: PartialEq>(items: Vec<Waiting<K>>, place: usize, first: K) -> Vec<K> {
     let rest: Vec<K> = batch(items, place).into_iter().filter(|k| *k != first).collect();
     std::iter::once(first).chain(rest).collect()

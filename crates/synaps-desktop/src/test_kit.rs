@@ -16,6 +16,8 @@ mod answer_tests;
 mod ask_tests;
 #[path = "cards_d_tests.rs"]
 mod cards_d_tests;
+#[path = "entry_tests.rs"]
+mod entry_tests;
 #[path = "hang_tests.rs"]
 mod hang_tests;
 #[path = "held_tests.rs"]
