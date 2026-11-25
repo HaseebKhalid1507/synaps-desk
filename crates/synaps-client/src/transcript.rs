@@ -497,6 +497,31 @@ pub struct Transcript {
     /// The history landed since [`Transcript::sync_cards`]: count
     /// [`Transcript::live_cards`] again.
     recount: bool,
+    /// The cards' fold the rows draw: the history's, then the live turn's
+    /// on top ([`Transcript::cards`]).
+    card_fold: cards_spec::fold::Fold,
+    /// The length and hash of the history folded ([`Transcript::history_settled`]).
+    mirror: crate::history::HistoryMirror,
+    /// The latest `Conversation` digest since the attach (`None`: the
+    /// attach's snapshot is the latest word).
+    digest: Option<crate::protocol::ConversationDigest>,
+    /// The steer the engine holds, by the latest word (the snapshot's or
+    /// a digest's `queued_message`).
+    queued: Option<String>,
+    /// A compaction this attachment heard start has not ended.
+    compacting: bool,
+    /// The conversation was swapped (a compaction applied, a resume): the
+    /// client asks for the new history at once, and until it lands the
+    /// history held says nothing of the new one.
+    swap_pending: bool,
+    /// The daemon dropped events for this attachment
+    /// ([`crate::protocol::stream_lagged`]): the client asks for the
+    /// history again at once, and until it lands what is held may be behind
+    /// what was dropped ([`Transcript::resyncing`]).
+    resyncing: bool,
+    /// Since the daemon dropped events, no word on the engine's slot
+    /// ([`Transcript::slot_known`]).
+    slot_unknown: bool,
 }
 
 impl Transcript {
@@ -519,6 +544,85 @@ impl Transcript {
     /// A turn is running.
     pub fn busy(&self) -> bool {
         self.busy
+    }
+
+    /// The agent cards' fold, as the rows draw them: the history's, then
+    /// the live turn's on top ([`crate::cards`]). What the card memo
+    /// follows (synaps-cards §3.5); a click is checked on it too (no
+    /// replacement or close heard since), and on the history's alone
+    /// ([`Transcript::history_cards`]).
+    pub fn cards(&self) -> &cards_spec::fold::Fold {
+        &self.card_fold
+    }
+
+    /// The agent cards' fold of the history alone, without the live turn:
+    /// the bindings the history confirms. A click answers a card only
+    /// while this holds it as it was drawn, on a settled history
+    /// ([`Transcript::history_settled`]): the live rows draw a card before
+    /// the history has it, and the history wins when it lands (Shady #81
+    /// P2-1).
+    pub fn history_cards(&self) -> &cards_spec::fold::Fold {
+        self.cards.fold()
+    }
+
+    /// The history folded is the one the latest `Conversation` digest
+    /// describes, its length and hash (synaps-cards §3.5, "settled view";
+    /// [`crate::history::HistoryMirror::matches`]), or no digest came since
+    /// the attach's snapshot. After a digest that disagrees the client asks
+    /// for the history again: until it lands, not settled; nor after the
+    /// daemon said it dropped events ([`Transcript::resyncing`]).
+    pub fn history_settled(&self) -> bool {
+        !self.swap_pending && !self.resyncing && self.digest.as_ref().is_none_or(|d| self.mirror.agrees(d))
+    }
+
+    /// The daemon said it dropped events for this attachment and carried on
+    /// (its "event stream lagged" notice, [`crate::protocol::stream_lagged`]):
+    /// the turn's checkpoint and its last digest may be among them, so the
+    /// history held, and the digest before the notice, are no word on
+    /// anything since. The client asks for the history again at once
+    /// ([`crate::Client`], as after a swap); until that lands (a
+    /// `HistoryUpdate::Replace`), not settled. Everything after the notice
+    /// came after what was dropped (one ordered broadcast), so the history
+    /// that lands then is past the gap. A reattach ends it too (its
+    /// snapshot).
+    pub fn resyncing(&self) -> bool {
+        self.resyncing
+    }
+
+    /// The steer the engine holds for its next round or turn, by the latest
+    /// word (meaningful on a settled view, [`Transcript::history_settled`],
+    /// whose slot is known, [`Transcript::slot_known`]).
+    pub fn queued_message(&self) -> Option<&str> {
+        self.queued.as_deref()
+    }
+
+    /// What [`Transcript::queued_message`] says is the engine's word since
+    /// the last events the daemon dropped for this attachment, if it
+    /// dropped any. On its notice the slot is unknown: the digest that
+    /// moved it, and the echoes, may be among what was dropped, and the
+    /// history asked for again has no slot (a `Messages` reply). It is
+    /// known again only from an event on this attachment's own ordered
+    /// stream that states it, at its place: a `Conversation` digest after
+    /// the notice, a `Dequeued` after it (the daemon sends one only once
+    /// it took the slot: empty, SynapsCLI `189a5a19`,
+    /// `session/actor.rs:3512-3514` and `:3630-3632`), or an attach's
+    /// snapshot. Not `SteeringDelivered`: the daemon clears the slot only
+    /// if it holds that text, and then says so with the digest it sends
+    /// next (`:3839-3843`); nor `Steered` (a driver's leaves the slot,
+    /// `:3327`). Nothing read out of band: no query answers the slot, and
+    /// an attach on another connection can't be told from another
+    /// client's (Shady #81 round 5). Not empty: unknown. A steer read as
+    /// lost on a stale slot is sent twice when the engine holds it
+    /// (Shady #81 round 4).
+    pub fn slot_known(&self) -> bool {
+        !self.slot_unknown
+    }
+
+    /// A compaction runs: one heard to start (`CompactionStarted`), not yet
+    /// applied, failed or cancelled. An attach can't tell (its snapshot has
+    /// no flag): `false` after one.
+    pub fn compacting(&self) -> bool {
+        self.compacting
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -928,6 +1032,8 @@ impl Transcript {
         self.title = a.meta.title.clone().or_else(|| a.conversation.header.get("title").and_then(Value::as_str).map(str::to_string));
         self.cost_usd = a.conversation.cost;
         self.pending_prompts = a.pending_prompts.clone();
+        self.mirror = crate::history::HistoryMirror::new(&a.conversation.api_messages);
+        self.queued.clone_from(&a.conversation.queued_message);
         self.fold_with_notes(&a.conversation.api_messages, notes, &mut reuse);
         self.busy = a.streaming;
         self.replaying = true;
@@ -965,9 +1071,18 @@ impl Transcript {
                 if *base_len != self.history_len {
                     return Err(TranscriptError::OutOfSync { have: self.history_len, base_len: *base_len });
                 }
+                self.mirror.append(messages);
                 self.rebuild(|t| t.append_history(messages));
             }
-            HistoryUpdate::Replace { messages } => self.rebuild(|t| t.replace_history(messages)),
+            HistoryUpdate::Replace { messages } => {
+                // The history asked for again: one that still disagrees with
+                // the digest on the hash alone is trusted by its length, as
+                // the client's mirror does.
+                self.mirror.replaced(messages, self.digest.as_ref());
+                self.swap_pending = false;
+                self.resyncing = false;
+                self.rebuild(|t| t.replace_history(messages));
+            }
         }
         Ok(())
     }
@@ -979,8 +1094,10 @@ impl Transcript {
         self.rebuild(|t| {
             if messages.len() >= t.history_len {
                 let start = t.history_len;
+                t.mirror.append(&messages[start..]);
                 t.append_history(&messages[start..]);
             } else {
+                t.mirror.reset(messages);
                 t.replace_history(messages);
             }
         });
@@ -1273,9 +1390,11 @@ impl Transcript {
         // No card called anywhere and none drawn: nothing to fold (a
         // session without cards pays only this, no row read).
         if self.cards.is_empty() && !self.live_cards && self.card_rows == 0 {
+            self.card_fold = cards_spec::fold::Fold::default();
             return;
         }
-        let mut want = crate::cards::rows(&self.cards, &self.items[live..]);
+        let (mut want, fold) = crate::cards::rows(&self.cards, &self.items[live..]);
+        self.card_fold = fold;
         self.card_rows = want.len();
         let mut changed = Vec::new();
         for (ix, it) in self.items.iter_mut().enumerate() {
@@ -1548,6 +1667,11 @@ impl Transcript {
                 if let Some(t) = digest.header.get("title").and_then(Value::as_str) {
                     self.title = Some(t.to_string());
                 }
+                // A digest that matches by hash trusts the hash again.
+                self.mirror.matches(digest);
+                self.queued.clone_from(&digest.queued_message);
+                self.slot_unknown = false;
+                self.digest = Some(crate::protocol::ConversationDigest { header: Value::Null, tokens: Value::Null, ..digest.clone() });
                 self.cost_usd = digest.cost;
                 self.engine_pending = digest.pending_events_len;
                 if self.engine_pending == 0 {
@@ -1578,8 +1702,22 @@ impl Transcript {
             SessionEvent::External { event } => self.live_event(event),
             // The input owner's own steer, whatever it looks like: events
             // come as `External` and `steering_delivered`, never so.
+            // An agent card's answer (its grammar, synaps-cards §3.3): its
+            // card says where it is (queued, then answered), never its JSON.
+            SessionEvent::Steered { text, .. } if cards_spec::message::parse(text).is_some() => {}
             SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
-            SessionEvent::SystemNotice { text } => self.notice(ItemKind::Notice, text.clone()),
+            SessionEvent::SystemNotice { text } => {
+                // Events were dropped here ([`Transcript::resyncing`]): the
+                // digest before them may describe a history they moved past,
+                // and one after them is checked against the history asked
+                // for again. A replay's is a past connection's.
+                if crate::protocol::stream_lagged(text) && !self.replaying {
+                    self.resyncing = true;
+                    self.digest = None;
+                    self.slot_unknown = true;
+                }
+                self.notice(ItemKind::Notice, text.clone())
+            }
             SessionEvent::Aborted { .. } => {
                 self.busy = false;
                 self.deliver_all();
@@ -1597,6 +1735,7 @@ impl Transcript {
                 self.notice(ItemKind::Notice, "conversation cleared");
             }
             SessionEvent::Resumed { new_id, clamp_notice, .. } => {
+                self.swap_pending = true;
                 self.drop_held();
                 self.swapped = true;
                 self.journal_id.clone_from(new_id);
@@ -1605,16 +1744,31 @@ impl Transcript {
                     self.notice(ItemKind::Notice, n.clone());
                 }
             }
+            SessionEvent::CompactionStarted => self.compacting = true,
             SessionEvent::CompactionApplied { session_id, msg_count, .. } => {
+                self.compacting = false;
+                self.swap_pending = true;
                 self.swapped = true;
                 self.journal_id.clone_from(session_id);
                 self.notice(ItemKind::Notice, format!("conversation compacted ({msg_count} messages)"));
             }
             SessionEvent::CompactionFailed { message } => {
+                self.compacting = false;
                 self.stick();
                 self.notice(ItemKind::Error, format!("compaction failed: {message}"))
             }
-            SessionEvent::CompactionCancelled => self.stick(),
+            SessionEvent::CompactionCancelled => {
+                self.compacting = false;
+                self.stick();
+            }
+            // The daemon took the slot (`queued_message`) and gives its
+            // text back: empty now, at this place, dropped events or not
+            // ([`Transcript::slot_known`]). A replay's is from before the
+            // snapshot, which says the slot.
+            SessionEvent::Dequeued { .. } if !self.replaying => {
+                self.queued = None;
+                self.slot_unknown = false;
+            }
             SessionEvent::SubagentRows { rows } => self.subagents = rows.clone(),
             SessionEvent::Reloading { .. } => self.notice(ItemKind::Notice, "daemon reloading, reconnecting..."),
             _ => {}

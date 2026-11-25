@@ -60,8 +60,8 @@ pub struct Live {
     /// The session connection is being re-made (reload).
     pub reattaching: bool,
     /// Sent, not yet confirmed by `TurnStarted` / `Steered`, oldest first:
-    /// given back to the user on a refusal (the oldest) or a detach (all),
-    /// in the composer of the pane that sent it.
+    /// given back on a refusal (the oldest) or a detach (all) to what sent
+    /// it, the composer of a pane or an agent card ([`Target`]).
     pub(crate) in_flight: InFlight,
     /// The attached session's numbers (the composer's foot, the right-hand
     /// panel).
@@ -259,25 +259,43 @@ impl Live {
         self.wanted == Some(attach_seq)
     }
 
+    /// An agent card's answer `text` went to the daemon (synaps-cards
+    /// §3.5): its echo or refusal is its card's, never a composer's.
+    pub(crate) fn card_sent(&mut self, card: cards_spec::CardId, text: String) {
+        self.in_flight.push(Target::Card(card), text);
+    }
+
     /// A refusal: the oldest unconfirmed text was refused (the daemon
     /// handles input in order, and earlier echoes confirmed the rest).
-    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) {
-        if let Some((pane, t)) = self.in_flight.pop_front() {
-            effects.push(Effect::Restore(pane, t));
+    /// A composer's goes back to it; a card's is the card's: `true` (its
+    /// memo hears the refusal, [`crate::deliver`]).
+    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> bool {
+        match self.in_flight.pop_front() {
+            Some((Target::Pane(pane), t)) => {
+                effects.push(Effect::Restore(pane, t));
+                false
+            }
+            Some((Target::Card(_), _)) => true,
+            None => false,
         }
     }
 
+    /// A detach: every composer's text back to it. A card's answer stays
+    /// its card's: its memo settles it when the session is back
+    /// (`Attached`), or says it couldn't tell (synaps-cards §3.5).
     pub(crate) fn give_back_all(&mut self, effects: &mut Vec<Effect>) {
         // One text per pane, in the order sent: each to its own composer.
         let all = self.in_flight.take();
         let mut panes: Vec<PaneId> = Vec::new();
         for (p, _) in &all {
-            if !panes.contains(p) {
+            if let Target::Pane(p) = p
+                && !panes.contains(p)
+            {
                 panes.push(*p);
             }
         }
         for p in panes {
-            let texts: Vec<&str> = all.iter().filter(|(q, _)| *q == p).map(|(_, t)| t.as_str()).collect();
+            let texts: Vec<&str> = all.iter().filter(|(q, _)| *q == Target::Pane(p)).map(|(_, t)| t.as_str()).collect();
             effects.push(Effect::Restore(p, texts.join("\n")));
         }
     }
@@ -298,11 +316,21 @@ pub(crate) fn pend(pending: &mut Option<Splice>, sp: Splice) {
     });
 }
 
-/// Input sent and not yet confirmed, oldest first, each with the pane
-/// that sent it (split/architecture.md §6.5): a refusal or a detach gives
-/// it back to that pane's composer, never another's.
+/// What sent a text in flight, and so gets it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A pane's composer.
+    Pane(PaneId),
+    /// An agent card of the store's session (synaps-cards §3.5): its
+    /// answer is never given to a composer.
+    Card(cards_spec::CardId),
+}
+
+/// Input sent and not yet confirmed, oldest first, each with what sent it
+/// (split/architecture.md §6.5): a refusal or a detach gives it back to
+/// that pane's composer, never another's, or to its card.
 #[derive(Default, Debug)]
-pub(crate) struct InFlight(VecDeque<(PaneId, String)>);
+pub(crate) struct InFlight(VecDeque<(Target, String)>);
 
 impl InFlight {
     /// The texts, oldest first (tests).
@@ -312,10 +340,14 @@ impl InFlight {
     }
 
     pub(crate) fn push_back(&mut self, pane: PaneId, text: String) {
-        self.0.push_back((pane, text));
+        self.push(Target::Pane(pane), text);
     }
 
-    pub(crate) fn pop_front(&mut self) -> Option<(PaneId, String)> {
+    pub(crate) fn push(&mut self, target: Target, text: String) {
+        self.0.push_back((target, text));
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<(Target, String)> {
         self.0.pop_front()
     }
 
@@ -333,13 +365,13 @@ impl InFlight {
     /// Pane `from` left the store (closed, or on another session now):
     /// what it sent is pane `to`'s (Shady #36 L5, r2 L-c).
     pub(crate) fn rehome(&mut self, from: PaneId, to: PaneId) {
-        for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == from) {
-            *p = to;
+        for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == Target::Pane(from)) {
+            *p = Target::Pane(to);
         }
     }
 
     /// Everything, oldest first; none left.
-    pub(crate) fn take(&mut self) -> Vec<(PaneId, String)> {
+    pub(crate) fn take(&mut self) -> Vec<(Target, String)> {
         std::mem::take(&mut self.0).into()
     }
 }

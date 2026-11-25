@@ -211,6 +211,114 @@ fn attached_with_history_renders() {
     assert!(t.items().iter().any(|i| i.text.contains("```python")));
 }
 
+/// Shady #81 round 4: the notice leaves the engine's slot unknown, not
+/// empty, and not the last digest's (here it held "A"): the history asked
+/// for again has no slot. Only an event on this stream that states it
+/// says it, at its place (round 6): a digest after the notice, a
+/// `Dequeued` (the daemon took the slot: empty), or an attach's snapshot.
+/// A `SteeringDelivered` or a `Steered` doesn't. A replay's notice is a
+/// past connection's, and a replay's `Dequeued` is from before the
+/// snapshot, which says the slot.
+#[test]
+fn a_lag_notice_leaves_the_slot_unknown_until_a_word_after_it() {
+    let ev = |v: serde_json::Value| decode_event(&v).unwrap();
+    let a = attached("attached_history.json");
+    let held = a.conversation.api_messages.clone();
+    let digest = |q: Option<&str>| {
+        ev(
+            serde_json::json!({"ev": "conversation", "digest": {"messages_len": held.len(), "messages_hash": messages_hash(&held), "queued_message": q}}),
+        )
+    };
+    let lag = |n: u32| ev(serde_json::json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")}));
+    let mut t = Transcript::new();
+    t.load_attached(&a).unwrap();
+    assert!(t.slot_known() && t.queued_message().is_none(), "the snapshot's");
+    t.apply(&digest(Some("A")));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, Some("A")));
+    t.apply(&lag(4));
+    assert!(!t.slot_known(), "the notice");
+    t.apply_update(&HistoryUpdate::Replace { messages: held.clone() }).unwrap();
+    assert!(t.history_settled() && !t.slot_known(), "the history asked for again has no slot");
+    t.apply(&digest(None));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a digest after it");
+    t.apply(&digest(Some("B")));
+    t.apply(&lag(2));
+    t.apply(&ev(serde_json::json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": "B"}})));
+    assert!(!t.slot_known(), "a SteeringDelivered: the slot cleared only if it held that, and a digest then says so");
+    t.apply(&ev(serde_json::json!({"ev": "steered", "text": "C", "delivered": true})));
+    assert!(!t.slot_known(), "a Steered: a driver's leaves the slot");
+    t.apply(&ev(serde_json::json!({"ev": "dequeued", "text": "C"})));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a Dequeued: taken, empty");
+    t.apply(&digest(Some("D")));
+    t.apply(&ev(serde_json::json!({"ev": "dequeued", "text": "D"})));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a Dequeued, no gap: empty too");
+    t.apply(&lag(1));
+    t.load_attached(&a).unwrap();
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "an attach's snapshot");
+    let mut v: serde_json::Value = serde_json::from_str(fixture("attached_history.json").trim()).unwrap();
+    v["replay"] = serde_json::json!([{"session_id": a.meta.id, "seq": 1, "ts": "t",
+        "event": {"ev": "system_notice", "text": "event stream lagged; 5 dropped"}}]);
+    let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    t.load_attached(&replayed).unwrap();
+    assert!(t.slot_known(), "a replay's notice");
+    v["conversation"]["queued_message"] = serde_json::json!("Q");
+    v["replay"] = serde_json::json!([{"session_id": a.meta.id, "seq": 1, "ts": "t", "event": {"ev": "dequeued", "text": "P"}}]);
+    let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    t.load_attached(&replayed).unwrap();
+    assert_eq!((t.slot_known(), t.queued_message()), (true, Some("Q")), "a replay's Dequeued: the snapshot's slot");
+}
+
+/// The daemon's "event stream lagged" notice (events dropped for this
+/// client): said as a notice, and not settled until the history asked for
+/// again lands. The digest from before the notice is no word on that
+/// history (here one the gap moved past); a digest after it alone doesn't
+/// settle it, and one the history then outgrew waits for the next. A
+/// replay's notice is a past connection's; an attach's snapshot is fresh.
+#[test]
+fn a_lag_notice_unsettles_until_the_history_asked_for_again() {
+    let ev = |v: serde_json::Value| decode_event(&v).unwrap();
+    let digest = |m: &[serde_json::Value]| {
+        ev(serde_json::json!({"ev": "conversation", "digest": {"messages_len": m.len(), "messages_hash": messages_hash(m)}}))
+    };
+    let lag = |n: u32| ev(serde_json::json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")}));
+    let more = |m: &[serde_json::Value], n: usize| {
+        let mut m = m.to_vec();
+        for i in 0..n {
+            m.push(serde_json::json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("after the gap {i}")}));
+        }
+        m
+    };
+    let a = attached("attached_history.json");
+    let held = a.conversation.api_messages.clone();
+    let mut t = Transcript::new();
+    t.load_attached(&a).unwrap();
+    t.apply(&digest(&held));
+    assert!(t.history_settled() && !t.resyncing());
+    t.apply(&lag(12));
+    assert!(t.resyncing() && !t.history_settled(), "the notice");
+    assert_eq!(t.items().last().map(|i| (i.kind, i.text.as_str())), Some((ItemKind::Notice, "event stream lagged; 12 dropped")));
+    let after = more(&held, 2);
+    t.apply_update(&HistoryUpdate::Replace { messages: after.clone() }).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "the history asked for again, past the digest before the gap");
+    t.apply(&lag(3));
+    t.apply(&digest(&after));
+    assert!(!t.history_settled(), "a digest after the notice alone");
+    let later = more(&after, 2);
+    t.apply_update(&HistoryUpdate::Replace { messages: later.clone() }).unwrap();
+    assert!(!t.resyncing() && !t.history_settled(), "the history outgrew that digest");
+    t.apply(&digest(&later));
+    assert!(t.history_settled(), "its own");
+    t.apply(&lag(1));
+    t.load_attached(&a).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "an attach's snapshot");
+    let mut v: serde_json::Value = serde_json::from_str(fixture("attached_history.json").trim()).unwrap();
+    v["replay"] = serde_json::json!([{"session_id": a.meta.id, "seq": 1, "ts": "t",
+        "event": {"ev": "system_notice", "text": "event stream lagged; 5 dropped"}}]);
+    let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    t.load_attached(&replayed).unwrap();
+    assert!(t.history_settled() && !t.resyncing(), "a replay's notice");
+}
+
 /// API 6: a `Digest` attach is refused, not silently rendered empty.
 #[test]
 fn a_digest_attach_is_refused() {

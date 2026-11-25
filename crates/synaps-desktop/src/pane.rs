@@ -133,6 +133,11 @@ pub struct Pane {
     /// summary, each on its own spring ([`FoldGap`], [`AppView::fold_gap_now`];
     /// a second fold never cuts the first: Shady #23 r3 M2).
     pub(crate) fold_gap: RefCell<Vec<FoldGap>>,
+    /// When each agent card's control was first painted in view in this
+    /// pane, actionable: it acts [`crate::app::ARM`] after (synaps-cards
+    /// §6.1: "a click acts only once the button is armed";
+    /// [`crate::ask::probe`]).
+    pub(crate) ask_shown: crate::ask::Shown,
     /// A body the user opened or closed (S1) ([`BodyHold`]).
     pub(crate) body_hold: Cell<Option<BodyHold>>,
     /// The user's scroll while an answered card folds: the room it leaves
@@ -460,6 +465,7 @@ impl Pane {
             list_gen: 0,
             fold_slack: Rc::new(Cell::new(None)),
             fold_gap: RefCell::new(Vec::new()),
+            ask_shown: Default::default(),
             body_hold: Cell::new(None),
             touch_kept: Cell::new(false),
             metrics_gen: 0,

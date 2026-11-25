@@ -1600,7 +1600,7 @@ impl AppView {
             Kind::Work => self.render_work(item, row, d.id, &p, &m, lay, cx),
             Kind::Day => day_line(d, &p, &m),
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
-            Kind::Ask => self.render_ask(item, d.id, &p, &m),
+            Kind::Ask => self.render_ask(item, d.id, &p, &m, cx),
             Kind::Answer => self.render_answer(item, d.id, &p, &m),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws

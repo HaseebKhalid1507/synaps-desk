@@ -651,6 +651,27 @@ fn attach_sid(attach_seq: u64) -> Vec<Event> {
     out
 }
 
+/// How long the synthetic daemon takes to echo an agent card's answer,
+/// and then to reply ([`card_answered`]).
+pub(crate) const ECHO_AFTER: std::time::Duration = std::time::Duration::from_millis(700);
+pub(crate) const REPLY_AFTER: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// The synthetic daemon's reply to an agent card's answer `text`, sent on
+/// `attach_seq` to `session_id` (`--offline`): its echo (the turn it
+/// starts, the session idle), then the agent's line and the turn's end.
+pub fn card_answered(attach_seq: u64, session_id: &str, text: &str) -> (Vec<Event>, Vec<Event>) {
+    let ev = |raw: Value| decode_event(&raw).ok().map(|e| Event::session(attach_seq, session_id, 0, e, Arc::new(raw)));
+    let echo = [json!({"ev": "turn_started", "turn_baseline": 0, "trigger": "user", "user_text": text})];
+    let line = "Thanks, carrying on with that.";
+    let reply = [
+        json!({"ev": "stream", "event": {"kind": "llm", "llm": "response_start"}}),
+        json!({"ev": "stream", "event": {"kind": "llm", "llm": "text", "text": line}}),
+        json!({"ev": "stream", "event": {"kind": "session", "session": "done"}}),
+        json!({"ev": "idle"}),
+    ];
+    (echo.into_iter().filter_map(ev).collect(), reply.into_iter().filter_map(ev).collect())
+}
+
 /// A `cards_ui` call and the result the `cards` extension writes for it,
 /// card id `card` (cards-spec's envelope: the digest of the doc it drew).
 fn asked(out: &mut Vec<Value>, tool: &str, card: &str, text: Option<&str>, input: Value) {
@@ -760,7 +781,7 @@ fn asks() -> Vec<Value> {
 fn ask_form() -> Vec<Value> {
     let mut out = vec![json!({"role": "user", "content": "Plan the token backfill with me before you run anything."})];
     let plan = json!({"question": "How should the backfill run?", "wait": true,
-        "detail": "About 2.4 million tokens. The file store stays readable until the cut-over.",
+        "detail": "About **2.4 million** tokens. The file store stays readable until the cut-over.\n- each batch is *verified* before the next\n- a failed batch rolls back with `relay rollback`",
         "options": [{"label": "In batches", "hint": "a pause between each"}, {"label": "All at once", "hint": "locks the table for about 3 minutes"}],
         "default": "In batches",
         "fields": [

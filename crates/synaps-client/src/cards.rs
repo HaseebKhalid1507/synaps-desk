@@ -55,6 +55,9 @@ pub enum CardRow {
 /// A card: what it asks, and where it stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ask {
+    /// Its call's tool id: the card in [`crate::Transcript::cards`]
+    /// (`Fold::card`), which an answer is checked against.
+    pub tool_id: String,
     /// The normalized doc (`cards_spec::parse_input`), as the extension
     /// validated it.
     pub doc: Arc<CardDoc>,
@@ -113,6 +116,11 @@ impl HistoryCards {
     /// No card call in the history.
     pub(crate) fn is_empty(&self) -> bool {
         !self.called
+    }
+
+    /// The fold of the history alone.
+    pub(crate) fn fold(&self) -> &Fold {
+        &self.fold
     }
 
     /// Read event `e`, drawn on `row` (a result's: none).
@@ -191,8 +199,8 @@ fn result_text(content: &Value) -> Option<String> {
 
 /// What each row draws: the history's fold, then the live rows (`live`,
 /// the rows after the history's) read on top, in the order their events
-/// came. By row id.
-pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> HashMap<u64, CardRow> {
+/// came. By row id; and that fold.
+pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> (HashMap<u64, CardRow>, Fold) {
     // The live events, each with its place in the stream: a call once its
     // input is whole (the history never holds a call that is still
     // streaming), a card call's result (no other binds: it is nothing to
@@ -227,6 +235,7 @@ pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> HashMap<u64, CardRo
         let (Some(doc), Some(r)) = (c.doc.as_ref().filter(|_| c.state != State::Plain), row(c.at)) else { continue };
         let doc = Arc::new(doc.clone());
         let ask = Ask {
+            tool_id: c.tool_id.clone(),
             doc: doc.clone(),
             wait: c.wait,
             id: c.id.clone(),
@@ -244,7 +253,7 @@ pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> HashMap<u64, CardRo
     for (r, doc) in &read.closes {
         out.insert(*r, CardRow::Close(Closed { doc: doc.clone() }));
     }
-    out
+    (out, read.fold)
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
 mod agent_surface;
+mod answer;
 mod app;
 mod ask;
 mod authorize;
@@ -42,7 +43,9 @@ mod chart;
 mod choice;
 mod chrome;
 mod dash;
+mod deliver;
 mod demo;
+mod detail;
 mod diag;
 mod dnd;
 mod events;
