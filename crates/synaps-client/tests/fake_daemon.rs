@@ -419,124 +419,47 @@ async fn a_lag_notice_asks_for_the_history_again() {
     client.shutdown().unwrap();
 }
 
-/// A slot probe's observer: its `Attach` (an `Observe` of `SID`, a
-/// digest's history), answered as observer `client` with `queued` in the
-/// engine's slot; then its `Detach`, and its goodbye.
-async fn observed(mut p: Conn, client: u64, queued: Option<&str>) {
-    assert_eq!((p.attach["attach"].as_str(), p.attach["session_id"].as_str()), (Some("existing"), Some(SID)));
-    assert_eq!((p.attach["mode"].as_str(), p.hello["client"]["history"].as_str()), (Some("observe"), Some("digest")), "an observer");
-    let mut a = attached_frame(client);
-    a["input_owner"] = json!(2);
-    a["conversation"]["queued_message"] = json!(queued);
-    p.send(a).await;
-    assert_eq!(p.recv_cmd().await, json!({"cmd": "detach", "client": client}), "detached at once");
-}
-
-/// The next `Event::Slot`, and the `ClientJoined` right before it, if
-/// the event before it was one; or, `marker` (a notice's text) first,
-/// `None`.
-async fn next_slot(events: &async_channel::Receiver<Event>, marker: &str) -> Option<(Option<String>, Option<u64>)> {
-    let mut last = None;
-    wait(events, marker, |e| match e {
-        Event::Slot { queued, .. } => Some(Some((queued.clone(), last))),
-        Event::Session { event: synaps_client::SessionEvent::SystemNotice { text }, .. } if text == marker => Some(None),
-        Event::Session { event: synaps_client::SessionEvent::ClientJoined { client, .. }, .. } => {
-            last = Some(*client);
-            None
-        }
-        Event::Session { .. } => {
-            last = None;
-            None
-        }
-        _ => None,
-    })
-    .await
-}
-
-/// Shady #81 round 4: a lag notice leaves the engine's slot unknown (its
-/// digest, and the echoes that moved it, may be among what was dropped),
-/// and no query answers it. The client reads it from the snapshot of an
-/// observer on a connection of its own, detached at once, and puts it
-/// where that observer's `ClientJoined` comes on the attachment's stream
-/// (the actor takes the snapshot and broadcasts the join in one step): a
-/// reply waits for its join, and a join before its reply is its place all
-/// the same. A reply whose join didn't come before another notice is read
-/// again, and so is one out at a notice whose join came before it; a
-/// digest after the notice says the slot itself. A probe that fails
-/// leaves it unknown, and the app's `resync` (its "Check again") reads it
-/// again. (The reply and the join come on two sockets: a short wait has
-/// one in first where the order is the point.)
+/// Shady #81 round 5: after a lag notice nothing reads the engine's slot
+/// out of band. The client asks for the history on this attachment's own
+/// connection, and "Check again" (`resync`) asks for it again there once
+/// the reply is in (with one out it asks nothing more). Nothing else: no
+/// other connection, no attach, no detach. At SynapsCLI `189a5a19` an
+/// attach on a second connection takes the first `Attached` the session
+/// broadcasts (`daemon/conn.rs:574-587`), maybe another client's, and its
+/// `Detach` would detach that client; a reattach's `Detach` can move
+/// input or revoke a driver.
 #[tokio::test]
-async fn a_lag_notice_reads_the_slot_again_from_an_observer() {
-    let mut fake = Fake::start("slot").await;
+async fn a_lag_notice_and_check_again_ask_for_the_history_on_this_connection_alone() {
+    let mut fake = Fake::start("lagonly").await;
     let (client, events) = fake.client();
     let seq = client.attach(SID, AttachMode::Mirror).unwrap();
-    let conn = attached(&mut fake, &events, 2).await;
-    let lag = |n: u64| json!({"ev": "system_notice", "text": format!("event stream lagged; {n} dropped")});
-    let joined = |c: u64| json!({"ev": "client_joined", "client": c, "kind": "attach", "name": "tester", "mode": "observe"});
-    let note = |s: &str| json!({"ev": "system_notice", "text": s});
-    let settle = || tokio::time::sleep(Duration::from_millis(150));
-
-    // Its reply first: nothing until its place, then right after it.
-    conn.event(u64::MAX, lag(9)).await;
-    observed(fake.next_attach().await, 9, Some("A")).await;
-    settle().await;
-    conn.event(30, note("replied")).await;
-    assert_eq!(next_slot(&events, "replied").await, None, "not before its place");
-    conn.event(31, joined(9)).await;
-    assert_eq!(next_slot(&events, "-").await, Some((Some("A".into()), Some(9))), "right after its join");
-
-    // Its place first, then its reply.
-    conn.event(u64::MAX, lag(3)).await;
-    let p = fake.next_attach().await;
-    conn.event(32, joined(10)).await;
-    conn.event(33, note("joined first")).await;
-    assert_eq!(next_slot(&events, "joined first").await, None);
-    observed(p, 10, None).await;
-    assert_eq!(next_slot(&events, "-").await, Some((None, None)), "at its reply, its place passed");
-
-    // A reply, then another gap before its join: maybe from before that
-    // gap, so read again; the first never placed.
-    conn.event(u64::MAX, lag(4)).await;
-    observed(fake.next_attach().await, 11, Some("B")).await;
-    settle().await;
-    conn.event(u64::MAX, lag(5)).await;
-    observed(fake.next_attach().await, 12, None).await;
-    conn.event(34, joined(11)).await;
-    conn.event(35, joined(12)).await;
-    assert_eq!(next_slot(&events, "-").await.map(|s| s.0), Some(None), "the second's");
-
-    // A digest after the notice says the slot: the probe out is nobody's.
-    conn.event(u64::MAX, lag(6)).await;
-    let p = fake.next_attach().await;
-    conn.event(36, json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": 0, "queued_message": "C"}})).await;
-    observed(p, 13, Some("D")).await;
-    conn.event(37, joined(13)).await;
-    settle().await;
-    conn.event(38, note("a digest")).await;
-    assert_eq!(next_slot(&events, "a digest").await, None, "the digest's word stands");
-
-    // Out at a notice, its join before it: from before that gap.
-    conn.event(u64::MAX, lag(7)).await;
-    let p = fake.next_attach().await;
-    conn.event(39, joined(14)).await;
-    conn.event(u64::MAX, lag(8)).await;
-    settle().await;
-    observed(p, 14, Some("E")).await;
-    observed(fake.next_attach().await, 15, None).await;
-    conn.event(40, joined(15)).await;
-    assert_eq!(next_slot(&events, "-").await.map(|s| s.0), Some(None), "read again, never the one from before");
-
-    // A probe that fails: unknown until the app asks again.
-    conn.event(u64::MAX, lag(9)).await;
-    let p = fake.next_attach().await;
-    p.send(json!({"type": "refused", "reason": {"reason": "unknown_session"}, "message": "no live session"})).await;
-    drop(p);
-    settle().await;
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let messages = |q: &Value| (q["cmd"].as_str().map(str::to_string), q["query"]["query"].as_str().map(str::to_string));
+    let history = |events: &async_channel::Receiver<Event>| {
+        let events = events.clone();
+        async move { wait(&events, "the history", |e| matches!(e, Event::History { .. }).then_some(())).await }
+    };
+    let now = vec![json!({"content": "go", "role": "user"}), json!({"content": [{"text": "done", "type": "text"}], "role": "assistant"})];
+    conn.event(u64::MAX, json!({"ev": "system_notice", "text": "event stream lagged; 9 dropped"})).await;
+    let q = conn.recv_cmd().await;
+    assert_eq!(messages(&q), (Some("query".into()), Some("messages".into())), "the history, on this connection");
     client.on(seq).resync().unwrap();
-    observed(fake.next_attach().await, 16, Some("F")).await;
-    conn.event(41, joined(16)).await;
-    assert_eq!(next_slot(&events, "-").await, Some((Some("F".into()), Some(16))), "asked again, read again");
+    conn.event(40, json!({"ev": "query_result", "id": q["id"], "value": now})).await;
+    history(&events).await;
+    client.on(seq).resync().unwrap();
+    let again = conn.recv_cmd().await;
+    assert_eq!(messages(&again), (Some("query".into()), Some("messages".into())), "Check again: the history again, here");
+    conn.event(41, json!({"ev": "query_result", "id": again["id"], "value": now})).await;
+    history(&events).await;
+    client.submit("x").unwrap();
+    assert_eq!(conn.recv_cmd().await["cmd"], "submit", "nothing else on this connection: no second query, no detach");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fake.attaches.try_recv().is_err(), "no other attach");
+    let mut connections = 0;
+    while fake.accepted.try_recv().is_ok() {
+        connections += 1;
+    }
+    assert_eq!(connections, 2, "the control connection and this attachment's, no other");
     client.shutdown().unwrap();
 }
 

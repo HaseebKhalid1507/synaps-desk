@@ -853,15 +853,16 @@ impl AppView {
             };
             let mut out = receipt(a, Some(&e.reply), look, id, p, m);
             if lost && let Some(painted) = Painted::of(a) {
-                // Dropped events: nothing is checked until the history and
-                // the slot are read again (`deliver`'s "Dropped events");
-                // past the wait, "Check again" where Resend would be.
+                // Dropped events: nothing is checked until the history is
+                // in again and an event has said the slot (`deliver`'s
+                // "Dropped events"); past the wait, the agent may have it,
+                // and "Check again" where Resend would be.
                 let gate = l
                     .input_gate()
                     .err()
                     .map(str::to_string)
-                    .or_else(|| crate::deliver::recovering(&l.transcript).then(|| self.model.memos.gap(s).to_string()));
-                let again = gate.as_deref() == Some(crate::deliver::UNCHECKED);
+                    .or_else(|| crate::deliver::recovering(&l.transcript).then(|| self.model.memos.answer_gap(s).to_string()));
+                let again = gate.as_deref() == Some(crate::deliver::MAY_HAVE_IT);
                 let resend = e.state == MemoState::Unconfirmed;
                 let can = gate.is_none()
                     && fold.is_some_and(|c| {
@@ -920,8 +921,8 @@ impl AppView {
                 let why = match l.input_gate() {
                     Err(e) => Some(read_only(e, l)),
                     Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
-                    // Dropped events: the history and the slot read again
-                    // first.
+                    // Dropped events: the history in again, and the slot
+                    // said, first.
                     Ok(()) if crate::deliver::recovering(&l.transcript) => {
                         Some(session.as_deref().map_or(crate::deliver::RESYNCING, |s| self.model.memos.gap(s)).to_string())
                     }

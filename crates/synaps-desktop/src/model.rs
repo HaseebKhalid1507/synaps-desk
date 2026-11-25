@@ -1570,7 +1570,7 @@ impl Model {
             ev => ev,
         };
         self.view_dirty = true;
-        if !matches!(ev, Event::Session { .. } | Event::History { .. } | Event::Slot { .. }) {
+        if !matches!(ev, Event::Session { .. } | Event::History { .. }) {
             self.rail_gen += 1;
         }
 
@@ -1892,10 +1892,12 @@ impl Model {
                     if let Some(h) = heard {
                         self.memos.on(&sid, h, now);
                     }
-                    // The view after it, but not after a `Dequeued`: the
-                    // digest that says what the cancel left comes next (and
-                    // the history after it), and until then the view still
-                    // shows the withdrawn answer in the slot (§3.4 d4).
+                    // The view after it, but not after a `Dequeued`: what
+                    // the cancel left comes next (its history and digest, or
+                    // at once its `Idle`: a cancelled compaction sends no
+                    // digest, SynapsCLI `189a5a19` `actor.rs:3508-3518`), and
+                    // the memo reads it there (§3.4 d4). The slot is empty
+                    // from the `Dequeued` on (`Transcript::slot_known`).
                     if !matches!(heard, Some(cards_spec::memo::Event::Dequeued { .. })) {
                         self.memos.observe(&sid, &self.lives[lid].transcript, now);
                     }
@@ -1914,14 +1916,6 @@ impl Model {
                     if let Some(a) = self.lives[lid].active.as_ref() {
                         self.memos.observe(&a.session_id, &self.lives[lid].transcript, std::time::Instant::now());
                     }
-                }
-            }
-            // The engine's slot read again after dropped events: the cards
-            // check what they had out on it (`deliver`'s "Dropped events").
-            Event::Slot { attach_seq, queued, .. } if self.lives[lid].current(attach_seq) => {
-                self.lives[lid].transcript.apply_slot(queued);
-                if let Some(a) = self.lives[lid].active.as_ref() {
-                    self.memos.observe(&a.session_id, &self.lives[lid].transcript, std::time::Instant::now());
                 }
             }
             Event::Detached { attach_seq, reason, .. } if self.lives[lid].current(attach_seq) => {

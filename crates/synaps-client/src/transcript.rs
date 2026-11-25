@@ -601,21 +601,21 @@ impl Transcript {
     /// dropped any. On its notice the slot is unknown: the digest that
     /// moved it, and the echoes, may be among what was dropped, and the
     /// history asked for again has no slot (a `Messages` reply). It is
-    /// known again from a `Conversation` digest after the notice (one
-    /// ordered stream), a reattach's snapshot, or the slot read again
-    /// ([`crate::Event::Slot`], at its place among the events:
-    /// [`Transcript::apply_slot`]). Not empty: unknown. A steer read as
+    /// known again only from an event on this attachment's own ordered
+    /// stream that states it, at its place: a `Conversation` digest after
+    /// the notice, a `Dequeued` after it (the daemon sends one only once
+    /// it took the slot: empty, SynapsCLI `189a5a19`,
+    /// `session/actor.rs:3512-3514` and `:3630-3632`), or an attach's
+    /// snapshot. Not `SteeringDelivered`: the daemon clears the slot only
+    /// if it holds that text, and then says so with the digest it sends
+    /// next (`:3839-3843`); nor `Steered` (a driver's leaves the slot,
+    /// `:3327`). Nothing read out of band: no query answers the slot, and
+    /// an attach on another connection can't be told from another
+    /// client's (Shady #81 round 5). Not empty: unknown. A steer read as
     /// lost on a stale slot is sent twice when the engine holds it
     /// (Shady #81 round 4).
     pub fn slot_known(&self) -> bool {
         !self.slot_unknown
-    }
-
-    /// The engine's slot read again after dropped events
-    /// ([`crate::Event::Slot`]): known now.
-    pub fn apply_slot(&mut self, queued: Option<String>) {
-        self.queued = queued;
-        self.slot_unknown = false;
     }
 
     /// A compaction runs: one heard to start (`CompactionStarted`), not yet
@@ -1760,6 +1760,14 @@ impl Transcript {
             SessionEvent::CompactionCancelled => {
                 self.compacting = false;
                 self.stick();
+            }
+            // The daemon took the slot (`queued_message`) and gives its
+            // text back: empty now, at this place, dropped events or not
+            // ([`Transcript::slot_known`]). A replay's is from before the
+            // snapshot, which says the slot.
+            SessionEvent::Dequeued { .. } if !self.replaying => {
+                self.queued = None;
+                self.slot_unknown = false;
             }
             SessionEvent::SubagentRows { rows } => self.subagents = rows.clone(),
             SessionEvent::Reloading { .. } => self.notice(ItemKind::Notice, "daemon reloading, reconnecting..."),

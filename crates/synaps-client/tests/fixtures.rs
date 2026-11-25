@@ -213,9 +213,12 @@ fn attached_with_history_renders() {
 
 /// Shady #81 round 4: the notice leaves the engine's slot unknown, not
 /// empty, and not the last digest's (here it held "A"): the history asked
-/// for again has no slot. A digest after the notice says it; so does the
-/// slot read again (`Event::Slot`), or an attach's snapshot. A replay's
-/// notice is a past connection's.
+/// for again has no slot. Only an event on this stream that states it
+/// says it, at its place (round 6): a digest after the notice, a
+/// `Dequeued` (the daemon took the slot: empty), or an attach's snapshot.
+/// A `SteeringDelivered` or a `Steered` doesn't. A replay's notice is a
+/// past connection's, and a replay's `Dequeued` is from before the
+/// snapshot, which says the slot.
 #[test]
 fn a_lag_notice_leaves_the_slot_unknown_until_a_word_after_it() {
     let ev = |v: serde_json::Value| decode_event(&v).unwrap();
@@ -238,9 +241,17 @@ fn a_lag_notice_leaves_the_slot_unknown_until_a_word_after_it() {
     assert!(t.history_settled() && !t.slot_known(), "the history asked for again has no slot");
     t.apply(&digest(None));
     assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a digest after it");
+    t.apply(&digest(Some("B")));
     t.apply(&lag(2));
-    t.apply_slot(Some("B".into()));
-    assert_eq!((t.slot_known(), t.queued_message()), (true, Some("B")), "read again");
+    t.apply(&ev(serde_json::json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": "B"}})));
+    assert!(!t.slot_known(), "a SteeringDelivered: the slot cleared only if it held that, and a digest then says so");
+    t.apply(&ev(serde_json::json!({"ev": "steered", "text": "C", "delivered": true})));
+    assert!(!t.slot_known(), "a Steered: a driver's leaves the slot");
+    t.apply(&ev(serde_json::json!({"ev": "dequeued", "text": "C"})));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a Dequeued: taken, empty");
+    t.apply(&digest(Some("D")));
+    t.apply(&ev(serde_json::json!({"ev": "dequeued", "text": "D"})));
+    assert_eq!((t.slot_known(), t.queued_message()), (true, None), "a Dequeued, no gap: empty too");
     t.apply(&lag(1));
     t.load_attached(&a).unwrap();
     assert_eq!((t.slot_known(), t.queued_message()), (true, None), "an attach's snapshot");
@@ -250,6 +261,11 @@ fn a_lag_notice_leaves_the_slot_unknown_until_a_word_after_it() {
     let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
     t.load_attached(&replayed).unwrap();
     assert!(t.slot_known(), "a replay's notice");
+    v["conversation"]["queued_message"] = serde_json::json!("Q");
+    v["replay"] = serde_json::json!([{"session_id": a.meta.id, "seq": 1, "ts": "t", "event": {"ev": "dequeued", "text": "P"}}]);
+    let DaemonFrame::Attached(replayed) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    t.load_attached(&replayed).unwrap();
+    assert_eq!((t.slot_known(), t.queued_message()), (true, Some("Q")), "a replay's Dequeued: the snapshot's slot");
 }
 
 /// The daemon's "event stream lagged" notice (events dropped for this

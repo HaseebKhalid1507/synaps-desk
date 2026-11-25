@@ -722,26 +722,36 @@ fn a_cards_options_measured_or_clipped_off_screen_arm_once_in_view(cx: &mut Test
     crate::app::pin_arm_clock(None);
 }
 
+/// After dropped events: the history asked for again (the demo's), and
+/// then, unless `history_only`, a digest on the stream that says the slot
+/// (empty).
+fn resynced(cx: &mut TestAppContext, view: &Entity<AppView>, history_only: bool) {
+    let (seq, sid) = attachment(cx, view);
+    let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
+        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+        other => panic!("{other:?}"),
+    };
+    let d = json!({"ev": "conversation", "digest": {"messages_len": messages.len(),
+        "messages_hash": synaps_client::history::messages_hash(&messages), "queued_message": null}});
+    let update = synaps_client::HistoryUpdate::Replace { messages };
+    view.update(cx, |v, cx| {
+        let mut batch = vec![synaps_client::Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update }];
+        if !history_only {
+            batch.push(synaps_client::Event::session(seq, sid, 0, decode_event(&d).unwrap(), Arc::new(d)));
+        }
+        v.apply_batch(batch, cx)
+    });
+}
+
 /// Shady #81 round 3: the daemon dropped events for this desk (its lag
-/// notice). Until the history asked for again lands, and the engine's
-/// slot is read again (round 5), a card's controls wait, saying why, and
-/// a click sends nothing; then one click answers. Unconfirmed, and
-/// another gap: its Resend waits too, its line saying why.
+/// notice). Until the history asked for again lands, and an event after
+/// the notice says the engine's slot (round 6: here a digest), a card's
+/// controls wait, saying why, and a click sends nothing; then one click
+/// answers. Unconfirmed, and another gap: its Resend waits too, its line
+/// saying why.
 #[gpui_kit::test]
 fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut TestAppContext) {
     let lag = || vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})];
-    let resynced = |cx: &mut TestAppContext, view: &Entity<AppView>| {
-        let (seq, sid) = attachment(cx, view);
-        let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
-            Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
-            other => panic!("{other:?}"),
-        };
-        let update = synaps_client::HistoryUpdate::Replace { messages };
-        view.update(cx, |v, cx| {
-            let slot = synaps_client::Event::Slot { attach_seq: seq, session_id: sid.clone(), queued: None };
-            v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }, slot], cx)
-        });
-    };
     let (w, view, _events) = open(cx, crate::demo::ASKS);
     let (id, ix) = card(cx, &view, SHIP);
     show(cx, w, &view, ix);
@@ -750,7 +760,7 @@ fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut
     assert!(has(cx, w, format!("ask-skip {id} off")), "its controls wait");
     click(cx, w, &view, format!("ask-option {id} 3"));
     assert!(sends(cx, &view).is_empty(), "nothing sent");
-    resynced(cx, &view);
+    resynced(cx, &view, false);
     settle(cx, w, 8);
     let (id, ix) = card(cx, &view, SHIP);
     show(cx, w, &view, ix);
@@ -768,18 +778,19 @@ fn dropped_events_hold_a_cards_clicks_until_the_history_asked_for_again(cx: &mut
     heard(cx, w, &view, lag());
     assert!(has(cx, w, format!("ask-resend {id} off")) && !has(cx, w, format!("ask-resend {id}")), "Resend waits");
     assert!(has(cx, w, format!("ask-cause {id}")), "and says why");
-    resynced(cx, &view);
+    resynced(cx, &view, false);
     settle(cx, w, 8);
     assert!(has(cx, w, format!("ask-resend {id}")), "then it doesn't");
     crate::app::pin_arm_clock(None);
 }
 
-/// Shady #81 round 4: an answer out through dropped events, the engine's
-/// slot not read again (the client's probe failed, say). Past the wait
-/// its row says the chat couldn't be checked, with "Check again" where
-/// Resend would be; a click asks again, and it checks for another wait,
-/// Resend waiting. The history and the slot read again (empty), it is
-/// not confirmed, with Resend.
+/// Shady #81 rounds 4 and 6: an answer out through dropped events, no
+/// event since saying the engine's slot. Past the wait its row says it
+/// couldn't be confirmed, with "Check again" where Resend would be; a
+/// click asks for the history again on the same attachment (no
+/// reattach), and it checks for another wait, Resend waiting. That
+/// history lands: still no Resend, the slot unknown. A digest after it
+/// says the slot (empty): not confirmed, with Resend.
 #[gpui_kit::test]
 fn past_the_wait_a_card_offers_check_again_not_resend(cx: &mut TestAppContext) {
     let (w, view, _events) = open(cx, crate::demo::ASKS);
@@ -799,22 +810,18 @@ fn past_the_wait_a_card_offers_check_again_not_resend(cx: &mut TestAppContext) {
     assert!(has(cx, w, format!("ask-state {id} not confirmed")), "it couldn't be checked");
     assert!(has(cx, w, format!("ask-check {id}")), "Check again");
     assert!(!has(cx, w, format!("ask-resend {id}")) && !has(cx, w, format!("ask-resend {id} off")), "no Resend");
+    let before = attachment(cx, &view);
     arm(cx, &view, id, true);
     click(cx, w, &view, format!("ask-check {id}"));
     settle(cx, w, 8);
+    assert_eq!(attachment(cx, &view), before, "the same attachment: no reattach");
     assert!(!has(cx, w, format!("ask-check {id}")), "checking again");
     assert!(has(cx, w, format!("ask-resend {id} off")), "Resend waits");
-    let (seq, sid) = attachment(cx, &view);
-    let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
-        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
-        other => panic!("{other:?}"),
-    };
-    view.update(cx, |v, cx| {
-        let update = synaps_client::HistoryUpdate::Replace { messages };
-        let slot = synaps_client::Event::Slot { attach_seq: seq, session_id: sid.clone(), queued: None };
-        v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }, slot], cx)
-    });
+    resynced(cx, &view, true);
     settle(cx, w, 8);
-    assert!(has(cx, w, format!("ask-resend {id}")), "read again: Resend");
+    assert!(has(cx, w, format!("ask-resend {id} off")) && !has(cx, w, format!("ask-resend {id}")), "its history: Resend waits");
+    resynced(cx, &view, false);
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-resend {id}")), "a digest says the slot: Resend");
     crate::app::pin_arm_clock(None);
 }

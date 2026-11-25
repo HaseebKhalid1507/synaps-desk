@@ -363,9 +363,10 @@ impl AppView {
         self.after_card(row, cx);
     }
 
-    /// "Check again" on the card `painted`, dropped events not read again
-    /// in time: the client asks again, and the card checks for another
-    /// while ([`crate::model::Model::check_again`]). No Resend meanwhile.
+    /// "Check again" on the card `painted`, dropped events not recovered
+    /// from in time: the client asks for the history again, on this
+    /// attachment, and the card checks for another while
+    /// ([`crate::model::Model::check_again`]). No Resend meanwhile.
     pub(crate) fn ask_check_again(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
         if self.card_session().filter(|_| self.ask_armed(row, painted, "check")).is_none() {
             return;

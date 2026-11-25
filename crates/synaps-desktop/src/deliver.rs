@@ -75,31 +75,44 @@
 //! and a Resend of an answer the daemon kept (Shady #81 round 3). So on
 //! the notice the view stops being settled until the history asked for
 //! again lands ([`synaps_client::Transcript::resyncing`]; the client asks
-//! at once, as after a swap), and the engine's slot is read again
+//! at once, as after a swap), and the engine's slot is unknown
 //! ([`synaps_client::Transcript::slot_known`]): its digest and the echoes
 //! that moved it may be among what was dropped, and a steer read as lost
 //! on a stale slot, a Resend of what the engine holds, goes in twice
 //! (Shady #81 round 4: a turn that failed before taking it in keeps it in
 //! the slot, `actor.rs:4136-4146`, and the next turn takes it in with the
-//! Resend). No query answers the slot and a reattach can move input or
-//! revoke a driver, so the client reads it from an observer's snapshot,
-//! at its place among the events (`synaps_client`'s `probe_slot`); a
-//! digest after the notice says it too. Until both are back nothing
-//! reconciles (the memo, and what was taken in, wait for a settled view
-//! whose slot is known; an answer taken in still reads "answered"), and a
-//! click, Retry or Resend sends nothing and says why ([`RESYNCING`]).
-//! After it, the first settled view is past the gap and decides as
-//! above, an `Idle` heard in the gap included: ours in the slot is queued
-//! or held, an empty slot after the turn's end is not confirmed, with
-//! Resend. Bounded by the memo's own wait for a settled view
-//! ([`CHECK_WAIT`]): past it the card says it couldn't check the chat
-//! ([`UNCHECKED`]), with "Check again" ([`crate::model::Model::check_again`])
-//! where Resend would be, and no Resend until a view settles.
+//! Resend). The slot is known again only from this attachment's own
+//! ordered stream, at its place: a digest after the notice, a `Dequeued`
+//! (the daemon took the slot: empty), or the snapshot of an attach. No
+//! query answers it, and nothing reads it out of band: an attach on a
+//! second connection can't be told from another client's (the daemon
+//! hands a joiner the first `Attached` it broadcasts), and its `Detach`
+//! could then detach that client, and a late snapshot can undo a
+//! `Dequeued` heard since (Shady #81 round 5). Until both are back
+//! nothing reconciles (the memo, and what was taken in, wait for a
+//! settled view whose slot is known; an answer taken in still reads
+//! "answered"), and a click, Retry or Resend sends nothing and says why
+//! ([`RESYNCING`]). After it, the first settled view is past the gap and
+//! decides as above, an `Idle` heard in the gap included: ours in the
+//! slot is queued or held, an empty slot after the turn's end is not
+//! confirmed, with Resend. Bounded by the memo's own wait for a settled
+//! view ([`CHECK_WAIT`]): past it an answer the gap holds says it couldn't
+//! be confirmed and that the agent may still have it ([`MAY_HAVE_IT`]),
+//! an open card's controls that the chat hasn't caught up ([`UNCHECKED`]),
+//! and "Check again" ([`crate::model::Model::check_again`]) stands where
+//! Resend would be: it asks for the history again on this connection,
+//! which can settle the history, not the slot. No Resend while the slot
+//! is unknown; an answer typed in the composer is the user's to send.
 //!
-//! One edge no frame the desk can ask for settles, the safe way (no
-//! Resend, so nothing goes twice): an `Idle` lost in the gap itself
-//! leaves an answer taken in "answered" until the next turn's end or a
-//! reattach (its `Idle` was the turn's end the history is read against).
+//! Two edges no frame the desk can ask for settles, both the safe way (no
+//! Resend, so nothing goes twice):
+//! - (a) an `Idle` lost in the gap itself leaves an answer taken in
+//!   "answered" until the next turn's end or a reattach (its `Idle` was
+//!   the turn's end the history is read against);
+//! - (c) a session that goes quiet after a gap, no digest or `Dequeued`
+//!   since, leaves the slot unknown until its next turn sends one: an
+//!   answer it holds says it couldn't be confirmed, and an open card's
+//!   controls wait, until then.
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -217,12 +230,16 @@ pub(crate) const OUT: &str = "Its answer is on its way";
 /// The daemon dropped events and the history asked for again isn't in
 /// (the module's "Dropped events"): a click waits for it.
 pub(crate) const RESYNCING: &str = "Checking the chat… some updates were dropped";
-/// And it hasn't come in [`CHECK_WAIT`].
+/// And it hasn't come in [`CHECK_WAIT`]: an open card's controls.
 pub(crate) const UNCHECKED: &str = "Couldn't check the chat: some updates were dropped, and it hasn't caught up";
+/// An answer the gap holds, past [`CHECK_WAIT`]: nothing on this
+/// connection has said whether the engine holds it, so no Resend.
+pub(crate) const MAY_HAVE_IT: &str =
+    "Couldn't confirm: some updates were dropped. The agent may still have it; if it doesn't answer, reply again in the chat";
 
-/// The daemon dropped events for `t`'s attachment, and the history or the
-/// engine's slot isn't read again yet (the module's "Dropped events"):
-/// nothing is checked on what is held.
+/// The daemon dropped events for `t`'s attachment, and the history asked
+/// for again isn't in or no event since has said the engine's slot (the
+/// module's "Dropped events"): nothing is checked on what is held.
 pub(crate) fn recovering(t: &Transcript) -> bool {
     t.resyncing() || !t.slot_known()
 }
@@ -291,21 +308,33 @@ impl Memos {
             || self.gaps.values().any(|g| !g.over)
     }
 
-    /// Why a card of `session` waits while its view resyncs after dropped
-    /// events ([`synaps_client::Transcript::resyncing`]): checking, or past
-    /// [`CHECK_WAIT`], couldn't check.
+    /// Why a card of `session` waits while its view recovers from dropped
+    /// events ([`recovering`]): checking, or past [`CHECK_WAIT`],
+    /// couldn't check.
     pub(crate) fn gap(&self, session: &str) -> &'static str {
-        if self.gaps.get(session).is_some_and(|g| g.over) { UNCHECKED } else { RESYNCING }
+        if self.over(session) { UNCHECKED } else { RESYNCING }
+    }
+
+    /// What an answer of `session` the gap holds says on its row: checking,
+    /// or past [`CHECK_WAIT`] that it couldn't be confirmed, the agent
+    /// maybe holding it ([`MAY_HAVE_IT`], with "Check again").
+    pub(crate) fn answer_gap(&self, session: &str) -> &'static str {
+        if self.over(session) { MAY_HAVE_IT } else { RESYNCING }
+    }
+
+    /// `session` has recovered from no gap in [`CHECK_WAIT`].
+    pub(crate) fn over(&self, session: &str) -> bool {
+        self.gaps.get(session).is_some_and(|g| g.over)
     }
 
     /// An answer of `session` the engine took in, its turn ended since, on
-    /// a view resyncing past [`CHECK_WAIT`]: no settled view has said
+    /// a view recovering past [`CHECK_WAIT`]: no settled view has said
     /// whether the turn's end saved it, so the card can't say it is in
     /// the chat; nor can a Resend be checked. It says so
     /// ([`Memos::words`]).
     pub(crate) fn unchecked(&self, session: &str, e: &Entry) -> bool {
         e.state == State::InChat
-            && self.gaps.get(session).is_some_and(|g| g.over)
+            && self.over(session)
             && self.taken.get(session).is_some_and(|v| v.iter().any(|k| k.card == e.card && k.ended))
     }
 
@@ -443,7 +472,7 @@ impl Memos {
     /// sent) the cause line under it.
     pub(crate) fn words(&self, session: &str, e: &Entry) -> (&'static str, Option<String>) {
         if self.unchecked(session, e) {
-            return ("not confirmed", Some(UNCHECKED.into()));
+            return ("not confirmed", Some(MAY_HAVE_IT.into()));
         }
         let word = match e.state {
             State::Sending => "sending…",
@@ -472,8 +501,8 @@ impl Memos {
     }
 
     /// "Check again" on a card of `session`, its gap over: the client asks
-    /// again, and the cards say they are checking for another
-    /// [`CHECK_WAIT`].
+    /// for the history again, and the cards say they are checking for
+    /// another [`CHECK_WAIT`].
     pub(crate) fn check_again(&mut self, session: &str, now: Instant) {
         if let Some(g) = self.gaps.get_mut(session).filter(|g| g.over) {
             *g = Gap { since: now, over: false };
@@ -550,8 +579,8 @@ impl crate::model::Model {
             return Err("not connected to the session: try again in a moment".into());
         };
         // Events dropped: nothing is checked on what is held until the
-        // history and the slot are read again (the module's "Dropped
-        // events").
+        // history is in again and an event on this stream has said the
+        // slot (the module's "Dropped events").
         if recovering(&l.transcript) {
             return Err(self.memos.gap(&a.session_id).into());
         }
@@ -622,10 +651,12 @@ impl crate::model::Model {
         }
     }
 
-    /// "Check again" on a card of store `lid`, dropped events not read
-    /// again in [`CHECK_WAIT`] (a probe failed, say): the client asks for
-    /// the history, and the slot while unknown, again
-    /// ([`synaps_client::Client`]'s `Resync`).
+    /// "Check again" on a card of store `lid`, dropped events not
+    /// recovered from in [`CHECK_WAIT`]: the client asks for the history
+    /// again, a `Messages` query on the card's own attachment
+    /// ([`synaps_client::Client`]'s `Resync`), and nothing else. It never
+    /// attaches or detaches (a `Detach` can move input or revoke a
+    /// driver), so it can settle the history, never the slot.
     pub(crate) fn check_again(&mut self, lid: crate::live::LiveId, now: Instant) -> Option<crate::model::Effect> {
         let l = &self.lives[lid];
         let (Some(seq), Some(a)) = (l.attachment(), l.active.as_ref()) else { return None };
