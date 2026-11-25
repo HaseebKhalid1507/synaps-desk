@@ -1,3 +1,21 @@
 # GPUI's Windows main thread needs a larger stack (as gpui-component sets it).
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:8000000"]
+
+# Dependencies optimized in dev builds, and so in `cargo test` (its `test`
+# profile is this one): GPUI's layout, text shaping and the rest of the
+# headless UI tests' work run about 4x faster. The workspace's own crates
+# stay at opt-level 0; debug assertions and overflow checks stay on in
+# every crate. Key timing in the tests is the test's own clock
+# (`app::input_now`), not the speed of the build.
+#
+# Here, not in the root Cargo.toml: CI's dependency caches
+# (Swatinem/rust-cache@v2) are keyed on this file, the members' manifests,
+# Cargo.lock and the toolchain, not on the root manifest. A profile there
+# would leave the key unchanged: CI would restore caches built at the
+# other opt-level as a full match, rebuild every dependency, and never
+# save the new ones.
+[profile.dev.package."*"]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
