@@ -123,7 +123,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cards_spec::fold::{Card, Event as Folded, Fold};
+use cards_spec::fold::{Answered, Card, Event as Folded, Fold};
 use cards_spec::memo::{CHECK_WAIT, Cause, Entry, Event as Heard, Memo, Resend, State, Trigger, View};
 use cards_spec::{CardDoc, CardId, Reply};
 use synaps_client::Transcript;
@@ -561,9 +561,31 @@ impl Memos {
 
     /// A press on `card` of `session` with `reply`: the text to send, or
     /// `None` (it can't be answered, or an answer to it is out).
+    ///
+    /// A change (D4) replaces this desk's last entry for the card, and
+    /// with it the only record of that answer. One the engine took in (in
+    /// the chat, its history still to come), or one not confirmed, may
+    /// still land in the history, ahead of the change: so the change's
+    /// entry counts it among the answers it saw, and its arrival reads as
+    /// ours and older, not as an answer this desk didn't know of, which
+    /// would drop the change's entry while it is on its way (Shady #94
+    /// P2-1). One that lands after the change is still the later answer.
     pub(crate) fn press(&mut self, session: &str, card: &Card, reply: Reply, now: Instant) -> Option<String> {
         let m = self.by.entry(session.to_string()).or_default();
-        let text = m.press(card, reply, now);
+        let before = card
+            .id
+            .as_ref()
+            .and_then(|id| m.get(id))
+            .filter(|e| e.answers(card) && matches!(e.state, State::InChat | State::Unconfirmed) && !shows(e, card));
+        let card = match before {
+            Some(e) => {
+                let mut c = card.clone();
+                c.answers.push(Answered { text: e.text.clone(), reply: e.reply.clone(), at: usize::MAX });
+                Cow::Owned(c)
+            }
+            None => Cow::Borrowed(card),
+        };
+        let text = m.press(&card, reply, now);
         if text.is_some() {
             self.changes += 1;
         }

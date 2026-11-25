@@ -8,7 +8,10 @@
 //! history, takes none; a change from the other pane; the later answer
 //! wins; Keep, Esc and the answer already given send nothing; Tab on a
 //! form's receipt opens nothing; a change never resolves a permission
-//! prompt (§5.1).
+//! prompt (§5.1). A change of an answer taken in, or not confirmed,
+//! stays on its way when that answer's history lands after it is sent,
+//! through a gap too, and a later answer of another desk's still wins
+//! (Shady #94 P2-1).
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`). Keys go in as new presses (`keys_tests::press`,
@@ -16,6 +19,7 @@
 
 use std::time::{Duration, Instant};
 
+use cards_spec::memo::State;
 use gpui_kit::{Entity, ListOffset, TestAppContext, px};
 use serde_json::{Value, json};
 
@@ -597,4 +601,185 @@ fn tab_on_a_forms_receipt_opens_nothing(cx: &mut TestAppContext) {
     assert_eq!(who, Some(cards_spec::FieldValue::Text("Ana".into())), "its field as answered");
     press(cx, w, "escape");
     assert!(!changing(cx, w, row) && sends(cx, &view).is_empty(), "Esc keeps it");
+}
+
+/// The session's history as the view holds it, a quiet session that
+/// asked `input` as card `card_id` (call `tool`, [`asked`]), with `more`
+/// sent after it: as the history asked for again gives it.
+fn history_with(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, card_id: &str, input: &Value, more: &[&str]) -> Vec<Value> {
+    let (seq, _) = attachment(cx, view);
+    let mut h = match crate::demo::attach(crate::demo::IDLE_CPU, seq).pop() {
+        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+        other => panic!("{other:?}"),
+    };
+    h.extend(super::answer_tests::asked_messages(tool, card_id, input, None));
+    let held = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    assert_eq!(h.len(), held, "the history held");
+    h.extend(more.iter().map(|t| json!({"role": "user", "content": t})));
+    h
+}
+
+/// The session's digest of `messages`, the engine's slot holding `queued`.
+fn slot_digest(messages: &[Value], queued: Option<&str>) -> Value {
+    json!({"ev": "conversation", "digest": {"messages_len": messages.len(),
+        "messages_hash": synaps_client::history::messages_hash(messages), "queued_message": queued}})
+}
+
+/// Shady #94 P2-1's start: a busy session's card, answered `main` by the
+/// keys (a `Steer`, A), which the engine took in (`SteeringDelivered`),
+/// the slot cleared on the old history: its checkpoint, the first history
+/// with A, still to come. The receipt offers a change; by mouse it goes,
+/// `hotfix` (B), a `Steer`, on its way. Returns A and B.
+fn taken_in_then_changed(cx: &mut TestAppContext, tool: &str, card_id: &str) -> (Asked, String, String) {
+    let input = branch();
+    let (w, view, row, events) = asked(cx, tool, card_id, &input);
+    nothing_waits_elsewhere(cx, &view);
+    busy(cx, w, &view);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    let a = message(card_id, &input, json!({"choice": "main"}));
+    assert_eq!(sends(cx, &view).last().map(|o| (o.busy, o.text.clone())), Some((true, a.clone())), "A: a Steer");
+    let old = history_with(cx, &view, tool, card_id, &input, &[]);
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "steered", "text": a, "delivered": true}),
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": a}}),
+            slot_digest(&old, None),
+        ],
+    );
+    assert!(has(cx, w, format!("ask-state {row} answered")), "A taken in, its history to come");
+    assert!(has(cx, w, format!("ask-change {row}")), "a change offered");
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-change {row}"));
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-option {row} 3"));
+    let b = changed(card_id, &input, json!({"choice": "hotfix"}));
+    assert_eq!(texts(cx, &view), vec![a.clone(), b.clone()]);
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "B on its way");
+    ((w, view, row, events), a, b)
+}
+
+/// B, on its way, is still this desk's: no change offered, nor Resend,
+/// and its entry (one for the session, whatever pane shows it) in flight.
+fn still_out(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, row: u64, card_id: &str, what: &str) {
+    assert!(!has(cx, w, format!("ask-change {row}")) && !has(cx, w, format!("ask-change {row} off")), "{what}: no change offered");
+    assert!(!has(cx, w, format!("ask-resend {row}")) && !has(cx, w, format!("ask-resend {row} off")), "{what}: no Resend");
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        let st = v.model.memos.get_state(&sid, card_id);
+        assert!(st.is_some_and(|s| !matches!(s, State::InChat | State::Unconfirmed | State::NotSent)), "{what}: B in flight ({st:?})");
+    });
+    assert_eq!(sends(cx, view).len(), 2, "{what}: nothing more sent");
+}
+
+/// Shady #94 P2-1: an answer taken in (A), its history still to come, is
+/// changed (B). The history with A lands before anything of B's: A is
+/// this desk's, and older than B, not an answer it didn't know of. B is
+/// still on its way, in both panes on the session (they share its memo):
+/// no change offered, no Resend. B's echo, its delivery and its history
+/// settle it: `changed`, the fold's latest, two `Steer`s in all.
+#[gpui_kit::test]
+fn a_change_keeps_its_way_when_the_answer_it_changes_lands(cx: &mut TestAppContext) {
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, "toolu_d1", "cd1takn");
+    view.update(cx, |v, _| v.app_settings.split = true);
+    super::answer_tests::key(cx, w, "ctrl-\\");
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 2, "two panes");
+        assert!(v.panes.iter().all(|p| p.live == v.panes.cur.live), "on the one session");
+    });
+    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "A's history: B still on its way");
+    still_out(cx, w, &view, row, "cd1takn", "A's history");
+    heard(cx, w, &view, vec![json!({"ev": "steered", "text": b, "delivered": true})]);
+    still_out(cx, w, &view, row, "cd1takn", "B's echo");
+    heard(cx, w, &view, vec![json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": b}})]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "B taken in");
+    land(cx, w, &view, vec![json!({"role": "user", "content": b})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "B's history");
+    view.read_with(cx, |v, _| {
+        let c = v.model.lives[v.panes.cur.live].transcript.cards().card("toolu_d1").cloned().unwrap();
+        let got: Vec<&str> = c.answers.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(got, [a.as_str(), b.as_str()], "A, then B: the latest");
+    });
+    assert_eq!(sends(cx, &view).len(), 2, "two Steers in all");
+    crate::app::pin_arm_clock(None);
+}
+
+/// P2-1 through a gap (Shady #81 rounds 4–7): B on its way, the daemon
+/// drops events for this desk, and the history asked for again lands
+/// with A, nothing since saying the engine's slot. B is still this
+/// desk's: no change offered, no Resend (an unknown slot never offers
+/// one). B's echo after the gap, a digest saying the slot holds it, its
+/// delivery and its history settle it: `changed`, nothing sent again.
+#[gpui_kit::test]
+fn a_change_keeps_its_way_through_a_gap_when_the_answer_it_changes_lands(cx: &mut TestAppContext) {
+    let input = branch();
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, "toolu_d2", "cd2takn");
+    heard(cx, w, &view, vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})]);
+    let with_a = history_with(cx, &view, "toolu_d2", "cd2takn", &input, &[&a]);
+    let (seq, sid) = attachment(cx, &view);
+    let update = synaps_client::HistoryUpdate::Replace { messages: with_a.clone() };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx));
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        assert!(!t.resyncing() && !t.slot_known(), "the history asked for again; the slot unknown");
+        assert_eq!(t.cards().card("toolu_d2").map(|c| c.answers.len()), Some(1), "A in it");
+    });
+    still_out(cx, w, &view, row, "cd2takn", "the gap's history");
+    heard(cx, w, &view, vec![json!({"ev": "steered", "text": b, "delivered": true})]);
+    still_out(cx, w, &view, row, "cd2takn", "B's echo, the slot unknown");
+    heard(cx, w, &view, vec![slot_digest(&with_a, Some(&b))]);
+    still_out(cx, w, &view, row, "cd2takn", "the slot holds B");
+    heard(cx, w, &view, vec![json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": b}})]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "B taken in");
+    land(cx, w, &view, vec![json!({"role": "user", "content": b})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "B's history");
+    assert_eq!(sends(cx, &view).len(), 2, "nothing sent again");
+    crate::app::pin_arm_clock(None);
+}
+
+/// P2-1, the answer not confirmed: A (no echo in 10 s) is changed, B. A
+/// did reach the chat, and its history lands late, before anything of
+/// B's: B is still on its way. An answer this desk didn't send, another
+/// desk's change (C), lands after it: the later answer wins, B's entry is
+/// dropped, and the card shows C, with no Resend of B over it.
+#[gpui_kit::test]
+fn a_change_of_an_answer_not_confirmed_keeps_its_way_and_a_later_one_wins(cx: &mut TestAppContext) {
+    let input = branch();
+    let (w, view, row, _events) = asked(cx, "toolu_d3", "cd3uncf", &input);
+    nothing_waits_elsewhere(cx, &view);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    let a = message("cd3uncf", &input, json!({"choice": "main"}));
+    unconfirmed(cx, w, &view);
+    assert!(has(cx, w, format!("ask-resend {row}")) && has(cx, w, format!("ask-change {row}")), "A not confirmed");
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-change {row}"));
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-option {row} 3"));
+    let b = changed("cd3uncf", &input, json!({"choice": "hotfix"}));
+    assert_eq!(texts(cx, &view), vec![a.clone(), b.clone()]);
+    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "A's history, late: B still on its way");
+    still_out(cx, w, &view, row, "cd3uncf", "A's history");
+    let c = changed("cd3uncf", &input, json!({"choice": "release"}));
+    land(cx, w, &view, vec![json!({"role": "user", "content": c})]);
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        assert_eq!(v.model.memos.get_state(&sid, "cd3uncf"), None, "C, later: B's entry dropped");
+    });
+    assert!(has(cx, w, format!("ask-state {row} changed")), "the card shows C");
+    assert!(!has(cx, w, format!("ask-resend {row}")), "no Resend of B over it");
+    assert_eq!(sends(cx, &view).len(), 2);
+    crate::app::pin_arm_clock(None);
 }
