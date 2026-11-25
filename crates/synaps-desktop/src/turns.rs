@@ -162,7 +162,7 @@ impl<V> TextRows<V> {
         }
     }
 
-    fn view(&self, id: u64) -> Option<&V> {
+    pub(crate) fn view(&self, id: u64) -> Option<&V> {
         self.kept.get(&id).map(|k| &k.view)
     }
 
@@ -1555,6 +1555,38 @@ impl Reveal {
     }
 }
 
+/// How long a flight's rewrap cross-fades ([`Fade`]).
+pub(crate) const REWRAP_FADE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A flight's rewrap, cross-faded (Haseeb, 2026-11-26: the column rewraps
+/// at the press, and its lines must not flash to the new wrap): for
+/// [`REWRAP_FADE`] after the flight's first frame, the rows as the frame
+/// before drew them (their column, its box where it was in the window)
+/// fade out under the rewrapped ones fading in, on the flight's own
+/// frames. Its list is the only second layout, and only for the fade's
+/// frames: the rows it shows, measured once at the old column. At Full.
+pub(crate) struct Fade {
+    /// The flight's first frame (the motion clock).
+    pub at: std::time::Instant,
+    /// The frame before's layout.
+    pub lay: Layout,
+    /// Its box: its left edge in the window and its width.
+    pub at_x: f32,
+    pub w: f32,
+    /// Its rows, laid out at its column from where its list was scrolled.
+    pub list: gpui_kit::ListState,
+    /// How many rows the pane had: another count ends the fade.
+    pub rows: usize,
+    /// Its strength as last drawn (the rewrapped rows').
+    pub k: std::cell::Cell<f32>,
+    /// Its rows' text views, its own: a view lays its text out for one
+    /// place a frame, and the rewrapped rows draw the pane's. Made as its
+    /// rows are first drawn (a row's text parsed at once up to 4 KiB).
+    pub texts: std::cell::RefCell<HashMap<u64, Entity<TextViewState>>>,
+    /// The ghost list is drawing ([`AppView::markdown`] takes its views).
+    pub drawing: std::cell::Cell<bool>,
+}
+
 /// About the characters a line of a `column` px column holds (a row's own
 /// side padding off): prose wraps at about two an em. An estimate: it counts
 /// bytes, so text that is not ASCII (CJK about one an em) comes out longer.
@@ -1566,6 +1598,14 @@ impl AppView {
     /// Row `ix`'s markdown (item `id`) in its kept view ([`TextRows`]), and
     /// the height it holds while the view's parse is pending (0 once landed).
     fn markdown(&self, ix: usize, id: u64, text: &SharedString, m: &Metrics, cx: &mut Context<Self>) -> (TextView, Pixels) {
+        // The rewrap's faded-out rows ([`Fade`]): their own views, as tall
+        // as their text at their column while one's parse is pending.
+        if let Some(f) = self.panes.cur.fade.as_ref().filter(|f| f.drawing.get()) {
+            let v = f.texts.borrow_mut().entry(id).or_insert_with(|| cx.new(|cx| TextViewState::markdown(text, cx))).clone();
+            let pending = v.read(cx).rendered_text().source().is_empty();
+            let h = if pending { text_lines(text, cpl(f.lay.column, m)) * m.body_line } else { 0. };
+            return (TextView::new(&v), px(h));
+        }
         let now = Instant::now();
         let keep = self.panes.cur.texts.borrow_mut().take(id, text);
         let kept = self.panes.cur.texts.borrow().view(id).map(|(v, _)| v.clone());

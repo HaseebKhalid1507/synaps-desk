@@ -8701,6 +8701,46 @@ impl AppView {
         (Layout { left, right, shift: from - g.at, ..lay }, Some(width))
     }
 
+    /// The pane's rewrap cross-fade ([`crate::turns::Fade`]): begun by a
+    /// flight's rewrap at Full (`start`: the frame before drawn, its box
+    /// `before`), its rows as the frame before drew them; ended when it
+    /// has faded, the flight lands, the pane shows something else or its
+    /// rows change.
+    fn rewrap_fade(&mut self, start: bool, before: Option<(f32, f32)>) {
+        let rows = self.panes.cur.disp.len();
+        // A card's field in the view (a secret's, an answer's): no fade, as
+        // A (an input lays out for one place a frame, as a text view does).
+        let top = self.panes.cur.list.logical_scroll_top().item_ix;
+        let ask = self.panes.cur.disp.iter().skip(top).any(|d| d.kind == Kind::Ask) && !self.card_drafts.is_empty();
+        let card = ask || self.current_card().is_some_and(|c| c.secret);
+        if let Some((x0, _)) = before.filter(|_| start && !card && self.fx.level() == crate::motion::Level::Full && rows > 0) {
+            let was = self.panes.cur.layout;
+            let list = ListState::new(rows, ListAlignment::Top, px(0.));
+            list.scroll_to(self.panes.cur.list.logical_scroll_top());
+            self.panes.cur.fade = Some(crate::turns::Fade {
+                at: self.fx.now(),
+                lay: was,
+                at_x: x0 + was.shift,
+                w: was.left + was.column + was.right,
+                list,
+                rows,
+                k: Cell::new(0.),
+                texts: RefCell::default(),
+                drawing: Cell::new(false),
+            });
+            return;
+        }
+        let flying = self.panel_fx.moving() || self.panes.flight.is_some();
+        if !flying || self.panes.cur.fade.as_ref().is_some_and(|f| f.rows != rows || self.fade_k(f) >= 1.) {
+            self.panes.cur.fade = None;
+        }
+    }
+
+    /// A rewrap's cross-fade's strength now: 0 as it begins, 1 faded.
+    fn fade_k(&self, f: &crate::turns::Fade) -> f32 {
+        self.fx.shot(Some(f.at), Duration::ZERO, turns::REWRAP_FADE, &crate::motion::ease::INOUT, crate::motion::Kind::Spatial)
+    }
+
     /// One pane's frame (split panes step 3): its layout in its rectangle,
     /// its tab strip, list, dock and composer, as the pane acted on
     /// ([`AppView::in_pane`]); with one pane, the whole centre.
@@ -8718,6 +8758,8 @@ impl AppView {
         // A split's or a close's flight is a flight too (split.md §10).
         let flying = self.panel_fx.moving() || self.panes.flight.is_some();
         let (lay, landed) = self.panes.cur.hang_fx.frame(lay, pane, pane_to, flying, &m);
+        // The box the frame before drew (the reveal keeps this one's).
+        let before = self.panes.cur.drawn_box.filter(|(f, _)| f + 1 == self.fx.frame()).map(|(_, b)| b);
         // Widening, the column as it lands, revealed: laid out in the pane
         // as it lands, its box moved (`shift`) where the reveal puts it.
         let (lay, boxed) =
@@ -8731,6 +8773,7 @@ impl AppView {
         // A new column re-wraps the rows: GPUI drops every row's height at
         // the new width and measures the ones it draws.
         let rewrap = lay.column != self.panes.cur.layout.column;
+        self.rewrap_fade(rewrap && flying && view.is_none(), before);
         // A wider one (a flight's landing at Full: a narrowing re-wraps at
         // its start) only makes them shorter: a room held at the end is not
         // read again against that frame's sums, half of them unmeasured
@@ -9064,6 +9107,51 @@ impl AppView {
                 None => vec![list.into_any_element(), sticky.into_any_element()],
             }
         });
+        // A rewrap cross-fading: the rows as the frame before drew them,
+        // where they were, fading out under these fading in.
+        let fade = self.panes.cur.fade.as_ref().filter(|_| !hold && shown_view.is_none()).map(|f| (self.fade_k(f), f));
+        let (rows, ghost) = match (rows, fade) {
+            (Some(rows), Some((k, f))) => {
+                f.k.set(k);
+                let old = f.lay;
+                let ghost = gpui_kit::list(
+                    f.list.clone(),
+                    cx.processor(move |this, ix, _window, cx| {
+                        this.in_drawn(id, |this| {
+                            let now = std::mem::replace(&mut this.panes.cur.layout, old);
+                            let drawing = |this: &Self, on: bool| this.panes.cur.fade.as_ref().map(|f| f.drawing.set(on));
+                            drawing(this, true);
+                            let row = this.render_disp(ix, cx).whole();
+                            drawing(this, false);
+                            this.panes.cur.layout = now;
+                            row
+                        })
+                        .unwrap_or_else(|| div().into_any_element())
+                    }),
+                )
+                .size_full()
+                .pl(px(old.left))
+                .pr(px(old.right))
+                .pt(px(pad_t))
+                .pb(px(pad_b));
+                let ghost = div()
+                    .id(("rewrap-fade", id.index()))
+                    .debug_selector(move || format!("rewrap-fade {}", id.index()))
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .left(px(f.at_x - g.at))
+                    .w(px(f.w))
+                    .child(ghost);
+                let rows = div().size_full().relative().children(rows);
+                (
+                    Some(vec![crate::motion::lift_from(rows, k, 0.).into_any_element()]),
+                    Some(crate::motion::lift_from(ghost, 1. - k, 0.).into_any_element()),
+                )
+            }
+            (rows, _) => (rows, None),
+        };
+        let fading = ghost.is_some();
         if let Some(v) = shown_view {
             v_flex().flex_1().h_full().min_w_0().bg(p.canvas).child(tabs).child(div().flex_1().min_h_0().child(v))
         } else {
@@ -9071,7 +9159,7 @@ impl AppView {
                 .flex_1()
                 .h_full()
                 .min_w_0()
-                .when(boxed.is_some(), |d| d.overflow_hidden())
+                .when(boxed.is_some() || fading, |d| d.overflow_hidden())
                 .bg(p.canvas)
                 .child(tabs)
                 // The naming row is the focused pane's (one name field).
@@ -9091,6 +9179,7 @@ impl AppView {
                         // Held (a dropped row's flight), nothing drawn
                         // from the rows (finish gate #48 r2 N1): no list,
                         // no sticky label (its row and time unlaid), no bar.
+                        .children(ghost)
                         .children(rows.into_iter().flatten())
                         .children((!hold).then(|| crate::motion::probe(&self.fx, "sticky")).flatten())
                         .child(crate::scroll::owner(self.panes.cur.scroller.clone(), self.fx.clone()))

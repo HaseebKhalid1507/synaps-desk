@@ -69,7 +69,10 @@ fn frame_at(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
 /// A frame as drawn: whether a panel was in flight, the pane's left edge
 /// and width, the column's width, the column's left edge in the window
 /// (the list's row `ix` as drawn), the list's item width there, and the
-/// composer's left and right edges.
+/// composer's left and right edges. Cross-fading its rewrap
+/// ([`crate::turns::Fade`]): the fade's strength, the faded-out rows' row
+/// `ix` as drawn (its left edge, its width), and whether its text views
+/// are their own (none the pane's).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Drawn {
     moving: bool,
@@ -78,7 +81,11 @@ struct Drawn {
     x: f32,
     item: f32,
     composer: (f32, f32),
+    fade: Option<Faded>,
 }
+
+/// A frame of a rewrap's cross-fade ([`Drawn::fade`]).
+type Faded = (f32, Option<(f32, f32)>, bool);
 
 fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix: usize) -> Drawn {
     let composer = VisualTestContext::from_window(w, cx).debug_bounds("composer-frame 0").expect("the composer");
@@ -92,6 +99,12 @@ fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix
             x: f32::from(b.left()),
             item: f32::from(b.size.width),
             composer: (f32::from(composer.left()), f32::from(composer.right())),
+            fade: v.panes.cur.fade.as_ref().map(|f| {
+                let row = f.list.bounds_for_item(ix).map(|b| (f32::from(b.left()), f32::from(b.size.width)));
+                let texts = v.texts.borrow();
+                let own = f.texts.borrow().iter().all(|(id, g)| texts.view(*id).is_none_or(|(v, _)| v.entity_id() != g.entity_id()));
+                (f.k.get(), row, own && !f.texts.borrow().is_empty())
+            }),
         }
     })
 }
@@ -244,6 +257,56 @@ fn at_reduced_and_off_the_column_lands_with_the_rail(cx: &mut TestAppContext) {
             assert_eq!(rewraps(&seen), vec![1], "{case}: one rewrap, at once");
             every_frame(&case, &seen);
             assert_eq!(settle(cx, w, 8), 0, "{case}: no frame at rest");
+        }
+    }
+}
+
+/// The rewrap cross-fades (B): in a flight's first frame the rows as the
+/// frame before drew them, where they were (their column, its width), at
+/// full strength and the rewrapped ones at none; on the flight's own
+/// frames, for [`crate::turns::REWRAP_FADE`], the one fading out as the
+/// other fades in; then one list, and nothing after the flight lands. The
+/// rail closing and opening, at 144 and 60 Hz; at Reduced and Off no fade.
+#[gpui_kit::test]
+fn a_flights_rewrap_cross_fades(cx: &mut TestAppContext) {
+    let (w, view) = opened(cx, 1100., 400);
+    // The turns' arrivals over (`wait` jumps the clock; they grow on frames).
+    for _ in 0..120 {
+        frame_at(cx, w, &view, 60);
+    }
+    for hz in [144, 60] {
+        for what in ["close", "open"] {
+            let case = format!("{what} at {hz} Hz");
+            let seen = toggle(cx, w, &view, hz, None);
+            eprintln!("FADE {case}: {:?}", seen.iter().map(|d| d.fade).collect::<Vec<_>>());
+            let (before, first) = (seen[0], seen[1]);
+            assert_eq!(before.fade, None, "{case}: none before");
+            // The toggle's own draw began it, a frame before this one: one
+            // frame's worth of the fade in (`ease::INOUT`: next to none).
+            let (k, rows, own) = first.fade.expect("fading from the first frame");
+            assert!(own, "{case}: the faded-out rows' text views their own");
+            assert!(k < 0.05 && rows == Some((before.x, before.column)), "{case}: the first frame is the frame before's rows: {first:?}");
+            let n = seen[1..].iter().take_while(|d| d.fade.is_some()).count();
+            let dt = 1000. / hz as f32;
+            assert!((n as f32 * dt - 100.).abs() <= dt + 0.5, "{case}: {n} frames of fade, 100 ms at {hz} Hz: {seen:?}");
+            let ks: Vec<f32> = seen[1..=n].iter().map(|d| d.fade.expect("fading").0).collect();
+            assert!(ks.windows(2).all(|k| k[1] > k[0] && k[1] < 1.), "{case}: fading in: {ks:?}");
+            for d in &seen[1..=n] {
+                assert_eq!(d.fade.and_then(|f| f.1), Some((before.x, before.column)), "{case}: the rows where they were: {d:?}");
+                assert!(d.fade.is_some_and(|f| f.2), "{case}: their own text views: {d:?}");
+            }
+            assert!(seen[n + 1..].iter().all(|d| d.fade.is_none()), "{case}: one list after the fade");
+            assert!(seen[n + 1].moving, "{case}: the fade ends in the flight");
+            assert_eq!(settle(cx, w, 8), 0, "{case}: no frame at rest");
+        }
+    }
+    for level in [Level::Reduced, Level::Off] {
+        motion_level(cx, &view, level);
+        settle(cx, w, 8);
+        for what in ["close", "open"] {
+            let seen = toggle(cx, w, &view, 144, None);
+            assert!(seen.iter().all(|d| d.fade.is_none()), "{what} at {level:?}: no fade: {seen:?}");
+            assert_eq!(settle(cx, w, 8), 0);
         }
     }
 }
