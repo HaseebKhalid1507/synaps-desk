@@ -665,7 +665,16 @@ impl AppView {
     /// Split (split.md §7, A14): nothing waits in the focused pane, the
     /// first pane in reading order whose visible session waits is focused
     /// and its card shown.
+    /// Agent cards (D2b): prompts first ([`crate::waiting`]'s order), then
+    /// the visible panes' cards, entered ([`AppView::ask_jump`]); a session
+    /// waiting off screen last. While a prompt has the keys, Ctrl+J goes
+    /// on to the cards.
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An agent card first in the order (no prompt on screen, or one
+        // has the keys already): entered (D2b, `crate::waiting`).
+        if self.ask_jump(window, cx) {
+            return;
+        }
         if self.model.lives[self.panes.cur.live].transcript.pending_prompts().is_empty() {
             if let Some(id) = self.waiting_pane() {
                 self.focus_pane(id, crate::pane::KeysTo::Follow, cx);
