@@ -127,6 +127,8 @@ impl Presses {
 
 /// A card's binding, as D3 names one to enter ([`AppView::enter_card`]):
 /// the call that asked it and the card id the history binds it to.
+// D3's (Shady #83 P2-7): until its chords and rows land, only tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub(crate) tool_id: String,
@@ -245,6 +247,7 @@ impl AppView {
     /// True if it was entered; false, and nothing changes, if not. A
     /// session in a background tab or another window is the caller's to
     /// bring forward first.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn enter_card(&mut self, session: &str, binding: &Binding, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let all = self.waiting_here(false);
         let shows = |pane: PaneId| {
