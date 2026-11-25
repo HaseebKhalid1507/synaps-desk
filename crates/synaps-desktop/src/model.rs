@@ -4077,11 +4077,14 @@ mod fake_daemon {
         let mut a = attaches.recv_timeout(T).unwrap();
         a.send(attached_with_prompt(A, 1));
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
-        // A's connection is gone before the sends go out, so each is
-        // refused on its own (a refusal gives back one text). Closed after
-        // them, it raced the connection thread: sent first, the three were
-        // given back by the end, one text per pane (n11, below).
+        // A's connection is gone, and the client has seen it go, before the
+        // sends: each is refused on its own (a refusal gives back one text).
+        // Written while the connection still took them, the three were given
+        // back by the end, one text per pane (n11, below). The fake's close
+        // alone does not make that so: a process another test spawns holds a
+        // copy of the socket until it execs, and writes until then go through.
         drop(a);
+        pump(&mut m, &events, "A's connection lost", |m| m.reattaching);
         let (p0, p1) = (PaneId::FIRST, PaneId::nth(1));
         for (p, t) in [(p0, "one"), (p1, "two"), (p0, "three")] {
             client.on(m.attachment().unwrap()).submit(t).unwrap();
