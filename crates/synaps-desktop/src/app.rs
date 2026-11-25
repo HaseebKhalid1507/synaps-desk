@@ -2268,7 +2268,7 @@ pub struct AppView {
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
-    /// Open agent cards across sessions (D3): a jump's landing.
+    /// Open agent cards across sessions (D3): a jump's landing, the OS told.
     pub(crate) lookout: crate::presence::Lookout,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
@@ -2712,18 +2712,24 @@ impl AppView {
         }
         // M3: a fold still waiting to be saved is written when the window
         // closes (the last one quits on Linux and Windows) or the app quits.
-        subs.push(cx.on_release(|this, _| {
+        // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
+        // waits for Linux's bus task to close them, within GPUI's shutdown
+        // allowance.
+        subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            let gone = crate::presence::window_gone(this, cx);
+            crate::notify::closing(gone, cx);
         }));
-        subs.push(cx.on_app_quit(|this, _| {
+        subs.push(cx.on_app_quit(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            async {}
+            let gone = crate::presence::window_gone(this, cx);
+            async move { gone.wait().await }
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
@@ -2750,7 +2756,7 @@ impl AppView {
             allow_all_focus,
             visible: window.is_visible(),
         };
-        match (client, synthetic) {
+        let mut v = match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
@@ -2773,7 +2779,10 @@ impl AppView {
                 v
             }
             (None, None) => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
-        }
+        };
+        // A card's notification clicked: this window, that card (D3).
+        crate::presence::listen(&mut v, window, cx);
+        v
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
@@ -3036,7 +3045,7 @@ impl AppView {
         // waits on it.
         self.cards_moved(cx);
         self.arm_card_tick(cx);
-        // Open cards across sessions: the rail, the tabs (D3).
+        // Open cards across sessions: the rail, the tabs, the OS (D3).
         self.sync_presence(cx);
         // An idle daemon's poll changes nothing: no frame, unless
         // the rail's ages have a new minute to show.
@@ -9152,7 +9161,7 @@ impl AppView {
             self.panes.cur.jump_card = None;
             self.reveal_card(window, cx);
         }
-        // Ctrl+Shift+J, WAITING, a tab dot: its card (D3).
+        // Ctrl+Shift+J, WAITING, a notification, a tab dot: its card (D3).
         self.land_card(window, cx);
         // Seen every frame while attached, shown or not: a card that comes
         // back (from a worker's view, Settings) is not new; another

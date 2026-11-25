@@ -44,6 +44,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The OS notifications of agent cards (D3, `src/notify.rs`): the XDG
+# service on the session bus. Both are already in the lock (notify-rust's,
+# under GPUI); the features are the ones that brings.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.2", default-features = false, features = ["proxy", "default-rt"] }
+futures-lite = "2.6"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 

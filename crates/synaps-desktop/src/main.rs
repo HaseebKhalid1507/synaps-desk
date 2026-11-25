@@ -63,6 +63,7 @@ mod model;
 mod model_list;
 mod motion;
 mod named;
+mod notify;
 mod overlay;
 mod palette;
 mod palettes;
@@ -403,6 +404,8 @@ fn main() {
 fn house(motion: motion::Setting, choice: theme::Choice, cx: &mut App) {
     gpui_kit::init(cx);
     diag::mark("kit_init_done");
+    // Who the OS notifications are from (D3's): the window's app id.
+    cx.set_app_identity("synaps-desktop", "Synaps");
     // After the kit read the OS's reduced-motion preference: a pinned
     // level wins over it (the kit's own motion follows ours).
     cx.set_global(motion);
