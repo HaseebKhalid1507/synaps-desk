@@ -67,6 +67,7 @@ mod overlay;
 mod palette;
 mod palettes;
 mod pane;
+mod presence;
 mod rail;
 #[cfg(test)]
 mod receipt_tests;

@@ -249,10 +249,13 @@ impl AppView {
         // Its own store's (another pane's, maybe; #31 M2).
         if let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].is_active(s)) {
             let tr = &self.model.lives[live].transcript;
-            if !tr.pending_prompts().is_empty() {
+            let cards = self.model.presence.of(s);
+            if !tr.pending_prompts().is_empty() || cards.wait > 0 {
                 State::NeedsYou
             } else if tr.busy() {
                 State::Running
+            } else if cards.asked > 0 {
+                State::Asked
             } else if self.model.active_workers(live) > 0 {
                 State::Workers
             } else {
@@ -618,6 +621,8 @@ impl AppView {
         let (word_color, mark_color) = glyph::ink(family, Ground::Chrome, p);
         let here = self.panes.cur.id;
         let session = self.model.tabs.iter().nth(ix).filter(|t| t.kind == Kind::Session).and_then(|t| t.session.clone());
+        // Its session's open agent cards (D3): a still dot.
+        let dot = self.tab_dot(id, session.as_deref(), p, cx);
         let drag = TabDrag { id, ix, from: here, session, label: label.clone(), bg: p.raised, fg: p.ink, edge: p.edge };
         let mark = p.focus_ch;
         let name = match (kind, worker) {
@@ -693,6 +698,7 @@ impl AppView {
                     .child(label),
             )
             .when_some(word, |d, w| d.child(display(w, 12., word_color).flex_none().relative().top(px(dy))))
+            .when_some(dot, |d, dot| d.child(div().flex_none().relative().top(px(dy)).child(dot)))
             .child(close.relative().top(px(dy)))
             // Formatted on hover only.
             // Not under an open menu (a right-click's pointer rests on the
@@ -786,7 +792,7 @@ pub(crate) fn tab_title(st: State, plain: bool, unfocused: bool, k: f32, p: &Pal
                 p.prose_ch
             }
         }
-        State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
+        State::NeedsYou | State::Running | State::Asked | State::Workers | State::Unread => p.ink,
         _ if on => p.ink,
         State::Parked | State::Locked | State::Saved => p.dim_ch,
         _ => p.prose_ch,

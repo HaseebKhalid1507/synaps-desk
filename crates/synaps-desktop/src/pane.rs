@@ -2235,6 +2235,10 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             // The film's first split once its recording has begun
             // (`scripts/capture-linux.sh` starts 3.5 s after the window).
             let film = how.starts_with("film");
+            if how.starts_with("d3") {
+                crate::presence::scene(&view, cx, &ex, &how).await;
+                return;
+            }
             if how == "film3b" {
                 sleep(5.0).await;
                 film3b(&view, cx, &ex, t0).await;

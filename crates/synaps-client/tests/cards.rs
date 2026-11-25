@@ -417,6 +417,31 @@ fn a_replaced_history_takes_its_cards_with_it() {
     assert_eq!(cards(&t).iter().map(|(_, c)| state(c)).collect::<Vec<_>>(), [(State::Open, true, 0)]);
 }
 
+/// Shady #83 R2-7: [`Transcript::cards_rev`] covers the times of the rows
+/// that ask a card, not only the fold: a replacement that only fills a
+/// row's missing time (the history's time fills a row that had none)
+/// moves it; the same history again doesn't.
+#[test]
+fn a_time_filled_by_a_replacement_moves_the_cards_revision() {
+    let mut h = vec![user("go")];
+    h.extend(asked("t1", A, ship()));
+    let mut t = attach(&h);
+    let at = |t: &Transcript| t.items().iter().find(|i| i.card.is_some()).and_then(|i| i.at.as_deref().map(str::to_string));
+    assert_eq!(at(&t), None, "no time in the history: none on its row");
+    let (rev, fold) = (t.cards_rev(), t.cards().cards().to_vec());
+    t.apply_update(&synaps_client::HistoryUpdate::Replace { messages: h.clone() }).unwrap();
+    assert_eq!(t.cards_rev(), rev, "the same history: nothing moved");
+    let mut timed = h.clone();
+    timed[1]["_synaps_at"] = json!("2031-02-03T04:05:06Z");
+    t.apply_update(&synaps_client::HistoryUpdate::Replace { messages: timed.clone() }).unwrap();
+    assert_eq!(t.cards().cards(), fold.as_slice(), "the same cards");
+    assert_eq!(at(&t).as_deref(), Some("2031-02-03T04:05:06Z"), "its time filled");
+    assert_ne!(t.cards_rev(), rev, "a time alone moves the revision");
+    let rev = t.cards_rev();
+    t.apply_update(&synaps_client::HistoryUpdate::Replace { messages: timed }).unwrap();
+    assert_eq!(t.cards_rev(), rev);
+}
+
 /// A close names the card it closed, though its id is bound again after
 /// (the extension restarted and drew it anew, §1.5): the later card is
 /// open, the close's row still says the first one's question.

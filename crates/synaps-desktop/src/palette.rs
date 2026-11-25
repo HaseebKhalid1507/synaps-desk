@@ -30,6 +30,8 @@ pub(crate) enum Mode {
 /// A group head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
+    /// The open agent cards (D3, [`crate::presence`]): first.
+    Waiting,
     Sessions,
     Workers,
     /// Before HISTORY: never under the shown rows' cap ([`SHOWN_MAX`]).
@@ -41,6 +43,7 @@ pub(crate) enum Group {
 impl Group {
     fn head(self) -> &'static str {
         match self {
+            Group::Waiting => label::WAITING,
             Group::Sessions => label::SESSIONS,
             Group::Workers => label::WORKERS,
             Group::History => label::HISTORY,
@@ -69,6 +72,8 @@ pub(crate) enum AppAct {
     FoldAll,
     UnfoldAll,
     JumpWaiting,
+    /// Ctrl+Shift+J: the oldest waiting agent card (D3).
+    JumpCard,
     Favourite,
     Halt,
     Detach,
@@ -97,6 +102,9 @@ pub(crate) enum Act {
     App(AppAct),
     /// An engine slash command ([`ENGINE`]).
     Engine(&'static str),
+    /// An open agent card: the binding its row shows (session, call, card
+    /// id; D3), the one a pick goes to.
+    Card(crate::presence::Key),
 }
 
 /// A row's lead glyph: a session's state, a worker's, or none.
@@ -726,7 +734,7 @@ impl AppView {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let (m, l) = (&self.model, &self.model.lives[self.panes.cur.live]);
         (m.rail_gen, l.input_gate().is_ok(), l.transcript.pending_prompts().len(), self.halt_shown(), l.transcript.busy()).hash(&mut h);
-        (m.tabs.len(), m.tabs.active(), l.active.as_ref().map(|a| &a.session_id)).hash(&mut h);
+        (m.tabs.len(), m.tabs.active(), l.active.as_ref().map(|a| &a.session_id), m.presence.rev()).hash(&mut h);
         for r in &self.tray.rows {
             (r.id, r.live as u8, &r.step, r.watchable).hash(&mut h);
         }
@@ -756,7 +764,8 @@ impl AppView {
         let mac = cfg!(target_os = "macos");
         let m = &self.model;
         let now = crate::chrome::now_secs();
-        let mut goto = Vec::new();
+        // WAITING: the open agent cards, wait cards first (D3).
+        let mut goto = self.waiting_entries(now);
         // SESSIONS: what the daemon holds, by state (needs you first), each
         // open tab's key as its trail.
         for (i, s) in m.sessions.iter().enumerate().filter(|(_, s)| s.lifecycle != "ending") {
@@ -829,7 +838,7 @@ impl AppView {
         let on_session = m.tabs.current().is_some_and(|t| t.kind == crate::tabs::Kind::Session && t.session.is_some());
         let level = crate::motion::Level::current(cx);
         let theme = cx.global::<crate::theme::Scheme>().choice.theme.clone();
-        let apps: [AppRow; 17] = [
+        let apps: [AppRow; 18] = [
             (AppAct::NewSession, "New session", k("Ctrl+T", "⌘T"), "in a new tab".into(), None),
             (AppAct::ToggleRail, "Toggle sessions rail", k("Ctrl+B", "⌘B"), "".into(), None),
             (AppAct::ToggleRight, "Toggle right panel", k("Ctrl+Alt+B", "⌘⌥B"), "".into(), None),
@@ -848,6 +857,13 @@ impl AppView {
                 "the authorize card".into(),
                 (l.transcript.pending_prompts().is_empty() && self.waiting_pane().is_none() && self.jump_elsewhere().is_none())
                     .then_some("nothing is waiting on you"),
+            ),
+            (
+                AppAct::JumpCard,
+                "Jump to the oldest waiting card",
+                k("Ctrl+Shift+J", "⌃⇧J"),
+                "an agent card, in any open session".into(),
+                m.presence.next().is_none().then_some("no agent card is waiting"),
             ),
             (
                 AppAct::Favourite,
@@ -956,6 +972,9 @@ impl AppView {
                 }
             }
             Act::App(a) => self.app_act(a, window, cx),
+            Act::Card(key) => {
+                self.go_to_card(key, window, cx);
+            }
             Act::Engine(name) => {
                 self.run_command(name, arg);
             }
@@ -1019,6 +1038,9 @@ impl AppView {
             AppAct::FoldAll => self.fold_all_runs(false, cx),
             AppAct::UnfoldAll => self.fold_all_runs(true, cx),
             AppAct::JumpWaiting => self.jump_to_card(window, cx),
+            AppAct::JumpCard => {
+                self.jump_waiting(window, cx);
+            }
             // A pick, not the raw chord: no typing guard (the composer
             // has the focus back by now when the palette was opened there).
             AppAct::Favourite => {
@@ -1128,19 +1150,20 @@ fn next_level(l: crate::motion::Level) -> crate::motion::Level {
     }
 }
 
-/// GO TO's session order: needs you, running, workers, unread, opening,
-/// then at rest.
+/// GO TO's session order: needs you, running, asked, workers, unread,
+/// opening, then at rest.
 fn state_rank(st: State) -> u32 {
     match st {
         State::NeedsYou => 0,
         State::Running => 1,
-        State::Workers => 2,
-        State::Unread => 3,
-        State::Opening => 4,
-        State::Idle => 5,
-        State::Locked => 6,
-        State::Parked => 7,
-        State::Saved => 8,
+        State::Asked => 2,
+        State::Workers => 3,
+        State::Unread => 4,
+        State::Opening => 5,
+        State::Idle => 6,
+        State::Locked => 7,
+        State::Parked => 8,
+        State::Saved => 9,
     }
 }
 
