@@ -151,6 +151,13 @@ fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     cx.run_until_parked();
 }
 
+/// A new press of `k`: the input clock past a repeat's `FoldKeys::PAIR`
+/// first (`crate::app::next_press`: no frame, no wall time), then [`key`].
+fn press(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
+    crate::app::next_press();
+    key(cx, window, k);
+}
+
 /// A frame drawn (its top runs what was deferred to it: the keys' move).
 fn frame(cx: &mut TestAppContext, window: AnyWindowHandle) {
     cx.run_until_parked();
@@ -431,7 +438,7 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
         // next one (a frame on), the first drawn after it.
         let at = view.read_with(cx, |v, _| v.fx.clock());
         view.read_with(cx, |v, _| v.fx.set_clock(at + Duration::from_micros(6944)));
-        key(cx, window, "ctrl-w");
+        press(cx, window, "ctrl-w");
         let mut frames = 0;
         while view.read_with(cx, |v, _| v.panes.flight.is_some() || v.panel_fx.moving()) {
             frame_144(cx, window, &view);
@@ -459,7 +466,7 @@ fn a_close_mid_split_turns_with_the_splits_velocity(cx: &mut TestAppContext) {
     level(cx, crate::motion::Level::Off);
     key(cx, window, "ctrl-\\");
     frame(cx, window);
-    key(cx, window, "ctrl-w");
+    press(cx, window, "ctrl-w");
     frame(cx, window);
     assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.flight.is_some())), (1, false), "Off: landed in its frame");
     view.update(cx, |v, _| v.client = None);
@@ -604,7 +611,7 @@ fn a_takeover_starts_from_its_last_frames_position_velocity_and_instant(cx: &mut
         });
         let t = view.read_with(cx, |v, _| v.fx.clock());
         view.read_with(cx, |v, _| v.fx.set_clock(t + Duration::from_micros(wait) + dt / 2));
-        key(cx, window, "ctrl-w");
+        press(cx, window, "ctrl-w");
         frame_dt(cx, window, &view, dt);
         let (v_new, want) = view.read_with(cx, |v, _| {
             let f = v.panes.flight.as_ref().expect("the close in the air");

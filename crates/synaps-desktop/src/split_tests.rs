@@ -264,6 +264,9 @@ fn the_views_allow_halt_and_message_reach_only_the_shown_stores_session(cx: &mut
 
 // ── Split panes step 3: panes on screen ─────────────────────────────────
 
+/// `k` down and up, then a frame. Raw: the input clock does not move
+/// (`crate::app::input_now`), so a key of the same gate let go just before
+/// makes this one its repeat. A new press is [`press`].
 fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
     let down = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
@@ -283,6 +286,13 @@ fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     cx.run_until_parked();
     let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
     cx.run_until_parked();
+}
+
+/// A new press of `k`: the input clock past a repeat's `FoldKeys::PAIR`
+/// first (`crate::app::next_press`: no frame, no wall time), then [`key`].
+fn press(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
+    crate::app::next_press();
+    key(cx, window, k);
 }
 
 fn names(c: &mut Conn) -> Vec<String> {
@@ -444,8 +454,7 @@ fn input_goes_only_to_the_focused_panes_own_attachment(cx: &mut TestAppContext) 
     feed(cx, window, &view, &events, "A's card gone, its turn running", |v| v.panes.cur.card.is_none() && v.halt_shown());
     // (A key let go and pressed again within `FoldKeys::PAIR` is a repeat.)
     key(cx, window, "escape");
-    std::thread::sleep(Duration::from_millis(40));
-    key(cx, window, "escape");
+    press(cx, window, "escape");
     assert_eq!(names(&mut a), ["cancel"], "HALT on A's attachment");
     assert!(names(&mut b).is_empty(), "nothing on B's");
     // Alt+2: the second pane, its keys; B's Allow by a click there.
@@ -1925,7 +1934,7 @@ fn a_split_grows_on_sheet_and_its_last_moving_frame_is_the_landed_layout(cx: &mu
         let r = view.read_with(cx, |v, _| v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h }));
         let b = pane_box(cx, window, id);
         assert_eq!(b[3], r.iter().find(|(i, _)| *i == id).expect("in the tree").1.h, "{l:?}: landed on its first frame");
-        key(cx, window, "ctrl-w");
+        press(cx, window, "ctrl-w");
     }
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
@@ -2168,7 +2177,7 @@ fn ctrl_alt_arrows_move_the_active_tab_across_panes(cx: &mut TestAppContext) {
     assert!(!two[0].contains(&active), "and gone from the first: {two:?}");
     let new = view.read_with(cx, |v, _| v.reading_order()[1]);
     assert_eq!(view.read_with(cx, |v, _| v.panes.focused), new, "focused with it");
-    key(cx, window, "ctrl-alt-left");
+    press(cx, window, "ctrl-alt-left");
     frame(cx, window);
     let back = pane_tabs(cx, &view);
     assert_eq!(back.len(), 1, "its pane closed with its only tab: {back:?}");
@@ -2535,7 +2544,7 @@ fn a_second_split_or_close_mid_flight_starts_from_where_the_panes_are_drawn(cx: 
         })
     };
     let run = |cx: &mut TestAppContext, first: &str, then: &str, what: &str, panes: usize| {
-        key(cx, window, first);
+        press(cx, window, first);
         let mut was = boxes(cx, window, &view);
         let mut bound = step(cx).unwrap_or(0.);
         for _ in 0..10 {
@@ -2547,7 +2556,7 @@ fn a_second_split_or_close_mid_flight_starts_from_where_the_panes_are_drawn(cx: 
         }
         assert!(view.read_with(cx, |v, _| v.panes.flight.is_some()), "{what}: still in the air");
         let before = step(cx).unwrap_or(0.);
-        key(cx, window, then);
+        press(cx, window, then);
         let now = boxes(cx, window, &view);
         let handover = most_moved(&was, &now);
         let bound = before.max(step(cx).unwrap_or(0.));
@@ -2808,7 +2817,7 @@ fn a_moved_tab_takes_its_draft(cx: &mut TestAppContext) {
     assert_ne!(new, first, "split off");
     assert_eq!(composer_text(cx, &view, new), "half a thought", "the draft in the new pane");
     assert_eq!(composer_text(cx, &view, first), "", "not left behind");
-    key(cx, window, "ctrl-alt-left");
+    press(cx, window, "ctrl-alt-left");
     frame(cx, window);
     frame(cx, window);
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 1, "its pane closed");
@@ -2846,7 +2855,7 @@ fn close_pane_reopens_and_join_keeps_every_tab(cx: &mut TestAppContext) {
     let tabs = pane_tabs(cx, &view);
     assert!(tabs[0].iter().any(|s| s == crate::demo::LEGACY), "Ctrl+Shift+T brings back the closed pane's tab: {tabs:?}");
     // Join: a Settings tab in the other pane comes too.
-    key(cx, window, "ctrl-alt-right");
+    press(cx, window, "ctrl-alt-right");
     frame(cx, window);
     view.update(cx, |v, cx| {
         v.model.tabs.open_view(crate::tabs::Kind::Settings);
@@ -2895,7 +2904,7 @@ fn a_held_move_key_moves_the_tab_once(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| v.focus_pane(left, crate::pane::KeysTo::Pane, cx));
     frame(cx, window);
     open(cx, crate::demo::LEGACY);
-    key(cx, window, "ctrl-alt-right");
+    press(cx, window, "ctrl-alt-right");
     assert_eq!(pane_tabs(cx, &view).iter().map(Vec::len).collect::<Vec<_>>(), [1, 2], "LEGACY moved right");
     key_held(cx, window, "ctrl-alt-right");
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "its repeat moved nothing: {:?}", pane_tabs(cx, &view));
@@ -3181,7 +3190,7 @@ fn a_closing_pane_slides_out_with_its_rows(cx: &mut TestAppContext) {
     key(cx, window, "ctrl-\\");
     land(cx, window, &view);
     let right = view.read_with(cx, |v, _| v.panes.focused);
-    key(cx, window, "ctrl-w");
+    press(cx, window, "ctrl-w");
     assert!(drawn(cx, window, format!("pane-list {}", right.index())).is_none(), "Reduced: the close is one frame");
     assert!(view.read_with(cx, |v, _| v.panes.flight.is_none() && v.panes.closing.is_empty()));
     view.update(cx, |v, _| v.client = None);
@@ -6012,7 +6021,7 @@ fn reduced_and_off_land_splits_closes_and_equalise_in_one_frame_with_nothing_arm
                 }),
                 2,
             ),
-            ("close", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| key(cx, window, "ctrl-w")), 1),
+            ("close", Box::new(|_: &mut TestAppContext| {}), Box::new(|cx: &mut TestAppContext| press(cx, window, "ctrl-w")), 1),
         ];
         for (what, setup, act, panes) in steps.iter() {
             setup(cx);
@@ -6797,16 +6806,14 @@ fn the_key_scenarios_hold_at_one_and_at_two_panes(cx: &mut TestAppContext) {
             })
         };
         let before = (count(cx, focused), other.map(|o| count(cx, o)));
-        std::thread::sleep(Duration::from_millis(60));
-        key(cx, window, "ctrl-t");
+        press(cx, window, "ctrl-t");
         let now = (count(cx, focused), other.map(|o| count(cx, o)));
         if now != (before.0 + 1, before.1) {
             fails.push(format!("{panes} pane(s): Ctrl+T, the tabs (focused, other): {before:?} → {now:?}"));
         }
         // A hand's pause: Ctrl+W within `FoldKeys::PAIR` (30 ms) of Ctrl+T's
         // key-up is its repeat (the tab keys share one gate).
-        std::thread::sleep(Duration::from_millis(60));
-        key(cx, window, "ctrl-w");
+        press(cx, window, "ctrl-w");
         let now = (count(cx, focused), other.map(|o| count(cx, o)), view.read_with(cx, |v, _| v.panes.len()));
         if now != (before.0, before.1, panes) {
             fails.push(format!("{panes} pane(s): Ctrl+W, the tabs (focused, other) and panes: {before:?} → {now:?}"));
