@@ -51,6 +51,16 @@ pub(crate) const MIN_THUMB: f32 = 24.;
 /// How long a bar stays after a scroll.
 pub(crate) const LINGER: Duration = Duration::from_secs(1);
 
+/// The clock a bar's linger and fade read: the executor's, which their
+/// timers run on. In the app that is the monotonic clock; in a test it is
+/// the test's, which moves only when the test moves it, so how many frames
+/// a fade asks for never rests on how fast the machine drew them. (A
+/// hiding bar's wake-up, [`hiding`], keeps the decay grid's phase: at most
+/// one tick away, whatever the clock.)
+fn now(cx: &App) -> Instant {
+    cx.background_executor().now()
+}
+
 /// What a bar sits on: its thumb's roles.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Ground {
@@ -727,7 +737,7 @@ impl<S: Scrolled> Bar<S> {
         }
         st.ours = false;
         geo.warp = st.warp;
-        let now = Instant::now();
+        let now = now(cx);
         let view = window.current_view();
         if st.last.is_some_and(|l| (l - at).abs() > 0.5) && !self.always {
             st.until = Some(now + LINGER);
@@ -868,7 +878,7 @@ impl<S: Scrolled> Frame<S> {
                 }
                 let (over, on_bar) = (pane.is_hovered(window), strip.as_ref().is_some_and(|h| h.is_hovered(window)));
                 if (over, on_bar) != (s.over, s.on_bar) {
-                    let now = Instant::now();
+                    let now = now(cx);
                     let before = s.look(always, now);
                     (s.over, s.on_bar) = (over, on_bar);
                     if s.look(always, now) != before {
@@ -883,7 +893,7 @@ impl<S: Scrolled> Frame<S> {
                 move |_: &MouseExitEvent, phase, _, cx| {
                     let mut s = state.0.borrow_mut();
                     if phase.bubble() && s.grab.is_none() {
-                        let now = Instant::now();
+                        let now = now(cx);
                         let before = s.look(always, now);
                         (s.over, s.on_bar) = (false, false);
                         if s.look(always, now) != before {
@@ -960,7 +970,7 @@ fn linger(state: BarState, view: EntityId, window: &mut Window, cx: &mut App) {
     window
         .spawn(cx, async move |cx| {
             loop {
-                let wait = state.0.borrow().until.map(|u| u.saturating_duration_since(Instant::now()));
+                let wait = state.0.borrow().until.map(|u| u.saturating_duration_since(cx.background_executor().now()));
                 match wait {
                     Some(w) if !w.is_zero() => cx.background_executor().timer(w).await,
                     _ => break,
