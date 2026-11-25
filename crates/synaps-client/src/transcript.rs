@@ -2043,6 +2043,13 @@ fn tail(s: &str) -> String {
     }
 }
 
+/// The next fold revision ([`Transcript::cards_rev`]): process-wide, so a
+/// revision names one fold of one transcript.
+fn next_card_rev() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod outcome_tests {
     use serde_json::json;
@@ -2487,11 +2494,4 @@ mod outcome_tests {
         t.load_attached(&a).unwrap();
         assert_eq!(t.resolved_outcome(1), None, "an attach starts over (prompt ids may start over)");
     }
-}
-
-/// The next fold revision ([`Transcript::cards_rev`]): process-wide, so a
-/// revision names one fold of one transcript.
-fn next_card_rev() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
