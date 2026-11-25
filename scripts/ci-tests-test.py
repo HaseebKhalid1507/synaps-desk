@@ -20,6 +20,7 @@ spec.loader.exec_module(ci_tests)
 DESKTOP = "synaps-desktop::bin/synaps-desktop"
 FIXTURES = "synaps-client::fixtures"
 MATCH = {"status": "matches"}
+NO_JUNIT = object()
 
 
 def case(match=MATCH, ignored=False):
@@ -48,7 +49,9 @@ def ran(suites):
 class Lane(unittest.TestCase):
     def check(self, name="Linux-workspace", suites=None, slices=None, doc="test result: ok. 2 passed; 0 failed"):
         """ci-tests.py's errors for a lane: `suites` listed, `slices` the
-        runs of each slice ([(binary, test, outcome)], None: no JUnit)."""
+        runs of each slice ([(binary, test, outcome)] in attempt 1; None:
+        no report; {attempt: runs}, runs NO_JUNIT: the attempt's report
+        without a JUnit file)."""
         suites = inventory() if suites is None else suites
         if slices is None:
             runs = ran(suites)
@@ -64,17 +67,24 @@ class Lane(unittest.TestCase):
             if doc is not None:
                 with open(os.path.join(d, "doctests.log"), "w") as f:
                     f.write(doc + "\n")
-            for k, runs in enumerate(slices, 1):
-                if runs is None:
+            for k, attempts in enumerate(slices, 1):
+                if attempts is None:
                     continue
-                s = os.path.join(root, f"junit-{name}-{k}")
-                os.makedirs(s)
-                with open(os.path.join(s, "junit.xml"), "w") as f:
-                    f.write('<testsuites><testsuite name="x">')
-                    for b, t, outcome in runs:
-                        inner = {"passed": "", "failed": "<failure/>", "skipped": "<skipped/>"}[outcome]
-                        f.write(f'<testcase classname="{b}" name="{t}" time="1.0">{inner}</testcase>')
-                    f.write("</testsuite></testsuites>")
+                if not isinstance(attempts, dict):
+                    attempts = {1: attempts}
+                for attempt, runs in attempts.items():
+                    s = os.path.join(root, f"junit-{name}-{k}-{attempt}")
+                    os.makedirs(s)
+                    if runs is NO_JUNIT:
+                        with open(os.path.join(s, "no-junit"), "w") as f:
+                            f.write(f"attempt {attempt} wrote no JUnit file\n")
+                        continue
+                    with open(os.path.join(s, "junit.xml"), "w") as f:
+                        f.write('<testsuites><testsuite name="x">')
+                        for b, t, outcome in runs:
+                            inner = {"passed": "", "failed": "<failure/>", "skipped": "<skipped/>"}[outcome]
+                            f.write(f'<testcase classname="{b}" name="{t}" time="1.0">{inner}</testcase>')
+                        f.write("</testsuite></testsuites>")
             with contextlib.redirect_stdout(io.StringIO()):
                 return ci_tests.lane(root, name, [])
 
@@ -144,6 +154,46 @@ class Lane(unittest.TestCase):
     def test_failed_or_missing_doc_tests(self):
         self.assertError(self.check(doc="test result: FAILED. 1 passed; 1 failed"), "the doc-tests did not pass")
         self.assertError(self.check(doc=None), "no doc-test log")
+
+    # Re-runs: each attempt's report is its own artifact
+    # (junit-<lane>-<k>-<attempt>); only a slice's newest is read.
+
+    def halves(self, failed_in_2=False):
+        """The lane's tests in two slices; slice 2's first test failed."""
+        runs = ran(inventory())
+        one, two = runs[0::2], runs[1::2]
+        if failed_in_2:
+            two = [(b, t, "failed") for b, t, _ in two[:1]] + two[1:]
+        return one, two
+
+    def test_a_rerun_that_passed_is_read_over_the_failed_attempt(self):
+        one, two = self.halves()
+        _, failed = self.halves(failed_in_2=True)
+        self.assertEqual(self.check(slices=[one, {1: failed, 2: two}]), [])
+
+    def test_an_older_pass_never_masks_a_newer_failure(self):
+        one, two = self.halves()
+        _, failed = self.halves(failed_in_2=True)
+        self.assertError(self.check(slices=[one, {1: two, 2: failed}]), "FAILED")
+        self.assertError(self.check(slices=[one, {1: two, 3: failed}]), "FAILED")
+
+    def test_a_newer_attempt_without_its_junit_is_an_error(self):
+        one, two = self.halves()
+        self.assertError(self.check(slices=[one, {1: two, 2: NO_JUNIT}]), "slice 2/2 wrote no JUnit file in attempt 2")
+
+    def test_attempts_compare_as_numbers(self):
+        one, two = self.halves()
+        _, failed = self.halves(failed_in_2=True)
+        self.assertEqual(self.check(slices=[one, {9: failed, 10: two}]), [])
+        self.assertError(self.check(slices=[one, {9: two, 10: failed}]), "FAILED")
+
+    def test_only_a_slices_own_reports_are_its(self):
+        with tempfile.TemporaryDirectory() as root:
+            # Slice 12's, another lane's slice 2, and a report named
+            # without its attempt: none is slice 2's (or 1's).
+            for d in ("junit-Linux-workspace-12-1", "junit-Linux-split-on-2-1", "junit-Linux-workspace-2"):
+                os.makedirs(os.path.join(root, d))
+            self.assertEqual(ci_tests.newest_reports(root, "Linux-workspace"), {12: (1, os.path.join(root, "junit-Linux-workspace-12-1"))})
 
     def test_no_list(self):
         with tempfile.TemporaryDirectory() as root:

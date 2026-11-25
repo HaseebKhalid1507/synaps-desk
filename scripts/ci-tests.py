@@ -21,11 +21,16 @@ slices:
   * the split-on lane: `split_tests::the_split_on_lane_builds_every_view_split_on`
     ran.
 
+Each slice's report is the one of its newest attempt: a re-run slice
+uploads its own (junit-<lane>-<k>-<attempt>), and an older attempt's,
+passed or failed, is never read. A newest attempt with no JUnit file is
+an error, whatever an older one says.
+
 usage: ci-tests.py <artifacts-dir> <lane>...
   lane: <runner.os>-<name>, e.g. Linux-workspace; its files are
   <dir>/list-<lane>/tests.json, <dir>/list-<lane>/slices (how many),
   <dir>/list-<lane>/doctests.log (workspace lanes) and
-  <dir>/junit-<lane>-<k>/**/junit.xml for each slice k.
+  <dir>/junit-<lane>-<k>-<attempt>/**/junit.xml for each slice k.
 """
 
 import collections
@@ -86,6 +91,19 @@ def find(root, name):
     return None
 
 
+def newest_reports(root, name):
+    """{slice: (attempt, dir)}: each slice's report of its newest attempt
+    (`github.run_attempt`, compared as a number)."""
+    newest = {}
+    for d in os.listdir(root):
+        m = re.fullmatch(rf"junit-{re.escape(name)}-(\d+)-(\d+)", d)
+        if m:
+            k, attempt = int(m[1]), int(m[2])
+            if k not in newest or attempt > newest[k][0]:
+                newest[k] = (attempt, os.path.join(root, d))
+    return newest
+
+
 def doctests(path):
     """(passed, ok) from `cargo test --doc`'s output."""
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -106,12 +124,18 @@ def lane(root, name, summary):
         slices = int(f.read())
     expected = {k for k, ignored in tests.items() if not ignored}
     runs = []
+    reports = newest_reports(root, name)
     for k in range(1, slices + 1):
-        path = find(os.path.join(root, f"junit-{name}-{k}"), "junit.xml")
-        if path is None:
+        if k not in reports:
             errors.append(f"{name}: slice {k}/{slices} wrote no JUnit file")
             continue
+        attempt, d = reports[k]
+        path = find(d, "junit.xml")
+        if path is None:
+            errors.append(f"{name}: slice {k}/{slices} wrote no JUnit file in attempt {attempt}, its newest")
+            continue
         runs += [(k, *r) for r in junit(path)]
+    reran = {k: a for k, (a, _) in sorted(reports.items()) if a > 1}
 
     seen = collections.Counter((b, t) for _, b, t, outcome, _ in runs if outcome != "skipped")
     passed = {(b, t) for _, b, t, outcome, _ in runs if outcome == "passed"}
@@ -167,9 +191,13 @@ def lane(root, name, summary):
     summary.append("")
     summary.append("Slowest: " + "; ".join(f"`{t}` {s:.0f} s" for s, t in slowest))
     summary.append("")
+    if reran:
+        summary.append("Re-run slices, read from their newest attempt: " + ", ".join(f"{k}: attempt {a}" for k, a in reran.items()))
+        summary.append("")
     print(f"{name}: {total} tests passed ({ui} UI tests), {len(expected)} listed to run, {sum(ignored.values())} ignored; "
           + ", ".join(f"{b}: {n}" for b, n in sorted(by_binary.items()))
-          + (f", doc-tests: {doc}" if doc is not None else ""))
+          + (f", doc-tests: {doc}" if doc is not None else "")
+          + "".join(f"; slice {k} from attempt {a}" for k, a in reran.items()))
     return errors
 
 
