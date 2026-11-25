@@ -63,13 +63,14 @@ fn up(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     cx.run_until_parked();
 }
 
-/// A new press of `k`: down and up, the frames it asks for, then past a
-/// repeat's 30 ms, so the next press of it is new whatever a frame costs.
+/// A new press of `k`: down and up, the frames it asks for, then the
+/// input clock past a repeat's 30 ms ([`crate::app::next_press`]): the
+/// next press of it is new, whatever the frames between cost.
 fn press(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     down(cx, w, k);
     up(cx, w, k);
     settle(cx, w, 8);
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 /// `events` heard, and drawn as they land (a test window draws when the
@@ -519,13 +520,13 @@ fn a_key_repeat_never_answers(cx: &mut TestAppContext) {
     repeat(cx, w, "2");
     assert!(sends(cx, &view).is_empty(), "a key held from before Ctrl+J");
     up(cx, w, "2");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     down(cx, w, "1");
     repeat(cx, w, "1");
     up(cx, w, "1");
     settle(cx, w, 8);
     assert_eq!(texts(cx, &view), vec![message("c4krept", &input, json!({"choice": "main"}))], "the press, not its repeat");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "2");
     assert_eq!(sends(cx, &view).len(), 1, "answered: nothing more");
 }
@@ -947,7 +948,7 @@ fn a_held_enter_in_a_field_sends_nothing(cx: &mut TestAppContext) {
         assert_eq!(keys_in(cx, w, &view, "toolu_he"), "env", "repeat {n}: and no move");
     }
     up(cx, w, "enter");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "shift-enter");
     assert!(sends(cx, &view).is_empty(), "Shift+Enter is no card's key");
     assert_eq!(keys_in(cx, w, &view, "toolu_he"), "env");
@@ -972,7 +973,7 @@ fn a_held_enter_in_a_note_sends_nothing(cx: &mut TestAppContext) {
     assert!(sends(cx, &view).is_empty(), "Enter held from the composer: no Submit");
     assert_eq!(keys_in(cx, w, &view, "toolu_hn"), "note");
     up(cx, w, "enter");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "enter");
     assert_eq!(texts(cx, &view), vec![message("c2hnote", &input, json!({"choice": "Not yet", "note": "the changelog"}))]);
 }
@@ -995,7 +996,7 @@ fn a_held_enter_in_a_form_to_fill_moves_once(cx: &mut TestAppContext) {
         assert_eq!(keys_in(cx, w, &view, "toolu_hf"), "when", "repeat {n}: nowhere");
     }
     up(cx, w, "enter");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     typing(cx, w, "Friday");
     press(cx, w, "enter");
     assert_eq!(texts(cx, &view), vec![message("c3hform", &input, json!({"fields": {"who": "Ana", "when": "Friday"}}))]);
@@ -1019,7 +1020,7 @@ fn a_held_ctrl_j_stays_at_the_prompt(cx: &mut TestAppContext) {
         assert_eq!(keys_at(cx, w, &view), (false, true), "repeat {n}");
     }
     up(cx, w, "ctrl-j");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "ctrl-j");
     assert!(entered(cx, w, id), "a new press: the card");
     prompt_pending(cx, &view, "Ctrl+J held, then pressed");
@@ -1042,7 +1043,7 @@ fn a_held_ctrl_j_freezes_one_batch(cx: &mut TestAppContext) {
     assert!(entered(cx, w, id), "the card stays entered");
     assert!(!has(cx, w, format!("ask-batch {id} 1 of 2")), "held: the batch as frozen");
     up(cx, w, "ctrl-j");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "ctrl-j");
     assert!(has(cx, w, format!("ask-batch {id} 1 of 2")), "a new press: a new batch");
     assert!(sends(cx, &view).is_empty());
@@ -1065,7 +1066,7 @@ fn a_held_tab_moves_one_stop(cx: &mut TestAppContext) {
         assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "when", "a field's Tab held, repeat {n}: one stop");
     }
     up(cx, w, "tab");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     press(cx, w, "shift-tab");
     assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "who");
     down(cx, w, "shift-tab");
@@ -1141,4 +1142,38 @@ fn tab_goes_round_a_forms_note_and_fields(cx: &mut TestAppContext) {
         texts(cx, &view),
         vec![message("c8tform", &input, json!({"choice": "Later", "note": "after the freeze", "fields": {"owner": "Ana", "ticket": ""}}))]
     );
+}
+
+/// Shady #86 P3-1: the card's keys and the card chord (Enter, Esc, Space)
+/// read one clock, the input clock (`crate::app::input_now`), put here an
+/// hour ahead of the wall's: a stamp left on the wall would be an hour
+/// off. Enter let go in the composer, then pressed on the entered card
+/// with only the wall's 40 ms between, and again 29 ms later on the input
+/// clock: a repeat to both gates, nothing sent. At 30 ms, a press to
+/// both: it answers.
+#[gpui_kit::test]
+fn card_keys_and_the_chord_read_one_input_clock(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let input = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"], "default": "main"});
+    let (w, view, id, _events) = asked(cx, "toolu_kc", "c9kclck", &input);
+    crate::app::advance_input_clock(Duration::from_secs(3600));
+    let gates = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.panes.cur.chord_press, v.ask_presses.last));
+    down(cx, w, "enter");
+    up(cx, w, "enter");
+    settle(cx, w, 8);
+    assert!(sends(cx, &view).is_empty(), "an empty composer sends nothing");
+    down(cx, w, "ctrl-j");
+    up(cx, w, "ctrl-j");
+    settle(cx, w, 8);
+    assert!(entered(cx, w, id));
+    std::thread::sleep(Duration::from_millis(40));
+    for (gap, press) in [(Duration::ZERO, false), (Duration::from_millis(29), false), (Duration::from_millis(30), true)] {
+        crate::app::advance_input_clock(gap);
+        down(cx, w, "enter");
+        assert_eq!(gates(cx), (press, press), "{gap:?} after the key-up: the chord's and the card's gates agree");
+        up(cx, w, "enter");
+        settle(cx, w, 8);
+        let sent = if press { vec![message("c9kclck", &input, json!({"choice": "main"}))] } else { vec![] };
+        assert_eq!(texts(cx, &view), sent, "{gap:?} after the key-up");
+    }
 }
