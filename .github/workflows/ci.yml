@@ -61,7 +61,7 @@ jobs:
     with:
       os: ubuntu-latest
       lane: workspace
-      slices: 4
+      slices: 6
 
   tests-windows:
     name: tests (workspace, windows)
@@ -69,7 +69,7 @@ jobs:
     with:
       os: windows-latest
       lane: workspace
-      slices: 4
+      slices: 5
 
   tests-split-on:
     name: tests (split-on, ubuntu)
@@ -77,7 +77,7 @@ jobs:
     with:
       os: ubuntu-latest
       lane: split-on
-      slices: 4
+      slices: 6
 
   release:
     name: release build (${{ matrix.os }})

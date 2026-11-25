@@ -68,11 +68,13 @@ jobs:
             split-on) args=(-p synaps-desktop --locked --features split-on-tests) ;;
             *) echo "unknown lane ${{ inputs.lane }}"; exit 2 ;;
           esac
-          cargo nextest archive "${args[@]}" --archive-file tests.tar.zst
-          mkdir list
+          mkdir run list
+          cargo nextest archive "${args[@]}" --archive-file run/tests.tar.zst
           cargo nextest list "${args[@]}" --message-format json > list/tests.json
           echo "${{ inputs.slices }}" > list/slices
-          ls -l tests.tar.zst
+          # The slices run this nextest: no download of their own.
+          cp "${CARGO_HOME:-$HOME/.cargo}"/bin/cargo-nextest* run/
+          ls -l run
       # nextest runs no doc-tests: `cargo test --doc` runs them here, in
       # the same workspace build.
       - name: Doc-tests (workspace)
@@ -87,7 +89,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tests-${{ runner.os }}-${{ inputs.lane }}
-          path: tests.tar.zst
+          path: run/
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
@@ -111,24 +113,26 @@ jobs:
       # The sources (`--workspace-remap .`): the tests' working directory,
       # their fixtures, and .config/nextest.toml's `ci` profile.
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.152
       - uses: actions/download-artifact@v4
         with:
           name: tests-${{ runner.os }}-${{ inputs.lane }}
+          path: ${{ runner.temp }}/run
       - name: Tests, slice ${{ matrix.slice }} of ${{ inputs.slices }} (${{ inputs.lane }})
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/nextest"
-          cargo-nextest nextest run --archive-file tests.tar.zst --workspace-remap . \
-            --extract-to "$RUNNER_TEMP/nextest" --profile ci \
+          # The runner's CPU: test times vary with it.
+          echo "$(nproc) CPUs:$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)" || true
+          run="$RUNNER_TEMP/run"
+          chmod +x "$run"/cargo-nextest*
+          mkdir -p "$run/x"
+          "$run"/cargo-nextest nextest run --archive-file "$run/tests.tar.zst" --workspace-remap . \
+            --extract-to "$run/x" --profile ci \
             --partition slice:${{ matrix.slice }}/${{ inputs.slices }}
       - name: JUnit
         if: always()
         shell: bash
         run: |
-          f=$(find "$RUNNER_TEMP/nextest" target -path '*nextest/ci/junit.xml' 2>/dev/null | head -n 1)
+          f=$(find "$RUNNER_TEMP/run" target -path '*nextest/ci/junit.xml' 2>/dev/null | head -n 1)
           test -n "$f" && cp "$f" junit.xml
       - uses: actions/upload-artifact@v4
         if: always()
