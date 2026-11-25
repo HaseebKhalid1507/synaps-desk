@@ -15,7 +15,11 @@
 //! - **Answered, skipped, closed, replaced**: its receipt, one line, the
 //!   card's head line: the question → what was answered, and the state
 //!   word at its end (`answered`, `changed`, `skipped`, `closed`,
-//!   `replaced`).
+//!   `replaced`). One this desk may change (D4, [`AppView::changeable`])
+//!   says `· change` after it: a click reopens the card, `changing`, the
+//!   answer in it, with Keep beside Skip. A skip of this desk's on its
+//!   way, or not confirmed, says `→ (skipped)`: what Resend or Retry
+//!   would send.
 //! - **An answer's message** is the user's turn, one slim line on the
 //!   user's surface: `↳ answered «Which approach?» → Refactor the parser`,
 //!   never its JSON.
@@ -115,7 +119,7 @@ pub(crate) fn state_word(a: &Ask) -> &'static str {
         State::Pending => "asking…",
         State::Open if a.wait => "the agent is waiting",
         State::Open => "open",
-        State::Answered if a.answers > 1 => "changed",
+        State::Answered if a.answers > 1 || matches!(a.reply, Some(Reply::Change(_))) => "changed",
         State::Answered => "answered",
         State::Skipped => "skipped",
         State::Closed => "closed",
@@ -198,6 +202,8 @@ pub(crate) struct Act {
     /// The footer's line, instead of how to answer: why the controls don't
     /// act, or what the last click met.
     pub(crate) line: Option<String>,
+    /// Reopened to change its answer (D4): `changing`, and Keep.
+    pub(crate) reopened: bool,
 }
 
 /// How to answer an open card by mouse, its footer's line.
@@ -208,6 +214,18 @@ pub(crate) fn how_click(doc: &CardDoc) -> &'static str {
         (Mode::Form, _, _) => "Fill it in and Send, or reply in your own words",
     }
 }
+
+/// How to change the answer of a reopened card by mouse, its footer's
+/// line (D4).
+pub(crate) fn how_change(doc: &CardDoc) -> &'static str {
+    match doc.mode() {
+        Mode::Quick => "Click another answer, or Keep this one",
+        Mode::Form => "Change it and Send, or Keep this one",
+    }
+}
+
+/// An entered receipt's line (D4): its keys.
+pub(crate) const RECEIPT_KEYS: &str = "Enter changes your answer · Esc back to your message";
 
 /// When each control of each card was first painted in view, actionable,
 /// in a pane: by row, and the control's key ([`control`]).
@@ -285,7 +303,8 @@ impl AppView {
         let doc = &a.doc;
         let r = m.r;
         let open = a.state == State::Open;
-        let word = state_word(a);
+        let reopened = act.is_some_and(|x| x.reopened);
+        let word = if reopened { "changing" } else { state_word(a) };
         let draft = act.and_then(|_| self.card_session()).and_then(|s| self.card_drafts.get(&(s, a.tool_id.clone())));
         // What is picked: the draft's, or a form's default before any click.
         let picks: Vec<String> = match (act, draft) {
@@ -316,7 +335,7 @@ impl AppView {
                     .font_family(fonts::SANS)
                     .text_px(m.meta)
                     .line_height(line(m.meta))
-                    .text_color(if a.wait && open { p.acc } else { p.dim_t })
+                    .text_color(if (a.wait && open) || reopened { p.acc } else { p.dim_t })
                     .whitespace_nowrap()
                     .debug_selector(move || format!("ask-state {id} {word}"))
                     .child(word),
@@ -565,7 +584,8 @@ impl AppView {
             Some(x) => match (&x.line, sends, &reply) {
                 (Some(l), _, _) => (l.clone(), true),
                 (None, true, Some(Err(needs))) if draft.is_some() => (needs.clone(), false),
-                _ if keys.is_some() => (how_keys(doc, hi.is_some()), false),
+                _ if keys.is_some() => (how_keys(doc, hi.is_some(), reopened), false),
+                _ if reopened => (how_change(doc).to_string(), false),
                 _ => (how_click(doc).to_string(), false),
             },
         };
@@ -599,7 +619,17 @@ impl AppView {
                             }))
                         })
                 });
-                h_flex().flex_none().gap(px(8.)).child(skip).children(send)
+                // Reopened: Keep closes it as it was, nothing sent.
+                let keep = x.reopened.then(|| {
+                    let (pane, painted) = (x.pane, x.painted.clone());
+                    let key = control(&painted.id, "keep");
+                    button("ask-keep", id, "Keep", false, true, p, m).child(probe(&self.panes.cur.ask_shown, id, key)).on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(pane, |this| this.ask_keep(id, &painted, cx));
+                        }),
+                    )
+                });
+                h_flex().flex_none().gap(px(8.)).child(skip).children(keep).children(send)
             });
             h_flex()
                 .mt(px((10. * r).round()))
@@ -638,8 +668,9 @@ impl AppView {
 }
 
 /// How to answer an entered card from the keys, its footer's line
-/// ([`crate::ask_keys`]); `hi`: an option is highlighted (Enter takes it).
-pub(crate) fn how_keys(doc: &CardDoc, hi: bool) -> String {
+/// ([`crate::ask_keys`]); `hi`: an option is highlighted (Enter takes it);
+/// `reopened`: its answer being changed (Esc keeps it).
+pub(crate) fn how_keys(doc: &CardDoc, hi: bool, reopened: bool) -> String {
     let n = doc.options.len();
     let digits = match n {
         0 => None,
@@ -666,7 +697,7 @@ pub(crate) fn how_keys(doc: &CardDoc, hi: bool) -> String {
         }
     }
     parts.push("0 skips".into());
-    parts.push("Esc back to your message".into());
+    parts.push(if reopened { "Esc keeps your answer" } else { "Esc back to your message" }.into());
     parts.join(" · ")
 }
 
@@ -737,10 +768,13 @@ pub(crate) fn parts(doc: &CardDoc, reply: &Reply) -> Vec<String> {
 const RECEIPT: &str = "ask-receipt";
 
 /// The card's receipt: its head line, the question → the answer, the state
-/// word at its end. `word` and `tone`: the state as the memo says it while
+/// word at its end, then `change` (D4: `· change`, when this desk may
+/// change it). `word` and `tone`: the state as the memo says it while
 /// an answer of this desk's is on its way (else the fold's). `open`: the
-/// whole answer under it, a line each ([`parts`]).
-pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &Palette, m: &Metrics) -> Div {
+/// whole answer under it, a line each ([`parts`]). A skip the state word
+/// doesn't name (on its way, not confirmed, not sent) says
+/// `→ (skipped)`, as its message does (§3.3).
+pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, change: Option<AnyElement>, p: &Palette, m: &Metrics) -> Div {
     let at = |d: Div| if look.opens { d.group(RECEIPT) } else { d };
     let (mark, mark_color) = match look.tone {
         Tone::Fold => receipt_mark(a, p),
@@ -748,7 +782,9 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &P
         Tone::Lost => (Glyph::Needs, p.warn),
     };
     let word = look.word.unwrap_or_else(|| state_word(a));
-    let said = reply.and_then(|r| summary(&a.doc, r));
+    let said = reply
+        .and_then(|r| summary(&a.doc, r))
+        .or_else(|| (matches!(reply, Some(Reply::Skip)) && word != "skipped").then(|| "(skipped)".to_string()));
     let has_said = said.is_some();
     let whole: Vec<String> = if look.open { reply.map(|r| parts(&a.doc, r)).unwrap_or_default() } else { Vec::new() };
     let word_color = match look.tone {
@@ -813,6 +849,7 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, p: &P
                         .debug_selector(move || format!("ask-state {id} {word}"))
                         .child(word),
                 )
+                .children(change)
                 .when(look.opens, |d| {
                     let g = if look.open { Glyph::FoldOpen } else { Glyph::Fold };
                     let open = look.open;
@@ -907,9 +944,11 @@ pub(crate) enum Tone {
 
 impl AppView {
     /// A card's row ([`crate::turns::Kind::Ask`]): the card while it is
-    /// open; once this desk answered it, its receipt with where the answer
-    /// is (§3.5's table) and, unconfirmed or not sent, the cause and
-    /// Resend or Retry; else the fold's receipt, which a click opens.
+    /// open, or reopened to change its answer (D4); once this desk answered
+    /// it, its receipt with where the answer is (§3.5's table) and,
+    /// unconfirmed or not sent, the cause and Resend or Retry; else the
+    /// fold's receipt, which a click opens. A receipt this desk may change
+    /// says `· change`; entered from the keys, its ring and its keys.
     pub(crate) fn render_ask(&self, item: &Item, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
         let Some(CardRow::Ask(a)) = item.card.as_deref() else { return div().into_any_element() };
         let pane = self.panes.cur.id;
@@ -919,8 +958,47 @@ impl AppView {
         let entry = session.as_deref().zip(fold).and_then(|(s, c)| Some((s, self.model.memos.entry(s, c)?)));
         let open = session.as_ref().is_some_and(|s| self.card_open.contains(&(s.clone(), a.tool_id.clone())));
         let said = session.as_ref().and_then(|s| self.card_drafts.get(&(s.clone(), a.tool_id.clone()))).and_then(|d| d.said.clone());
-        // An answer of this desk's on its way, or not confirmed.
-        if let Some((s, e)) = entry.filter(|(_, e)| e.state != MemoState::InChat || whole(a)) {
+        // D4: may its answer change now (§3.6), and is it reopened to.
+        let change = session.as_ref().and(Painted::of(a)).filter(|painted| self.changeable(self.panes.cur.live, painted).is_some());
+        if let Some(painted) = change.clone().filter(|_| session.as_deref().is_some_and(|s| self.changing(s, &a.tool_id))) {
+            let why = self.ask_why(&painted, session.as_deref());
+            let act = Act { painted, pane, can: why.is_none(), line: why.or(said), reopened: true };
+            return self.card(a, id, p, m, Some(&act), cx).into_any_element();
+        }
+        let link = change.map(|painted| {
+            let can = self.ask_why(&painted, session.as_deref()).is_none();
+            self.change_link(painted, id, pane, can, p, m, cx)
+        });
+        // Its receipt entered from the keys (D4: Ctrl+J, last in its order).
+        let keyed = self
+            .panes
+            .cur
+            .ask
+            .entry
+            .as_ref()
+            .filter(|e| e.receipt && e.painted.tool_id == a.tool_id && Some(&e.painted.id) == a.id.as_ref());
+        let keyed = |d: Div| match keyed {
+            Some(e) => {
+                let says = self.ask_why(&e.painted, Some(&e.session)).unwrap_or_else(|| RECEIPT_KEYS.to_string());
+                d.relative().key_context(crate::ask_keys::ASK_ENTERED).child(ring(e, id, p)).child(
+                    div()
+                        .mt(px((6. * m.r).round()))
+                        .pl(px(Glyph::Needs.size() + 8.))
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .line_height(line(m.meta))
+                        .text_color(p.dim_t)
+                        .debug_selector(move || format!("ask-footer {id}"))
+                        .child(says),
+                )
+            }
+            None => d,
+        };
+        // An answer of this desk's on its way, or not confirmed; or taken
+        // in, and the card doesn't show it yet (a change steered in, its
+        // history still to come: not the old answer).
+        let behind = |e: &cards_spec::memo::Entry| whole(a) || fold.is_none_or(|c| !crate::deliver::Memos::shown(e, c));
+        if let Some((s, e)) = entry.filter(|(_, e)| e.state != MemoState::InChat || behind(e)) {
             let (word, cause) = self.model.memos.words(s, e);
             // Taken in, its turn over, or queued or held, and no settled
             // view since dropped events: not confirmed, and nothing to
@@ -939,7 +1017,7 @@ impl AppView {
                 open,
                 opens: false,
             };
-            let mut out = receipt(a, Some(&e.reply), look, id, p, m);
+            let mut out = receipt(a, Some(&e.reply), look, id, link, p, m);
             if lost && let Some(painted) = Painted::of(a) {
                 // Dropped events: nothing is checked until the history is
                 // in again and an event has said the slot (`deliver`'s
@@ -1002,19 +1080,19 @@ impl AppView {
                         .children(btn),
                 );
             }
-            return out.into_any_element();
+            return keyed(out).into_any_element();
         }
         if whole(a) {
             let act = Painted::of(a).filter(|_| a.state == State::Open).zip(session.as_ref()).map(|(painted, _)| {
                 let why = self.ask_why(&painted, session.as_deref());
-                Act { painted, pane, can: why.is_none(), line: why.or(said) }
+                Act { painted, pane, can: why.is_none(), line: why.or(said), reopened: false }
             });
             return self.card(a, id, p, m, act.as_ref(), cx).into_any_element();
         }
         let tool = a.tool_id.clone();
         let reply = a.reply.as_ref();
         let opens = session.is_some() && reply.is_some_and(|r| !parts(&a.doc, r).is_empty());
-        let r = receipt(a, reply, Look { open, opens, ..Look::default() }, id, p, m);
+        let r = keyed(receipt(a, reply, Look { open, opens, ..Look::default() }, id, link, p, m));
         if opens {
             r.id(("ask-receipt", id))
                 .cursor_pointer()
@@ -1026,6 +1104,50 @@ impl AppView {
         } else {
             r.into_any_element()
         }
+    }
+
+    /// A receipt's `· change` (D4): a click reopens its card
+    /// ([`AppView::ask_change`]), once armed, as any control. Dim and
+    /// inert while this window can't answer it ([`AppView::ask_why`]).
+    #[allow(clippy::too_many_arguments)]
+    fn change_link(
+        &self,
+        painted: Painted,
+        id: u64,
+        pane: PaneId,
+        can: bool,
+        p: &Palette,
+        m: &Metrics,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = control(&painted.id, "change");
+        let hi = p.ink;
+        let word = div()
+            .id(("ask-change", id))
+            .relative()
+            .flex_none()
+            .text_px(m.meta)
+            .text_color(if can { p.acc } else { p.dim_k })
+            .debug_selector(move || format!("ask-change {id}{}", if can { "" } else { " off" }))
+            .child("change");
+        let word = if can {
+            word.child(probe(&self.panes.cur.ask_shown, id, key)).cursor_pointer().hover(move |d| d.text_color(hi)).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    // Its own: the receipt under it doesn't open.
+                    cx.stop_propagation();
+                    this.in_pane(pane, |this| this.ask_change(id, &painted, window, cx));
+                },
+            ))
+        } else {
+            word
+        };
+        h_flex()
+            .flex_none()
+            .gap(px(6.))
+            .items_center()
+            .child(div().text_px(m.meta).text_color(p.dim_t).child("·"))
+            .child(word)
+            .into_any_element()
     }
 
     /// Why the controls of the open card `painted` (of `session`) don't act

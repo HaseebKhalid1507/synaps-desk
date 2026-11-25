@@ -309,6 +309,14 @@ impl Memos {
         self.by.get(session)?.get(id).filter(|e| e.answers(card))
     }
 
+    /// Whether `card`'s answers show `e`, ours, past those it saw when
+    /// sent (the memo's rule 2): until they do, the card draws ours (D4:
+    /// a change taken in, the history still to come, is not the old
+    /// answer).
+    pub(crate) fn shown(e: &Entry, card: &Card) -> bool {
+        shows(e, card)
+    }
+
     /// Whether any entry waits on the clock (sending: its echo; checking:
     /// a settled view).
     pub(crate) fn timed(&self) -> bool {
@@ -489,7 +497,8 @@ impl Memos {
 
     /// What a card in the memo says of its answer, as §3.5's table words
     /// it: the state word on its receipt line, and (unconfirmed, not
-    /// sent) the cause line under it.
+    /// sent) the cause line under it. In the chat, it says what it was
+    /// (D4): `answered`, `changed` or `skipped`, as the fold's receipt.
     pub(crate) fn words(&self, session: &str, e: &Entry) -> (&'static str, Option<String>) {
         if self.unchecked(session, e) {
             return ("not confirmed", Some(self.answer_gap(session).into()));
@@ -499,7 +508,14 @@ impl Memos {
             State::Queued => "queued · the agent reads it at its next step",
             State::Held => "held · it goes in after the agent's next turn",
             State::Checking => "checking…",
-            State::InChat => return ("answered", None),
+            State::InChat => {
+                let word = match e.reply {
+                    Reply::Answer(_) => "answered",
+                    Reply::Change(_) => "changed",
+                    Reply::Skip => "skipped",
+                };
+                return (word, None);
+            }
             State::Unconfirmed => "not confirmed",
             State::NotSent => "not sent",
         };
