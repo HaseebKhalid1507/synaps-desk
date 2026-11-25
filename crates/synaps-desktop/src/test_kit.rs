@@ -20,6 +20,8 @@ mod cards_d_tests;
 mod hang_tests;
 #[path = "held_tests.rs"]
 mod held_tests;
+#[path = "key_clock_tests.rs"]
+mod key_clock_tests;
 #[path = "keys_tests.rs"]
 mod keys_tests;
 #[path = "send_tests.rs"]
