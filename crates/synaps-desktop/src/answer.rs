@@ -26,6 +26,12 @@
 //! An answer never resolves a permission prompt (§5.1): its one effect is
 //! a `Submit` or `Steer` of the text `cards_spec::message` built, on the
 //! card's attachment ([`AppView::send_card`]).
+//!
+//! The keys (D2b, [`crate::ask_keys`]) act through the same paths as a
+//! click, without its arm (theirs is the card's first paint): a pick, a
+//! field, Send, Skip, all through [`AppView::ask_send`]. A click that
+//! answers ends a keyboard batch, and the keys go back to the composer
+//! ([`AppView::clicked_an_answer`]).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -193,14 +199,30 @@ impl AppView {
             log::debug!(target: "synaps_desktop::card", "card {}: a click before it armed, nothing sent", painted.id);
             return;
         };
+        if self.card_pick(&session, row, painted, label, window, cx) {
+            self.clicked_an_answer(cx);
+        }
+    }
+
+    /// Option `label` of the card `painted` of `session`, by a click or a
+    /// key (D2b): a quick card's answer (true: it went), or a pick.
+    pub(crate) fn card_pick(
+        &mut self,
+        session: &str,
+        row: u64,
+        painted: &Painted,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let doc = painted.doc.clone();
-        let Some(op) = doc.option(label) else { return };
+        let Some(op) = doc.option(label) else { return false };
         if doc.mode() == Mode::Quick && op.note.is_none() {
             let reply =
                 Reply::Answer(cards_spec::Answer { choice: Some(cards_spec::Choice::One(label.to_string())), note: None, fields: None });
-            self.ask_send(&session, row, painted, reply, cx);
-            return;
+            return self.ask_send(session, row, painted, reply, cx);
         }
+        let session = session.to_string();
         let asks_note = op.note.clone();
         let d = self.draft(&session, painted);
         d.said = None;
@@ -231,12 +253,21 @@ impl AppView {
         }
         self.remeasure_row(row);
         cx.notify();
+        false
     }
 
     /// A click on field `id` of the card `painted`: a check ticks; a text
     /// field opens to type in, its prefill in it.
     pub(crate) fn ask_field(&mut self, row: u64, painted: &Painted, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, &format!("field {id}"))) else { return };
+        self.card_field(&session, row, painted, id, window, cx);
+    }
+
+    /// Field `id` of the card `painted` of `session`, by a click or a key
+    /// (D2b): a check ticks; a text field opens to type in, its prefill in
+    /// it, and has the keys.
+    pub(crate) fn card_field(&mut self, session: &str, row: u64, painted: &Painted, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let session = session.to_string();
         let doc = painted.doc.clone();
         let Some(f) = doc.field(id) else { return };
         let now = self.draft(&session, painted).value(&doc, id, cx);
@@ -293,25 +324,38 @@ impl AppView {
 
     /// A single-line input of row `row`'s card: typing redraws it (Send
     /// lights when the form is whole).
+    /// Enter there, the card entered from the keys, goes forward
+    /// ([`AppView::ask_field_enter`]).
     fn watch_input(row: u64, e: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
-        cx.subscribe_in(e, window, move |this: &mut Self, _, ev: &InputEvent, _, cx| {
-            if matches!(ev, InputEvent::Change) {
+        cx.subscribe_in(e, window, move |this: &mut Self, _, ev: &InputEvent, window, cx| match ev {
+            InputEvent::Change => {
                 this.remeasure_row(row);
                 cx.notify();
             }
+            InputEvent::PressEnter { .. } => this.ask_field_enter(row, window, cx),
+            _ => {}
         })
     }
 
     /// Send on the card `painted`: its draft's answer, once whole.
     pub(crate) fn ask_submit(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
         let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "send")) else { return };
-        let reply = self.draft(&session, painted).reply(&painted.doc, cx);
+        if self.card_submit(&session, row, painted, cx) {
+            self.clicked_an_answer(cx);
+        }
+    }
+
+    /// Send on the card `painted` of `session`, by a click or a key (D2b):
+    /// its draft's answer, once whole (true: it went), else what it needs.
+    pub(crate) fn card_submit(&mut self, session: &str, row: u64, painted: &Painted, cx: &mut Context<Self>) -> bool {
+        let reply = self.draft(session, painted).reply(&painted.doc, cx);
         match reply {
-            Ok(reply) => self.ask_send(&session, row, painted, reply, cx),
+            Ok(reply) => self.ask_send(session, row, painted, reply, cx),
             Err(why) => {
-                self.draft(&session, painted).said = Some(why);
+                self.draft(session, painted).said = Some(why);
                 self.remeasure_row(row);
                 cx.notify();
+                false
             }
         }
     }
@@ -319,25 +363,31 @@ impl AppView {
     /// Skip on the card `painted` (F7): `[card <id> skipped]`.
     pub(crate) fn ask_skip(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
         let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "skip")) else { return };
-        self.ask_send(&session, row, painted, Reply::Skip, cx);
+        if self.ask_send(&session, row, painted, Reply::Skip, cx) {
+            self.clicked_an_answer(cx);
+        }
     }
 
     /// Press `reply` on the card `painted`: checked on what the store holds
-    /// now ([`crate::model::Model::press_card`]), sent, its draft gone;
-    /// or the card says why nothing went.
-    fn ask_send(&mut self, session: &str, row: u64, painted: &Painted, reply: Reply, cx: &mut Context<Self>) {
+    /// now ([`crate::model::Model::press_card`]), sent, its draft gone
+    /// (true); or the card says why nothing went. D2b's keys send here
+    /// too: the one delivery path.
+    pub(crate) fn ask_send(&mut self, session: &str, row: u64, painted: &Painted, reply: Reply, cx: &mut Context<Self>) -> bool {
         let live = self.panes.cur.live;
-        match self.model.press_card(live, painted, reply, Instant::now()) {
+        let sent = match self.model.press_card(live, painted, reply, Instant::now()) {
             Ok(out) => {
                 self.send_card(live, out, cx);
                 self.card_drafts.remove(&(session.to_string(), painted.tool_id.clone()));
+                true
             }
             Err(why) => {
                 log::info!(target: "synaps_desktop::card", "card {}: not sent ({why})", painted.id);
                 self.draft(session, painted).said = Some(why);
+                false
             }
-        }
+        };
         self.after_card(row, cx);
+        sent
     }
 
     /// Retry on the card `painted`'s answer, not sent.
