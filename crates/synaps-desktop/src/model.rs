@@ -4086,6 +4086,11 @@ mod fake_daemon {
         let mut a = attaches.recv_timeout(T).unwrap();
         a.send(attached_with_prompt(A, 1));
         pump(&mut m, &events, "A attached", |m| m.is_active(A) && m.can_send());
+        // A's connection is gone before the sends go out, so each is
+        // refused on its own (a refusal gives back one text). Closed after
+        // them, it raced the connection thread: sent first, the three were
+        // given back by the end, one text per pane (n11, below).
+        drop(a);
         let (p0, p1) = (PaneId::FIRST, PaneId::nth(1));
         for (p, t) in [(p0, "one"), (p1, "two"), (p0, "three")] {
             client.on(m.attachment().unwrap()).submit(t).unwrap();
@@ -4093,8 +4098,9 @@ mod fake_daemon {
         }
         m.tabs.open(B, "b", Place::New);
         let _ = ui_switch(&mut m, &client, B, None);
-        drop(a);
-        let seen = effects(&mut m, &events, 1, |e| matches!(e, Effect::Unsent { .. }));
+        // Three refusals, three texts: wait for all of them (the first can
+        // be applied before the next has come).
+        let seen = effects(&mut m, &events, 3, |e| matches!(e, Effect::Unsent { .. }));
         assert_eq!(
             seen.iter().filter(|e| matches!(e, Effect::Unsent { .. })).collect::<Vec<_>>(),
             vec![
