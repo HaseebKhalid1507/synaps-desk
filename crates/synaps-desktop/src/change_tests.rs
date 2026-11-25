@@ -55,11 +55,26 @@ fn id(card: &str) -> cards_spec::CardId {
     cards_spec::CardId::parse(card).unwrap()
 }
 
+/// Nothing waits off screen either: the session list as a daemon's with
+/// none that needs you but the one on screen. The demo's has some, and
+/// with split panes on (the tests' split-on lane) Ctrl+J opens a session
+/// waiting off screen before anything that doesn't wait (split.md §7),
+/// such as an answer to change.
+fn nothing_waits_elsewhere(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, _| {
+        let here: Vec<String> = v.model.sessions.iter().filter(|s| v.model.is_active(&s.id)).map(|s| s.id.clone()).collect();
+        v.model.sessions.retain(|s| here.contains(&s.id));
+        assert!(v.jump_elsewhere().is_none() && v.waiting_pane().is_none(), "nothing waits off screen");
+    });
+}
+
 /// A quiet session whose agent asked `input` live as card `card_id` (call
 /// `tool`), answered `values` in the history (another desk's, or this
-/// one's, its turn over): start state A, the composer with the keys.
+/// one's, its turn over): start state A, the composer with the keys, and
+/// nothing waiting anywhere.
 fn answered(cx: &mut TestAppContext, tool: &str, card_id: &str, input: &Value, values: Value) -> Asked {
     let (w, view, row, events) = asked(cx, tool, card_id, input);
+    nothing_waits_elsewhere(cx, &view);
     land(cx, w, &view, vec![json!({"role": "user", "content": message(card_id, input, values)})]);
     play(cx, w, &view);
     at_rest(cx, w, &view);
@@ -290,6 +305,7 @@ fn a_skip_or_a_change_taken_in_reads_as_it_is(cx: &mut TestAppContext) {
 fn a_change_waits_for_an_answer_on_its_way_and_replaces_one_unconfirmed(cx: &mut TestAppContext) {
     let input = branch();
     let (w, view, row, _events) = asked(cx, "toolu_c6", "c6inflt", &input);
+    nothing_waits_elsewhere(cx, &view);
     press(cx, w, "ctrl-j");
     press(cx, w, "1");
     assert_eq!(texts(cx, &view), vec![message("c6inflt", &input, json!({"choice": "main"}))]);
