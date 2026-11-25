@@ -1,14 +1,16 @@
 //! The memory of card choices without a window ([`super`]): what "the same
 //! question" is, what a choice is kept as, the store's cap, the file (its
-//! format, an unreadable one, atomic and ordered writes), off reading and
-//! writing nothing, and a card's recall fixed at first sight.
+//! format, an unreadable one, atomic and ordered writes, a Forget no save
+//! undoes), off reading and writing nothing, and a card's recall fixed
+//! at first sight.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use cards_spec::{Answer, CardDoc, Choice, Reply};
 use serde_json::{Value, json};
 
-use super::{Asked, CAP, Recall, Store, enabled, write};
+use super::{Asked, CAP, Recall, Store, accept_forget, enabled, remove, save, save_then};
 
 fn doc(v: Value) -> CardDoc {
     match cards_spec::parse_input(&v).expect("a card") {
@@ -45,6 +47,16 @@ fn dir(name: &str) -> PathBuf {
 }
 
 const CWD: &str = "/home/you/work/relay-gateway";
+
+/// A save free to go.
+fn go() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+/// A snapshot's number, newer than every one before.
+fn generation() -> u64 {
+    super::next_generation()
+}
 
 /// The same question: the folder, the question (its spacing and case
 /// aside), one pick or several, and the option set (in any order, any
@@ -215,8 +227,8 @@ fn an_unreadable_file_starts_empty_and_says_why() {
 }
 
 /// A write is whole or nothing (a temporary file renamed over it, none
-/// left behind), never an older snapshot over a newer one, and `None`
-/// removes the file.
+/// left behind), never an older snapshot over a newer one; a removal
+/// removes it.
 #[test]
 fn writes_are_atomic_and_in_order() {
     let d = dir("writes");
@@ -224,9 +236,10 @@ fn writes_are_atomic_and_in_order() {
     let mut s = Store::default();
     s.put("3f9a1c2e4b5d6f70".into(), vec![1]);
     let newer = s.to_text();
-    let g = super::GENERATION.fetch_add(10, std::sync::atomic::Ordering::SeqCst) + 10;
-    write(&path, g, Some(&newer)).unwrap();
-    write(&path, g - 1, Some("{\"version\": 1, \"choices\": []}\n")).unwrap();
+    let older = generation();
+    let g = generation();
+    assert!(save(&path, g, &newer, &go()).unwrap());
+    assert!(!save(&path, older, "{\"version\": 1, \"choices\": []}\n", &go()).unwrap());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "the older snapshot never lands over the newer");
     let left: Vec<String> = std::fs::read_dir(&d)
         .unwrap()
@@ -240,9 +253,75 @@ fn writes_are_atomic_and_in_order() {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "this user's only");
     }
-    write(&path, g + 1, None).unwrap();
+    remove(&path, generation()).unwrap();
     assert!(!path.exists(), "removed");
-    write(&path, g + 2, None).unwrap();
+    remove(&path, generation()).unwrap();
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// A Forget accepted while a save is mid-write (Shady #93 P2-1): its
+/// removal waits for that write, then removes the file; a save numbered
+/// before the Forget that comes later never writes, even when the removal
+/// failed.
+#[test]
+fn a_forget_waits_for_a_save_mid_write_and_no_older_save_lands_after() {
+    use std::sync::mpsc::channel;
+    let d = dir("forget-race");
+    let path = d.join(super::FILE);
+    let text = "{\"version\": 1, \"choices\": []}\n";
+    let (waiting, late) = (generation(), generation());
+    let mid = generation();
+    let (inside, at) = (channel(), channel::<()>());
+    let p = path.clone();
+    let writer = std::thread::spawn(move || {
+        save_then(&p, mid, text, &go(), || {
+            inside.0.send(()).unwrap();
+            at.1.recv().unwrap();
+        })
+    });
+    inside.1.recv().unwrap();
+    // The save holds its write; the Forget is accepted all the same.
+    let forget = accept_forget(&path);
+    let p = path.clone();
+    let removal = std::thread::spawn(move || remove(&p, forget));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!removal.is_finished(), "the removal waits for the write");
+    at.0.send(()).unwrap();
+    assert!(writer.join().unwrap().unwrap(), "the save mid-write finished");
+    removal.join().unwrap().unwrap();
+    assert!(!path.exists(), "then the removal: gone");
+    for g in [waiting, late] {
+        assert!(!save(&path, g, text, &go()).unwrap(), "a save from before the Forget never writes");
+    }
+    assert!(!path.exists());
+    // A removal that fails still bars every older save.
+    std::fs::create_dir_all(path.join("in-the-way")).unwrap();
+    let before = generation();
+    let forget = accept_forget(&path);
+    assert!(remove(&path, forget).is_err(), "not removable");
+    std::fs::remove_dir_all(&path).unwrap();
+    assert!(!save(&path, before, text, &go()).unwrap(), "older than the Forget: never written");
+    assert!(!path.exists());
+    assert!(save(&path, generation(), text, &go()).unwrap(), "a save after it writes");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// Off stops a save not begun; never a removal.
+#[test]
+fn off_stops_a_save_not_begun_never_a_removal() {
+    let d = dir("stop");
+    let path = d.join(super::FILE);
+    let text = "{\"version\": 1, \"choices\": []}\n";
+    assert!(!save(&path, generation(), text, &AtomicBool::new(true)).unwrap(), "stopped: nothing written");
+    assert!(!path.exists());
+    assert!(save(&path, generation(), text, &go()).unwrap());
+    let mut r = Recall::new(true, Some(path.clone()));
+    let (_, _, _, stop) = r.snapshot().unwrap();
+    let forget = r.forget().map(|(_, g)| g).unwrap();
+    r.set_on(false);
+    assert!(stop.load(std::sync::atomic::Ordering::SeqCst), "off: the save not begun is stopped");
+    remove(&path, forget).unwrap();
+    assert!(!path.exists(), "the removal, never");
     let _ = std::fs::remove_dir_all(d);
 }
 
@@ -259,7 +338,6 @@ fn off_reads_nothing_and_keeps_nothing() {
     assert_eq!((r.reads, r.len()), (0, 0), "not read");
     assert_eq!(r.at("s", "toolu_1", Some(CWD), &ship), Vec::<usize>::new());
     assert!(!r.remember(CWD, &ship, &one("Don't run it")), "nothing kept");
-    assert!(r.snapshot().is_some_and(|(_, _, text)| text.is_none()), "and nothing to write but a removal (Forget's)");
     r.set_on(true);
     assert_eq!((r.reads, r.len()), (1, 1), "on: read now");
     assert_eq!(r.at("s", "toolu_2", Some(CWD), &ship), vec![0], "Run it now");
@@ -285,7 +363,7 @@ fn what_a_card_recalls_is_fixed_at_first_sight() {
     assert_eq!(r.at("s", "toolu_3", Some(CWD), &ship), vec![0], "the latest choice");
     assert_eq!(r.at("s", "toolu_4", Some("/elsewhere"), &ship), Vec::<usize>::new(), "another folder");
     assert_eq!(r.at("s", "toolu_5", None, &ship), Vec::<usize>::new(), "no folder");
-    r.forget();
+    assert!(r.forget().is_none(), "no file to remove");
     assert_eq!(r.len(), 0);
     assert_eq!(r.at("s", "toolu_3", Some(CWD), &ship), Vec::<usize>::new(), "forgotten, on every card");
 }

@@ -42,14 +42,20 @@
 //!   wins.
 //! - **The setting** `cards.remember` (Settings, THIS APP: "Remember card
 //!   choices", on unless `false` or `"off"`): off, the file is neither
-//!   read nor written, and nothing is marked. "Forget remembered choices"
-//!   empties it and removes the file, on or off.
+//!   read nor written, a save not begun is dropped, and nothing is
+//!   marked.
+//! - **Forget** ("Forget remembered choices", on or off) empties the
+//!   memory and removes the file. Accepted at the click, it runs to its
+//!   end on a task of its own: after a save already writing, never undone
+//!   by an older save, Off or a closed window ([`accept_forget`],
+//!   [`remove`]). It is this desk process's: another one running keeps
+//!   what it read, and may write it back.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use cards_spec::sanitize::fold_key;
 use cards_spec::{CardDoc, Reply};
@@ -70,9 +76,6 @@ pub(crate) const CAP: usize = 300;
 
 /// The file's format.
 const VERSION: u64 = 1;
-
-/// Open cards whose recall is fixed, at most (then it starts over).
-const SEEN_CAP: usize = 1024;
 
 /// `cards.remember` as the settings file has it: on unless `false` or
 /// `"off"`.
@@ -159,10 +162,6 @@ impl Store {
         self.entries.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub(crate) fn get(&self, key: &str) -> Option<&[u8]> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, p)| p.as_slice())
     }
@@ -236,60 +235,108 @@ fn read(path: &Path) -> (Store, Option<String>) {
     }
 }
 
-/// Every write's number, across the process: a later one is a newer
-/// snapshot.
+/// Every snapshot's and every Forget's number, across the process: a
+/// later one is newer.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Per file, the newest snapshot written: an older write that comes after
-/// it does nothing.
+fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Per file, the newest snapshot that reached it (written, or the file
+/// removed). Held across each write, so one write at a time: an older
+/// snapshot that comes after a newer one does nothing.
 static WRITTEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Mutex::default);
 
-/// Write snapshot `generation` to `path`, or remove the file (`None`).
-/// Atomic: a temporary file of this process beside it, synced, renamed
-/// over it (and on Unix the folder synced); the temporary file never
-/// outlives a failure. One write at a time, and never an older snapshot
-/// over a newer one. Off the UI thread ([`AppView::save_recall`]).
-pub(crate) fn write(path: &Path, generation: u64, text: Option<&str>) -> std::io::Result<()> {
+/// Per file, the newest Forget accepted: a save numbered before it never
+/// writes, whenever it runs. Held only for a look, never across a write:
+/// the UI thread raises it at the click, never waiting on the disk.
+static FORGOTTEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Mutex::default);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A Forget of `path` accepted (on the UI thread): its number. From now
+/// on no save numbered before it writes the file, one waiting or one
+/// cancelled too late; its removal ([`remove`]) runs after a save already
+/// writing.
+pub(crate) fn accept_forget(path: &Path) -> u64 {
+    let generation = next_generation();
+    let mut f = lock(&FORGOTTEN);
+    let at = f.entry(path.to_path_buf()).or_default();
+    *at = (*at).max(generation);
+    generation
+}
+
+/// Write snapshot `generation` to `path` (true), unless memory was turned
+/// off before it began (`stop`), a Forget came after it, or a newer
+/// snapshot is there (false). Atomic: a temporary file of this process
+/// beside it, synced, renamed over it (and on Unix the folder synced); the temporary file
+/// never outlives a failure. One write at a time. Off the UI thread
+/// ([`AppView::save_recall`]).
+pub(crate) fn save(path: &Path, generation: u64, text: &str, stop: &AtomicBool) -> std::io::Result<bool> {
+    save_then(path, generation, text, stop, || {})
+}
+
+/// [`save`], `between` run once the temporary file is written, before the
+/// rename, the write's lock held (tests: a save caught mid-write).
+pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicBool, between: impl FnOnce()) -> std::io::Result<bool> {
     use std::io::Write as _;
-    let mut written = WRITTEN.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut written = lock(&WRITTEN);
+    let forgotten = lock(&FORGOTTEN).get(path).is_some_and(|f| *f > generation);
+    if forgotten || stop.load(Ordering::SeqCst) || written.get(path).is_some_and(|g| *g >= generation) {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("json.{}.{generation}.tmp", std::process::id()));
+    let done = (|| {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let mut f = o.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        between();
+        std::fs::rename(&tmp, path)
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    written.insert(path.to_path_buf(), generation);
+    Ok(true)
+}
+
+/// Remove the file at `path`: Forget `generation`'s removal. After a save
+/// already writing (the lock), never cancelled (its task is its own). A
+/// snapshot newer than the Forget already there is left: it holds only
+/// what was chosen after it.
+pub(crate) fn remove(path: &Path, generation: u64) -> std::io::Result<()> {
+    let mut written = lock(&WRITTEN);
     if written.get(path).is_some_and(|g| *g >= generation) {
         return Ok(());
     }
-    match text {
-        None => match std::fs::remove_file(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        },
-        Some(text) => {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension(format!("json.{}.{generation}.tmp", std::process::id()));
-            let done = (|| {
-                let mut o = std::fs::OpenOptions::new();
-                o.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-                let mut f = o.open(&tmp)?;
-                f.write_all(text.as_bytes())?;
-                f.sync_all()?;
-                std::fs::rename(&tmp, path)
-            })();
-            if done.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            done?;
-            #[cfg(unix)]
-            if let Some(dir) = path.parent()
-                && let Ok(d) = std::fs::File::open(dir)
-            {
-                let _ = d.sync_all();
-            }
-        }
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
     }
     written.insert(path.to_path_buf(), generation);
     Ok(())
 }
+
+/// Open cards whose recall is fixed, at most (then it starts over).
+const SEEN_CAP: usize = 1024;
 
 /// The window's memory of card choices.
 pub(crate) struct Recall {
@@ -308,14 +355,28 @@ pub(crate) struct Recall {
     pub(crate) reads: u32,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) writes: u32,
-    /// The write on its way: a newer snapshot, or turning it off, drops it.
+    /// The save on its way: a newer snapshot drops it, as turning it off
+    /// does. Never a Forget's removal: that runs on its own.
     save: Option<Task<()>>,
+    /// Set when memory is turned off: a save not begun by then writes
+    /// nothing (one already writing finishes: a write can't be recalled).
+    stop: Arc<AtomicBool>,
 }
 
 impl Recall {
     /// On or off, its file: read now if on.
     pub(crate) fn new(on: bool, path: Option<PathBuf>) -> Self {
-        let mut r = Recall { on, path, store: Store::default(), seen: RefCell::default(), said: None, reads: 0, writes: 0, save: None };
+        let mut r = Recall {
+            on,
+            path,
+            store: Store::default(),
+            seen: RefCell::default(),
+            said: None,
+            reads: 0,
+            writes: 0,
+            save: None,
+            stop: Arc::default(),
+        };
         if on {
             r.load();
         }
@@ -336,9 +397,9 @@ impl Recall {
         self.store.len()
     }
 
-    /// Turned on (the file read) or off (what was read let go, a write on
-    /// its way dropped). Open cards recall again; an entered card's
-    /// highlight stays where it is.
+    /// Turned on (the file read) or off (what was read let go, a save not
+    /// begun stopped; never a Forget). Open cards recall again; an entered
+    /// card's highlight stays where it is.
     pub(crate) fn set_on(&mut self, on: bool) {
         if on == self.on {
             return;
@@ -351,6 +412,8 @@ impl Recall {
             self.load();
         } else {
             self.save = None;
+            self.stop.store(true, Ordering::SeqCst);
+            self.stop = Arc::default();
         }
     }
 
@@ -384,18 +447,23 @@ impl Recall {
         true
     }
 
-    /// Forget every choice: open cards recall nothing more.
-    pub(crate) fn forget(&mut self) {
+    /// Forget every choice: open cards recall nothing more, a save on its
+    /// way is dropped, and no older one writes after it. Its removal's
+    /// path and number (`None`: no file).
+    pub(crate) fn forget(&mut self) -> Option<(PathBuf, u64)> {
         self.store = Store::default();
         self.seen.borrow_mut().clear();
+        self.save = None;
+        let path = self.path.clone()?;
+        let generation = accept_forget(&path);
+        Some((path, generation))
     }
 
-    /// The file's next snapshot: its path, number and text (`None`: the
-    /// file goes, nothing being kept).
-    fn snapshot(&self) -> Option<(PathBuf, u64, Option<String>)> {
+    /// The file's next snapshot: its path, number and text, and what stops
+    /// it.
+    fn snapshot(&self) -> Option<(PathBuf, u64, String, Arc<AtomicBool>)> {
         let path = self.path.clone()?;
-        let text = (!self.store.is_empty()).then(|| self.store.to_text());
-        Some((path, GENERATION.fetch_add(1, Ordering::SeqCst) + 1, text))
+        Some((path, next_generation(), self.store.to_text(), self.stop.clone()))
     }
 }
 
@@ -447,16 +515,13 @@ impl AppView {
         }
     }
 
-    /// The memory's file, written as it stands off the UI thread (removed
-    /// when it keeps nothing).
+    /// The memory's file, written as it stands off the UI thread.
     pub(crate) fn save_recall(&mut self, cx: &mut Context<Self>) {
-        let Some((path, generation, text)) = self.recall.snapshot() else { return };
+        let Some((path, generation, text, stop)) = self.recall.snapshot() else { return };
         self.recall.writes += 1;
-        self.recall.save = Some(cx.spawn(async move |_, cx| {
-            let shown = path.display().to_string();
-            let done = cx.background_spawn(async move { write(&path, generation, text.as_deref()) }).await;
-            if let Err(e) = done {
-                log::warn!(target: "synaps_desktop::card", "card choices {shown}: not saved ({e})");
+        self.recall.save = Some(cx.background_spawn(async move {
+            if let Err(e) = save(&path, generation, &text, &stop) {
+                log::warn!(target: "synaps_desktop::card", "card choices {}: not saved ({e})", path.display());
             }
         }));
     }
@@ -469,12 +534,22 @@ impl AppView {
     }
 
     /// Settings' "Forget remembered choices": the memory empties, and its
-    /// file goes (on or off: the user asked).
+    /// file goes (on or off: the user asked). Accepted now: the removal
+    /// runs to its end on a task of its own, after a save already writing,
+    /// whatever comes next (Off, the window closed).
     pub(crate) fn forget_card_choices(&mut self, cx: &mut Context<Self>) {
-        self.recall.forget();
-        self.recall.save = None;
-        log::info!(target: "synaps_desktop::card", "card choices: forgotten");
-        self.save_recall(cx);
+        let Some((path, generation)) = self.recall.forget() else {
+            log::info!(target: "synaps_desktop::card", "card choices: forgotten");
+            cx.notify();
+            return;
+        };
+        cx.background_spawn(async move {
+            match remove(&path, generation) {
+                Ok(()) => log::info!(target: "synaps_desktop::card", "card choices: forgotten, {} removed", path.display()),
+                Err(e) => log::warn!(target: "synaps_desktop::card", "card choices {}: forgotten, not removed ({e})", path.display()),
+            }
+        })
+        .detach();
         cx.notify();
     }
 }

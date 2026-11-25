@@ -10,6 +10,9 @@
 //! the file; no frame at rest; a pending permission prompt untouched; a
 //! choice remembered meanwhile never moves an open card.
 //!
+//! Shady #93: Off, an older save or the window closing never undo a
+//! Forget (P2-1).
+//!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
 //! are D2a's and D2b's ([`super::answer_tests`], [`super::keys_tests`]).
@@ -566,26 +569,20 @@ fn a_choice_remembered_meanwhile_never_moves_an_open_card(cx: &mut TestAppContex
     assert_eq!(marked(cx, w, third), vec![1], "the next card recalls it");
 }
 
-/// Settings, THIS APP: "Remember card choices" with "forget remembered
-/// choices" beside it; a click forgets (the file goes) and it says
-/// nothing is remembered.
-#[gpui_kit::test]
-fn settings_forget_remembered_choices(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, VisualTestContext};
-    let input = ship_input();
-    let (w, view, _first, _events) = asked(cx, "toolu_v1", "c1vvv01", &input);
-    let path = remembering(cx, &view, "settings");
-    press(cx, w, "ctrl-j");
-    press(cx, w, "1");
-    reached(cx, w, &view, &message("c1vvv01", &input, json!({"choice": "Run it now"})));
-    assert!(path.exists());
+/// Settings, THIS APP, found by "remember card": drawn.
+fn settings(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     view.update(cx, |v, cx| {
         v.open_view(crate::tabs::Kind::Settings, cx);
         v.settings_find("remember card".into(), cx);
     });
     cx.run_until_parked();
-    play(cx, w, &view);
-    assert!(!has(cx, w, "recall-none".into()));
+    play(cx, w, view);
+}
+
+/// A click on Settings' "forget remembered choices", and what it does
+/// played out.
+fn click_forget(cx: &mut TestAppContext, w: AnyWindowHandle) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, VisualTestContext};
     let mut vcx = VisualTestContext::from_window(w, cx);
     let position = vcx.debug_bounds("recall-forget").expect("forget remembered choices, drawn").center();
     vcx.simulate_event(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() });
@@ -599,7 +596,111 @@ fn settings_forget_remembered_choices(cx: &mut TestAppContext) {
     vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
     vcx.run_until_parked();
     settle(cx, w, 8);
+}
+
+/// Settings, THIS APP: "Remember card choices" with "forget remembered
+/// choices" beside it; a click forgets (the file goes) and it says
+/// nothing is remembered.
+#[gpui_kit::test]
+fn settings_forget_remembered_choices(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_v1", "c1vvv01", &input);
+    let path = remembering(cx, &view, "settings");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1vvv01", &input, json!({"choice": "Run it now"})));
+    assert!(path.exists());
+    settings(cx, w, &view);
+    assert!(!has(cx, w, "recall-none".into()));
+    click_forget(cx, w);
     assert!(!path.exists(), "the file is gone");
     assert_eq!(kept(cx, &view).0, 0);
     assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()), "nothing remembered");
+}
+
+/// The doc `input` asks, as a card drawn (call `tool`, card `card`)
+/// would carry it.
+fn painted(input: &Value, tool: &str, card: &str) -> crate::deliver::Painted {
+    let doc = match cards_spec::parse_input(input).expect("a card") {
+        cards_spec::Input::Create { doc, .. } => doc,
+        cards_spec::Input::Close(_) => unreachable!(),
+    };
+    crate::deliver::Painted {
+        tool_id: tool.into(),
+        id: cards_spec::CardId::parse(card).unwrap(),
+        doc: std::sync::Arc::new(doc),
+        wait: true,
+    }
+}
+
+/// Forget, then Off before its removal ran (Shady #93 P2-1): Off never
+/// cancels a Forget. The file goes, and On again reads nothing back.
+#[gpui_kit::test]
+fn forget_then_off_before_the_removal_runs_still_removes_the_file(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_h1", "c1hhh01", &input);
+    let path = remembering(cx, &view, "forget-off");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1hhh01", &input, json!({"choice": "Run it now"})));
+    assert!(path.exists());
+    view.update(cx, |v, cx| {
+        v.forget_card_choices(cx);
+        v.settings_pick(Pick::Remember, "off", cx);
+    });
+    cx.run_until_parked();
+    assert!(!path.exists(), "Off never cancels a Forget");
+    view.update(cx, |v, cx| v.settings_pick(Pick::Remember, "on", cx));
+    assert_eq!(kept(cx, &view).0, 0, "on again: nothing read back");
+    let id = asks_again(cx, w, &view, "toolu_h2", "c2hhh02", &input);
+    assert!(marked(cx, w, id).is_empty(), "forgotten");
+}
+
+/// A save not yet written, then Forget, then Off, before either ran
+/// (Shady #93 P2-1): neither the older save nor Off undoes the Forget.
+#[gpui_kit::test]
+fn a_save_on_its_way_never_lands_after_a_forget(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_i1", "c1iii01", &input);
+    let path = remembering(cx, &view, "forget-race");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1iii01", &input, json!({"choice": "Run it now"})));
+    assert!(path.exists());
+    let other = json!({"question": "Tag the release?", "wait": true, "options": ["Tag it", "Not yet"]});
+    let doc = painted(&other, "toolu_i9", "c9iii09").doc;
+    let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &json!({"choice": "Tag it"})).unwrap());
+    view.update(cx, |v, cx| {
+        let cwd = v.model.lives[v.panes.cur.live].cwd().expect("its folder").to_string();
+        assert!(v.recall.remember(&cwd, &doc, &reply));
+        v.save_recall(cx);
+        v.forget_card_choices(cx);
+        v.settings_pick(Pick::Remember, "off", cx);
+    });
+    cx.run_until_parked();
+    assert!(!path.exists(), "the save before the Forget never lands, and Off never cancels it");
+    view.update(cx, |v, cx| v.settings_pick(Pick::Remember, "on", cx));
+    assert_eq!(kept(cx, &view).0, 0, "nothing read back");
+}
+
+/// Forget, then the window closes before the removal ran (Shady #93
+/// P2-1): the file goes all the same.
+#[gpui_kit::test]
+fn a_forget_outlives_its_window(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, events) = asked(cx, "toolu_j1", "c1jjj01", &input);
+    let path = remembering(cx, &view, "forget-close");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1jjj01", &input, json!({"choice": "Run it now"})));
+    assert!(path.exists());
+    view.update(cx, |v, cx| v.forget_card_choices(cx));
+    let gone = view.downgrade();
+    cx.update_window(w, |_, window, _| window.remove_window()).expect("the window");
+    drop((view, events));
+    cx.update(|_| {});
+    assert!(gone.upgrade().is_none(), "the window and its view, gone before the removal ran");
+    assert!(path.exists(), "not removed yet");
+    cx.run_until_parked();
+    assert!(!path.exists(), "the file is gone all the same");
 }
