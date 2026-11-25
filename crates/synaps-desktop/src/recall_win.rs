@@ -38,7 +38,7 @@ pub(crate) unsafe fn take(s: *mut u16) -> String {
 }
 
 /// The current user's SID (`S-1-5-21-…`), from the process's token.
-pub(crate) fn user_sid() -> io::Result<String> {
+fn user_sid() -> io::Result<String> {
     unsafe {
         let mut token: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -65,7 +65,7 @@ pub(crate) fn user_sid() -> io::Result<String> {
 
 /// The file's security descriptor, as SDDL: a protected DACL (`P`), one
 /// entry allowing full file access (`FA`) to the current user.
-pub(crate) fn private_sddl() -> io::Result<String> {
+fn private_sddl() -> io::Result<String> {
     Ok(format!("D:P(A;;FA;;;{})", user_sid()?))
 }
 
@@ -113,30 +113,118 @@ pub(crate) fn create_private(path: &Path) -> io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_handle(h) })
 }
 
-/// Tests: an object's DACL read back, and a folder's set.
+/// Tests: an object's DACL read back, and a folder's set; this user's
+/// SID as the test finds it (its own token, not [`user_sid`]), and
+/// whether a DACL allows that SID alone (Shady #93 R2 P3-1).
 #[cfg(test)]
 pub(crate) mod acl {
     use super::*;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
     };
-    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
-    /// `sd`'s DACL as SDDL (`D:<flags>(<ace>)…`).
-    pub(crate) fn sddl_of(sd: PSECURITY_DESCRIPTOR) -> io::Result<String> {
-        let mut s: *mut u16 = null_mut();
-        if unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut s, null_mut())
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { take(s) })
+    /// `ACCESS_ALLOWED_ACE_TYPE` (`Win32_System_SystemServices`, a feature
+    /// the desk doesn't take for one number).
+    const ACCESS_ALLOWED: u8 = 0;
+
+    /// A SID: its bytes, and its string (`S-1-…`).
+    pub(crate) struct Sid {
+        bytes: Vec<u64>,
+        pub(crate) text: String,
     }
 
-    /// The DACL of the file or folder at `path`, as SDDL.
-    pub(crate) fn dacl(path: &Path) -> io::Result<String> {
+    impl Sid {
+        pub(crate) fn psid(&self) -> PSID {
+            self.bytes.as_ptr() as PSID
+        }
+
+        /// The SID whose string is `text` (`S-1-…`).
+        pub(crate) fn parse(text: &str) -> io::Result<Sid> {
+            let s = wide(OsStr::new(text));
+            let mut sid: PSID = null_mut();
+            if unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let out = unsafe { Sid::copy(sid) };
+            unsafe { LocalFree(sid) };
+            out
+        }
+
+        /// The user this test process runs as, from its own token:
+        /// `TokenUser`, its SID's string by `ConvertSidToStringSidW`.
+        pub(crate) fn of_this_process() -> io::Result<Sid> {
+            unsafe {
+                let mut token: HANDLE = null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut len = 0u32;
+                GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+                let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+                let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+                let err = io::Error::last_os_error();
+                CloseHandle(token);
+                if ok == 0 {
+                    return Err(err);
+                }
+                Sid::copy((*(buf.as_ptr() as *const TOKEN_USER)).User.Sid)
+            }
+        }
+
+        /// # Safety
+        /// `sid` is a valid SID.
+        unsafe fn copy(sid: PSID) -> io::Result<Sid> {
+            let mut s: *mut u16 = null_mut();
+            if unsafe { ConvertSidToStringSidW(sid, &mut s) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let text = unsafe { take(s) };
+            let len = unsafe { GetLengthSid(sid) } as usize;
+            let mut bytes = vec![0u64; len.div_ceil(8)];
+            unsafe { std::ptr::copy_nonoverlapping(sid as *const u8, bytes.as_mut_ptr().cast::<u8>(), len) };
+            Ok(Sid { bytes, text })
+        }
+    }
+
+    /// A descriptor's DACL as SDDL after a round trip through Windows: the
+    /// form Windows writes a DACL back in (a SID or its alias).
+    pub(crate) fn canonical(sddl: &str) -> io::Result<String> {
+        sddl_of(Descriptor::of(sddl)?.0)
+    }
+
+    /// Whether `sd`'s DACL is protected and holds one entry, allowing full
+    /// file access to `sid`, compared as SIDs.
+    pub(crate) fn allows_only(sd: PSECURITY_DESCRIPTOR, sid: &Sid) -> io::Result<bool> {
+        let (mut present, mut defaulted) = (0, 0);
+        let mut acl: *mut ACL = null_mut();
+        if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (mut control, mut revision) = (0u16, 0u32);
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 0 || acl.is_null() || control & SE_DACL_PROTECTED == 0 || unsafe { (*acl).AceCount } != 1 {
+            return Ok(false);
+        }
+        let mut ace: *mut core::ffi::c_void = null_mut();
+        if unsafe { GetAce(acl, 0, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ace = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+        let trustee = &ace.SidStart as *const u32 as PSID;
+        Ok(ace.Header.AceType == ACCESS_ALLOWED && ace.Mask == FILE_ALL_ACCESS && unsafe { EqualSid(trustee, sid.psid()) } != 0)
+    }
+
+    /// The security descriptor (its DACL) of the file or folder at `path`.
+    pub(crate) fn descriptor(path: &Path) -> io::Result<Descriptor> {
         let name = wide(path.as_os_str());
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
         let e = unsafe {
@@ -154,8 +242,24 @@ pub(crate) mod acl {
         if e != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(e as i32));
         }
-        let sd = Descriptor(sd);
-        sddl_of(sd.0)
+        Ok(Descriptor(sd))
+    }
+
+    /// `sd`'s DACL as SDDL (`D:<flags>(<ace>)…`).
+    pub(crate) fn sddl_of(sd: PSECURITY_DESCRIPTOR) -> io::Result<String> {
+        let mut s: *mut u16 = null_mut();
+        if unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut s, null_mut())
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { take(s) })
+    }
+
+    /// The DACL of the file or folder at `path`, as SDDL.
+    pub(crate) fn dacl(path: &Path) -> io::Result<String> {
+        sddl_of(descriptor(path)?.0)
     }
 
     /// Set the folder at `path`'s DACL to `sddl`'s, protected.

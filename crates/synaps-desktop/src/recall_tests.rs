@@ -299,32 +299,35 @@ fn a_link_in_the_temporary_files_place_is_never_followed() {
 
 /// Windows (Shady #93 P2-3): in a folder open to Everyone, inherited by
 /// what is created there, the temporary file and the file a save leaves
-/// both carry a protected DACL of one entry, the current user's SID, full
-/// access; nothing inherited. A file made there as std makes one (as the
-/// save did before) inherits Everyone: the check tells them apart.
+/// both carry a protected DACL of one entry, full access for the user
+/// this test runs as; nothing inherited. What is wanted is made here, from
+/// the test's own token (R2 P3-1: never the code checked), and compared
+/// twice: as SDDL after a round trip through Windows (its SID or alias,
+/// the built-in Administrator's being `LA`), and SID to SID. A file made
+/// there as std makes one (as the save did before), and a DACL for
+/// another account, fail both.
 #[cfg(windows)]
 #[test]
 fn on_windows_the_file_is_this_users_only() {
-    use super::win::{Descriptor, acl, private_sddl, user_sid};
+    use super::win::{Descriptor, acl};
     let d = dir("acl");
-    let sid = user_sid().expect("this user's SID");
-    acl::set_dacl(&d, &format!("D:P(A;OICI;FA;;;WD)(A;OICI;FA;;;{sid})")).expect("an open folder");
-    // A DACL as SDDL: its flags (`P`: protected) and its entries.
-    let parts = |s: &str| -> (String, String) {
-        let s = s.strip_prefix("D:").unwrap_or_else(|| panic!("a DACL: {s}"));
-        let at = s.find('(').unwrap_or(s.len());
-        (s[..at].to_string(), s[at..].to_string())
-    };
-    // The entries wanted, as Windows writes them back: one, allowing full
-    // access to this user's SID, written as the SID or as its alias (the
-    // built-in Administrator's is `LA`).
-    let want = parts(&acl::sddl_of(Descriptor::of(&private_sddl().unwrap()).unwrap().0).unwrap()).1;
-    assert_eq!(want.matches('(').count(), 1, "{want}");
-    assert!(want.starts_with("(A;;FA;;;") && !want.contains(";WD)"), "{want}");
+    let me = acl::Sid::of_this_process().expect("this user's SID");
+    // BUILTIN\Users: another SID, never this user's.
+    let users = acl::Sid::parse("S-1-5-32-545").unwrap();
+    assert_ne!(me.text, users.text);
+    acl::set_dacl(&d, &format!("D:P(A;OICI;FA;;;WD)(A;OICI;FA;;;{})", me.text)).expect("an open folder");
+    let want = acl::canonical(&format!("D:P(A;;FA;;;{})", me.text)).unwrap();
+    let theirs = format!("D:P(A;;FA;;;{})", users.text);
+    assert_ne!(acl::canonical(&theirs).unwrap(), want, "another account's DACL reads otherwise");
+    let other = Descriptor::of(&theirs).unwrap();
+    assert!(!acl::allows_only(other.0, &me).unwrap(), "another account's DACL is not this user's");
+    assert!(acl::allows_only(other.0, &users).unwrap(), "the SID check tells SIDs apart");
     let private = |p: &std::path::Path| {
-        let got = acl::dacl(p).unwrap();
-        let (flags, aces) = parts(&got);
-        flags.contains('P') && aces == want
+        let sd = acl::descriptor(p).unwrap();
+        let by_sddl = acl::sddl_of(sd.0).unwrap() == want;
+        let by_sid = acl::allows_only(sd.0, &me).unwrap();
+        assert_eq!(by_sddl, by_sid, "both checks agree: {}", acl::sddl_of(sd.0).unwrap());
+        by_sid
     };
     let plain = d.join("plain.json");
     std::fs::write(&plain, "{}").unwrap();
