@@ -17,6 +17,9 @@ on:
         type: number
         required: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -46,7 +49,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev \
             libxcb1-dev libvulkan1 libzstd-dev libssl-dev libasound2-dev
-      - uses: taiki-e/install-action@v2
+      # Pinned to a commit (v2.90.8): its manifest holds the SHA-256 of
+      # nextest 0.9.152's archives, checked before it is unpacked.
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c
         with:
           tool: cargo-nextest@0.9.152
       # The workspace as it ships (#28): one build of every crate, so
@@ -70,7 +75,11 @@ jobs:
           esac
           mkdir run list
           cargo nextest archive "${args[@]}" --archive-file run/tests.tar.zst
-          cargo nextest list "${args[@]}" --message-format json > list/tests.json
+          # The list the `ci` job checks the slices against: every test in
+          # the archive the slices run, read from that archive, with no
+          # filter and no partition.
+          cargo nextest list --archive-file run/tests.tar.zst --workspace-remap . \
+            --profile ci --ignore-default-filter --message-format json > list/tests.json
           echo "${{ inputs.slices }}" > list/slices
           # The slices run this nextest: no download of their own.
           cp "${CARGO_HOME:-$HOME/.cargo}"/bin/cargo-nextest* run/
@@ -126,7 +135,7 @@ jobs:
           chmod +x "$run"/cargo-nextest*
           mkdir -p "$run/x"
           "$run"/cargo-nextest nextest run --archive-file "$run/tests.tar.zst" --workspace-remap . \
-            --extract-to "$run/x" --profile ci \
+            --extract-to "$run/x" --profile ci --ignore-default-filter \
             --partition slice:${{ matrix.slice }}/${{ inputs.slices }}
       - name: JUnit
         if: always()

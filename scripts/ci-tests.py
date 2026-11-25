@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """CI's test report (.github/workflows/ci.yml, the `ci` job).
 
-Each lane's tests are listed once where they were built (`cargo nextest
-list`, tests.json) and run in slices on other runners, each slice writing
-a JUnit file. This checks, per lane, what the single `cargo test` step
-used to check, across the slices:
+Each lane's tests are built once into an archive, listed from that
+archive with no filter and no partition (`cargo nextest list
+--archive-file ... --ignore-default-filter`, tests.json), and run in
+slices on other runners, each slice writing a JUnit file. This checks,
+per lane, what the single `cargo test` step used to check, across the
+slices:
 
-  * every test the build listed ran exactly once and passed (none lost
+  * the list holds every test in the archive: each binary listed and
+    each test either selected or `#[ignore]`d (a test or binary a filter
+    left out is an error, as `cargo test` would have run it);
+  * every test the list selected ran exactly once and passed (none lost
     between slices, none run twice), and nothing failed;
   * tests ran (passed > 0) and UI tests ran (`ui_tests::`);
   * workspace lanes: the client's fixture
@@ -35,14 +40,28 @@ SPLIT_ON = "split_tests::the_split_on_lane_builds_every_view_split_on"
 
 
 def listed(path):
-    """(binary, test) -> ignored, as `cargo nextest list` found them."""
+    """((binary, test) -> ignored, errors) from `cargo nextest list`'s JSON.
+
+    A test is to run (filter-match `matches`) or `#[ignore]`d (`ignored`,
+    not matched for that reason only). A binary not listed or a test not
+    matched for any other reason (a default filter, an expression, a
+    partition) was filtered out of a list taken with no filter: an error,
+    never counted as ignored."""
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
-    tests = {}
+    tests, errors = {}, []
     for binary, suite in doc["rust-suites"].items():
+        if suite.get("status") != "listed":
+            errors.append(f"binary {binary} was not listed ({suite.get('status')}): its tests would never run")
         for name, case in suite["testcases"].items():
-            tests[(binary, name)] = case.get("ignored", False) or case["filter-match"]["status"] != "matches"
-    return tests
+            match = case["filter-match"]
+            if match["status"] == "matches":
+                tests[(binary, name)] = False
+            elif case.get("ignored") and match.get("reason") == "ignored":
+                tests[(binary, name)] = True
+            else:
+                errors.append(f"filtered out of the list ({match.get('reason')}): {binary} {name}")
+    return tests, errors
 
 
 def junit(path):
@@ -69,7 +88,8 @@ def find(root, name):
 
 def doctests(path):
     """(passed, ok) from `cargo test --doc`'s output."""
-    text = open(path, encoding="utf-8", errors="replace").read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     results = re.findall(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", text, re.M)
     return sum(int(p) for _, p, _ in results), bool(results) and all(r == "ok" and f == "0" for r, _, f in results)
@@ -80,8 +100,10 @@ def lane(root, name, summary):
     tests_json = os.path.join(root, f"list-{name}", "tests.json")
     if not os.path.exists(tests_json):
         return [f"{name}: no test list (the build job did not finish)"]
-    tests = listed(tests_json)
-    slices = int(open(os.path.join(root, f"list-{name}", "slices")).read())
+    tests, list_errors = listed(tests_json)
+    errors += [f"{name}: {e}" for e in list_errors]
+    with open(os.path.join(root, f"list-{name}", "slices"), encoding="utf-8") as f:
+        slices = int(f.read())
     expected = {k for k, ignored in tests.items() if not ignored}
     runs = []
     for k in range(1, slices + 1):
