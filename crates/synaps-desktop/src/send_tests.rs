@@ -514,7 +514,7 @@ fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     put(cx, w, PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }));
     // Ctrl+T, Ctrl+W and Ctrl+Shift+T count presses together: one let go
     // and the next pressed within `FoldKeys::PAIR` is a repeat.
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 /// A message typed and sent with Enter (its key let go too), as a hand
@@ -646,7 +646,7 @@ fn act_outside(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVie
     assert!(outside, "{what}: the focus outside the view");
     cx.run_until_parked();
     // Ctrl+T and Ctrl+W count presses together (`FoldKeys::PAIR`).
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 /// Whether the view's own focus handle has the focus.
