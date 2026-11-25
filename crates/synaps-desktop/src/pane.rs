@@ -1057,6 +1057,15 @@ impl crate::app::AppView {
         }
         let focused = self.panes.focused;
         match self.in_pane(focused, |v| v.model.tabs.view().is_none().then(|| v.panes.cur.composer.clone())).flatten() {
+            // A window that is not active gets no focus events, so a
+            // composer focused and left there never hears its blur: its
+            // caret would blink on, a frame of every pane each 500 ms, for
+            // the window's life. There the focus alone: the kit starts the
+            // caret of the input focused when the window is active again.
+            Some(c) if !window.is_window_active() => {
+                let h = c.read(cx).focus_handle(cx);
+                window.focus(&h, cx);
+            }
             Some(c) => c.update(cx, |s, cx| s.focus(window, cx)),
             None => window.focus(&self.focus, cx),
         }

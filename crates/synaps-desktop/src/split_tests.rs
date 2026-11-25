@@ -7180,3 +7180,56 @@ fn nine_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
         assert!(v.panes.iter().all(|p| !p.disp.is_empty()), "every pane's list built");
     });
 }
+
+/// A window that is not active (opened behind another, or left for
+/// one): GPUI sends it no focus events, so a composer the keys went to
+/// and left there never hears its blur, and its caret blinked on for the
+/// window's life, each blink a frame of every pane (three of four split
+/// panes' at once: 6 frames a second). No caret blinks there; active
+/// again, the focused composer's does, alone (a frame every 500 ms).
+#[gpui_kit::test]
+fn panes_split_in_a_window_not_active_leave_no_caret_blinking(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 2560., 1440.);
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Off), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        let other = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(other, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
+    // As `SYNAPS_DESK_PANES=4` splits them: each new pane's composer
+    // takes the keys, frames drawn between.
+    for (at, side) in crate::pane::shape(4) {
+        let _ = cx.update_window(window, |_, w, cx| {
+            view.update(cx, |v, cx| {
+                if let Some(i) = at {
+                    v.focus_nth(i, cx);
+                }
+                v.split_pane(side, w, cx);
+            })
+        });
+        for _ in 0..20 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4);
+    let frames = |cx: &mut TestAppContext| {
+        for _ in 0..40 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+        let f0 = view.read_with(cx, |v, _| v.fx.frames());
+        for _ in 0..80 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+        view.read_with(cx, |v, _| v.fx.frames()) - f0
+    };
+    assert_eq!(frames(cx), 0, "not active: no caret blinks, 4 s at rest");
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    let n = frames(cx);
+    assert!((7..=9).contains(&n), "active: the focused composer's caret alone, a frame every 500 ms: {n} in 4 s");
+}
