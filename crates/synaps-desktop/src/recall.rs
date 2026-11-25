@@ -48,8 +48,9 @@
 //!   memory and removes the file. Accepted at the click, it runs to its
 //!   end on a task of its own: after a save already writing, never undone
 //!   by an older save, Off or a closed window ([`accept_forget`],
-//!   [`remove`]). It is this desk process's: another one running keeps
-//!   what it read, and may write it back.
+//!   [`remove`]). Settings offers it while anything may be there, and
+//!   says so if the removal failed. It is this desk process's: another
+//!   one running keeps what it read, and may write it back.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -158,8 +159,13 @@ fn is_key(k: &str) -> bool {
 }
 
 impl Store {
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&[u8]> {
@@ -214,23 +220,24 @@ impl Store {
     }
 }
 
-/// Read the file at `path`: what it keeps, and why it was not used, if it
-/// wasn't (missing is not a reason: empty).
-fn read(path: &Path) -> (Store, Option<String>) {
+/// Read the file at `path`: what it keeps, why it was not used, if it
+/// wasn't (missing is not a reason: empty), and whether something is
+/// there (an unreadable file too).
+fn read(path: &Path) -> (Store, Option<String>, bool) {
     let text = match std::fs::read(path) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Store::default(), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Store::default(), None, false),
         Err(e) => Err(e.to_string()),
     };
     match text.and_then(|t| Store::parse(&t)) {
-        Ok((store, 0)) => (store, None),
+        Ok((store, 0)) => (store, None, true),
         Ok((store, bad)) => {
             log::warn!(target: "synaps_desktop::card", "card choices {}: {bad} unreadable entries left out", path.display());
-            (store, None)
+            (store, None, true)
         }
         Err(why) => {
             log::warn!(target: "synaps_desktop::card", "card choices {}: unreadable ({why}); starting empty", path.display());
-            (Store::default(), Some(why))
+            (Store::default(), Some(why), true)
         }
     }
 }
@@ -361,6 +368,14 @@ pub(crate) struct Recall {
     /// Set when memory is turned off: a save not begun by then writes
     /// nothing (one already writing finishes: a write can't be recalled).
     stop: Arc<AtomicBool>,
+    /// The file may be there: it was when read (whatever it held), or a
+    /// save started since; not once a Forget removed it.
+    on_disk: bool,
+    /// The newest save's number, and the newest Forget's.
+    saved: u64,
+    forgot: u64,
+    /// Why the last Forget could not remove the file, until one does.
+    pub(crate) failed: Option<String>,
 }
 
 impl Recall {
@@ -376,6 +391,10 @@ impl Recall {
             writes: 0,
             save: None,
             stop: Arc::default(),
+            on_disk: false,
+            saved: 0,
+            forgot: 0,
+            failed: None,
         };
         if on {
             r.load();
@@ -386,15 +405,26 @@ impl Recall {
     fn load(&mut self) {
         let Some(path) = self.path.as_deref() else { return };
         self.reads += 1;
-        (self.store, self.said) = read(path);
+        let there;
+        (self.store, self.said, there) = read(path);
+        self.on_disk |= there;
     }
 
     pub(crate) fn on(&self) -> bool {
         self.on
     }
 
+    /// Questions remembered (tests).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.store.len()
+    }
+
+    /// Settings offers Forget: off (the file unread, unknown), something
+    /// remembered, the file there (an unreadable one too), or the last
+    /// Forget failed.
+    pub(crate) fn offers_forget(&self) -> bool {
+        !self.on || !self.store.is_empty() || self.on_disk || self.failed.is_some()
     }
 
     /// Turned on (the file read) or off (what was read let go, a save not
@@ -456,14 +486,33 @@ impl Recall {
         self.save = None;
         let path = self.path.clone()?;
         let generation = accept_forget(&path);
+        self.forgot = generation;
         Some((path, generation))
+    }
+
+    /// Forget `generation`'s removal is done: the file gone (unless a save
+    /// since put one back), or why not. An older Forget's word is late.
+    pub(crate) fn removed(&mut self, generation: u64, done: Result<(), String>) {
+        if generation < self.forgot {
+            return;
+        }
+        match done {
+            Ok(()) => {
+                self.on_disk &= self.saved > generation;
+                self.failed = None;
+            }
+            Err(why) => self.failed = Some(why),
+        }
     }
 
     /// The file's next snapshot: its path, number and text, and what stops
     /// it.
-    fn snapshot(&self) -> Option<(PathBuf, u64, String, Arc<AtomicBool>)> {
+    fn snapshot(&mut self) -> Option<(PathBuf, u64, String, Arc<AtomicBool>)> {
         let path = self.path.clone()?;
-        Some((path, next_generation(), self.store.to_text(), self.stop.clone()))
+        let generation = next_generation();
+        self.saved = generation;
+        self.on_disk = true;
+        Some((path, generation, self.store.to_text(), self.stop.clone()))
     }
 }
 
@@ -536,18 +585,28 @@ impl AppView {
     /// Settings' "Forget remembered choices": the memory empties, and its
     /// file goes (on or off: the user asked). Accepted now: the removal
     /// runs to its end on a task of its own, after a save already writing,
-    /// whatever comes next (Off, the window closed).
+    /// whatever comes next (Off, the window closed); Settings hears how it
+    /// went.
     pub(crate) fn forget_card_choices(&mut self, cx: &mut Context<Self>) {
         let Some((path, generation)) = self.recall.forget() else {
             log::info!(target: "synaps_desktop::card", "card choices: forgotten");
             cx.notify();
             return;
         };
-        cx.background_spawn(async move {
-            match remove(&path, generation) {
+        let removal = cx.background_spawn(async move {
+            let done = remove(&path, generation);
+            match &done {
                 Ok(()) => log::info!(target: "synaps_desktop::card", "card choices: forgotten, {} removed", path.display()),
                 Err(e) => log::warn!(target: "synaps_desktop::card", "card choices {}: forgotten, not removed ({e})", path.display()),
             }
+            done.map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let done = removal.await;
+            let _ = this.update(cx, |v, cx| {
+                v.recall.removed(generation, done);
+                v.views_changed(cx);
+            });
         })
         .detach();
         cx.notify();

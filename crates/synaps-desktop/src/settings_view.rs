@@ -1069,9 +1069,10 @@ impl AppView {
             tag: None,
             under: Vec::new(),
         });
-        // Off, the file isn't read: what it keeps is unknown, and Forget
-        // removes it all the same.
-        let forget: AnyElement = if self.recall.on() && self.recall.len() == 0 {
+        // Forget while anything may be there: off (the file unread), a
+        // choice remembered, the file there (an unreadable one too), or a
+        // removal that failed, said under the row.
+        let forget: AnyElement = if !self.recall.offers_forget() {
             mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
         } else {
             div()
@@ -1090,7 +1091,7 @@ impl AppView {
             id: "app-recall".into(),
             label: "Remember card choices".into(),
             key: crate::recall::SETTING,
-            help: "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. It never answers for you: Enter or a click still does. Only which option you picked is kept, on this machine, never a note or a field's text.",
+            help: "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. The highlight is only a starting point: nothing is ticked or sent for you, and Enter sends what's ticked (on a one-choice card, the option highlighted). Only which option you picked is kept, on this machine, never a note or a field's text.",
             control: h_flex()
                 .gap(px(12.))
                 .items_center()
@@ -1106,7 +1107,18 @@ impl AppView {
                 ))
                 .into_any_element(),
             tag: None,
-            under: Vec::new(),
+            under: self
+                .recall
+                .failed
+                .as_ref()
+                .map(|why| {
+                    mono(format!("couldn't remove {}: {why}", crate::recall::FILE), 12., p.err)
+                        .whitespace_normal()
+                        .debug_selector(|| "recall-failed".into())
+                        .into_any_element()
+                })
+                .into_iter()
+                .collect(),
         });
         for (rail, label, key, id) in
             [(true, "Sessions rail", "rail_collapsed", "app-rail"), (false, "Right panel", "right_collapsed", "app-right")]

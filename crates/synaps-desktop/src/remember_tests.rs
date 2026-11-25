@@ -11,7 +11,8 @@
 //! choice remembered meanwhile never moves an open card.
 //!
 //! Shady #93: Off, an older save or the window closing never undo a
-//! Forget (P2-1).
+//! Forget (P2-1); an unreadable file, or a removal that failed, keeps
+//! Forget in Settings, which says so (P3-1).
 //!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
@@ -703,4 +704,46 @@ fn a_forget_outlives_its_window(cx: &mut TestAppContext) {
     assert!(path.exists(), "not removed yet");
     cx.run_until_parked();
     assert!(!path.exists(), "the file is gone all the same");
+}
+
+/// A corrupt file (Shady #93 P3-1): nothing remembered, but the file is
+/// there, so Settings offers Forget, which removes it.
+#[gpui_kit::test]
+fn a_corrupt_file_can_be_forgotten_from_settings(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_l1", "c1lll01", &input);
+    let path = remembering(cx, &view, "corrupt-forget");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{\"version\": 1, \"choices\": [{").unwrap();
+    view.update(cx, |v, _| v.recall = Recall::new(true, Some(path.clone())));
+    assert_eq!(kept(cx, &view).0, 0);
+    settings(cx, w, &view);
+    assert!(has(cx, w, "recall-forget".into()) && !has(cx, w, "recall-none".into()), "the file is there: Forget");
+    click_forget(cx, w);
+    assert!(!path.exists(), "removed");
+    assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()));
+}
+
+/// A removal that fails (Shady #93 P3-1): Settings says so and keeps
+/// Forget; once the cause is gone, Forget again removes it.
+#[gpui_kit::test]
+fn a_failed_removal_says_so_and_forget_stays(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_q1", "c1qqq01", &input);
+    let path = remembering(cx, &view, "forget-fails");
+    // A folder where the file goes: unreadable, and not removable as a file.
+    std::fs::create_dir_all(path.join("in-the-way")).unwrap();
+    view.update(cx, |v, _| v.recall = Recall::new(true, Some(path.clone())));
+    settings(cx, w, &view);
+    assert!(has(cx, w, "recall-forget".into()) && !has(cx, w, "recall-none".into()), "something there: Forget");
+    click_forget(cx, w);
+    assert!(path.exists(), "not removed");
+    assert!(has(cx, w, "recall-failed".into()), "Settings says so");
+    assert!(has(cx, w, "recall-forget".into()), "Forget stays, to try again");
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"{}").unwrap();
+    click_forget(cx, w);
+    assert!(!path.exists(), "removed");
+    assert!(!has(cx, w, "recall-failed".into()));
+    assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()));
 }
