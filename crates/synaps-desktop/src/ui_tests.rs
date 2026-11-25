@@ -176,7 +176,7 @@ fn a_held_enter_after_picking(cx: &mut TestAppContext, act: Act) {
     assert_eq!(composer_text(cx, &view), DRAFT, "the draft is as it was");
     up(cx, w, "enter");
     // A new press is the user's: it steers.
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     down(cx, w, "enter", false);
     assert_eq!(view.read_with(cx, |v, _| v.submits.clone()), vec![(DRAFT.to_string(), true)]);
 }
@@ -210,7 +210,7 @@ fn a_held_ctrl_enter_after_a_keyboard_pick_never_sends(cx: &mut TestAppContext) 
     assert_eq!(view.read_with(cx, |v, _| v.submits.clone()), Vec::<(String, bool)>::new(), "nothing went out");
     assert_eq!(composer_text(cx, &view), DRAFT);
     up(cx, w, "enter");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
     down(cx, w, "enter", false);
     assert_eq!(view.read_with(cx, |v, _| v.submits.clone()), vec![(DRAFT.to_string(), false)]);
 }
@@ -248,6 +248,7 @@ fn a_worker_swap_carries_no_text_view_or_drag_over(cx: &mut TestAppContext) {
     assert!(!scout.is_scrollbar_dragging(), "the drag ended with scout's list");
     assert_eq!(views(cx).1, 0, "the session's list again: none of scout's views");
     menu_on(cx, w, &view, Act::OpenTab);
+    crate::app::next_press();
     down(cx, w, "enter", false);
     up(cx, w, "enter");
     assert!(view.read_with(cx, |v, _| v.model.tabs.current_worker().is_some()), "scout's tab on screen");
@@ -554,7 +555,7 @@ fn a_tab_at_its_narrowest_cuts_its_title_cleanly(cx: &mut TestAppContext) {
 fn tap(cx: &mut TestAppContext, w: AnyWindowHandle, key: &str) {
     down(cx, w, key, false);
     up(cx, w, key);
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 fn focus_composer(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
@@ -645,6 +646,7 @@ fn esc_esc_halts_once(cx: &mut TestAppContext) {
     up(cx, w, "enter");
     assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
     focus_composer(cx, w, &view);
+    crate::app::next_press();
     tap(cx, w, "escape");
     assert!(view.read_with(cx, |v, _| v.model.watch.focus().is_none()), "Esc went back");
     tap(cx, w, "escape");
@@ -710,6 +712,7 @@ fn the_stub_is_only_over_a_worker_view_with_a_waiting_prompt(cx: &mut TestAppCon
     // No prompt waiting: no stub over the worker either.
     resolve_prompt(cx, &view);
     menu_on(cx, w, &view, Act::Open);
+    crate::app::next_press();
     down(cx, w, "enter", false);
     up(cx, w, "enter");
     assert!(view.read_with(cx, |v, _| v.model.watch.focus() == Some("sa_1")));
