@@ -229,7 +229,12 @@ fn a_restart_reuses_ids_and_nothing_crosses_over(cx: &mut TestAppContext) {
     assert_eq!(order, ["AddMatch", "AddMatch", "AddMatch", "GetNameOwner", "GetCapabilities", "Notify"], "rules, then the owner");
     let rules: Vec<String> = named(&calls, "AddMatch").iter().map(|m| m.body().deserialize::<String>().unwrap()).collect();
     assert!(rules.iter().any(|r| r.contains("member='NameOwnerChanged'") && r.contains(&format!("arg0='{XDG_NAME}'"))), "{rules:?}");
-    assert!(rules.iter().filter(|r| r.contains("ActionInvoked") || r.contains("NotificationClosed")).all(|r| r.contains(&format!("path='{XDG_PATH}'"))));
+    assert!(
+        rules
+            .iter()
+            .filter(|r| r.contains("ActionInvoked") || r.contains("NotificationClosed"))
+            .all(|r| r.contains(&format!("path='{XDG_PATH}'")))
+    );
     let notify = named(&calls, "Notify")[0];
     assert_eq!(to(notify), ":1.10", "to the owner's unique name, never the service's");
     assert_eq!(notify_text(notify).1, "Ship &lt;b&gt;it&lt;/b&gt; &amp; go?", "A reads markup: escaped");
@@ -248,7 +253,11 @@ fn a_restart_reuses_ids_and_nothing_crosses_over(cx: &mut TestAppContext) {
     s.markup = false;
     s.next = 1;
     let calls = s.serve(cx);
-    assert_eq!(calls.iter().map(|c| (member(c), to(c))).collect::<Vec<_>>(), [("GetCapabilities".to_string(), ":1.11".to_string())], "B asked anew");
+    assert_eq!(
+        calls.iter().map(|c| (member(c), to(c))).collect::<Vec<_>>(),
+        [("GetCapabilities".to_string(), ":1.11".to_string())],
+        "B asked anew"
+    );
     // Another app's notification on B is id 1: its click and its close are not ours.
     s.clicked(1, ":1.11");
     s.signal(":1.11", XDG_PATH, XDG_NAME, "NotificationClosed", &(1u32, 2u32));
@@ -294,7 +303,11 @@ fn a_restart_reuses_ids_and_nothing_crosses_over(cx: &mut TestAppContext) {
     assert!(named(&calls, "CloseNotification").is_empty(), "nothing closed at C by B's id: {calls:?}");
     let notify = named(&calls, "Notify");
     assert_eq!(notify.len(), 1, "t3 never told again; t4 told: {calls:?}");
-    assert_eq!((to(notify[0]), notify_text(notify[0]).1), (":1.12".to_string(), "a &amp; b?".to_string()), "C's capabilities, not the impostor's");
+    assert_eq!(
+        (to(notify[0]), notify_text(notify[0]).1),
+        (":1.12".to_string(), "a &amp; b?".to_string()),
+        "C's capabilities, not the impostor's"
+    );
     assert_ne!(tag_of(&key(4)), t3);
     // C's capabilities unknown (an error): escaped, the safe reading.
     s.owned(Some(":1.13"));

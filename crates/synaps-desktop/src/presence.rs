@@ -42,9 +42,10 @@
 //! (ASKED) card, never twice for one binding while its session is open
 //! here, whatever its card does meanwhile (an answer on its way, then not
 //! sent; a history that drops it and brings it back). Taken down when its
-//! card resolves. Its click brings the window up and lands on the card,
-//! as Ctrl+Shift+J does, if the card still waits; a stale one does
-//! nothing. `notify.cards` (`false` or `"off"`) in the settings file
+//! card resolves, or its window goes ([`window_gone`]). Its click is
+//! checked against what the window holds as it comes ([`AppView::waits_now`]):
+//! if the card still waits, the window comes up and lands on it, as
+//! Ctrl+Shift+J does; a stale one does nothing. `notify.cards` (`false` or `"off"`) in the settings file
 //! turns them off.
 
 use std::collections::{HashMap, HashSet, VecDeque};

@@ -147,7 +147,6 @@ impl Xdg {
         }
         self.link.as_ref().expect("a task runs")
     }
-
 }
 
 impl Transport for Xdg {
@@ -290,11 +289,7 @@ pub(crate) async fn run(
             {
                 t.late = true;
             }
-            if t.sent.is_some() || !t.heard.is_empty() || t.ended || t.woke.is_some() || t.late {
-                Poll::Ready(t)
-            } else {
-                Poll::Pending
-            }
+            if t.sent.is_some() || !t.heard.is_empty() || t.ended || t.woke.is_some() || t.late { Poll::Ready(t) } else { Poll::Pending }
         })
         .await;
         let now = ex.now();
@@ -615,9 +610,8 @@ impl Bus {
                 {
                     // Not said: escaped, as for markup (literal entities at
                     // worst, never markup read).
-                    let markup = r.map_or(true, |m| {
-                        m.body().deserialize::<Vec<String>>().map_or(true, |c| c.iter().any(|c| c == "body-markup"))
-                    });
+                    let markup =
+                        r.map_or(true, |m| m.body().deserialize::<Vec<String>>().map_or(true, |c| c.iter().any(|c| c == "body-markup")));
                     e.caps = Caps::Markup(markup);
                 }
             }

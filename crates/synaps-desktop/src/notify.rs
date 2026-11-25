@@ -125,6 +125,41 @@ impl Gone {
             let _ = rx.recv().await;
         }
     }
+
+    pub(crate) fn done(&self) -> bool {
+        self.0.as_ref().is_none_or(async_channel::Receiver::is_closed)
+    }
+}
+
+/// The teardowns of windows already released that are still closing
+/// their notifications (Linux's bus tasks): the app's quit waits for them
+/// too, within GPUI's shutdown allowance ([`closing`]).
+#[derive(Default)]
+struct Closing(Vec<Gone>);
+
+impl Global for Closing {}
+
+/// A released window's teardown, `gone`, kept for the app's quit to wait
+/// on while it is not done (the last window's release comes just before
+/// the quit, with its bus task still closing).
+pub(crate) fn closing(gone: Gone, cx: &mut App) {
+    if gone.done() {
+        return;
+    }
+    if !cx.has_global::<Closing>() {
+        cx.on_app_quit(|cx| {
+            let all = std::mem::take(&mut cx.default_global::<Closing>().0);
+            async move {
+                for g in all {
+                    g.wait().await;
+                }
+            }
+        })
+        .detach();
+    }
+    let c = cx.default_global::<Closing>();
+    c.0.retain(|g| !g.done());
+    c.0.push(gone);
 }
 
 /// GPUI's notifications (macOS, Windows; the test platform): queued, then

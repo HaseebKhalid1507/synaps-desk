@@ -2702,7 +2702,8 @@ impl AppView {
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            let _ = crate::presence::window_gone(this, cx);
+            let gone = crate::presence::window_gone(this, cx);
+            crate::notify::closing(gone, cx);
         }));
         subs.push(cx.on_app_quit(|this, cx| {
             this.flush_panels();

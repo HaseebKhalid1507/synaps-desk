@@ -1174,7 +1174,8 @@ fn a_window_closed_takes_its_notifications_with_it(cx: &mut TestAppContext) {
         let delivered: Vec<String> = cx.delivered_system_notifications().iter().map(|n| n.tag.to_string()).collect();
         assert!(tags.iter().all(|t| delivered.contains(t)), "both up: {delivered:?}");
         // One more posted as the window closes: queued, not yet handed over.
-        let k = Key { session: ASK_OPEN.into(), tool_id: format!("toolu_w{round}c"), card: CardId::parse(&format!("c7w{round}caa")).unwrap() };
+        let k =
+            Key { session: ASK_OPEN.into(), tool_id: format!("toolu_w{round}c"), card: CardId::parse(&format!("c7w{round}caa")).unwrap() };
         let n = crate::notify::note(&k, "Relay log levels", "Queued as it closed?");
         let queued = n.tag.clone();
         view.update(cx, |v, cx| v.lookout.notes.post(k, n, cx));
@@ -1222,9 +1223,14 @@ fn a_click_is_checked_as_it_comes_not_at_the_last_frame(cx: &mut TestAppContext)
             window.dispatch_event(e, cx);
         };
         mouse(window, cx, MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }.to_platform_input());
-        let down = MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
+        let down =
+            MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
         mouse(window, cx, down.to_platform_input());
-        mouse(window, cx, MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input());
+        mouse(
+            window,
+            cx,
+            MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
+        );
         view.update(cx, |v, cx| {
             assert!(v.model.presence.get(ASK_OPEN, "toolu_p1").is_some(), "no frame yet: the presence still lists it");
             let pressed = state(v);
@@ -1271,10 +1277,8 @@ fn a_click_is_checked_as_it_comes_not_at_the_last_frame(cx: &mut TestAppContext)
 /// A transcript whose fold is wait cards `cards` (call `toolu_<n>`, card
 /// `c<n>` in six digits), open, and nothing else.
 fn folded(cards: &[usize]) -> Transcript {
-    let messages: Vec<Value> = cards
-        .iter()
-        .flat_map(|n| card_messages(&format!("toolu_{n}"), &format!("c{n:06}"), &wait_card(&format!("Card {n}?"))).0)
-        .collect();
+    let messages: Vec<Value> =
+        cards.iter().flat_map(|n| card_messages(&format!("toolu_{n}"), &format!("c{n:06}"), &wait_card(&format!("Card {n}?"))).0).collect();
     let mut t = Transcript::new();
     t.apply_history(&messages);
     t
