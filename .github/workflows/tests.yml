@@ -137,16 +137,27 @@ jobs:
           "$run"/cargo-nextest nextest run --archive-file "$run/tests.tar.zst" --workspace-remap . \
             --extract-to "$run/x" --profile ci --ignore-default-filter \
             --partition slice:${{ matrix.slice }}/${{ inputs.slices }}
+      # The slice's report, one per attempt: a re-run's never has the
+      # name of the attempt's before it, which download-artifact would
+      # resolve by artifact id (not in attempt order: #84's re-run read the
+      # failed attempt's). With no JUnit file the report says so, and the
+      # step fails as before; the `ci` job reads each slice's newest
+      # attempt (scripts/ci-tests.py).
       - name: JUnit
         if: always()
         shell: bash
         run: |
+          mkdir report
           f=$(find "$RUNNER_TEMP/run" target -path '*nextest/ci/junit.xml' 2>/dev/null | head -n 1)
-          test -n "$f" && cp "$f" junit.xml
+          if [ -z "$f" ]; then
+            echo "attempt ${{ github.run_attempt }} wrote no JUnit file" > report/no-junit
+            exit 1
+          fi
+          cp "$f" report/junit.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: junit-${{ runner.os }}-${{ inputs.lane }}-${{ matrix.slice }}
-          path: junit.xml
+          name: junit-${{ runner.os }}-${{ inputs.lane }}-${{ matrix.slice }}-${{ github.run_attempt }}
+          path: report/
           retention-days: 7
           if-no-files-found: error
