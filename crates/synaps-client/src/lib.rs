@@ -119,18 +119,3 @@ pub use protocol::{
     RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage, validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};
-
-/// TEMPORARY, reverted before review (ci/rerun-artifacts' proof on a real
-/// run): in CI's sliced runs (nextest, `GITHUB_RUN_ATTEMPT` set) this
-/// passes on attempt 2 only.
-#[cfg(test)]
-mod rerun_probe {
-    #[test]
-    fn passes_on_attempt_2_only() {
-        let attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default();
-        if std::env::var_os("NEXTEST_RUN_ID").is_none() || attempt.is_empty() {
-            return;
-        }
-        assert_eq!(attempt, "2", "the re-run probe fails on attempt {attempt}");
-    }
-}
