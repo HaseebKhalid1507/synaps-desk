@@ -7,7 +7,8 @@
 //! (`AppView::card_sends`): exactly one `Submit` or `Steer`, its text and
 //! its attachment. The daemon's echoes are applied as it sends them.
 //!
-//! The helpers are `ui_tests`' own, from [`super`] (`test_kit`).
+//! The helpers are `ui_tests`' own, from [`super`] (`test_kit`); the
+//! keyboard's tests (D2b, `keys_tests`) share this file's.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,12 +24,12 @@ use crate::deliver::Outgoing;
 use crate::pane::PaneId;
 use crate::turns::Kind;
 
-type Window = (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>);
+pub(super) type Window = (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>);
 
 /// The demo's window, showing its session `id`, with a client (whose
 /// daemon is nowhere: what is sent is the view's record, and goes no
 /// further).
-fn open(cx: &mut TestAppContext, id: &str) -> Window {
+pub(super) fn open(cx: &mut TestAppContext, id: &str) -> Window {
     let (w, view, events) = open_at(cx, (1440., 900.), crate::theme::Panels::default().text_size);
     let client = view.update(cx, |v, cx| {
         // The demo answers the attach; the client sends.
@@ -44,7 +45,7 @@ fn open(cx: &mut TestAppContext, id: &str) -> Window {
     (w, view, events)
 }
 
-fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
+pub(super) fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
     let down = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
         keystroke: keystroke.clone(),
@@ -64,7 +65,7 @@ fn key(cx: &mut TestAppContext, window: AnyWindowHandle, k: &str) {
     settle(cx, window, 8);
 }
 
-fn has(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> bool {
+pub(super) fn has(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> bool {
     VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel)).is_some()
 }
 
@@ -76,7 +77,7 @@ fn center(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> Point<Pix
 /// A click on what `sel` names, at its centre: in some pane's list, as
 /// the hand would have it (a row past the list's edge is under the
 /// composer, never clicked).
-fn click(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sel: String) {
+pub(super) fn click(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sel: String) {
     use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     let position = center(cx, w, sel.clone());
     let lists: Vec<_> = view.read_with(cx, |v, _| v.panes.iter().map(|p| p.list.viewport_bounds()).collect());
@@ -96,7 +97,7 @@ fn click(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, se
 }
 
 /// The card asking `question`: its row id and display index.
-fn card(cx: &mut TestAppContext, view: &Entity<AppView>, question: &str) -> (u64, usize) {
+pub(super) fn card(cx: &mut TestAppContext, view: &Entity<AppView>, question: &str) -> (u64, usize) {
     view.read_with(cx, |v, _| {
         let items = v.model.transcript.items();
         v.disp
@@ -112,7 +113,7 @@ fn card(cx: &mut TestAppContext, view: &Entity<AppView>, question: &str) -> (u64
 }
 
 /// Display row `ix` at the view's top, drawn.
-fn show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix: usize) {
+pub(super) fn show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix: usize) {
     view.update(cx, |v, cx| {
         v.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
         cx.notify();
@@ -124,19 +125,19 @@ fn show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix:
 /// The card's arm (`crate::app::ARM` from the first frame each of its
 /// controls is painted in view): run out for every control drawn so far,
 /// or a fifth of the way for the first drawn (less for the rest).
-fn arm(cx: &mut TestAppContext, view: &Entity<AppView>, row: u64, armed: bool) {
+pub(super) fn arm(cx: &mut TestAppContext, view: &Entity<AppView>, row: u64, armed: bool) {
     let shown: Vec<Instant> =
         view.read_with(cx, |v, _| v.panes.cur.ask_shown.borrow().iter().filter(|((r, _), _)| *r == row).map(|(_, at)| *at).collect());
     let at = if armed { shown.iter().max().map(|t| *t + crate::app::ARM) } else { shown.iter().min().map(|t| *t + crate::app::ARM / 5) };
     crate::app::pin_arm_clock(Some(at.expect("the card's controls were drawn")));
 }
 
-fn sends(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<Outgoing> {
+pub(super) fn sends(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<Outgoing> {
     view.read_with(cx, |v, _| v.card_sends.clone())
 }
 
 /// The attachment on screen: its seq and session.
-fn attachment(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, String) {
+pub(super) fn attachment(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, String) {
     view.read_with(cx, |v, _| {
         let l = &v.model.lives[v.panes.cur.live];
         (l.attachment().expect("attached"), l.active.as_ref().unwrap().session_id.clone())
@@ -145,7 +146,7 @@ fn attachment(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, String) 
 
 /// Session events as the daemon sends them, through the model as the
 /// client hands them over.
-fn heard(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, events: Vec<Value>) {
+pub(super) fn heard(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, events: Vec<Value>) {
     let (seq, sid) = attachment(cx, view);
     view.update(cx, |v, cx| {
         let batch = events
@@ -169,13 +170,13 @@ fn doc(input: &Value) -> (cards_spec::CardDoc, bool) {
 }
 
 /// The message answering card `card` (asked `input`) with `values`.
-fn message(card: &str, input: &Value, values: Value) -> String {
+pub(super) fn message(card: &str, input: &Value, values: Value) -> String {
     let (d, _) = doc(input);
     let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&d, &values).unwrap());
     cards_spec::message::build(&cards_spec::CardId::parse(card).unwrap(), &d, &reply)
 }
 
-fn showing(card: &str, input: &Value) -> String {
+pub(super) fn showing(card: &str, input: &Value) -> String {
     let (d, wait) = doc(input);
     format!(
         "{}\nIts answer will come as a user message starting \"[card {card}]\".",
@@ -183,14 +184,14 @@ fn showing(card: &str, input: &Value) -> String {
     )
 }
 
-fn llm(v: Value) -> Value {
+pub(super) fn llm(v: Value) -> Value {
     json!({"ev": "stream", "event": v})
 }
 
 /// The agent asks `input` live as card `card` (call `tool`), and waits:
 /// its turn ends, and its history lands (the round's checkpoint): the
 /// card's binding is the history's (Shady #81 P2-1).
-fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, card: &str, input: Value) {
+pub(super) fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, card: &str, input: Value) {
     heard(
         cx,
         w,
@@ -211,7 +212,7 @@ fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
 
 /// The history of a turn that asked `input` as card `card` (call `tool`),
 /// then said `after`.
-fn asked_messages(tool: &str, card: &str, input: &Value, after: Option<&str>) -> Vec<Value> {
+pub(super) fn asked_messages(tool: &str, card: &str, input: &Value, after: Option<&str>) -> Vec<Value> {
     let mut out = vec![
         json!({"role": "user", "content": "go"}),
         json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_ui", "input": input}]}),
@@ -225,7 +226,7 @@ fn asked_messages(tool: &str, card: &str, input: &Value, after: Option<&str>) ->
 
 /// The history after what the view holds lands: `messages`, appended (as
 /// the client hands a round's checkpoint over).
-fn land(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+pub(super) fn land(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
     let (seq, sid) = attachment(cx, view);
     view.update(cx, |v, cx| {
         let base_len = v.model.lives[v.panes.cur.live].transcript.history_len();
@@ -239,13 +240,13 @@ fn land(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, mes
 /// What just came plays out: its rows arrive and grow to their height.
 /// The motion clock is the test's, and a growing row steps at most 50 ms
 /// a frame (`PaneFx::grow_on`): two seconds of frames, 50 ms apart.
-fn play(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn play(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     for _ in 0..40 {
         wait(cx, w, view, 50);
     }
 }
 
-const SHIP: &str = "Run the migration on staging now?";
+pub(super) const SHIP: &str = "Run the migration on staging now?";
 
 /// F1, F2 and §7's negative test: a click on an option before the card
 /// armed sends nothing; once armed, one click is the answer: one

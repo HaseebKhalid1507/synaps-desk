@@ -138,6 +138,9 @@ pub struct Pane {
     /// §6.1: "a click acts only once the button is armed";
     /// [`crate::ask::probe`]).
     pub(crate) ask_shown: crate::ask::Shown,
+    /// The agent card the keys entered here, and the focus that holds
+    /// them then ([`crate::ask_keys`], D2b).
+    pub(crate) ask: crate::ask_keys::CardMode,
     /// A body the user opened or closed (S1) ([`BodyHold`]).
     pub(crate) body_hold: Cell<Option<BodyHold>>,
     /// The user's scroll while an answered card folds: the room it leaves
@@ -466,6 +469,7 @@ impl Pane {
             fold_slack: Rc::new(Cell::new(None)),
             fold_gap: RefCell::new(Vec::new()),
             ask_shown: Default::default(),
+            ask: Default::default(),
             body_hold: Cell::new(None),
             touch_kept: Cell::new(false),
             metrics_gen: 0,
@@ -989,6 +993,7 @@ impl crate::app::AppView {
             let has = p.composer.read(cx).focus_handle(cx).is_focused(window)
                 || p.secret_input.read(cx).focus_handle(cx).is_focused(window)
                 || p.allow_all_focus.is_focused(window)
+                || p.ask.focus.as_ref().is_some_and(|f| f.is_focused(window))
                 || (view_field && tabs.view() == Some(crate::tabs::Kind::Settings));
             if has {
                 return if p.id == focused { KeysAt::Focused } else { KeysAt::Other };

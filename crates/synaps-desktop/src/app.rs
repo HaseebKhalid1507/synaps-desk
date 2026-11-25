@@ -490,6 +490,8 @@ pub fn bind_keys(cx: &mut App) {
     keys.push(KeyBinding::new("tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new("shift-tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new("tab", MenuTab, Some(MENU_CTX)));
+    keys.push(KeyBinding::new("tab", crate::ask_keys::AskTab, Some(crate::ask_keys::ASK_CTX)));
+    keys.push(KeyBinding::new("shift-tab", crate::ask_keys::AskTabBack, Some(crate::ask_keys::ASK_CTX)));
     keys.push(KeyBinding::new("shift-tab", MenuTabBack, Some(MENU_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
@@ -2328,6 +2330,9 @@ pub struct AppView {
     pub(crate) card_tick: Option<Task<()>>,
     /// The memos' change count the cards were last measured at.
     pub(crate) memo_seen: u64,
+    /// Every key's presses: an entered card's keys act on new ones only
+    /// ([`crate::ask_keys::Presses`]).
+    pub(crate) ask_presses: crate::ask_keys::Presses,
 
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -2619,7 +2624,13 @@ impl AppView {
         // the window's root, above this view: the focus comes back here once
         // a frame has drawn without it. Until then the fold keys reach an
         // app-wide fallback, which also hands the focus back.
-        subs.push(cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx)));
+        // An entered agent card's field gone with its row: the composer, never
+        // the window, whose keys answer a prompt (D2b).
+        subs.push(cx.on_focus_lost(window, |this, window, cx| {
+            if !this.ask_focus_lost(window, cx) {
+                window.focus(&this.focus, cx);
+            }
+        }));
         // The window went: a card's keys are not live. It came back: they
         // wait again ([`Arm`]), whether or not a frame was drawn meanwhile
         // (a hidden Wayland surface or an occluded macOS window draws none).
@@ -2910,6 +2921,7 @@ impl AppView {
             card_open: HashSet::new(),
             card_tick: None,
             memo_seen: 0,
+            ask_presses: Default::default(),
 
             _tasks: Vec::new(),
             _subs: subs,
@@ -7901,10 +7913,15 @@ impl AppView {
         let (detached, model, effort, _) = self.session_src();
         // Only what is out of the ordinary: the routine two are SEND's and
         // STEER's tooltips.
+        // The cards waiting here, while none is entered (D2b): its click is
+        // Ctrl+J. Not over a prompt's card, which Ctrl+J visits first.
+        let chip: Option<SharedString> = (!to_card && worker.is_none()).then(|| self.ask_chip()).flatten().map(Into::into);
         let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
             Some((n.clone(), self.note_color(&n, p)))
         } else if self.client.is_none() && !self.synthetic {
             Some(("offline: no daemon to send to".into(), p.dim_u))
+        } else if let Some(c) = chip.clone() {
+            Some((c, p.acc))
         } else if self.client.is_none() {
             Some(("offline: synthetic transport, nothing is sent".into(), p.dim_u))
         } else if self.model.lives[self.panes.cur.live].switching() {
@@ -8225,9 +8242,17 @@ impl AppView {
             });
             // Cut short, its tooltip has it whole.
             let hint = hint.filter(|_| fit.hint).map(|(h, c)| {
+                let is_chip = chip.as_ref() == Some(&h);
+                let said = h.clone();
                 mono(h.clone(), m.meta, c)
-                    .id("composer-note")
-                    .debug_selector(|| "composer-note".into())
+                    .id(if is_chip { "composer-chip" } else { "composer-note" })
+                    .debug_selector(move || if is_chip { format!("composer-chip {said}") } else { "composer-note".into() })
+                    .when(is_chip, |d| {
+                        let pane = self.panes.cur.id;
+                        d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.in_pane(pane, |this| this.jump_to_card(window, cx));
+                        }))
+                    })
                     .ml(px(16.))
                     .flex_1()
                     .min_w_0()
@@ -8937,6 +8962,8 @@ impl AppView {
                     window,
                     cx,
                 ))
+                // An agent card's keys (D2b).
+                .map(|d| self.ask_hooks(d, cx))
         }
     }
 
@@ -9032,6 +9059,7 @@ impl AppView {
         self.sync_card(window, cx);
         self.sync_list();
         self.read_card_on_screen();
+        self.sync_ask(window, cx);
         if self.panes.cur.stub_away.is_some()
             && (self.card_on_screen() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
         {
@@ -10078,6 +10106,8 @@ impl Render for AppView {
                 }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
+                // Every key: an entered agent card's act on new presses only.
+                this.ask_presses.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
                 // or another pane's (split.md §7).
                 let m = &ev.keystroke.modifiers;
@@ -10086,6 +10116,7 @@ impl Render for AppView {
                     && !(m.alt || m.shift || m.platform || m.function)
                     && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
                         || this.waiting_pane().is_some()
+                        || this.ask_waits()
                         || this.jump_elsewhere().is_some())
                 {
                     cx.stop_propagation();
@@ -10296,6 +10327,7 @@ impl Render for AppView {
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
                 let k = &ev.keystroke.key;
                 this.panes.cur.chord.up(k, Instant::now());
+                this.ask_presses.up(k, Instant::now());
                 if k.eq_ignore_ascii_case("b") {
                     this.fold_keys.release(Instant::now());
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
