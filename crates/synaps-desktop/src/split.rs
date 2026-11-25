@@ -258,7 +258,7 @@ impl Node {
     }
 
     /// The most panes this tree puts side by side, and stacked.
-    fn extent(&self) -> (usize, usize) {
+    pub(crate) fn extent(&self) -> (usize, usize) {
         match self {
             Node::Leaf(_) => (1, 1),
             Node::Split { axis, kids, .. } => {

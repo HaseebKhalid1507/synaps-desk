@@ -73,6 +73,10 @@ pub(crate) fn question_line(q: &str) -> String {
 /// it, the answer the rest.
 const QUESTION_SHARE: f32 = 0.55;
 
+/// An option's label gives way this much less than its hint and note
+/// (flex weights: they, at 1, go first; then the label ellipsizes).
+const LABEL_SHRINK: f32 = 0.01;
+
 /// A receipt's question: with an answer after it, whole up to
 /// [`QUESTION_SHARE`] of the line; alone, as wide as the line.
 fn question_box(d: Div, answered: bool) -> Div {
@@ -359,7 +363,17 @@ impl AppView {
                         .text_color(p.dim_t)
                         .child(shown(h, Lines::Single))
                 });
-                let note = o.note.as_ref().map(|_| div().flex_none().text_px(m.meta).text_color(p.dim_t).child("+ a note"));
+                let note = o.note.as_ref().map(|_| {
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_px(m.meta)
+                        .text_color(p.dim_t)
+                        .child("+ a note")
+                });
                 let (cap_bg, cap_fg) = if picked { (p.acc, p.acc_ink) } else { (p.well_d, p.dim_t) };
                 let row = h_flex()
                     .id(("ask-option", id * 64 + n as u64))
@@ -386,8 +400,13 @@ impl AppView {
                             .child(n.to_string()),
                     )
                     .child(
+                        // In a narrow pane (the 2026-11-25 note under
+                        // split.md §0) the hint and the note give way
+                        // first, then the label ellipsizes: the key and
+                        // the tags after it stay whole.
                         div()
-                            .flex_none()
+                            .min_w_0()
+                            .flex_shrink(LABEL_SHRINK)
                             .max_w(px((360. * r).round()))
                             .overflow_hidden()
                             .text_ellipsis()

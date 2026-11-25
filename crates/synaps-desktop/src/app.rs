@@ -582,7 +582,7 @@ pub(crate) const fn worker_keys(mac: bool) -> [(&'static str, Step); 4] {
     }
 }
 
-const COMPOSER_PLACEHOLDER: &str = "Message, or steer a running turn  (Enter sends, Shift+Enter: new line)";
+pub(crate) const COMPOSER_PLACEHOLDER: &str = "Message, or steer a running turn  (Enter sends, Shift+Enter: new line)";
 
 /// The worker key as the hints spell it.
 pub(crate) const WORKER_KEY: &str = if cfg!(target_os = "macos") { "⌥↑/↓" } else { "Ctrl+↑/↓" };
@@ -1032,6 +1032,9 @@ pub(crate) fn advance_input_clock(by: Duration) {
 pub(crate) fn next_press() {
     advance_input_clock(FoldKeys::PAIR + Duration::from_millis(10));
 }
+
+/// A pane map's narrowest cell, across or down ([`AppView::pane_map`]).
+pub(crate) const MAP_CELL_MIN: f32 = 2.;
 
 /// A pane map's cell (split.md §4, §6): `prose` where its pane is lit,
 /// else `rest_mark`, the chrome's mark at rest, which reads on the chrome,
@@ -3229,18 +3232,20 @@ impl AppView {
         }
     }
 
-    /// Input given back for the composer's tab goes in, then, if the
-    /// visible tab changed, the composer's text and caret go to the tab
-    /// left and the shown tab's come back ([`crate::tabs::Drafts::frame`]):
-    /// in that order, so input given back in the frame of a switch stays
-    /// with its tab. Nothing is read or allocated on a frame with neither.
-    fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The composer's placeholder: the session's, or the watched worker's;
+    /// without its key hints where the field is short (cramped, or a pane
+    /// too narrow for the whole of it). Run each frame, from
+    /// [`AppView::sync_composer`] and again once the pane's layout is known
+    /// ([`AppView::pane_main`]: the column it is drawn at this frame).
+    fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Over a worker's view the composer steers it (compared, not
         // allocated, each frame).
         let worker = self.model.lives[self.panes.cur.live].watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
         let cramped = self.panes.cur.layout.cramped;
+        let column = self.panes.cur.layout.column;
         if worker != self.panes.cur.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t))
             || cramped != self.panes.cur.placeholder_cramped
+            || column != self.panes.cur.placeholder_column
         {
             let text = match self.model.lives[self.panes.cur.live].watch.focused() {
                 Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()),
@@ -3249,12 +3254,30 @@ impl AppView {
                 None => COMPOSER_PLACEHOLDER.to_string(),
             };
             // Cramped, the field is short: its key hints go, so it is not
-            // cut off against the glyph.
-            let text: SharedString = if cramped { text.split("  (").next().unwrap_or_default().to_string().into() } else { text.into() };
+            // cut off against the glyph. So in a pane too narrow for the
+            // whole of it (the 2026-11-25 note under split.md §0): never
+            // cut off mid-word at the field's edge.
+            let room = column - 2. * theme::metrics(cx).pad_x;
+            let short = cramped || self.sans_w(&text, theme::metrics(cx).body, window) > room;
+            let text: SharedString = if short { text.split("  (").next().unwrap_or_default().to_string().into() } else { text.into() };
             self.panes.cur.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
             self.panes.cur.placeholder_cramped = cramped;
-            self.panes.cur.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
+            self.panes.cur.placeholder_column = column;
+            // Set only when it changes: a new column alone is no frame.
+            if text != self.panes.cur.placeholder_said {
+                self.panes.cur.placeholder_said = text.clone();
+                self.panes.cur.composer.update(cx, |c, cx| c.set_placeholder(text, window, cx));
+            }
         }
+    }
+
+    /// Input given back for the composer's tab goes in, then, if the
+    /// visible tab changed, the composer's text and caret go to the tab
+    /// left and the shown tab's come back ([`crate::tabs::Drafts::frame`]):
+    /// in that order, so input given back in the frame of a switch stays
+    /// with its tab. Nothing is read or allocated on a frame with neither.
+    fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_placeholder(window, cx);
         // Worker tabs that followed their session: their drafts with them.
         for (from, to) in self.model.tabs.take_rekeys() {
             self.drafts.rekey(&from, &to);
@@ -7759,6 +7782,20 @@ impl AppView {
 
     /// Display caps `text` at `size`, as wide as it is drawn: measured once
     /// per size in the embedded face.
+    /// `text`'s width (px) in the body face at `size`, as the composer's
+    /// field draws its placeholder. Not cached: read when the column changes.
+    fn sans_w(&self, text: &str, size: f32, window: &Window) -> f32 {
+        let run = TextRun {
+            len: text.len(),
+            font: font(fonts::SANS),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(window.text_system().shape_line(text.to_string().into(), px(size), &[run], None).width).ceil()
+    }
+
     pub(crate) fn display_w(&self, text: &'static str, size: f32, window: &Window) -> f32 {
         let key = (text, size.to_bits());
         if let Some(w) = self.widths.borrow().get(&key) {
@@ -8121,8 +8158,11 @@ impl AppView {
                 lead: lead_w,
                 word: word_w,
                 name: name_w,
-                model: if lay.tight { 0. } else { model.as_deref().map_or(0., mono_w) },
-                effort: if lay.tight { 0. } else { effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)) },
+                // A narrow pane's model and thinking stay while they fit,
+                // in the foot's one order (the 2026-11-25 note under
+                // split.md §0: with five panes across, every pane is tight).
+                model: model.as_deref().map_or(0., mono_w),
+                effort: effort.as_deref().map_or(0., |e| 8. + cell + 8. + mono_w(e)),
                 hint: hint.as_ref().map_or(0., |(h, _)| mono_w(h)),
                 halt: halt_w,
                 primary: primary_w,
@@ -8381,7 +8421,7 @@ impl AppView {
                     .children(hint)
                     .children(filler)
                     .children(halt_el.map(|h| h.ml(px(24.))))
-                    .child(send.ml(px(24.))),
+                    .child(send.ml(px(24.)).debug_selector(|| "foot-send".into())),
             )
         };
         // Drawn on its edge, over where the frame was (a pixel out of the
@@ -8728,6 +8768,7 @@ impl AppView {
         }
         self.panes.cur.layout = lay;
         self.panes.cur.layout_naming = ex.naming;
+        self.sync_placeholder(window, cx);
         // The tray takes what is left over the card's least well and a
         // one-line composer; the composer grows only into room the card's
         // smallest form and the tray leave.
@@ -9419,6 +9460,13 @@ impl AppView {
     /// cell per pane 1 px apart ([`map_cell`]); with `click`, a cell focuses
     /// its pane.
     pub(crate) fn pane_map(&self, w: f32, h: f32, lit: impl Fn(PaneId) -> bool, click: bool, p: &Palette, cx: &Context<Self>) -> Div {
+        // Five or more across (or four down: the 2026-11-25 note under
+        // split.md §0), it widens (or deepens) to keep each cell
+        // [`MAP_CELL_MIN`] px with the 1 px between, so a cell never goes to
+        // nothing and the lit one is still told apart.
+        let (across, down) = self.panes.tree.extent();
+        let fit = |n: usize, at: f32| at.max(n as f32 * MAP_CELL_MIN + (n.max(1) - 1) as f32 * crate::split::DIVIDER);
+        let (w, h) = (fit(across, w), fit(down, h));
         let cells = self.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h });
         div().relative().flex_none().w(px(w)).h(px(h)).children(cells.into_iter().map(|(id, r)| {
             let cell = div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w.max(1.))).h(px(r.h.max(1.))).bg(map_cell(p, lit(id)));

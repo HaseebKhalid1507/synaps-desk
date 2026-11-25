@@ -197,6 +197,10 @@ pub struct Pane {
     /// The composer's placeholder was set for a cramped window (its key
     /// hints dropped: the field is short).
     pub(crate) placeholder_cramped: bool,
+    /// And for a column this wide (a pane too narrow for the whole of it
+    /// drops its key hints too), as it was set.
+    pub(crate) placeholder_column: f32,
+    pub(crate) placeholder_said: SharedString,
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
     pub(crate) restore: Option<String>,
@@ -493,6 +497,8 @@ impl Pane {
             composer_rows: crate::fit::COMPOSER_ROWS,
             placeholder_of: None,
             placeholder_cramped: false,
+            placeholder_column: 0.,
+            placeholder_said: SharedString::new_static(crate::app::COMPOSER_PLACEHOLDER),
             restore: None,
             cmd_draft: None,
             cmd_clear: None,
@@ -672,22 +678,12 @@ impl Panes {
 
     /// A split's flight to `tree` (split.md §10): `new` grows beside `at`
     /// from the split line, every other pane from where it is drawn (a
-    /// pane still growing or closing carries on). A split that evened out
-    /// its row or column ([`crate::split::Node::split`]) lands each pane
-    /// there, in `area`.
-    pub(crate) fn fly_split(
-        &mut self,
-        tree: &crate::split::Node,
-        at: PaneId,
-        side: crate::split::Side,
-        new: PaneId,
-        area: crate::split::Rect,
-    ) {
+    /// pane still growing or closing carries on).
+    pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
         use crate::split::Flight;
-        let evened = self.tree.split_as(at, side, new).as_ref() != Some(tree);
         self.hand_over();
         let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
-        // A closing pane's id handed out again (all nine in use): its share
+        // A closing pane's id handed out again (all four in use): its share
         // keeps closing under a ghost's id, its ground only (its content
         // goes: [`crate::app::AppView::reap_closing`]), and no pane moves
         // for it (Shady #42 r2-L1).
@@ -700,13 +696,6 @@ impl Panes {
         }
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
-                // Evened: where `tree` puts each pane, the closing ones'
-                // shares still going to 0.
-                let to = match (evened, ghosts.is_empty()) {
-                    (false, _) => to,
-                    (true, true) => tree.clone(),
-                    (true, false) => to.fitted(&tree.rects(area), &ghosts),
-                };
                 grow.push(new);
                 Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
             }
@@ -1226,8 +1215,15 @@ impl crate::app::AppView {
         // Its share grows from the split line on `sheet` (split.md §10),
         // the panes from where they are drawn. A divider held goes with
         // the layout it was found in (Shady #42 M2).
-        let (w, h) = area;
-        self.panes.fly_split(&tree, at, side, new, crate::split::Rect { x: 0., y: 0., w, h });
+        let evened = self.panes.tree.split_as(at, side, new).as_ref() != Some(&tree);
+        self.panes.fly_split(&tree, at, side, new);
+        // A split that evened out its row or column (`Node::split`): each
+        // pane lands where the tree puts it, the closing ones' shares still
+        // going to 0.
+        if evened && let Some(f) = self.panes.flight.as_mut() {
+            let (w, h) = area;
+            f.to = f.to.fitted(&tree.rects(crate::split::Rect { x: 0., y: 0., w, h }), &f.ghosts);
+        }
         self.panes.tree = tree;
         self.panes.grab = None;
         self.panes.rest.push(pane);
@@ -2224,14 +2220,23 @@ pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)
 }
 
 /// The demo's sessions the narrow panes' stills show, one a pane: a card
-/// waiting with its workers, a running turn's chips, agent cards, folded
-/// runs, a form.
-const ACROSS: [&str; 5] = [crate::demo::SID, crate::demo::FLAKY, crate::demo::ASKS, crate::demo::IDLE_CPU, crate::demo::ASK_FORM];
+/// waiting with its workers, a running turn's chips, agent cards, a form
+/// (and folded runs, in the last pane).
+const ACROSS: [&str; 4] = [crate::demo::SID, crate::demo::FLAKY, crate::demo::ASKS, crate::demo::ASK_FORM];
 
-/// `across:<n>` (the 2026-11-25 note under split.md §0: narrow panes'
-/// stills): both panels at their strips, `n` panes side by side, evened,
-/// each on another of [`ACROSS`]; the first with two more tabs.
-async fn across(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, n: usize) {
+/// `across:<n>[:<w>[:<k>]]` (the 2026-11-25 note under split.md §0:
+/// narrow panes' stills): both panels at their strips, `n` panes side by
+/// side, evened (with `w`: each `w` px wide but the last, which has the
+/// rest), each on the next of [`ACROSS`] from its `k`th, the last on the
+/// demo's idle session; the first with two more tabs.
+async fn across(
+    view: &WeakEntity<crate::app::AppView>,
+    cx: &mut AsyncWindowContext,
+    ex: &BackgroundExecutor,
+    n: usize,
+    w: Option<usize>,
+    k: usize,
+) {
     use crate::app::Open;
     let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
     let act = |cx: &mut AsyncWindowContext, f: &dyn Fn(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
@@ -2247,18 +2252,23 @@ async fn across(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowCont
         sleep(0.6).await;
     }
     act(cx, &|v, _, _| {
-        let (w, h) = v.centre.get();
-        v.panes.tree.equalise_all(crate::split::Rect { x: 0., y: 0., w, h });
+        let (cw, h) = v.centre.get();
+        v.panes.tree.equalise_all(crate::split::Rect { x: 0., y: 0., w: cw, h });
+        if let (Some(w), crate::split::Node::Split { ratios, .. }) = (w, &mut v.panes.tree) {
+            let room = cw - (ratios.len() - 1) as f32 * crate::split::DIVIDER;
+            let k = ratios.len();
+            for (i, r) in ratios.iter_mut().enumerate() {
+                *r = if i + 1 < k { w as f32 / room } else { 1. - (k - 1) as f32 * w as f32 / room };
+            }
+        }
         v.panes.drawn = v.panes.tree.clone();
     });
     sleep(0.6).await;
     for i in 0..n {
+        let s = if i + 1 == n && n > 1 { crate::demo::IDLE_CPU } else { ACROSS[(i + k) % ACROSS.len()] };
         act(cx, &|v, _, cx| {
             v.focus_nth(i, cx);
-            v.open_tab(
-                Open::Attach { session_id: ACROSS[i % ACROSS.len()].into(), fallback: None, open: false },
-                crate::tabs::Place::Current,
-            );
+            v.open_tab(Open::Attach { session_id: s.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         });
         sleep(0.8).await;
     }
@@ -2394,9 +2404,12 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
                 film6(&view, cx, &ex, t0).await;
                 return;
             }
-            if let Some(n) = how.strip_prefix("across:").and_then(|n| n.parse::<usize>().ok()) {
+            if let Some((n, w, k)) = how.strip_prefix("across:").and_then(|a| {
+                let mut it = a.split(':').map(|n| n.parse::<usize>().ok());
+                Some((it.next()??, it.next().flatten(), it.next().flatten().unwrap_or(0)))
+            }) {
                 sleep(1.5).await;
-                across(&view, cx, &ex, n).await;
+                across(&view, cx, &ex, n, w, k).await;
                 mark("across");
                 return;
             }

@@ -665,8 +665,9 @@ fn in_pane_at(cx: &mut TestAppContext, window: AnyWindowHandle, sel: &'static st
     // Allow is drawn filled or outlined (the theme's style).
     let alt = if sel == "allow-fill" { "allow-outline" } else { sel };
     let b = vcx.debug_bounds(sel).or_else(|| vcx.debug_bounds(alt)).unwrap_or_else(|| panic!("{sel} drawn"));
-    let from =
-        (0..4).find(|j| vcx.debug_bounds(format!("pane {j}").leak()).is_some_and(|p| p.contains(&b.center()))).expect("drawn in a pane");
+    let from = (0..crate::pane::PANES_MAX)
+        .find(|j| vcx.debug_bounds(format!("pane {j}").leak()).is_some_and(|p| p.contains(&b.center())))
+        .expect("drawn in a pane");
     let card =
         |vcx: &mut VisualTestContext, j: usize| vcx.debug_bounds(format!("card {j}").leak()).unwrap_or_else(|| panic!("pane {j}'s card"));
     let (c_from, c_to) = (card(&mut vcx, from), card(&mut vcx, id.index()));
@@ -679,8 +680,10 @@ fn composer_at(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane
     let mut vcx = VisualTestContext::from_window(window, cx);
     let bar = vcx.debug_bounds("composer-bar").expect("the focused composer's bar");
     let at = gpui_kit::point(bar.origin.x + px(80.), bar.center().y);
-    let from =
-        (0..4).filter_map(|j| vcx.debug_bounds(format!("pane {j}").leak())).find(|p| p.contains(&bar.center())).expect("drawn in a pane");
+    let from = (0..crate::pane::PANES_MAX)
+        .filter_map(|j| vcx.debug_bounds(format!("pane {j}").leak()))
+        .find(|p| p.contains(&bar.center()))
+        .expect("drawn in a pane");
     let to = vcx.debug_bounds(format!("pane {}", id.index()).leak()).expect("the pane drawn");
     at - from.origin + to.origin
 }
@@ -7140,4 +7143,40 @@ fn six_across_restored_into_1280_fold_and_widened_lay_out(cx: &mut TestAppContex
     while attaches.try_recv().is_ok() {}
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+/// split.md A18 with nine panes (the 2026-11-25 note under split.md §0):
+/// at rest they ask for no frame, as four do; only the rail's spinners
+/// keep their beat.
+#[gpui_kit::test]
+fn nine_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    nine_panes(cx, window, &view);
+    let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
+    for _ in 0..240 {
+        let ran = idle_step(cx, window, &view, Duration::from_micros(6944));
+        if ran == 0 && !view.read_with(cx, |v, _| v.fx.pending().0) {
+            break;
+        }
+    }
+    assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "nine panes at rest: a display frame");
+    for _ in 0..60 {
+        idle_step(cx, window, &view, Duration::from_millis(50));
+    }
+    let f0 = view.read_with(cx, |v, _| v.fx.frames());
+    for i in 0..40 {
+        idle_step(cx, window, &view, Duration::from_millis(50));
+        assert_eq!(view.read_with(cx, |v, _| v.fx.frames()), f0, "at rest, {} ms on: a render", (i + 1) * 50);
+    }
+    let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
+    assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{sites:?}");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 9);
+        assert!(v.panes.iter().all(|p| !p.disp.is_empty()), "every pane's list built");
+    });
 }
