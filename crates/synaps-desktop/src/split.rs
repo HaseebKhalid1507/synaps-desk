@@ -1055,6 +1055,39 @@ mod tests {
         assert_eq!(one.split(p(0), Side::Down, p(1), (1000., 480.)), Err(Refused::Room));
     }
 
+    /// Room is the only limit (split.md §0, the 2026-11-25 note): no cap
+    /// across or down, only each pane's 320 × 240 and [`PANES_MAX`] in all.
+    /// A pane halved under its minimum evens out the split it joins
+    /// instead, when that fits.
+    #[test]
+    fn room_is_the_only_limit() {
+        // 1920 with both panels at their strips.
+        let a = (1856., 1040.);
+        let area = Rect { x: 0., y: 0., w: a.0, h: a.1 };
+        let mut t = Node::Leaf(p(0));
+        for i in 1..5 {
+            t = t.split(p(i - 1), Side::Right, p(i), a).unwrap_or_else(|e| panic!("pane {i} across: {e:?}"));
+        }
+        let r = t.rects(area);
+        assert_eq!(r.len(), 5);
+        assert!(r.iter().all(|(_, b)| b.y == 0. && b.h == a.1 && b.w >= PANE_MIN_W), "five across, each at least 320: {r:?}");
+        // A sixth across would be 308: refused, and Ctrl+\ splits down.
+        assert_eq!(t.split(p(4), Side::Right, p(5), a), Err(Refused::Room));
+        let (t, side) = t.split_right(p(4), p(5), a).expect("down");
+        assert_eq!(side, Side::Down);
+        // Four down in a column where they fit (4 × 240 + 3 ≤ 1040).
+        let t = t.split(p(5), Side::Down, p(6), a).expect("a third row");
+        let t = t.split(p(6), Side::Down, p(7), a).expect("a fourth row, the column evened");
+        assert!(t.rects(area).iter().all(|(_, b)| b.w >= PANE_MIN_W && b.h >= PANE_MIN_H), "{:?}", t.rects(area));
+        assert_eq!(t.split(p(7), Side::Down, p(8), a), Err(Refused::Room), "a fifth row: 5 × 240 + 4 > 1040");
+        let t = t.split(p(0), Side::Down, p(8), a).expect("the ninth");
+        assert_eq!(t.len(), PANES_MAX);
+        assert_eq!(PANES_MAX, 9);
+        // The tenth: the total's cap, whatever the room.
+        assert_eq!(t.split(p(1), Side::Down, PaneId::ghost(0), (8000., 4000.)), Err(Refused::Most));
+        assert_eq!(Refused::Most.note(), "9 panes is the most");
+    }
+
     /// Ctrl+\ on a pane too narrow for two splits it down (split.md §2).
     #[test]
     fn split_right_falls_back_to_down() {

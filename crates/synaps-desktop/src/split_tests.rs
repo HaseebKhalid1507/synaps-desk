@@ -6977,3 +6977,135 @@ fn the_composer_pickers_are_each_panes_own(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+// ── Room is the only limit (split.md §0, the 2026-11-25 note) ───────────
+
+/// The pane key `n` (1-based) as this platform binds it: Alt+N, Ctrl+N on
+/// macOS.
+fn nth_key(n: usize) -> String {
+    format!("{}-{n}", if cfg!(target_os = "macos") { "ctrl" } else { "alt" })
+}
+
+/// Haseeb, 2026-11-25: "i can only have 3 columns?? thats too less." No
+/// cap across or down: at 1920 × 1080 with both panels at their strips,
+/// Ctrl+\ four times gives five panes side by side, each at least 320
+/// wide (a halved pane under 320 evens out its row instead). A sixth
+/// across would be under 320: an explicit split right is refused with "no
+/// room to split this pane", and Ctrl+\ splits down instead. Nine panes
+/// in all; the tenth is refused, "9 panes is the most". Alt+1–9 focus
+/// each in reading order.
+#[gpui_kit::test]
+fn five_across_fit_at_1920_with_both_panels_folded_and_a_tenth_is_refused(cx: &mut TestAppContext) {
+    use crate::split::{PANE_MIN_H, PANE_MIN_W};
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    let (rail, right) = crate::app::panel_keys(cfg!(target_os = "macos"));
+    press(cx, window, rail);
+    press(cx, window, right);
+    frame(cx, window);
+    let strip = crate::app::STRIP;
+    let shown = view.read_with(cx, |v, _| (v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown));
+    assert_eq!(shown, (strip, strip), "both panels at their strips");
+    for n in 2..=5 {
+        key(cx, window, "ctrl-\\");
+        frame(cx, window);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), n, "Ctrl+\\ made pane {n}");
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let boxes: Vec<[f32; 4]> = order.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert!(boxes.iter().all(|b| b[1] == boxes[0][1] && b[3] == boxes[0][3]), "five across, one row: {boxes:?}");
+    assert!(boxes.windows(2).all(|w| w[1][0] > w[0][0]), "side by side: {boxes:?}");
+    assert!(boxes.iter().all(|b| b[2] >= PANE_MIN_W), "each at least 320 wide: {boxes:?}");
+    assert!(!view.read_with(cx, |v, _| v.panes.folded), "not folded");
+    // A sixth across: refused, in the composer's words; nothing changed.
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.split_pane(Some(crate::split::Side::Right), w, cx)));
+    frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.tree, tree, "no sixth across");
+        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("no room to split this pane"));
+    });
+    // Ctrl+\ splits the narrow pane down instead.
+    let at = view.read_with(cx, |v, _| v.panes.focused);
+    let above = pane_box(cx, window, at);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let below = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(below, at, "a new pane");
+    let (a, b) = (pane_box(cx, window, at), pane_box(cx, window, below));
+    assert!(a[0] == above[0] && b[0] == above[0] && b[1] > a[1], "split down: {a:?} over {b:?}");
+    // Down to nine: the other columns' tops split down too.
+    for n in 1..=3 {
+        key(cx, window, &nth_key(n));
+        key(cx, window, "ctrl-\\");
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 9, "nine panes");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert!(
+        order.iter().map(|id| pane_box(cx, window, *id)).all(|b| b[2] >= PANE_MIN_W && b[3] >= PANE_MIN_H),
+        "every pane at least 320 × 240"
+    );
+    // The tenth: refused, by the total alone.
+    key(cx, window, "ctrl-\\");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 9, "no tenth pane");
+        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("9 panes is the most"));
+    });
+    // Alt+1–9 (Ctrl on macOS): pane N in reading order, each.
+    for n in (1..=9).rev() {
+        key(cx, window, &nth_key(n));
+        assert_eq!(view.read_with(cx, |v, _| v.panes.focused), order[n - 1], "{} focuses pane {n}", nth_key(n));
+    }
+}
+
+/// A saved layout is read by its total alone (split.md §0, the 2026-11-25
+/// note): six across restored into a 1280 window takes the too-small path
+/// (folded, nothing lost); widened to 2560 it is six across, each at
+/// least 320; narrowed to 1920 (six need 1925 between the strips) it
+/// folds again, the tree untouched. Five across at 1920 keep the rail at
+/// its strip when Ctrl+B would open it (the panes win, split.md §5).
+#[gpui_kit::test]
+fn six_across_restored_into_1280_fold_and_widened_lay_out(cx: &mut TestAppContext) {
+    use crate::split::PANE_MIN_W;
+    let six = crate::theme::Layout {
+        focused: 0,
+        tree: crate::theme::LayoutNode::Split {
+            axis: crate::split::Axis::Row,
+            ratios: vec![1. / 6.; 6],
+            kids: (0..6).map(crate::theme::LayoutNode::Pane).collect(),
+        },
+        panes: (0..6).map(|_| saved(&[A])).collect(),
+    };
+    let (window, view, client, attaches, _events) = launch_in(cx, "six-across", Some(six), None, true, (1280., 800.));
+    let (len, folded) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.folded));
+    assert_eq!(len, 6, "the six panes restored");
+    assert!(folded, "1280: too small for six, folded");
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    resize(cx, window, 2560., 1080.);
+    let (order, folded) = view.read_with(cx, |v, _| (v.reading_order(), v.panes.folded));
+    assert!(!folded, "2560: laid out");
+    let boxes: Vec<[f32; 4]> = order.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert!(boxes.iter().all(|b| b[1] == boxes[0][1] && b[2] >= PANE_MIN_W), "six across, each at least 320: {boxes:?}");
+    resize(cx, window, 1920., 1080.);
+    assert!(view.read_with(cx, |v, _| v.panes.folded), "1920: six don't fit between the strips, folded");
+    assert!(view.read_with(cx, |v, _| v.panes.tree.same_shape(&tree)), "the tree untouched");
+    // Five across at 1920: Ctrl+B leaves the rail at its strip.
+    view.update(cx, |v, cx| {
+        v.focus_nth(5, cx);
+        v.panels.rail_collapsed = true;
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.app_act(crate::palette::AppAct::ClosePane, w, cx))).unwrap();
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 5, "five left");
+    assert!(!view.read_with(cx, |v, _| v.panes.folded), "five fit at 1920");
+    let strip = crate::app::STRIP;
+    key(cx, window, crate::app::panel_keys(cfg!(target_os = "macos")).0);
+    frame(cx, window);
+    frame(cx, window);
+    let (rail, folded) = view.read_with(cx, |v, _| (v.panel_fx.sides[0].shown, v.panes.folded));
+    assert!(rail <= strip + 0.5 && !folded, "the rail yields to five across: {rail}, folded {folded}");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}

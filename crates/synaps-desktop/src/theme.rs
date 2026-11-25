@@ -3622,6 +3622,40 @@ mod tests {
         assert_eq!(two(&["a"], &["b"]).without_empty_panes(), two(&["a"], &["b"]), "none empty: as it was");
     }
 
+    /// Room is the only limit (split.md §0, the 2026-11-25 note): a saved
+    /// layout is read by its total alone. Six across and four down are
+    /// read (a window too small for them folds them); ten panes are not.
+    #[test]
+    fn a_saved_layout_is_read_by_its_total_alone() {
+        let dir = std::env::temp_dir().join(format!("synaps-desktop-layout-total-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pane = r#"{"sessions": ["s1"], "active": 0}"#;
+        let flat = |axis: &str, n: usize| {
+            let kids: Vec<String> = (0..n).map(|i| format!(r#"{{"pane": {i}}}"#)).collect();
+            let ratios = vec![format!("{}", 1. / n as f64); n];
+            let panes = vec![pane; n];
+            format!(
+                r#"{{"v": 1, "tree": {{"split": "{axis}", "ratios": [{}], "kids": [{}]}}, "panes": [{}]}}"#,
+                ratios.join(", "),
+                kids.join(", "),
+                panes.join(", ")
+            )
+        };
+        for (what, layout, n) in [
+            ("six across", flat("row", 6), Some(6)),
+            ("four down", flat("column", 4), Some(4)),
+            ("nine across", flat("row", 9), Some(9)),
+            ("ten panes", flat("row", 10), None),
+        ] {
+            let file = format!(r#"{{"tabs": {{"k": {{"sessions": ["s1"], "active": 0}}}}, "layout": {{"k": {layout}}}}}"#);
+            std::fs::write(&path, file).unwrap();
+            assert_eq!(load_layout(&path, "k").map(|l| l.panes.len()), n, "{what}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// split/architecture.md §5: a layout that is not whole is none, and a
     /// launch falls back to `tabs.<key>` as one pane; malformed input never
     /// panics.
