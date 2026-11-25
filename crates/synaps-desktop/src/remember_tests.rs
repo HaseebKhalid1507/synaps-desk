@@ -3,11 +3,12 @@
 //! the same question in the same folder starts on the last choice, marked
 //! "last time", and Enter on it sends exactly one `Submit` of it; another
 //! folder or changed options recall nothing; a multi pick's set is marked,
-//! never ticked; only an answer that reached the chat is remembered (not
-//! sent, unconfirmed and Resend waiting are not); off, the file is neither
-//! read nor written; Forget; an unreadable file; no free text in the file;
-//! no frame at rest; a pending permission prompt untouched; a choice
-//! remembered meanwhile never moves an open card.
+//! never ticked; only an answer that reached the chat (answered, or a
+//! steer taken in) is remembered (not sent, queued, unconfirmed and
+//! Resend waiting are not); off, the file is neither read nor written;
+//! Forget; an unreadable file; no free text in the file; no frame at
+//! rest; a pending permission prompt untouched; a choice remembered
+//! meanwhile never moves an open card.
 //!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
@@ -303,6 +304,27 @@ fn only_an_answer_that_reached_the_chat_is_remembered(cx: &mut TestAppContext) {
     assert!(has(cx, w, format!("ask-state {skip} skipped")));
     assert_eq!(kept(cx, &view), (1, 1), "a skip: nothing more");
     assert_eq!(std::fs::read(&path).unwrap(), file);
+}
+
+/// Taken in: busy, the answer goes as a `Steer`. Queued (its echo) is not
+/// remembered; the engine's `SteeringDelivered` is (D2a's "taken in").
+#[gpui_kit::test]
+fn a_steer_is_remembered_once_taken_in(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, id, _events) = asked(cx, "toolu_d1", "c1ddd01", &input);
+    remembering(cx, &view, "steer");
+    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 44, "trigger": "user", "user_text": "go on"})]);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    let s = sends(cx, &view);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].busy, "a Steer: the session is busy");
+    heard(cx, w, &view, vec![json!({"ev": "steered", "text": s[0].text, "delivered": true})]);
+    assert!(has(cx, w, format!("ask-state {id} queued · the agent reads it at its next step")));
+    assert_eq!(kept(cx, &view), (0, 0), "queued: nothing");
+    heard(cx, w, &view, vec![llm(json!({"kind": "agent", "agent": "steering_delivered", "message": s[0].text}))]);
+    assert!(has(cx, w, format!("ask-state {id} answered")), "taken in");
+    assert_eq!(kept(cx, &view), (1, 1), "taken in: remembered, written");
 }
 
 /// Off (Settings): the file is neither read nor written, nothing is
