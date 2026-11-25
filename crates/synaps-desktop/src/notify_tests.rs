@@ -1,6 +1,7 @@
-//! D3's notification boundary (Shady #83 P2-5, P2-6): the text the OS is
-//! given, and the notifications as owned, bounded resources, with a fake
-//! transport and the XDG task's memory without a bus.
+//! D3's notification boundary (Shady #83 P2-5, P2-6, R2-3): the text the
+//! OS is given, and the notifications as owned, bounded resources, with a
+//! fake transport and with GPUI's (the window's teardown). Linux's bus
+//! transport has its own: `notify_xdg_tests.rs`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -66,6 +67,13 @@ impl Transport for Fake {
         self.log.borrow_mut().push(format!("close {tag}"));
         self.up.borrow_mut().retain(|t| t != tag);
     }
+
+    fn retire(&mut self, _: &mut App) -> Gone {
+        for t in self.up.borrow_mut().drain(..) {
+            self.log.borrow_mut().push(format!("close {t}"));
+        }
+        Gone(None)
+    }
 }
 
 /// Notifications are owned: each card's taken down when it resolves
@@ -105,31 +113,55 @@ fn notifications_are_owned_and_bounded(cx: &mut TestAppContext) {
     });
 }
 
-/// The XDG task's memory (Linux): each tag's server id, at most
-/// `NOTES_MAX`; a tag shown again replaces its own id; a server that
-/// closes one (expired, dismissed, clicked) is heard; one that dies
-/// without a word (nothing closes) still leaves at most `NOTES_MAX`
-/// remembered, the oldest closed first; the window gone, every one is
-/// closed.
-#[test]
-fn the_xdg_memory_is_bounded_without_a_server() {
-    let mut s = Shown::default();
-    assert!(s.shown("a".into(), 1).is_empty());
-    assert_eq!((s.id("a"), s.tag(1)), (Some(1), Some("a")));
-    assert!(s.shown("a".into(), 2).is_empty(), "replaced");
-    assert_eq!((s.id("a"), s.tag(1), s.len()), (Some(2), None, 1));
-    s.closed(2);
-    assert_eq!((s.id("a"), s.len()), (None, 0), "the server closed it");
-    assert_eq!(s.forget("a"), None);
-    // A server gone silent: thousands shown, none closed by it.
-    let mut closed = Vec::new();
-    for n in 0..5000u32 {
-        closed.extend(s.shown(format!("t{n}"), n + 10));
-        assert!(s.len() <= NOTES_MAX);
-    }
-    assert_eq!(closed.len(), 5000 - NOTES_MAX, "each pushed out is closed");
-    assert_eq!(closed[0], 10, "the oldest first");
-    assert_eq!(s.forget(&format!("t{}", 4999)), Some(5009), "a card resolved: its id, to close");
-    assert_eq!(s.drain().len(), NOTES_MAX - 1, "the window gone: every one closed");
-    assert_eq!(s.len(), 0);
+/// Shady #83 R2-3, GPUI's transport: a note is handed to the platform
+/// from a task of its own (never in place); one taken down before that is
+/// never shown; one shown is dismissed when its card resolves. The window
+/// gone: every one up dismissed there and then, one still queued never
+/// shown, nothing posted after, and nothing left registered.
+#[gpui_kit::test]
+fn gpui_notes_go_with_their_window(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_app_identity("synaps-desktop", "Synaps"));
+    let mut notes = Notes::new(Box::new(Gpui::default()), None);
+    let tag = |n: usize| tag_of(&key(n));
+    let shown = |cx: &mut TestAppContext| cx.shown_system_notifications().iter().map(|n| n.tag.to_string()).collect::<Vec<_>>();
+    cx.update(|cx| notes.post(key(1), note(&key(1), "s", "q"), cx));
+    assert!(shown(cx).is_empty(), "queued, not shown in place");
+    cx.run_until_parked();
+    assert_eq!(shown(cx), [tag(1)]);
+    cx.update(|cx| {
+        notes.post(key(2), note(&key(2), "s", "q"), cx);
+        notes.post(key(3), note(&key(3), "s", "q"), cx);
+        notes.retire(&tag(2), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(cx), [tag(1), tag(3)], "2 resolved while queued: never shown");
+    assert!(cx.dismissed_system_notifications().is_empty());
+    // One platform call per turn of the UI thread (R2-8).
+    cx.update(|cx| {
+        for n in 6..9 {
+            notes.post(key(n), note(&key(n), "s", "q"), cx);
+        }
+    });
+    assert!(cx.executor().tick(), "the task's first turn");
+    assert_eq!(shown(cx).len(), 3, "one shown per turn, not three");
+    cx.run_until_parked();
+    assert_eq!(shown(cx).len(), 5);
+    cx.update(|cx| (6..9).for_each(|n| _ = notes.retire(&tag(n), cx)));
+    cx.run_until_parked();
+    assert_eq!(cx.dismissed_system_notifications().len(), 3, "dismissed with their cards");
+    cx.update(|cx| {
+        notes.post(key(4), note(&key(4), "s", "q"), cx);
+        let _ = notes.teardown(cx);
+        notes.post(key(5), note(&key(5), "s", "q"), cx);
+    });
+    let mut dismissed: Vec<String> = cx.dismissed_system_notifications().iter().skip(3).map(|t| t.to_string()).collect();
+    dismissed.sort();
+    let mut up = vec![tag(1), tag(3)];
+    up.sort();
+    assert_eq!(dismissed, up, "every one up dismissed at the teardown");
+    cx.run_until_parked();
+    let shown_now = shown(cx);
+    assert!(!shown_now.contains(&tag(4)) && !shown_now.contains(&tag(5)), "4 (queued) and 5 (after) never shown");
+    assert!(cx.delivered_system_notifications().is_empty(), "nothing left registered");
+    assert_eq!(notes.len(), 0);
 }

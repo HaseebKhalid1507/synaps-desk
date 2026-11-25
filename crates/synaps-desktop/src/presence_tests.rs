@@ -310,6 +310,27 @@ fn open(cx: &mut TestAppContext) -> Win {
     (window, view)
 }
 
+/// One more window of the same app (`open`'s, without setting the app up
+/// again).
+fn another(cx: &mut TestAppContext) -> Win {
+    let (window, view) = cx.update(|cx| {
+        let bounds = Bounds { origin: Default::default(), size: size(px(1440.), px(900.)) };
+        let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+        crate::beat::open_window(options, cx, true, |window, cx| {
+            cx.new(|cx| {
+                let v = AppView::new(None, Some(crate::demo::events()), window, cx);
+                v.fx.pin_clock();
+                v
+            })
+        })
+        .expect("a test window")
+    });
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, w, _| w.activate_window());
+    wait(cx, window, &view, 1000);
+    (window, view)
+}
+
 fn wait(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ms: u64) {
     let d = Duration::from_millis(ms);
     view.read_with(cx, |v, _| v.fx.set_clock(v.fx.tick() + d));
@@ -1129,4 +1150,179 @@ fn a_landing_that_cannot_happen_is_dropped(cx: &mut TestAppContext) {
     view.update(cx, |_, cx| cx.notify());
     settle(cx, w, 8);
     assert!(view.read_with(cx, |v, _| v.lookout.land.is_none()), "past its wait: dropped");
+}
+
+/// Shady #83 R2-3: a window closed with its cards unanswered, while
+/// another keeps the app up, takes its notifications with it. Each one it
+/// posted is dismissed; one still queued as it closed is never shown;
+/// nothing stays registered with the platform, and its click route goes;
+/// window after window.
+#[gpui_kit::test]
+fn a_window_closed_takes_its_notifications_with_it(cx: &mut TestAppContext) {
+    let (_keep_w, _keep) = open(cx);
+    for round in 0..3 {
+        let (w, view) = another(cx);
+        view.update(cx, |v, _| v.client = None);
+        open_tab(cx, w, &view, ASK_OPEN);
+        away(cx, w, &view);
+        let mut tags = Vec::new();
+        for c in ["a", "b"] {
+            let (tool, card) = (format!("toolu_w{round}{c}"), format!("c7w{round}{c}aa"));
+            ask_live(cx, w, &view, &tool, &card, wait_card("Close the window on it?"));
+            tags.push(crate::notify::tag_of(&Key { session: ASK_OPEN.into(), tool_id: tool, card: CardId::parse(&card).unwrap() }));
+        }
+        let delivered: Vec<String> = cx.delivered_system_notifications().iter().map(|n| n.tag.to_string()).collect();
+        assert!(tags.iter().all(|t| delivered.contains(t)), "both up: {delivered:?}");
+        // One more posted as the window closes: queued, not yet handed over.
+        let k = Key { session: ASK_OPEN.into(), tool_id: format!("toolu_w{round}c"), card: CardId::parse(&format!("c7w{round}caa")).unwrap() };
+        let n = crate::notify::note(&k, "Relay log levels", "Queued as it closed?");
+        let queued = n.tag.clone();
+        view.update(cx, |v, cx| v.lookout.notes.post(k, n, cx));
+        cx.update_window(w, |_, window, _| window.remove_window()).expect("the window");
+        drop(view);
+        // The window's view released, as its close's own update ends.
+        cx.update(|_| {});
+        cx.run_until_parked();
+        let (shown_n, dismissed) = told(cx);
+        assert!(tags.iter().all(|t| dismissed.contains(t)), "round {round}: each dismissed: {dismissed:?}");
+        assert!(shown_n.iter().all(|n| n.tag.as_ref() != queued), "the queued one never shown");
+        assert!(cx.delivered_system_notifications().is_empty(), "round {round}: nothing left registered");
+        assert_eq!(cx.update(|cx| cx.global::<Clickers>().0.len()), 1, "only the window still open hears clicks");
+    }
+}
+
+/// Shady #83 R2-5, the click: checked against what the window holds as it
+/// comes, not the presence a frame refreshes. A real press on the card's
+/// option (its answer on its way), then its notification's click, with
+/// no frame between (both in one update; GPUI's callback and Linux's
+/// channel both call `notification_clicked`): the notification is taken
+/// down and nothing moves: no window raised, no landing, the same
+/// session, tabs and scroll. Then a card whose tab closes, and its click,
+/// again with no frame between: the same.
+#[gpui_kit::test]
+fn a_click_is_checked_as_it_comes_not_at_the_last_frame(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    away(cx, w, &view);
+    ask_live(cx, w, &view, "toolu_p1", "c7p1aaa", wait_card("Press it, then click it?"));
+    let tag = told(cx).0.last().expect("told").tag.to_string();
+    let (id, _) = row(cx, &view, "toolu_p1").expect("its row");
+    arm(cx, &view, id);
+    // The synthetic daemon takes the answer and never echoes it: on its way.
+    view.update(cx, |v, _| v.synthetic_tx = Some(async_channel::unbounded().0));
+    let at = center(cx, w, format!("ask-option {id} 1"));
+    let state = |v: &AppView| {
+        let top = v.panes.cur.list.logical_scroll_top();
+        (v.model.lives[v.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()), v.model.tabs.len(), v.model.tabs.active(), top)
+    };
+    let before = view.read_with(cx, |v, _| state(v));
+    cx.update_window(w, |_, window, cx| {
+        let mouse = |window: &mut Window, cx: &mut App, e: gpui_kit::PlatformInput| {
+            window.dispatch_event(e, cx);
+        };
+        mouse(window, cx, MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }.to_platform_input());
+        let down = MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
+        mouse(window, cx, down.to_platform_input());
+        mouse(window, cx, MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input());
+        view.update(cx, |v, cx| {
+            assert!(v.model.presence.get(ASK_OPEN, "toolu_p1").is_some(), "no frame yet: the presence still lists it");
+            let pressed = state(v);
+            assert!(v.notification_clicked(&tag, window, cx), "this window's");
+            assert_eq!(state(v), pressed, "the click moved nothing: session, tabs, scroll");
+            assert!(v.lookout.land.is_none(), "no landing");
+            assert!(v.lookout.notes.card(&tag).is_none(), "taken down");
+        });
+    })
+    .expect("the window");
+    let after = view.read_with(cx, |v, _| state(v));
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2), "the same session and tabs");
+    cx.run_until_parked();
+    assert!(!view.read_with(cx, |v, _| v.window_active), "the window not raised");
+    assert_eq!(sends(cx, &view).len(), 1, "the press's answer, once");
+    assert!(told(cx).1.contains(&tag), "dismissed");
+    crate::app::pin_arm_clock(None);
+    // Its tab closed, then its click, no frame between.
+    show_tab(cx, w, &view, 1);
+    away(cx, w, &view);
+    ask_live(cx, w, &view, "toolu_p2", "c7p2aaa", wait_card("Close its tab, then click it?"));
+    let tag2 = told(cx).0.last().expect("told").tag.to_string();
+    assert_ne!(tag2, tag);
+    show_tab(cx, w, &view, 0);
+    let first = shown(cx, &view);
+    assert_ne!(first.as_deref(), Some(ASK_OPEN));
+    cx.update_window(w, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            let ix = v.model.tabs.find(ASK_OPEN).expect("its tab");
+            v.close_tab(ix);
+            assert!(v.model.presence.get(ASK_OPEN, "toolu_p2").is_some(), "no frame yet: the presence still lists it");
+            assert!(v.notification_clicked(&tag2, window, cx));
+            assert!(v.lookout.land.is_none(), "no landing");
+            assert_eq!(v.model.tabs.find(ASK_OPEN), None, "never opened again");
+        });
+    })
+    .expect("the window");
+    cx.run_until_parked();
+    assert!(!view.read_with(cx, |v, _| v.window_active), "the window not raised");
+    assert_eq!(shown(cx, &view), first, "nothing attached");
+    assert!(told(cx).1.contains(&tag2), "dismissed");
+}
+
+/// A transcript whose fold is wait cards `cards` (call `toolu_<n>`, card
+/// `c<n>` in six digits), open, and nothing else.
+fn folded(cards: &[usize]) -> Transcript {
+    let messages: Vec<Value> = cards
+        .iter()
+        .flat_map(|n| card_messages(&format!("toolu_{n}"), &format!("c{n:06}"), &wait_card(&format!("Card {n}?"))).0)
+        .collect();
+    let mut t = Transcript::new();
+    t.apply_history(&messages);
+    t
+}
+
+fn bound(n: usize) -> Key {
+    Key { session: "s".into(), tool_id: format!("toolu_{n}"), card: CardId::parse(&format!("c{n:06}")).unwrap() }
+}
+
+/// Shady #83 R2-6: the ledger's bound never forgets a card still waiting.
+/// Card 0 waits while more than `SEEN_MAX` others come and go: it is
+/// never told again, and what is remembered stays bounded.
+#[test]
+fn the_ledgers_bound_keeps_a_waiting_card() {
+    let mut a = Arrivals::default();
+    a.look(Look::Baseline, "s", &folded(&[]));
+    a.look(Look::Live, "s", &folded(&[0]));
+    assert_eq!(a.take(), [bound(0)]);
+    for n in 1..=SEEN_MAX + 8 {
+        a.look(Look::Live, "s", &folded(&[0, n]));
+        assert_eq!(a.take(), [bound(n)], "only the new card");
+        a.look(Look::Live, "s", &folded(&[0]));
+        assert!(a.take().is_empty(), "card 0 still waits: not news (after {n} others)");
+    }
+    assert!(a.seen() <= 1 + SEEN_MAX, "bounded: {}", a.seen());
+}
+
+/// Shady #83 R2-6, under a bound of 4: more cards open at once than the
+/// bound are all kept, none told again; those no longer open are bounded.
+/// The one exception, as documented: a card that left its fold and stayed
+/// out while more than the bound of others left theirs, back again.
+#[test]
+fn the_ledgers_bound_keeps_every_open_card() {
+    let mut a = Arrivals::with_cap(4);
+    a.look(Look::Baseline, "s", &folded(&[]));
+    let many: Vec<usize> = (100..110).collect();
+    a.look(Look::Live, "s", &folded(&many));
+    assert_eq!(a.take().len(), 10);
+    let more: Vec<usize> = many.iter().copied().chain([200]).collect();
+    a.look(Look::Live, "s", &folded(&more));
+    assert_eq!(a.take(), [bound(200)], "eleven open, past the bound: none news again");
+    for n in 1..=6 {
+        a.look(Look::Live, "s", &folded(&[n]));
+        assert_eq!(a.take(), [bound(n)]);
+        assert!(a.seen() <= 1 + 4, "the open one and four that left: {}", a.seen());
+    }
+    a.look(Look::Live, "s", &folded(&[6, 1]));
+    assert_eq!(a.take(), [bound(1)], "card 1 left and was forgotten: the documented exception");
+    a.look(Look::Live, "s", &folded(&[6, 1, 5]));
+    assert!(a.take().is_empty(), "card 5 left, but only just: remembered");
 }

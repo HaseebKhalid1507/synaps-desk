@@ -262,9 +262,11 @@ impl Look {
     }
 }
 
-/// Bindings remembered at most (the oldest forgotten first); a session
-/// this window no longer holds is forgotten whole.
-const SEEN_MAX: usize = 4096;
+/// Bindings remembered once they are no longer open, at most (the oldest
+/// forgotten first). One still open in its session's fold is never
+/// forgotten while its session is held; a session this window no longer
+/// holds is forgotten whole.
+pub(crate) const SEEN_MAX: usize = 4096;
 
 /// F12's provenance, at the event boundary ([`crate::model::Model::apply`]):
 /// every bound wait card a session's events bring is seen once per
@@ -274,17 +276,41 @@ const SEEN_MAX: usize = 4096;
 /// whether to tell the OS). Seen stays seen while the session is open in
 /// this window: a card answered and then not sent, or dropped by a
 /// history and brought back, is never new again.
-#[derive(Debug, Default)]
+///
+/// The bound (Shady #83 R2-6): a binding open in its session's fold at
+/// that session's last look is kept, however many there are (they are
+/// the fold's own cards, already in memory). Only bindings no longer open
+/// are bounded, [`SEEN_MAX`] of them, the oldest to stop being open
+/// forgotten first; so an open card is never news again. The one
+/// exception, by that bound: a binding that left its fold, stayed out
+/// while [`SEEN_MAX`] others left theirs, and then comes back is told
+/// again.
+#[derive(Debug)]
 pub(crate) struct Arrivals {
     seen: HashSet<Key>,
-    order: VecDeque<Key>,
+    /// Each held session's bindings open at its last look: never forgotten.
+    open: HashMap<String, HashSet<Key>>,
+    /// Seen bindings no longer open, in the order they stopped being: the
+    /// oldest forgotten past `cap`.
+    left: VecDeque<Key>,
+    cap: usize,
     came: Vec<Key>,
     /// Each session's fold revision at its last live look: unchanged,
     /// nothing is read.
     looked: HashMap<String, u64>,
 }
 
+impl Default for Arrivals {
+    fn default() -> Self {
+        Self::with_cap(SEEN_MAX)
+    }
+}
+
 impl Arrivals {
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self { seen: HashSet::new(), open: HashMap::new(), left: VecDeque::new(), cap, came: Vec::new(), looked: HashMap::new() }
+    }
+
     /// `session`'s fold `t`, as event `how` left it.
     pub(crate) fn look(&mut self, how: Look, session: &str, t: &Transcript) {
         let rev = t.cards_rev();
@@ -295,21 +321,26 @@ impl Arrivals {
                 self.looked.insert(session.to_string(), rev);
             }
         }
+        let mut now: HashSet<Key> = HashSet::new();
         for c in t.cards().cards().iter().filter(|c| c.wait && c.state == State::Open) {
             let Some(card) = c.id.clone() else { continue };
             let k = Key { session: session.to_string(), tool_id: c.tool_id.clone(), card };
-            if self.seen.contains(&k) {
-                continue;
+            if self.seen.insert(k.clone()) && how == Look::Live {
+                self.came.push(k.clone());
             }
-            self.seen.insert(k.clone());
-            self.order.push_back(k.clone());
-            while self.order.len() > SEEN_MAX {
-                if let Some(old) = self.order.pop_front() {
-                    self.seen.remove(&old);
-                }
-            }
-            if how == Look::Live {
-                self.came.push(k);
+            now.insert(k);
+        }
+        let before = self.open.insert(session.to_string(), now).unwrap_or_default();
+        let now = &self.open[session];
+        // Back in the fold: no longer bounded.
+        if self.left.iter().any(|k| k.session == session && now.contains(k)) {
+            self.left.retain(|k| !now.contains(k));
+        }
+        // Out of it: bounded from now on.
+        self.left.extend(before.into_iter().filter(|k| !now.contains(k)));
+        while self.left.len() > self.cap {
+            if let Some(k) = self.left.pop_front() {
+                self.seen.remove(&k);
             }
         }
     }
@@ -323,7 +354,8 @@ impl Arrivals {
     /// attach brings them back as the baseline).
     pub(crate) fn keep(&mut self, held: impl Fn(&str) -> bool) {
         self.seen.retain(|k| held(&k.session));
-        self.order.retain(|k| held(&k.session));
+        self.open.retain(|s, _| held(s));
+        self.left.retain(|k| held(&k.session));
         self.came.retain(|k| held(&k.session));
         self.looked.retain(|s, _| held(s));
     }
@@ -509,19 +541,50 @@ impl AppView {
     }
 
     /// A click on notification `tag`: whether it is this window's. Its
-    /// card still open here, the window comes up and lands on it, as
-    /// Ctrl+Shift+J; else (answered, closed, its tab closed since) it is
-    /// taken down and nothing moves.
+    /// card is checked as it is now, not as the presence last said
+    /// ([`AppView::waits_now`]: a press or a closed tab since need no
+    /// frame to count). Still waiting, the window shows it and comes up,
+    /// and lands on it as Ctrl+Shift+J does; else (answered, on its way,
+    /// closed, its tab closed) it is taken down and nothing moves: no
+    /// window raised, no pane, tab or scroll changed.
     pub(crate) fn notification_clicked(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(k) = self.lookout.notes.card(tag).cloned() else { return false };
-        if !self.model.presence.holds(&k) {
+        if !self.waits_now(&k) {
             log::info!(target: "synaps_desktop::card", "notification {tag}: its card no longer waits");
             self.lookout.notes.retire(tag, cx);
             return true;
         }
-        window.activate_window();
-        self.go_to_card(k.session, k.tool_id, window, cx);
+        // The presence as of now, so the jump reads what was just checked.
+        self.sync_presence(cx);
+        // Raised only once the jump has somewhere to go.
+        if self.go_to_card(k.session, k.tool_id, window, cx) {
+            window.activate_window();
+        }
         true
+    }
+
+    /// Whether binding `k` waits on this desk now, read from what the
+    /// window holds at this instant rather than from the presence (which
+    /// is derived when a batch ends or a frame begins): its session held
+    /// here (an attachment, else a session tab's cache, as last seen,
+    /// which its attach checks again), its fold's card bound as `k`, open,
+    /// a wait card, with no answer of this desk's on its way.
+    pub(crate) fn waits_now(&self, k: &Key) -> bool {
+        let m = &self.model;
+        let waits = |t: &Transcript| {
+            t.cards().card(&k.tool_id).is_some_and(|c| {
+                c.wait && c.state == State::Open && c.id.as_ref() == Some(&k.card) && c.doc.is_some() && !answered(&m.memos, &k.session, c)
+            })
+        };
+        if let Some(id) = m.lives.ids().into_iter().find(|id| m.lives[*id].active.as_ref().is_some_and(|a| a.session_id == k.session)) {
+            return waits(&m.lives[id].transcript);
+        }
+        let tabbed = m
+            .tabs
+            .iter()
+            .chain(self.panes.rest.iter().flat_map(|p| p.parked.tabs.iter()))
+            .any(|t| t.kind == TabKind::Session && t.session.as_deref() == Some(k.session.as_str()));
+        tabbed && self.tab_cache.peek(&k.session).is_some_and(|c| waits(&c.transcript))
     }
 
     /// Ctrl+Shift+J: the first waiting card ([`Presence::next`]). Whether
@@ -793,6 +856,16 @@ pub(crate) fn listen(view: &mut AppView, window: &Window, cx: &mut Context<AppVi
         })
         .detach();
     }
+}
+
+/// `view`'s window is going (released, or the app quitting): the
+/// notifications it posted taken down with it, nothing it queued shown
+/// after (Shady #83 R2-3), and its place among the click routes dropped.
+pub(crate) fn window_gone(view: &mut AppView, cx: &mut App) -> crate::notify::Gone {
+    if cx.has_global::<Clickers>() {
+        cx.global_mut::<Clickers>().0.retain(|(_, v)| v.upgrade().is_some());
+    }
+    view.lookout.notes.teardown(cx)
 }
 
 #[cfg(test)]

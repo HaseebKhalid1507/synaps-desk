@@ -13,24 +13,27 @@
 //! formats it as markup anyway (dunst's `markup = full`) may style a
 //! session name's tags, never act on them.
 //!
-//! **The transports** ([`Transport`]):
+//! **The transports** ([`Transport`]), each one the window's, taken down
+//! with it ([`Notes::teardown`], from the view's release and the app's
+//! quit):
 //! - macOS and Windows: GPUI's own (`show_system_notification`, and
-//!   `dismiss_system_notification` when the card resolves: the delivered
-//!   notification or toast is removed). Called from a task of its own,
-//!   never from a frame.
+//!   `dismiss_system_notification` when the card resolves or the window
+//!   goes: the delivered notification or toast is removed). [`Gpui`]
+//!   queues them and hands them to the platform from a task of its own,
+//!   one call per turn of the UI thread, never from a frame; what is
+//!   still queued when the window goes is never shown. The residual
+//!   (Shady #83 R2-8): GPUI keeps the platform's notification state on
+//!   the UI thread (a `RefCell` in the platform, not `Send`), so each
+//!   call still runs there, outside any frame. On Windows that is the
+//!   toast's XML document and `ToastNotifier::Show`/`Hide` (COM calls),
+//!   and, the first time, `CreateToastNotifierWithId` and an unpackaged
+//!   app's `HKCU\Software\Classes\AppUserModelId\synaps-desktop`
+//!   registry write. GPUI offers no other thread for them.
 //! - Linux: the XDG notifications service on the session bus, directly
-//!   ([`Xdg`]): GPUI's Linux backend keeps a thread per notification
-//!   waiting for its click and cannot close one. Here one task per
-//!   window owns the bus connection: it sends `Notify`, sends
-//!   `CloseNotification` by the server's id when the card resolves, and
-//!   hears every `ActionInvoked` and `NotificationClosed` on one signal
-//!   stream. No thread waits per notification and nothing polls; what it
-//!   remembers is bounded ([`Shown`]). The residual: a server that dies
-//!   with notifications up never says they closed. They stay remembered
-//!   until their card resolves or [`NOTES_MAX`] newer ones push them
-//!   out, and their `CloseNotification` goes to the new server, which
-//!   ignores an id it doesn't know. A bus lost ends the task; the next
-//!   notification connects again.
+//!   ([`xdg`]): GPUI's Linux backend keeps a thread per notification
+//!   waiting for its click and cannot close one. One task per window owns
+//!   a bus connection and never stops reading it; ids are the issuing
+//!   server's own (its unique bus name), never another's. See [`xdg`].
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
@@ -98,33 +101,161 @@ pub(crate) fn xdg_body(body: &str, markup: bool) -> String {
 pub(crate) trait Transport {
     fn show(&mut self, note: Note, cx: &mut App);
     fn close(&mut self, tag: &str, cx: &mut App);
+    /// The window is going: every notification it posted is taken down,
+    /// and nothing still queued is shown after. [`Gone`] is ready once
+    /// that is done (at once where it is done here).
+    fn retire(&mut self, cx: &mut App) -> Gone;
+
+    /// How many notes wait in the transport's own queue (a test's look).
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        0
+    }
 }
 
-/// GPUI's notifications (macOS, Windows; the test platform), from a task
-/// of their own: a frame never waits on the OS.
+/// A transport's teardown, done: ready at once, or (Linux) when its bus
+/// task has closed the window's notifications and ended.
+#[must_use]
+pub(crate) struct Gone(pub(crate) Option<async_channel::Receiver<()>>);
+
+impl Gone {
+    pub(crate) async fn wait(self) {
+        if let Some(rx) = self.0 {
+            // Nothing is ever sent: the task's end closes the channel.
+            let _ = rx.recv().await;
+        }
+    }
+}
+
+/// GPUI's notifications (macOS, Windows; the test platform): queued, then
+/// handed to the platform from a task of their own, one call per turn of
+/// the UI thread, never from a frame.
 #[cfg(not(all(target_os = "linux", not(test))))]
-pub(crate) struct Gpui;
+#[derive(Default)]
+pub(crate) struct Gpui {
+    q: std::rc::Rc<std::cell::RefCell<Queue>>,
+}
+
+/// What [`Gpui`] has to do, and what it did.
+#[cfg(not(all(target_os = "linux", not(test))))]
+#[derive(Default)]
+struct Queue {
+    /// Posted, not yet handed to the platform.
+    show: VecDeque<Note>,
+    /// Handed to the platform: each one dismissed when its card resolves
+    /// or the window goes.
+    up: Vec<String>,
+    /// To dismiss.
+    dismiss: VecDeque<String>,
+    /// A task is working through it.
+    draining: bool,
+    /// The window is gone: nothing more is shown.
+    gone: bool,
+}
+
+#[cfg(not(all(target_os = "linux", not(test))))]
+enum Op {
+    Show(Note),
+    Dismiss(String),
+}
+
+#[cfg(not(all(target_os = "linux", not(test))))]
+impl Gpui {
+    /// The queue worked through by one task: one platform call per turn,
+    /// the window's going checked before each.
+    fn drain(&self, cx: &mut App) {
+        if std::mem::replace(&mut self.q.borrow_mut().draining, true) {
+            return;
+        }
+        let q = self.q.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                let op = {
+                    let mut q = q.borrow_mut();
+                    let op = if q.gone {
+                        None
+                    } else if let Some(t) = q.dismiss.pop_front() {
+                        Some(Op::Dismiss(t))
+                    } else {
+                        q.show.pop_front().map(|n| {
+                            q.up.push(n.tag.clone());
+                            Op::Show(n)
+                        })
+                    };
+                    if op.is_none() {
+                        q.draining = false;
+                    }
+                    op
+                };
+                let Some(op) = op else { return };
+                cx.update(|cx| match op {
+                    Op::Dismiss(t) => cx.dismiss_system_notification(&t),
+                    Op::Show(n) => cx.show_system_notification(SystemNotification {
+                        tag: n.tag.into(),
+                        title: n.title.into(),
+                        body: n.body.into(),
+                        actions: Vec::new(),
+                    }),
+                });
+                // The next call in a later turn: a frame may come between.
+                yield_now().await;
+            }
+        })
+        .detach();
+    }
+}
 
 #[cfg(not(all(target_os = "linux", not(test))))]
 impl Transport for Gpui {
     fn show(&mut self, n: Note, cx: &mut App) {
-        cx.spawn(async move |cx| {
-            cx.update(|cx| {
-                cx.show_system_notification(SystemNotification {
-                    tag: n.tag.into(),
-                    title: n.title.into(),
-                    body: n.body.into(),
-                    actions: Vec::new(),
-                })
-            })
-        })
-        .detach();
+        self.q.borrow_mut().show.push_back(n);
+        self.drain(cx);
     }
 
     fn close(&mut self, tag: &str, cx: &mut App) {
-        let tag = tag.to_string();
-        cx.spawn(async move |cx| cx.update(|cx| cx.dismiss_system_notification(&tag))).detach();
+        let mut q = self.q.borrow_mut();
+        if let Some(ix) = q.show.iter().position(|n| n.tag == tag) {
+            // Never shown: nothing to take down.
+            q.show.remove(ix);
+            return;
+        }
+        let Some(ix) = q.up.iter().position(|t| t == tag) else { return };
+        let t = q.up.remove(ix);
+        q.dismiss.push_back(t);
+        drop(q);
+        self.drain(cx);
     }
+
+    /// Every notification handed to the platform dismissed now (the window
+    /// is going: there is no later turn of its own); the queue dropped.
+    fn retire(&mut self, cx: &mut App) -> Gone {
+        let down: Vec<String> = {
+            let mut q = self.q.borrow_mut();
+            q.gone = true;
+            q.show.clear();
+            let up = std::mem::take(&mut q.up);
+            q.dismiss.drain(..).chain(up).collect()
+        };
+        for t in down {
+            cx.dismiss_system_notification(&t);
+        }
+        Gone(None)
+    }
+}
+
+/// One turn given back to the executor.
+#[cfg(not(all(target_os = "linux", not(test))))]
+async fn yield_now() {
+    let mut once = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut once, true) {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 /// The notifications a window posted: each one's card, oldest first.
@@ -134,11 +265,13 @@ pub(crate) struct Notes {
     /// The clicks a transport of the window's own hears (Linux's), for
     /// [`crate::presence::listen`] to take.
     clicks: Option<async_channel::Receiver<String>>,
+    /// Torn down with its window: nothing is posted again.
+    gone: bool,
 }
 
 impl std::fmt::Debug for Notes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Notes").field("posted", &self.posted).finish_non_exhaustive()
+        f.debug_struct("Notes").field("posted", &self.posted).field("gone", &self.gone).finish_non_exhaustive()
     }
 }
 
@@ -147,17 +280,17 @@ impl Default for Notes {
     fn default() -> Self {
         #[cfg(all(target_os = "linux", not(test)))]
         {
-            let (tx, rx) = async_channel::unbounded();
-            Self::new(Box::new(Xdg::new(tx)), Some(rx))
+            let (tx, rx) = async_channel::bounded(NOTES_MAX);
+            Self::new(Box::new(xdg::Xdg::new(xdg::session(), tx)), Some(rx))
         }
         #[cfg(not(all(target_os = "linux", not(test))))]
-        Self::new(Box::new(Gpui), None)
+        Self::new(Box::new(Gpui::default()), None)
     }
 }
 
 impl Notes {
     pub(crate) fn new(transport: Box<dyn Transport>, clicks: Option<async_channel::Receiver<String>>) -> Self {
-        Self { posted: VecDeque::new(), transport, clicks }
+        Self { posted: VecDeque::new(), transport, clicks, gone: false }
     }
 
     pub(crate) fn take_clicks(&mut self) -> Option<async_channel::Receiver<String>> {
@@ -165,9 +298,9 @@ impl Notes {
     }
 
     /// The OS told of card `k` (once: a tag up stays as it is); the
-    /// oldest taken down past [`NOTES_MAX`].
+    /// oldest taken down past [`NOTES_MAX`]. Nothing once torn down.
     pub(crate) fn post(&mut self, k: Key, n: Note, cx: &mut App) {
-        if self.posted.iter().any(|(t, _)| *t == n.tag) {
+        if self.gone || self.posted.iter().any(|(t, _)| *t == n.tag) {
             return;
         }
         while self.posted.len() >= NOTES_MAX {
@@ -201,220 +334,32 @@ impl Notes {
         }
     }
 
+    /// The window is going (Shady #83 R2-3): every notification it posted
+    /// taken down by its transport, nothing queued shown after, nothing
+    /// posted again; the map forgotten.
+    pub(crate) fn teardown(&mut self, cx: &mut App) -> Gone {
+        if std::mem::replace(&mut self.gone, true) {
+            return Gone(None);
+        }
+        self.posted.clear();
+        self.transport.retire(cx)
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.posted.len()
     }
-}
-
-/// What the XDG service shows of a window's: each tag's server id,
-/// oldest first, at most [`NOTES_MAX`] (the bus task's memory; pure, so
-/// it is tested without a bus).
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Default)]
-pub(crate) struct Shown {
-    up: VecDeque<(String, u32)>,
-}
-
-#[cfg(any(target_os = "linux", test))]
-impl Shown {
-    /// The id `tag` is up as (a new `Notify` replaces it).
-    pub(crate) fn id(&self, tag: &str) -> Option<u32> {
-        self.up.iter().find(|(t, _)| t == tag).map(|(_, i)| *i)
-    }
-
-    pub(crate) fn tag(&self, id: u32) -> Option<&str> {
-        self.up.iter().find(|(_, i)| *i == id).map(|(t, _)| t.as_str())
-    }
-
-    /// `tag` is up as `id`; the ids to close to stay within [`NOTES_MAX`].
-    pub(crate) fn shown(&mut self, tag: String, id: u32) -> Vec<u32> {
-        self.up.retain(|(t, i)| *t != tag && *i != id);
-        self.up.push_back((tag, id));
-        let mut out = Vec::new();
-        while self.up.len() > NOTES_MAX {
-            out.extend(self.up.pop_front().map(|(_, i)| i));
-        }
-        out
-    }
-
-    /// `tag` taken down: its id, to close.
-    pub(crate) fn forget(&mut self, tag: &str) -> Option<u32> {
-        let ix = self.up.iter().position(|(t, _)| t == tag)?;
-        self.up.remove(ix).map(|(_, i)| i)
-    }
-
-    /// The server closed `id` (expired, dismissed, clicked, or ours).
-    pub(crate) fn closed(&mut self, id: u32) {
-        self.up.retain(|(_, i)| *i != id);
-    }
-
-    /// Every id up (the window gone: each is closed).
-    pub(crate) fn drain(&mut self) -> Vec<u32> {
-        self.up.drain(..).map(|(_, i)| i).collect()
-    }
 
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.up.len()
+    pub(crate) fn queued(&self) -> usize {
+        self.transport.queued()
     }
 }
 
-/// Linux: the XDG notifications service, through one task per window
-/// that owns its bus connection ([`bus`]).
-#[cfg(all(target_os = "linux", not(test)))]
-pub(crate) struct Xdg {
-    tx: Option<async_channel::Sender<Cmd>>,
-    clicks: async_channel::Sender<String>,
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-enum Cmd {
-    Show(Note),
-    Close(String),
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-impl Xdg {
-    fn new(clicks: async_channel::Sender<String>) -> Self {
-        Self { tx: None, clicks }
-    }
-
-    /// To the bus task; one started if none runs (the first notification,
-    /// or the bus was lost).
-    fn send(&mut self, cmd: Cmd, cx: &mut App) {
-        if self.tx.as_ref().is_none_or(async_channel::Sender::is_closed) {
-            if matches!(cmd, Cmd::Close(_)) {
-                return;
-            }
-            let (tx, rx) = async_channel::unbounded();
-            cx.background_spawn(bus(rx, self.clicks.clone())).detach();
-            self.tx = Some(tx);
-        }
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send(cmd);
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-impl Transport for Xdg {
-    fn show(&mut self, n: Note, cx: &mut App) {
-        self.send(Cmd::Show(n), cx);
-    }
-
-    fn close(&mut self, tag: &str, cx: &mut App) {
-        self.send(Cmd::Close(tag.to_string()), cx);
-    }
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-const XDG_NAME: &str = "org.freedesktop.Notifications";
-#[cfg(all(target_os = "linux", not(test)))]
-const XDG_PATH: &str = "/org/freedesktop/Notifications";
-
-/// The bus task: `Notify` and `CloseNotification` as commands come, and
-/// the service's signals as they come, on one connection. Ends when the
-/// window's side is dropped (every notification still up is closed) or
-/// the bus is lost.
-#[cfg(all(target_os = "linux", not(test)))]
-async fn bus(rx: async_channel::Receiver<Cmd>, clicks: async_channel::Sender<String>) {
-    use futures_lite::StreamExt as _;
-    use std::collections::HashMap;
-    enum Next {
-        Cmd(Option<Cmd>),
-        Sig(Option<zbus::Result<zbus::Message>>),
-    }
-    let conn = match zbus::Connection::session().await {
-        Ok(c) => c,
-        Err(e) => return log::warn!(target: "synaps_desktop::card", "no session bus for notifications: {e}"),
-    };
-    let rules = async {
-        let proxy = zbus::fdo::DBusProxy::new(&conn).await?;
-        for member in ["ActionInvoked", "NotificationClosed"] {
-            let rule = zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(XDG_NAME).member(member).build()?;
-            proxy.add_match_rule(rule).await?;
-        }
-        zbus::Result::Ok(())
-    };
-    let mut stream = zbus::MessageStream::from(&conn);
-    if let Err(e) = rules.await {
-        return log::warn!(target: "synaps_desktop::card", "notification signals: {e}");
-    }
-    let markup = match conn.call_method(Some(XDG_NAME), XDG_PATH, Some(XDG_NAME), "GetCapabilities", &()).await {
-        Ok(m) => m.body().deserialize::<Vec<String>>().is_ok_and(|c| c.iter().any(|c| c == "body-markup")),
-        Err(e) => return log::warn!(target: "synaps_desktop::card", "no notification service: {e}"),
-    };
-    let mut shown = Shown::default();
-    let close = async |id: u32| {
-        if let Err(e) = conn.call_method(Some(XDG_NAME), XDG_PATH, Some(XDG_NAME), "CloseNotification", &(id,)).await {
-            log::debug!(target: "synaps_desktop::card", "close notification {id}: {e}");
-        }
-    };
-    loop {
-        let next = futures_lite::future::or(async { Next::Cmd(rx.recv().await.ok()) }, async { Next::Sig(stream.next().await) }).await;
-        match next {
-            Next::Cmd(None) => {
-                for id in shown.drain() {
-                    close(id).await;
-                }
-                return;
-            }
-            Next::Cmd(Some(Cmd::Show(n))) => {
-                let hints: HashMap<&str, zbus::Variant> = HashMap::new();
-                let body = (
-                    "Synaps",
-                    shown.id(&n.tag).unwrap_or(0),
-                    "",
-                    n.title.as_str(),
-                    xdg_body(&n.body, markup),
-                    vec!["default", "Open"],
-                    hints,
-                    -1i32,
-                );
-                match conn.call_method(Some(XDG_NAME), XDG_PATH, Some(XDG_NAME), "Notify", &body).await {
-                    Ok(m) => match m.body().deserialize::<u32>() {
-                        Ok(id) => {
-                            for old in shown.shown(n.tag, id) {
-                                close(old).await;
-                            }
-                        }
-                        Err(e) => log::warn!(target: "synaps_desktop::card", "notify: {e}"),
-                    },
-                    Err(e) => log::warn!(target: "synaps_desktop::card", "notify: {e}"),
-                }
-            }
-            Next::Cmd(Some(Cmd::Close(tag))) => {
-                if let Some(id) = shown.forget(&tag) {
-                    close(id).await;
-                }
-            }
-            Next::Sig(None) => return log::info!(target: "synaps_desktop::card", "session bus gone: notifications end"),
-            Next::Sig(Some(Err(_))) => {}
-            Next::Sig(Some(Ok(msg))) => {
-                let h = msg.header();
-                if h.message_type() != zbus::message::Type::Signal || h.interface().is_none_or(|i| i.as_str() != XDG_NAME) {
-                    continue;
-                }
-                match h.member().map(|m| m.as_str()) {
-                    Some("ActionInvoked") => {
-                        if let Ok((id, _action)) = msg.body().deserialize::<(u32, String)>()
-                            && let Some(tag) = shown.tag(id)
-                        {
-                            let _ = clicks.try_send(tag.to_string());
-                        }
-                    }
-                    Some("NotificationClosed") => {
-                        if let Ok((id, _why)) = msg.body().deserialize::<(u32, u32)>() {
-                            shown.closed(id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
+/// Linux's transport: the XDG notifications service on the session bus.
+#[cfg(target_os = "linux")]
+#[path = "notify_xdg.rs"]
+pub(crate) mod xdg;
 
 #[cfg(test)]
 #[path = "notify_tests.rs"]

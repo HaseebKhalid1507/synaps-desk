@@ -2654,18 +2654,23 @@ impl AppView {
         }
         // M3: a fold still waiting to be saved is written when the window
         // closes (the last one quits on Linux and Windows) or the app quits.
-        subs.push(cx.on_release(|this, _| {
+        // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
+        // waits for Linux's bus task to close them, within GPUI's shutdown
+        // allowance.
+        subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            let _ = crate::presence::window_gone(this, cx);
         }));
-        subs.push(cx.on_app_quit(|this, _| {
+        subs.push(cx.on_app_quit(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            async {}
+            let gone = crate::presence::window_gone(this, cx);
+            async move { gone.wait().await }
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
