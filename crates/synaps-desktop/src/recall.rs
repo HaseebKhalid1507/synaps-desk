@@ -48,7 +48,9 @@
 //!   removed, with every regular file of exactly that name pattern beside
 //!   the file and nothing else ([`sweep`]: no link followed or removed),
 //!   off the UI thread: at launch and On (memory on), and with every
-//!   Forget.
+//!   Forget. One a sweep can't remove (a crash's snapshot alone, no file
+//!   beside it, too) is said in Settings, which keeps Forget: the next
+//!   sweep (On) or a Forget retries it ([`Recall::swept`]).
 //! - **The setting** `cards.remember` (Settings, THIS APP: "Remember card
 //!   choices", on unless `false` or `"off"`): off, the file is neither
 //!   read nor written, a save not begun is dropped, and a card first seen
@@ -64,7 +66,9 @@
 //!   next load or save, before anything else. Settings offers it while
 //!   anything may be there, and says so if the removal failed. It is this
 //!   desk process's: another one running keeps what it read, and may write
-//!   it back.
+//!   it back. Nor does it outlast the process: a desk that quits or
+//!   crashes before the removal ran leaves the file, read at the next
+//!   launch.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -538,6 +542,12 @@ pub(crate) struct Recall {
     forgot: u64,
     /// Why the last Forget could not remove the file, until one does.
     pub(crate) failed: Option<String>,
+    /// What the newest sweep of a load's could not remove (a crash's
+    /// snapshot, perhaps with no file beside it), and its number: until a
+    /// sweep or a Forget after it does.
+    left: Option<(u64, String)>,
+    /// The newest load's sweep: its number.
+    sweeping: u64,
     /// What the last load left to do on the disk.
     tidy: Option<Tidy>,
 }
@@ -560,6 +570,8 @@ impl Recall {
             saved: 0,
             forgot: 0,
             failed: None,
+            left: None,
+            sweeping: 0,
             tidy: None,
         };
         if on {
@@ -601,10 +613,35 @@ impl Recall {
     }
 
     /// Settings offers Forget: off (the file unread, unknown), something
-    /// remembered, the file there (an unreadable one too), or the last
-    /// Forget failed.
+    /// remembered, the file there (an unreadable one too), the last Forget
+    /// failed, or a sweep left something.
     pub(crate) fn offers_forget(&self) -> bool {
-        !self.on || !self.store.is_empty() || self.on_disk || self.failed.is_some()
+        !self.on || !self.store.is_empty() || self.on_disk || self.not_removed().is_some()
+    }
+
+    /// What Settings says could not be removed: the last Forget's failure,
+    /// or else what the newest sweep left.
+    pub(crate) fn not_removed(&self) -> Option<&str> {
+        self.failed.as_deref().or(self.left.as_ref().map(|(_, why)| why.as_str()))
+    }
+
+    /// A load's sweep begins: its number.
+    pub(crate) fn sweep_started(&mut self) -> u64 {
+        self.sweeping = next_generation();
+        self.sweeping
+    }
+
+    /// Sweep `n` is done: all gone, or what it could not remove. A newer
+    /// sweep's word, or a Forget's since, is the one that counts (true:
+    /// Settings changed).
+    pub(crate) fn swept(&mut self, n: u64, done: Result<(), String>) -> bool {
+        if n < self.sweeping || n < self.forgot {
+            return false;
+        }
+        let left = done.err().map(|why| (n, why));
+        let changed = left != self.left;
+        self.left = left;
+        changed
     }
 
     /// Turned on (the file read, unless a Forget is not yet done) or off
@@ -693,6 +730,8 @@ impl Recall {
             Ok(()) => {
                 self.on_disk &= self.saved > generation;
                 self.failed = None;
+                // Its removal swept too: what an older sweep left is gone.
+                self.left = self.left.take().filter(|(n, _)| *n > generation);
             }
             Err(why) => self.failed = Some(why),
         }
@@ -822,17 +861,32 @@ impl AppView {
         let Some(Tidy { path, retry }) = self.recall.take_tidy() else { return };
         match retry {
             Some(generation) => self.run_removal(path, generation, cx),
-            None => cx
-                .background_spawn(async move {
+            None => {
+                let n = self.recall.sweep_started();
+                let sweep = cx.background_spawn(async move {
                     match sweep_leftovers(&path) {
-                        Ok(0) => {}
-                        Ok(n) => log::info!(target: "synaps_desktop::card", "card choices {}: {n} crash leftovers removed", path.display()),
+                        Ok(gone) => {
+                            if gone > 0 {
+                                log::info!(target: "synaps_desktop::card", "card choices {}: {gone} crash leftovers removed", path.display());
+                            }
+                            Ok(())
+                        }
                         Err(e) => {
-                            log::warn!(target: "synaps_desktop::card", "card choices {}: crash leftovers not removed ({e})", path.display())
+                            log::warn!(target: "synaps_desktop::card", "card choices {}: crash leftovers not removed ({e})", path.display());
+                            Err(e.to_string())
                         }
                     }
+                });
+                cx.spawn(async move |this, cx| {
+                    let done = sweep.await;
+                    let _ = this.update(cx, |v, cx| {
+                        if v.recall.swept(n, done) {
+                            v.views_changed(cx);
+                        }
+                    });
                 })
-                .detach(),
+                .detach();
+            }
         }
     }
 

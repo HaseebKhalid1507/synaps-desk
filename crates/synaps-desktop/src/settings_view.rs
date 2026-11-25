@@ -1071,7 +1071,7 @@ impl AppView {
         });
         // Forget while anything may be there: off (the file unread), a
         // choice remembered, the file there (an unreadable one too), or a
-        // removal that failed, said under the row.
+        // removal or a sweep that failed, said under the row.
         let forget: AnyElement = if !self.recall.offers_forget() {
             mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
         } else {
@@ -1109,8 +1109,7 @@ impl AppView {
             tag: None,
             under: self
                 .recall
-                .failed
-                .as_ref()
+                .not_removed()
                 .map(|why| {
                     mono(format!("couldn't remove {why}"), 12., p.err)
                         .whitespace_normal()

@@ -21,6 +21,10 @@
 //! removes it (R2 P2-1); what a dead writer left beside the file goes at
 //! launch and with a Forget (R2 P2-2).
 //!
+//! Shady #93 round 3: a crash's snapshot alone beside no file, whose
+//! sweep at launch fails, keeps Forget in Settings, which says why; the
+//! retry, at On or with a Forget, removes it (R3 P3).
+//!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
 //! are D2a's and D2b's ([`super::answer_tests`], [`super::keys_tests`]).
@@ -1078,4 +1082,74 @@ fn crash_leftovers_go_at_launch_and_with_a_forget(cx: &mut TestAppContext) {
     click_forget(cx, w);
     assert!(!path.exists() && !leftover(2).exists(), "a Forget: the file and the leftover, gone");
     assert_eq!(std::fs::read_to_string(&other).unwrap(), "{}", "nothing else touched");
+}
+
+/// A writer that died (no such process) left snapshot `n` beside `path`,
+/// and no file: its path.
+fn orphan(path: &std::path::Path, n: u64) -> PathBuf {
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let left = dir.join(format!("{}.tmp.{}.{n}", crate::recall::FILE, u32::MAX));
+    std::fs::write(&left, br#"{"version": 1, "choices": [{"key": "3f9a1c2e4b5d6f70", "pick": [1]}]}"#).unwrap();
+    assert!(!path.exists());
+    left
+}
+
+/// Off and On again, played out.
+fn off_and_on(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        v.settings_pick(Pick::Remember, "off", cx);
+        v.settings_pick(Pick::Remember, "on", cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+}
+
+/// A crash's snapshot alone, no file (Shady #93 R3 P3): its sweep at
+/// launch fails, so Settings says why and keeps Forget (never "nothing
+/// remembered" while it is there); On again retries it, failing while
+/// held, and once it can, removes it: then nothing more is said.
+#[gpui_kit::test]
+fn an_orphan_snapshot_not_swept_keeps_forget_and_on_retries_it(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_o1", "c1ooo01", &input);
+    let path = remembering(cx, &view, "orphan-on");
+    let left = orphan(&path, 3);
+    let hold = crate::recall::tests::held(&left);
+    view.update(cx, |v, cx| v.start_recall(true, Some(path.clone()), cx));
+    cx.run_until_parked();
+    settings(cx, w, &view);
+    assert!(left.exists(), "held back: not removed");
+    assert!(has(cx, w, "recall-failed".into()), "Settings says why");
+    assert!(has(cx, w, "recall-forget".into()) && !has(cx, w, "recall-none".into()), "Forget stays");
+    off_and_on(cx, w, &view);
+    assert!(left.exists() && has(cx, w, "recall-failed".into()) && has(cx, w, "recall-forget".into()), "the retry failed too: still said");
+    drop(hold);
+    off_and_on(cx, w, &view);
+    assert!(!left.exists(), "on again: the retry removed it");
+    assert!(!has(cx, w, "recall-failed".into()), "nothing more to say");
+    assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()), "nothing remembered, now true");
+}
+
+/// The same orphan, its sweep at launch failed (Shady #93 R3 P3): Forget,
+/// while it is still held, fails and says so; once it can, Forget removes
+/// it and Settings says nothing is remembered.
+#[gpui_kit::test]
+fn an_orphan_snapshot_not_swept_goes_with_a_forget(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_p1", "c1ppp01", &input);
+    let path = remembering(cx, &view, "orphan-forget");
+    let left = orphan(&path, 4);
+    let hold = crate::recall::tests::held(&left);
+    view.update(cx, |v, cx| v.start_recall(true, Some(path.clone()), cx));
+    cx.run_until_parked();
+    settings(cx, w, &view);
+    assert!(left.exists() && has(cx, w, "recall-failed".into()), "not swept: said");
+    click_forget(cx, w);
+    assert!(left.exists() && has(cx, w, "recall-failed".into()) && has(cx, w, "recall-forget".into()), "Forget, held: failed, said");
+    drop(hold);
+    click_forget(cx, w);
+    assert!(!left.exists(), "Forget removed it");
+    assert!(!has(cx, w, "recall-failed".into()), "nothing more to say");
+    assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()), "nothing remembered");
 }

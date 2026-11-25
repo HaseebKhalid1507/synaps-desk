@@ -8,6 +8,9 @@
 //! bars every load (no read: empty) until the file is confirmed gone, and
 //! the next save retries it first (R2 P2-1); a Forget removes what a dead
 //! writer left beside the file, and nothing else (R2 P2-2).
+//!
+//! Shady #93 round 3: what a sweep could not remove is said, and keeps
+//! Forget, until a newer sweep or a Forget after it says otherwise (R3 P3).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -712,4 +715,33 @@ fn a_failed_write_leaves_the_file_and_no_temporary() {
     let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(names, vec![super::FILE.to_string()], "no temporary file left");
     let _ = std::fs::remove_dir_all(d);
+}
+
+/// What a sweep left (Shady #93 R3 P3) is said, and keeps Forget, until a
+/// newer sweep, or a Forget after it, says otherwise; an older sweep's
+/// word, or one from before a Forget, is late.
+#[test]
+fn what_a_sweep_left_is_said_until_a_newer_word() {
+    let path = dir("swept").join(super::FILE);
+    let mut r = Recall::new(true, Some(path));
+    assert!(!r.offers_forget() && r.not_removed().is_none(), "nothing there");
+    let (older, newer) = (r.sweep_started(), r.sweep_started());
+    assert!(r.swept(newer, Err("card-choices.json.tmp.9.1: denied".into())), "said");
+    assert_eq!(r.not_removed(), Some("card-choices.json.tmp.9.1: denied"));
+    assert!(r.offers_forget(), "Forget stays");
+    assert!(!r.swept(older, Ok(())), "an older sweep's word is late");
+    assert!(r.not_removed().is_some());
+    let (_, g) = r.forget().expect("a file");
+    r.removed(g, Ok(()));
+    assert!(r.not_removed().is_none() && !r.offers_forget(), "a Forget after it removed it");
+    let before = r.sweep_started();
+    let (_, g) = r.forget().expect("a file");
+    assert!(!r.swept(before, Err("denied".into())), "a sweep from before a Forget: the Forget's word counts");
+    let after = r.sweep_started();
+    assert!(r.swept(after, Err("denied".into())));
+    r.removed(g, Ok(()));
+    assert_eq!(r.not_removed(), Some("denied"), "a Forget before it: still said");
+    let again = r.sweep_started();
+    assert!(r.swept(again, Ok(())), "a newer sweep removed it: nothing more to say");
+    assert!(r.not_removed().is_none() && !r.offers_forget());
 }
