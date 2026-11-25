@@ -3243,9 +3243,14 @@ impl AppView {
         let worker = self.model.lives[self.panes.cur.live].watch.focused().map(|w| (w.handle_id.as_str(), w.state(), w.tabbed));
         let cramped = self.panes.cur.layout.cramped;
         let column = self.panes.cur.layout.column;
+        // The text size too: a pane narrower than 42 rem keeps its column
+        // as the text grows or shrinks, and the placeholder's width does
+        // not (Shady #95 P3).
+        let m = theme::metrics(cx);
         if worker != self.panes.cur.placeholder_of.as_ref().map(|(h, s, t)| (h.as_str(), s.as_str(), *t))
             || cramped != self.panes.cur.placeholder_cramped
             || column != self.panes.cur.placeholder_column
+            || m.step != self.panes.cur.placeholder_step
         {
             let text = match self.model.lives[self.panes.cur.live].watch.focused() {
                 Some(w) if w.read_only() && w.tabbed => format!("{} is {}: nothing to steer", w.name, w.state()),
@@ -3257,12 +3262,13 @@ impl AppView {
             // cut off against the glyph. So in a pane too narrow for the
             // whole of it (the 2026-11-25 note under split.md §0): never
             // cut off mid-word at the field's edge.
-            let room = column - 2. * theme::metrics(cx).pad_x;
-            let short = cramped || self.sans_w(&text, theme::metrics(cx).body, window) > room;
+            let room = column - 2. * m.pad_x;
+            let short = cramped || self.sans_w(&text, m.body, window) > room;
             let text: SharedString = if short { text.split("  (").next().unwrap_or_default().to_string().into() } else { text.into() };
             self.panes.cur.placeholder_of = worker.map(|(h, s, t)| (h.to_string(), s.to_string(), t));
             self.panes.cur.placeholder_cramped = cramped;
             self.panes.cur.placeholder_column = column;
+            self.panes.cur.placeholder_step = m.step;
             // Set only when it changes: a new column alone is no frame.
             if text != self.panes.cur.placeholder_said {
                 self.panes.cur.placeholder_said = text.clone();
@@ -7780,10 +7786,9 @@ impl AppView {
         true
     }
 
-    /// Display caps `text` at `size`, as wide as it is drawn: measured once
-    /// per size in the embedded face.
     /// `text`'s width (px) in the body face at `size`, as the composer's
-    /// field draws its placeholder. Not cached: read when the column changes.
+    /// field draws its placeholder. Not cached: read when the column or
+    /// the text size changes.
     fn sans_w(&self, text: &str, size: f32, window: &Window) -> f32 {
         let run = TextRun {
             len: text.len(),
@@ -7796,6 +7801,8 @@ impl AppView {
         f32::from(window.text_system().shape_line(text.to_string().into(), px(size), &[run], None).width).ceil()
     }
 
+    /// Display caps `text` at `size`, as wide as it is drawn: measured once
+    /// per size in the embedded face.
     pub(crate) fn display_w(&self, text: &'static str, size: f32, window: &Window) -> f32 {
         let key = (text, size.to_bits());
         if let Some(w) = self.widths.borrow().get(&key) {

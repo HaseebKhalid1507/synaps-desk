@@ -200,6 +200,8 @@ pub struct Pane {
     /// And for a column this wide (a pane too narrow for the whole of it
     /// drops its key hints too), as it was set.
     pub(crate) placeholder_column: f32,
+    /// And at this text step (its width is the body face's at it).
+    pub(crate) placeholder_step: u8,
     pub(crate) placeholder_said: SharedString,
     /// Refused input to put back in the composer (needs a `Window`: done
     /// at the next frame).
@@ -498,6 +500,7 @@ impl Pane {
             placeholder_of: None,
             placeholder_cramped: false,
             placeholder_column: 0.,
+            placeholder_step: 0,
             placeholder_said: SharedString::new_static(crate::app::COMPOSER_PLACEHOLDER),
             restore: None,
             cmd_draft: None,

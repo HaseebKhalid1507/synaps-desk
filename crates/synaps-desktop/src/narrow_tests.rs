@@ -35,6 +35,13 @@ fn in_a_row(cx: &mut TestAppContext, w: AnyWindowHandle, within: [f32; 4], sels:
 /// The demo's window with one pane `pane` px wide (both panels at their
 /// strips), on its session `id`.
 fn one_pane(cx: &mut TestAppContext, pane: f32, id: &str) -> (AnyWindowHandle, Entity<AppView>) {
+    let (w, view) = pane_of(cx, pane, id);
+    assert!(view.read_with(cx, |v, _| v.panes.cur.layout.tight), "a {pane} px pane is tight");
+    (w, view)
+}
+
+/// [`one_pane`], tight or not.
+fn pane_of(cx: &mut TestAppContext, pane: f32, id: &str) -> (AnyWindowHandle, Entity<AppView>) {
     let win = pane + 2. * crate::app::STRIP;
     let (w, view, _events) = open_at(cx, (win, 900.), crate::theme::Panels::default().text_size);
     let client = view.update(cx, |v, cx| {
@@ -50,7 +57,6 @@ fn one_pane(cx: &mut TestAppContext, pane: f32, id: &str) -> (AnyWindowHandle, E
     wait(cx, w, &view, 500);
     let frame = edges(cx, w, "composer-frame 0".into()).expect("the composer");
     assert!(frame[0] >= crate::app::STRIP && frame[2] <= win - crate::app::STRIP, "one pane between the strips: {frame:?}");
-    assert!(view.read_with(cx, |v, _| v.panes.cur.layout.tight), "a {pane} px pane is tight");
     (w, view)
 }
 
@@ -140,4 +146,41 @@ fn a_320_px_panes_card_options_keep_their_parts_inside(cx: &mut TestAppContext) 
         }
     }
     assert!(suggested >= 1, "a suggested option shown");
+}
+
+/// The placeholder's fit is judged again when the text size changes and
+/// the column does not (a pane narrower than 42 rem at either size: its
+/// column is the pane's): bigger, its key hints go rather than being cut
+/// off; smaller again, they come back (Shady #95 P3). The test's text
+/// system sets 0.6 em a character: a worker's 58 fit 552 px at 14 (488 of
+/// 524) and not at 18 (627 of 516).
+#[gpui_kit::test]
+fn the_placeholders_fit_follows_the_text_size(cx: &mut TestAppContext) {
+    let (w, view) = pane_of(cx, 600., crate::demo::SID);
+    view.update(cx, |v, cx| {
+        v.model.lives[v.panes.cur.live].watch.open(&crate::watch::Candidate::of(1, "scout"), None, std::time::Instant::now());
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let at = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| (crate::theme::metrics(cx).step, v.panes.cur.layout.column, v.panes.cur.placeholder_said.to_string()))
+    };
+    let step = |cx: &mut TestAppContext, k: &str, n: usize| {
+        for _ in 0..n {
+            super::answer_tests::key(cx, w, k);
+            settle(cx, w, 8);
+        }
+    };
+    step(cx, "ctrl--", 2);
+    let (s14, c14, said) = at(cx);
+    assert_eq!(s14, 14);
+    assert!(said.starts_with("Steer scout") && said.contains("  (Enter sends)"), "14: whole: {said:?}");
+    step(cx, "ctrl-=", 4);
+    let (s18, c18, said) = at(cx);
+    assert_eq!((s18, c18), (18, c14), "18, the same column");
+    assert!(said.starts_with("Steer scout") && !said.contains("  ("), "18: its key hints gone: {said:?}");
+    step(cx, "ctrl--", 4);
+    let (_, c, said) = at(cx);
+    assert_eq!(c, c14);
+    assert!(said.contains("  (Enter sends)"), "14 again: whole again: {said:?}");
 }
