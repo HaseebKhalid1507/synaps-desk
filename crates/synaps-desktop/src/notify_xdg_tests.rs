@@ -481,3 +481,73 @@ fn no_service_is_started_once_then_followed(cx: &mut TestAppContext) {
     assert_eq!(notify.len(), 1, "only the new card: {calls:?}");
     assert_eq!(to(notify[0]), ":1.20");
 }
+
+/// The production dial ([`session`]) on a real, private session bus,
+/// against a real notification server (`notifyd.py`, in the evidence:
+/// GDBus, ids from 1 per process, a click on its first id): the task's
+/// calls, the bus daemon's routing and the servers' own headers. Server A
+/// (markup) is told t1 and clicks it; A dies and B (plain text) takes the
+/// name, its ids from 1 again: nothing of t1's reaches B; B is told t2 as
+/// plain text, and B's click on its id 1 is t2's; the window gone, B
+/// closes t2. Not run by default: `d3-evidence/notify/realbus/run.sh`
+/// runs it inside `dbus-run-session` on bella.
+#[gpui_kit::test]
+#[ignore = "a private session bus and D3N_NOTIFYD=<notifyd.py>: d3-evidence/notify/realbus/run.sh"]
+fn on_a_real_session_bus(cx: &mut TestAppContext) {
+    // Real I/O: zbus's own thread wakes the task (GPUI's leave for it).
+    cx.executor().allow_parking();
+    let script = std::env::var("D3N_NOTIFYD").expect("D3N_NOTIFYD: the server's script");
+    let dir = std::env::temp_dir().join(format!("d3n-realbus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let serve = |name: &str, args: &[&str]| {
+        let log = std::fs::File::create(dir.join(format!("{name}.log"))).unwrap();
+        std::process::Command::new("python3").arg(&script).arg(name).args(args).stdout(log).spawn().expect("python3")
+    };
+    let read = |name: &str| std::fs::read_to_string(dir.join(format!("{name}.log"))).unwrap_or_default();
+    let until = |cx: &mut TestAppContext, what: &str, f: &mut dyn FnMut() -> bool| {
+        for _ in 0..400 {
+            spin(cx);
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("not within 10 s: {what}");
+    };
+    let mut a = serve("A", &[]);
+    until(cx, "A owns the name", &mut || read("A").contains("owns"));
+    let (mut n, rx) = notes(session());
+    let mut heard = Vec::new();
+    let t1 = post(cx, &mut n, 1, "Ship <b>it</b>?");
+    until(cx, "A's click", &mut || {
+        heard.extend(clicks(&rx));
+        !heard.is_empty()
+    });
+    assert_eq!(heard, std::slice::from_ref(&t1), "A's click on its id 1 is t1's");
+    assert!(read("A").contains("body='Ship &lt;b&gt;it&lt;/b&gt;?'"), "A reads markup: escaped\n{}", read("A"));
+    a.kill().unwrap();
+    a.wait().unwrap();
+    let mut b = serve("B", &["--plain"]);
+    until(cx, "B asked anew", &mut || read("B").contains("GetCapabilities"));
+    cx.update(|cx| n.retire(&t1, cx));
+    for _ in 0..20 {
+        spin(cx);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!read("B").contains("CloseNotification"), "t1's id never sent to B\n{}", read("B"));
+    let t2 = post(cx, &mut n, 2, "x < y?");
+    heard.clear();
+    until(cx, "B's click", &mut || {
+        heard.extend(clicks(&rx));
+        !heard.is_empty()
+    });
+    assert_eq!(heard, [t2], "B's click on its id 1 is t2's, not t1's");
+    assert!(read("B").contains("body='x < y?'"), "B reads plain text\n{}", read("B"));
+    let gone = cx.update(|cx| n.teardown(cx));
+    until(cx, "the task's end", &mut || gone.done());
+    assert!(read("B").contains("CloseNotification from"), "t2 closed at B as the window went\n{}", read("B"));
+    b.kill().unwrap();
+    let _ = b.wait();
+    eprintln!("--- A\n{}--- B\n{}", read("A"), read("B"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
