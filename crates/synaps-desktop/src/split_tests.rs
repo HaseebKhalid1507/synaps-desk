@@ -2446,7 +2446,7 @@ fn open_to_the_side_follows_its_order(cx: &mut TestAppContext) {
         frame(cx, window);
     };
     let attach = |cx: &mut TestAppContext, s: &'static str| {
-        let mut c = crate::test_waits::recv(&attaches).expect("an attach at the daemon");
+        let mut c = next_attach(cx, window, &attaches, "an attach at the daemon");
         c.send(attached(s, None));
         feed(cx, window, &view, &events, "attached", |v| v.model.lives.iter().any(|l| l.is_active(s)));
         let _ = names(&mut c);
@@ -3366,7 +3366,7 @@ fn join_closing_two_panes_on_one_store_keeps_their_unsent_text(cx: &mut TestAppC
         v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
         cx.notify();
     });
-    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
+    let mut b = next_attach(cx, window, &attaches, "B's attach at the daemon");
     b.send(attached(B, None));
     feed(cx, window, &view, &events, "B attached in the first pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
     let _ = (names(&mut a), names(&mut b));
