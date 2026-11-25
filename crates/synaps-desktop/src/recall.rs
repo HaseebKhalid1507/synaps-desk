@@ -12,9 +12,11 @@
 //!   `Submit` or `Steer` like any other; nothing here sends, answers or
 //!   counts as an answer (§10 decision 4: no auto-answer, no "Always").
 //! - **Fixed at first sight.** What a card recalls is read once, the
-//!   first time it is drawn or entered, and kept while it is open: a
-//!   choice remembered meanwhile never moves a highlight or a mark under
-//!   the user.
+//!   first time it is drawn or entered, and kept while it is open (bound,
+//!   not answered, closed or replaced; behind a tab counts): a choice
+//!   remembered meanwhile, the setting turned off or on, other cards come
+//!   and gone, a second pane on its session never move a highlight or a
+//!   mark under the user. Only Forget clears it.
 //! - **The same question** ([`Asked`]): the session's folder as the daemon
 //!   reports it (`SessionMeta.cwd`), the question (whitespace collapsed,
 //!   case-folded as the spec folds labels), whether it is a multi pick,
@@ -42,8 +44,8 @@
 //!   wins.
 //! - **The setting** `cards.remember` (Settings, THIS APP: "Remember card
 //!   choices", on unless `false` or `"off"`): off, the file is neither
-//!   read nor written, a save not begun is dropped, and nothing is
-//!   marked.
+//!   read nor written, a save not begun is dropped, and a card first seen
+//!   off marks nothing (one already open keeps what it showed).
 //! - **Forget** ("Forget remembered choices", on or off) empties the
 //!   memory and removes the file. Accepted at the click, it runs to its
 //!   end on a task of its own: after a save already writing, never undone
@@ -52,14 +54,14 @@
 //!   says so if the removal failed. It is this desk process's: another
 //!   one running keeps what it read, and may write it back.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use cards_spec::sanitize::fold_key;
-use cards_spec::{CardDoc, Reply};
+use cards_spec::{CardDoc, CardId, Reply};
 use gpui_kit::*;
 use serde_json::{Value, json};
 
@@ -342,8 +344,13 @@ pub(crate) fn remove(path: &Path, generation: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Open cards whose recall is fixed, at most (then it starts over).
-const SEEN_CAP: usize = 1024;
+/// A drawn card, as what it recalled is kept: its session, call and id
+/// (its binding).
+pub(crate) type Sight = (String, String, CardId);
+
+/// Cards seen kept before the first sweep of those no longer open
+/// ([`Recall::at`]).
+const SWEEP: usize = 64;
 
 /// The window's memory of card choices.
 pub(crate) struct Recall {
@@ -351,9 +358,12 @@ pub(crate) struct Recall {
     /// The file (`None`: none, kept for this run only).
     path: Option<PathBuf>,
     store: Store,
-    /// What each open card recalled at first sight, by session and call:
-    /// fixed while it is open.
-    seen: RefCell<HashMap<(String, String), Vec<usize>>>,
+    /// What each card recalled at first sight: kept while it is open,
+    /// whatever else comes (the setting turned, other cards seen, a choice
+    /// remembered). Swept of cards closed, answered or gone
+    /// ([`AppView::recall_open`]) once it holds [`Recall::sweep_at`].
+    seen: RefCell<HashMap<Sight, Vec<usize>>>,
+    sweep_at: Cell<usize>,
     /// Why the file was not used when read, if it wasn't (the log says so).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) said: Option<String>,
@@ -386,6 +396,7 @@ impl Recall {
             path,
             store: Store::default(),
             seen: RefCell::default(),
+            sweep_at: Cell::new(SWEEP),
             said: None,
             reads: 0,
             writes: 0,
@@ -428,14 +439,13 @@ impl Recall {
     }
 
     /// Turned on (the file read) or off (what was read let go, a save not
-    /// begun stopped; never a Forget). Open cards recall again; an entered
-    /// card's highlight stays where it is.
+    /// begun stopped; never a Forget). What open cards recalled stays:
+    /// one first seen off recalls nothing, on again too.
     pub(crate) fn set_on(&mut self, on: bool) {
         if on == self.on {
             return;
         }
         self.on = on;
-        self.seen.borrow_mut().clear();
         self.store = Store::default();
         self.said = None;
         if on {
@@ -447,22 +457,32 @@ impl Recall {
         }
     }
 
-    /// The options of card `tool` of `session` (folder `cwd`, `doc`) that
-    /// were chosen last time, in its order: read at its first sight, then
-    /// kept while it is open.
-    pub(crate) fn at(&self, session: &str, tool: &str, cwd: Option<&str>, doc: &CardDoc) -> Vec<usize> {
-        let Some(cwd) = cwd.filter(|_| self.on) else { return Vec::new() };
-        let k = (session.to_string(), tool.to_string());
-        if let Some(v) = self.seen.borrow().get(&k) {
+    /// The options of card `card` (folder `cwd`, `doc`) that were chosen
+    /// last time, in its order: read at its first sight (nothing, off),
+    /// then kept while it is open. `open` says if a card kept is still
+    /// open, for the sweep.
+    pub(crate) fn at(&self, card: &Sight, cwd: Option<&str>, doc: &CardDoc, open: impl Fn(&Sight) -> bool) -> Vec<usize> {
+        if let Some(v) = self.seen.borrow().get(card) {
             return v.clone();
         }
-        let v = Asked::of(cwd, doc).and_then(|a| self.store.get(&a.key).map(|p| a.options(p, doc))).unwrap_or_default();
+        let v = cwd
+            .filter(|_| self.on)
+            .and_then(|cwd| Asked::of(cwd, doc))
+            .and_then(|a| self.store.get(&a.key).map(|p| a.options(p, doc)))
+            .unwrap_or_default();
         let mut seen = self.seen.borrow_mut();
-        if seen.len() >= SEEN_CAP {
-            seen.clear();
+        if seen.len() >= self.sweep_at.get() {
+            seen.retain(|k, _| open(k));
+            self.sweep_at.set((2 * seen.len()).max(SWEEP));
         }
-        seen.insert(k, v.clone());
+        seen.insert(card.clone(), v.clone());
         v
+    }
+
+    /// Cards whose recall is kept (tests).
+    #[cfg(test)]
+    pub(crate) fn seen_len(&self) -> usize {
+        self.seen.borrow().len()
     }
 
     /// An answer `reply` to `doc`, in folder `cwd`, reached the chat:
@@ -477,12 +497,14 @@ impl Recall {
         true
     }
 
-    /// Forget every choice: open cards recall nothing more, a save on its
-    /// way is dropped, and no older one writes after it. Its removal's
-    /// path and number (`None`: no file).
+    /// Forget every choice: open cards recall nothing more (and keep
+    /// that), a save on its way is dropped, and no older one writes
+    /// after it. Its removal's path and number (`None`: no file).
     pub(crate) fn forget(&mut self) -> Option<(PathBuf, u64)> {
         self.store = Store::default();
-        self.seen.borrow_mut().clear();
+        for v in self.seen.borrow_mut().values_mut() {
+            v.clear();
+        }
         self.save = None;
         let path = self.path.clone()?;
         let generation = accept_forget(&path);
@@ -523,7 +545,31 @@ impl AppView {
     pub(crate) fn recalled(&self, painted: &Painted) -> Vec<usize> {
         let l = &self.model.lives[self.panes.cur.live];
         let Some(a) = l.active.as_ref() else { return Vec::new() };
-        self.recall.at(&a.session_id, &painted.tool_id, l.cwd(), &painted.doc)
+        let card = (a.session_id.clone(), painted.tool_id.clone(), painted.id.clone());
+        self.recall.at(&card, l.cwd(), &painted.doc, |c| self.recall_open(c))
+    }
+
+    /// Whether card `card` may still be open: open in a store that shows
+    /// its session (bound to its call, not answered, closed or replaced),
+    /// or its session behind a tab of a pane (unknown there: kept). Gone
+    /// otherwise.
+    pub(crate) fn recall_open(&self, (session, tool, id): &Sight) -> bool {
+        let lives = &self.model.lives;
+        let mut any = false;
+        for l in lives.ids().into_iter().map(|i| &lives[i]).filter(|l| l.active.as_ref().is_some_and(|a| a.session_id == *session)) {
+            any = true;
+            let f = l.transcript.cards();
+            let open = f.card(tool).is_some_and(|c| {
+                c.state == cards_spec::fold::State::Open
+                    && c.id.as_ref() == Some(id)
+                    && f.bound(id).is_some_and(|b| b.tool_id == c.tool_id && b.at == c.at)
+            });
+            if open {
+                return true;
+            }
+        }
+        let behind = |t: &crate::tabs::Tabs| t.iter().any(|t| t.session.as_deref() == Some(session.as_str()));
+        !any && (behind(&self.model.tabs) || self.panes.rest.iter().any(|p| behind(&p.parked.tabs)))
     }
 
     /// Where an entered card's highlight starts, if memory says: the first

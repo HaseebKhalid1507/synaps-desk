@@ -12,7 +12,9 @@
 //!
 //! Shady #93: Off, an older save or the window closing never undo a
 //! Forget (P2-1); an unreadable file, or a removal that failed, keeps
-//! Forget in Settings, which says so (P3-1).
+//! Forget in Settings, which says so (P3-1); what a card recalled holds
+//! while it is open, the setting turned, past 1,024 other cards, in two
+//! panes on its session (P2-2).
 //!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
@@ -634,6 +636,35 @@ fn painted(input: &Value, tool: &str, card: &str) -> crate::deliver::Painted {
     }
 }
 
+/// `n` other cards of `input`, each seen once and gone: what a long day
+/// of cards looks up.
+fn seen_and_gone(cx: &mut TestAppContext, view: &Entity<AppView>, input: &Value, n: usize) {
+    view.read_with(cx, |v, _| {
+        for i in 0..n {
+            v.recalled(&painted(input, &format!("toolu_gone{i}"), &format!("cg{i:05}")));
+        }
+    });
+}
+
+/// What card `tool` marks "last time", scrolled into view first.
+fn marks(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str) -> Vec<usize> {
+    let (id, ix) = row(cx, view, tool);
+    show(cx, w, view, ix);
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-option {id} 1")), "card {tool}, drawn");
+    marked(cx, w, id)
+}
+
+/// Answers the open card of row `id` with option `n` by a click: its text.
+fn answer_by_click(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, id: u64, n: usize) {
+    let (_, ix) = row(cx, view, tool);
+    show(cx, w, view, ix);
+    arm(cx, view, id, true);
+    click(cx, w, view, format!("ask-option {id} {n}"));
+    crate::app::pin_arm_clock(None);
+    at_rest(cx, w, view);
+}
+
 /// Forget, then Off before its removal ran (Shady #93 P2-1): Off never
 /// cancels a Forget. The file goes, and On again reads nothing back.
 #[gpui_kit::test]
@@ -746,4 +777,124 @@ fn a_failed_removal_says_so_and_forget_stays(cx: &mut TestAppContext) {
     assert!(!path.exists(), "removed");
     assert!(!has(cx, w, "recall-failed".into()));
     assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()));
+}
+
+/// A card keeps what it first recalled while it is open, however many
+/// other cards come and go (Shady #93 P2-2: past the old 1,024, the
+/// frozen recall was dropped).
+#[gpui_kit::test]
+fn an_open_card_keeps_what_it_recalled_however_many_cards_pass(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_w1", "c1www01", &input);
+    remembering(cx, &view, "count");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1www01", &input, json!({"choice": "Run it now"})));
+    let a = asks_again(cx, w, &view, "toolu_w2", "c2www02", &input);
+    assert_eq!(marks(cx, w, &view, "toolu_w2"), vec![1]);
+    let b = asks_again(cx, w, &view, "toolu_w3", "c3www03", &input);
+    answer_by_click(cx, w, &view, "toolu_w3", b, 3);
+    reached(cx, w, &view, &message("c3www03", &input, json!({"choice": "Don't run it"})));
+    assert_eq!(kept(cx, &view).0, 1, "Don't run it, remembered over Run it now");
+    seen_and_gone(cx, &view, &input, 1100);
+    settle(cx, w, 8);
+    assert_eq!(marks(cx, w, &view, "toolu_w2"), vec![1], "still what it first recalled");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, a));
+    assert_eq!(hi(cx, &view), Some(1), "entered: on what it first recalled");
+    press(cx, w, "escape");
+    asks_again(cx, w, &view, "toolu_w4", "c4www04", &input);
+    assert_eq!(marks(cx, w, &view, "toolu_w4"), vec![3], "a new card: the latest");
+}
+
+/// Off and on again while a card is open (Shady #93 P2-2): the card keeps
+/// what it showed; one first seen while off recalls nothing, on again
+/// included; a choice remembered meanwhile shows on the next card only.
+#[gpui_kit::test]
+fn turning_memory_off_and_on_never_changes_an_open_card(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_x1", "c1xxx01", &input);
+    remembering(cx, &view, "toggle");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1xxx01", &input, json!({"choice": "Run it now"})));
+    let a = asks_again(cx, w, &view, "toolu_x2", "c2xxx02", &input);
+    assert_eq!(marks(cx, w, &view, "toolu_x2"), vec![1]);
+    view.update(cx, |v, cx| v.settings_pick(Pick::Remember, "off", cx));
+    settle(cx, w, 8);
+    assert_eq!(marks(cx, w, &view, "toolu_x2"), vec![1], "off: an open card keeps what it showed");
+    let c = asks_again(cx, w, &view, "toolu_x3", "c3xxx03", &input);
+    assert!(marks(cx, w, &view, "toolu_x3").is_empty(), "first seen off: nothing");
+    view.update(cx, |v, cx| v.settings_pick(Pick::Remember, "on", cx));
+    settle(cx, w, 8);
+    assert_eq!(marks(cx, w, &view, "toolu_x2"), vec![1], "on again: unchanged");
+    assert!(marks(cx, w, &view, "toolu_x3").is_empty(), "first seen off: still nothing");
+    let b = asks_again(cx, w, &view, "toolu_x4", "c4xxx04", &input);
+    answer_by_click(cx, w, &view, "toolu_x4", b, 3);
+    reached(cx, w, &view, &message("c4xxx04", &input, json!({"choice": "Don't run it"})));
+    for on in ["off", "on"] {
+        view.update(cx, |v, cx| v.settings_pick(Pick::Remember, on, cx));
+        settle(cx, w, 8);
+        assert_eq!(marks(cx, w, &view, "toolu_x2"), vec![1], "{on}: what it first recalled");
+        assert!(marks(cx, w, &view, "toolu_x3").is_empty(), "{on}: still nothing");
+    }
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, a));
+    assert_eq!(hi(cx, &view), Some(1), "entered: what it first recalled");
+    press(cx, w, "enter");
+    reached(cx, w, &view, &message("c2xxx02", &input, json!({"choice": "Run it now"})));
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, c), "the one card open");
+    assert_eq!(hi(cx, &view), Some(2), "first seen off: the default, though Run it now is remembered");
+    press(cx, w, "escape");
+    asks_again(cx, w, &view, "toolu_x5", "c5xxx05", &input);
+    assert_eq!(marks(cx, w, &view, "toolu_x5"), vec![1], "a new card: the latest");
+}
+
+/// The same session in two panes (Shady #93 P2-2): one card, one recall.
+/// Past a toggle and many cards, both panes mark what it first recalled
+/// and enter on it.
+#[gpui_kit::test]
+fn two_panes_on_one_session_keep_one_recall(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_y1", "c1yyy01", &input);
+    remembering(cx, &view, "panes");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1yyy01", &input, json!({"choice": "Run it now"})));
+    let a1 = asks_again(cx, w, &view, "toolu_y2", "c2yyy02", &input);
+    assert_eq!(marked(cx, w, a1), vec![1]);
+    let b = asks_again(cx, w, &view, "toolu_y3", "c3yyy03", &input);
+    answer_by_click(cx, w, &view, "toolu_y3", b, 3);
+    reached(cx, w, &view, &message("c3yyy03", &input, json!({"choice": "Don't run it"})));
+    assert_eq!(kept(cx, &view).0, 1, "Don't run it, remembered over Run it now");
+    let first = view.read_with(cx, |v, _| v.panes.cur.id);
+    view.update(cx, |v, _| v.app_settings.split = true);
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx))).expect("the window");
+    press(cx, w, "ctrl-\\");
+    play(cx, w, &view);
+    let (second, live) = view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 2);
+        (v.panes.cur.id, v.panes.cur.live)
+    });
+    assert_ne!(first, second, "the new pane, focused");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.rest[0].live), live, "the same session: one store");
+    let a2 = row(cx, &view, "toolu_y2").0;
+    for on in ["off", "on"] {
+        view.update(cx, |v, cx| v.settings_pick(Pick::Remember, on, cx));
+    }
+    seen_and_gone(cx, &view, &input, 1100);
+    settle(cx, w, 8);
+    assert_eq!(marked(cx, w, a2), vec![1], "the new pane: what the card first recalled");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, a2));
+    assert_eq!(hi(cx, &view), Some(1), "entered here: on it");
+    press(cx, w, "escape");
+    press(cx, w, "f6");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.id), first, "the first pane");
+    let a1 = row(cx, &view, "toolu_y2").0;
+    assert_eq!(marked(cx, w, a1), vec![1], "the first pane: the same");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, a1));
+    assert_eq!(hi(cx, &view), Some(1), "entered there: on it too");
 }

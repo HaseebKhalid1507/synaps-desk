@@ -1,16 +1,16 @@
 //! The memory of card choices without a window ([`super`]): what "the same
 //! question" is, what a choice is kept as, the store's cap, the file (its
 //! format, an unreadable one, atomic and ordered writes, a Forget no save
-//! undoes), off reading and writing nothing, and a card's recall fixed
-//! at first sight.
+//! undoes), off reading and writing nothing, and a card's
+//! recall fixed at first sight, for as long as it is open.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use cards_spec::{Answer, CardDoc, Choice, Reply};
+use cards_spec::{Answer, CardDoc, CardId, Choice, Reply};
 use serde_json::{Value, json};
 
-use super::{Asked, CAP, Recall, Store, accept_forget, enabled, remove, save, save_then};
+use super::{Asked, CAP, Recall, Sight, Store, accept_forget, enabled, remove, save, save_then};
 
 fn doc(v: Value) -> CardDoc {
     match cards_spec::parse_input(&v).expect("a card") {
@@ -47,6 +47,17 @@ fn dir(name: &str) -> PathBuf {
 }
 
 const CWD: &str = "/home/you/work/relay-gateway";
+
+/// Card `tool` of session `s` (its id made from the call's).
+fn sight(s: &str, tool: &str) -> Sight {
+    let n: u32 = tool.bytes().map(u32::from).sum();
+    (s.into(), tool.into(), CardId::parse(&format!("c{n:06}")).unwrap())
+}
+
+/// Every card still open.
+fn open(_: &Sight) -> bool {
+    true
+}
 
 /// A save free to go.
 fn go() -> AtomicBool {
@@ -336,36 +347,69 @@ fn off_reads_nothing_and_keeps_nothing() {
     std::fs::write(&path, json!({"version": 1, "choices": [{"key": k, "pick": [1]}]}).to_string()).unwrap();
     let mut r = Recall::new(false, Some(path.clone()));
     assert_eq!((r.reads, r.len()), (0, 0), "not read");
-    assert_eq!(r.at("s", "toolu_1", Some(CWD), &ship), Vec::<usize>::new());
+    assert_eq!(r.at(&sight("s", "toolu_1"), Some(CWD), &ship, open), Vec::<usize>::new());
     assert!(!r.remember(CWD, &ship, &one("Don't run it")), "nothing kept");
     r.set_on(true);
     assert_eq!((r.reads, r.len()), (1, 1), "on: read now");
-    assert_eq!(r.at("s", "toolu_2", Some(CWD), &ship), vec![0], "Run it now");
+    assert_eq!(r.at(&sight("s", "toolu_1"), Some(CWD), &ship, open), Vec::<usize>::new(), "first seen off: nothing, kept");
+    assert_eq!(r.at(&sight("s", "toolu_2"), Some(CWD), &ship, open), vec![0], "Run it now");
     r.set_on(false);
     assert_eq!((r.reads, r.len()), (1, 0), "off again: let go, not read");
-    assert_eq!(r.at("s", "toolu_3", Some(CWD), &ship), Vec::<usize>::new());
+    assert_eq!(r.at(&sight("s", "toolu_3"), Some(CWD), &ship, open), Vec::<usize>::new());
+    assert_eq!(r.at(&sight("s", "toolu_2"), Some(CWD), &ship, open), vec![0], "off: an open card keeps what it showed");
     let _ = std::fs::remove_dir_all(d);
 }
 
 /// What an open card recalls is read at its first sight and kept while
 /// it is open: a choice remembered meanwhile shows on the next card, not
-/// on this one. Forget empties it for every card after.
+/// on this one. Forget empties it for every card, and keeps that.
 #[test]
 fn what_a_card_recalls_is_fixed_at_first_sight() {
     let ship = doc(ship());
     let mut r = Recall::new(true, None);
-    assert_eq!(r.at("s", "toolu_1", Some(CWD), &ship), Vec::<usize>::new(), "nothing yet");
+    let at = |r: &Recall, tool: &str, cwd: Option<&str>| r.at(&sight("s", tool), cwd, &ship, open);
+    assert_eq!(at(&r, "toolu_1", Some(CWD)), Vec::<usize>::new(), "nothing yet");
     assert!(r.remember(CWD, &ship, &one("Don't run it")));
-    assert_eq!(r.at("s", "toolu_1", Some(CWD), &ship), Vec::<usize>::new(), "the card seen before: unchanged");
-    assert_eq!(r.at("s", "toolu_2", Some(CWD), &ship), vec![2], "a new card: Don't run it");
+    assert_eq!(at(&r, "toolu_1", Some(CWD)), Vec::<usize>::new(), "the card seen before: unchanged");
+    assert_eq!(at(&r, "toolu_2", Some(CWD)), vec![2], "a new card: Don't run it");
     assert!(r.remember(CWD, &ship, &one("Run it now")));
-    assert_eq!(r.at("s", "toolu_2", Some(CWD), &ship), vec![2], "still what it first recalled");
-    assert_eq!(r.at("s", "toolu_3", Some(CWD), &ship), vec![0], "the latest choice");
-    assert_eq!(r.at("s", "toolu_4", Some("/elsewhere"), &ship), Vec::<usize>::new(), "another folder");
-    assert_eq!(r.at("s", "toolu_5", None, &ship), Vec::<usize>::new(), "no folder");
+    assert_eq!(at(&r, "toolu_2", Some(CWD)), vec![2], "still what it first recalled");
+    assert_eq!(at(&r, "toolu_3", Some(CWD)), vec![0], "the latest choice");
+    assert_eq!(at(&r, "toolu_4", Some("/elsewhere")), Vec::<usize>::new(), "another folder");
+    assert_eq!(at(&r, "toolu_5", None), Vec::<usize>::new(), "no folder");
     assert!(r.forget().is_none(), "no file to remove");
     assert_eq!(r.len(), 0);
-    assert_eq!(r.at("s", "toolu_3", Some(CWD), &ship), Vec::<usize>::new(), "forgotten, on every card");
+    assert_eq!(at(&r, "toolu_3", Some(CWD)), Vec::<usize>::new(), "forgotten, on every card");
+    assert!(r.remember(CWD, &ship, &one("Run it now")));
+    assert_eq!(at(&r, "toolu_3", Some(CWD)), Vec::<usize>::new(), "and kept so");
+    assert_eq!(at(&r, "toolu_6", Some(CWD)), vec![0], "a new card: what was chosen since");
+}
+
+/// What cards recalled is kept while they are open, past any count; the
+/// sweep, once enough are kept, lets go only of cards no longer open, so
+/// what is kept stays within twice the open ones (Shady #93 P2-2).
+#[test]
+fn what_cards_recalled_lives_as_long_as_they_are_open() {
+    let ship = doc(ship());
+    let mut r = Recall::new(true, None);
+    assert!(r.remember(CWD, &ship, &one("Run it now")));
+    let a = sight("s", "toolu_a");
+    assert_eq!(r.at(&a, Some(CWD), &ship, open), vec![0]);
+    assert!(r.remember(CWD, &ship, &one("Don't run it")));
+    let kept = |k: &Sight| *k == a || k.1.starts_with("toolu_open");
+    for i in 0..5000 {
+        let tool = if i % 100 == 0 { format!("toolu_open{i}") } else { format!("toolu_gone{i}") };
+        let card = ("s".to_string(), tool, CardId::parse(&format!("c{i:06}")).unwrap());
+        assert_eq!(r.at(&card, Some(CWD), &ship, kept), vec![2]);
+        assert!(r.seen_len() <= 2 * 51 + super::SWEEP, "{i}: {} kept", r.seen_len());
+    }
+    assert_eq!(r.at(&a, Some(CWD), &ship, kept), vec![0], "a, open all along: what it first recalled");
+    assert_eq!(r.at(&sight("s", "toolu_open4900"), Some(CWD), &ship, kept), vec![2]);
+    for i in 0..200 {
+        let card = ("s".to_string(), format!("toolu_after{i}"), CardId::parse(&format!("c{i:06}")).unwrap());
+        r.at(&card, Some(CWD), &ship, |_| false);
+    }
+    assert!(r.seen_len() <= super::SWEEP, "every one closed: let go at the next sweep");
 }
 
 /// `cards.remember`: on unless `false` or `"off"`.
