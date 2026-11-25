@@ -14,20 +14,28 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# Every lane runs in parallel: lint, the release build and the three test
+# lanes (each built once, its tests in slices on runners of their own).
+# The `ci` job at the end checks the test lanes across their slices and is
+# the one result to wait on.
 jobs:
-  build:
-    name: ${{ matrix.os }}
+  lint:
+    name: clippy + client alone (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -43,39 +51,58 @@ jobs:
       # serde_json without `preserve_order` (its maps sort their keys).
       - name: Test synaps-client on its own (fixtures, named-pipe derivation on Windows)
         run: cargo test -p synaps-client --locked
-      # The workspace as it ships (#28): one build of every crate, so
-      # serde_json's features are unified as in the release build below.
-      # gpui's http client turns on `preserve_order` (maps keep insertion
-      # order), so the client's fixtures run here in the desktop's build,
-      # where `-p synaps-client` alone never ran them. With the desktop's
-      # logic tests and its UI tests (GPUI's headless test window: no
-      # display, no GPU, no daemon). The counts are printed so the log
-      # shows they ran.
-      - name: Test the workspace as shipped (client + desktop, logic + headless UI tests)
+
+  # The workspace as it ships, on both platforms (the client's fixtures in
+  # the desktop's build, #28), and the split-on-tests lane, Linux only: the
+  # layout is the same on every platform. See tests.yml.
+  tests-linux:
+    name: tests (workspace, ubuntu)
+    uses: ./.github/workflows/tests.yml
+    with:
+      os: ubuntu-latest
+      lane: workspace
+      slices: 4
+
+  tests-windows:
+    name: tests (workspace, windows)
+    uses: ./.github/workflows/tests.yml
+    with:
+      os: windows-latest
+      lane: workspace
+      slices: 4
+
+  tests-split-on:
+    name: tests (split-on, ubuntu)
+    uses: ./.github/workflows/tests.yml
+    with:
+      os: ubuntu-latest
+      lane: split-on
+      slices: 4
+
+  release:
+    name: release build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
         shell: bash
-        run: |
-          set -o pipefail
-          cargo test --workspace --locked 2>&1 | tee workspace-tests.log
-          passed=$(grep -E '^test result: ok' workspace-tests.log | awk '{s += $4} END {print s + 0}')
-          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' workspace-tests.log || true)
-          fixtures=$(grep -cE '^test catalog_page_requests_encode_as_the_daemon_expects \.\.\. ok' workspace-tests.log || true)
-          echo "workspace: $passed tests passed, $ui of them UI tests; the client's fixtures ran: $fixtures"
-          test "$passed" -gt 0 && test "$ui" -gt 0 && test "$fixtures" -eq 1
-      # The same suites with every test's view split panes on (one pane;
-      # the split tests add two), as a launch with no settings file has
-      # been since split panes are on by default (Shady #59 M1). Linux: the
-      # layout is the same on every platform.
-      - name: Test synaps-desktop, split panes on (the split-on-tests lane)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Linux system packages
         if: runner.os == 'Linux'
-        shell: bash
         run: |
-          set -o pipefail
-          cargo test -p synaps-desktop --locked --features split-on-tests 2>&1 | tee desktop-tests-split-on.log
-          passed=$(grep -E '^test result: ok' desktop-tests-split-on.log | awk '{s += $4} END {print s + 0}')
-          ui=$(grep -cE '^test ui_tests::.* \.\.\. ok' desktop-tests-split-on.log || true)
-          grep -qE '^test split_tests::the_split_on_lane_builds_every_view_split_on \.\.\. ok' desktop-tests-split-on.log
-          echo "synaps-desktop, split on: $passed tests passed, $ui of them UI tests"
-          test "$passed" -gt 0 && test "$ui" -gt 0
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libxcb1-dev libvulkan1 libzstd-dev libssl-dev libasound2-dev
       - name: Build release
         run: cargo build --release --locked -p synaps-desktop -p synaps-client
       - name: Binary size
@@ -91,10 +118,39 @@ jobs:
             target/release/synaps-probe.exe
           if-no-files-found: error
 
+  # The one result: every job above passed, and across each lane's slices
+  # every test it listed ran once and passed, UI tests among them, the
+  # client's fixtures in the workspace build, the split-on lane's own test
+  # in that lane (scripts/ci-tests.py; the counts are in the job summary).
+  ci:
+    name: CI result
+    if: ${{ !cancelled() }}
+    needs: [lint, tests-linux, tests-windows, tests-split-on, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: list-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: artifacts
+      - name: Every test of every lane ran once and passed
+        run: python3 scripts/ci-tests.py artifacts Linux-workspace Windows-workspace Linux-split-on
+      - name: Every job passed
+        if: always()
+        run: |
+          echo '${{ toJSON(needs) }}'
+          test "${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}" = true
+
   # macOS minutes bill at 10x on a private repo: manual runs and tags only.
   macos:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)

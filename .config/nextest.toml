@@ -1,0 +1,27 @@
+# CI's test runs (.github/workflows/ci.yml): one build archived, its tests
+# run in slices on parallel runners. `cargo test` stays the local way to
+# run them; nothing here changes a test.
+[profile.ci]
+# Every test runs, failed or not, and none is ever run twice: a flaky
+# test fails the run as it would under `cargo test`.
+fail-fast = false
+retries = 0
+failure-output = "immediate-final"
+# Slow tests are reported, never stopped: the job's timeout is the hang
+# backstop (and `test_waits`' own BACKSTOP inside the tests).
+slow-timeout = { period = "60s" }
+
+[profile.ci.junit]
+# Read by scripts/ci-tests.py: which tests ran and passed, per lane.
+path = "junit.xml"
+
+# The frame and animation tests are the long ones (60 s to 13 min each on
+# a CI runner): start them first in each slice, so a slice never ends
+# waiting on one that began last. Order only.
+[[profile.ci.overrides]]
+filter = 'test(=split_motion_tests::every_flight_rewraps_each_pane_at_most_once)'
+priority = 100
+
+[[profile.ci.overrides]]
+filter = 'test(/^(ui_tests|split_tests|split_motion_tests|test_kit::(held|hang|cards_d)_tests)::/)'
+priority = 50
