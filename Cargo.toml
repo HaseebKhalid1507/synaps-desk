@@ -32,14 +32,3 @@ debug = false
 
 [profile.dev]
 debug = "limited"
-
-# Dependencies optimized in dev builds, and so in `cargo test` (its `test`
-# profile is this one): GPUI's layout, text shaping and the rest of the
-# headless UI tests' work run about 4x faster. The workspace's own crates
-# stay at opt-level 0, and debug assertions and overflow checks stay on in
-# every crate. Key timing in the tests is the test's own clock
-# (`app::input_now`), not the speed of the build.
-[profile.dev.package."*"]
-opt-level = 2
-debug-assertions = true
-overflow-checks = true
