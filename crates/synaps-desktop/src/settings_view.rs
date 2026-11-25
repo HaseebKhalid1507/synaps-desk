@@ -1076,6 +1076,7 @@ impl AppView {
         } else {
             div()
                 .id("recall-forget")
+                .debug_selector(|| "recall-forget".into())
                 .cursor_pointer()
                 .child(mono("forget remembered choices", 12., p.dim))
                 .hover(|d| d.text_color(p.ink))

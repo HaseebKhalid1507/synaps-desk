@@ -6,9 +6,9 @@
 //! never ticked; only an answer that reached the chat (answered, or a
 //! steer taken in) is remembered (not sent, queued, unconfirmed and
 //! Resend waiting are not); off, the file is neither read nor written;
-//! Forget; an unreadable file; no free text in the file; no frame at
-//! rest; a pending permission prompt untouched; a choice remembered
-//! meanwhile never moves an open card.
+//! Forget, and Settings' link to it; an unreadable file; no free text in
+//! the file; no frame at rest; a pending permission prompt untouched; a
+//! choice remembered meanwhile never moves an open card.
 //!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
@@ -564,4 +564,42 @@ fn a_choice_remembered_meanwhile_never_moves_an_open_card(cx: &mut TestAppContex
     press(cx, w, "escape");
     let third = asks_again(cx, w, &view, "toolu_f3", "c3fff03", &input);
     assert_eq!(marked(cx, w, third), vec![1], "the next card recalls it");
+}
+
+/// Settings, THIS APP: "Remember card choices" with "forget remembered
+/// choices" beside it; a click forgets (the file goes) and it says
+/// nothing is remembered.
+#[gpui_kit::test]
+fn settings_forget_remembered_choices(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, VisualTestContext};
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_v1", "c1vvv01", &input);
+    let path = remembering(cx, &view, "settings");
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, &view, &message("c1vvv01", &input, json!({"choice": "Run it now"})));
+    assert!(path.exists());
+    view.update(cx, |v, cx| {
+        v.open_view(crate::tabs::Kind::Settings, cx);
+        v.settings_find("remember card".into(), cx);
+    });
+    cx.run_until_parked();
+    play(cx, w, &view);
+    assert!(!has(cx, w, "recall-none".into()));
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    let position = vcx.debug_bounds("recall-forget").expect("forget remembered choices, drawn").center();
+    vcx.simulate_event(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() });
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 });
+    vcx.run_until_parked();
+    settle(cx, w, 8);
+    assert!(!path.exists(), "the file is gone");
+    assert_eq!(kept(cx, &view).0, 0);
+    assert!(has(cx, w, "recall-none".into()) && !has(cx, w, "recall-forget".into()), "nothing remembered");
 }
