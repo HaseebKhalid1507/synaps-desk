@@ -37,6 +37,9 @@ log = "0.4"
 # Message times in local time (the system's zone): already in the tree
 # through GPUI, with the same features.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The key a card's remembered choice is kept by (`src/recall.rs`): already in
+# the tree through cards-spec, the same version.
+sha2 = "0.10"
 
 # A picker read's command runs as a process tree of its own, killed whole
 # (`model_list::tree`): a process group, a job object. Both already in the

@@ -114,6 +114,8 @@ pub(crate) enum Pick {
     Right,
     /// The cards' OS notifications: on or off (D3).
     Notify,
+    /// The cards' remembered choices: on or off (D4, [`crate::recall`]).
+    Remember,
     Range,
     Host,
 }
@@ -242,6 +244,10 @@ impl AppView {
             Pick::Notify => {
                 self.app_settings.quiet = value == "off";
                 self.save_app(NOTIFY, Some(value.to_string()), cx);
+            }
+            Pick::Remember => {
+                self.set_recall(value == "on", cx);
+                self.save_app(crate::recall::SETTING, Some(value.to_string()), cx);
             }
             Pick::Range => {
                 if let Some(r) = Range::parse(value) {
@@ -1060,6 +1066,44 @@ impl AppView {
                 p,
                 cx,
             ),
+            tag: None,
+            under: Vec::new(),
+        });
+        // Off, the file isn't read: what it keeps is unknown, and Forget
+        // removes it all the same.
+        let forget: AnyElement = if self.recall.on() && self.recall.len() == 0 {
+            mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
+        } else {
+            div()
+                .id("recall-forget")
+                .cursor_pointer()
+                .child(mono("forget remembered choices", 12., p.dim))
+                .hover(|d| d.text_color(p.ink))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.forget_card_choices(cx);
+                    this.views_changed(cx);
+                }))
+                .into_any_element()
+        };
+        rows.push(Row {
+            id: "app-recall".into(),
+            label: "Remember card choices".into(),
+            key: crate::recall::SETTING,
+            help: "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. It never answers for you: Enter or a click still does. Only which option you picked is kept, on this machine, never a note or a field's text.",
+            control: h_flex()
+                .gap(px(12.))
+                .items_center()
+                .child(forget)
+                .child(self.choice(
+                    crate::recall::SETTING,
+                    Pick::Remember,
+                    vec!["on".into(), "off".into()],
+                    Some(if self.recall.on() { "on" } else { "off" }),
+                    None,
+                    p,
+                    cx,
+                ))
+                .into_any_element(),
             tag: None,
             under: Vec::new(),
         });
