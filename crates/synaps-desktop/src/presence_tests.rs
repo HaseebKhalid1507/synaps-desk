@@ -1,6 +1,7 @@
-//! D3's tests (synaps-cards `docs/design.md` §6.1, §7's F10, §9.3):
-//! the presence model and its counters, live against last seen, NEEDS YOU
-//! and ASKED, and in the window the tab dot,
+//! D3's tests (synaps-cards `docs/design.md` §6.1, §7's F10 and F12, §9.3):
+//! the presence model and its counters, live against last seen, F12's
+//! provenance at the event boundary, the notifications' lifetimes and
+//! clicks, NEEDS YOU and ASKED, and in the window the tab dot,
 //! Ctrl+Shift+J (and an IME's composition), the palette's WAITING, and no
 //! idle frames. F11 (a session only in the rail) stays the known gap
 //! (§8 #1): nothing here reads a session the window doesn't hold.
@@ -16,11 +17,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     AnyWindowHandle, Bounds, Entity, EntityInputHandler, Focusable, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
+    Pixels, Point, SystemNotificationResponse, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size,
 };
 use serde_json::{Value, json};
 use synaps_client::protocol::{SessionMeta, decode_event};
-use synaps_client::{Event, Transcript};
+use synaps_client::{Event, HistoryUpdate, Transcript};
 
 use super::*;
 // `super`'s `gpui_kit::*` brings the kit's `test` too: the std one here.
@@ -73,6 +74,7 @@ fn presence_counts_and_orders_oldest_first() {
     assert_eq!(p.last_seen("a"), Count::default());
     assert_eq!(p.next().map(|c| c.tool_id.as_str()), Some("t3"), "the oldest live wait card, though older ones are open or last seen");
     assert_eq!(ids(p.listed()), ["t3", "t2", "t1", "t4", "t5"], "live wait, live open, then as last seen");
+    assert!(p.holds(&cards[4].key()) && !p.holds(&Key { card: cid("zz"), ..cards[4].key() }), "the exact binding");
     assert!(!p.set(cards.iter().rev().cloned().collect()), "the same cards, in any order: no change");
     assert_eq!(p.rev(), g);
     assert!(p.set(vec![card("a", "t1", false, Some(100), true)]));
@@ -147,6 +149,64 @@ fn open_cards_are_the_folds_less_what_this_desk_answered() {
     assert!(open_cards(crate::demo::SID, &transcript(crate::demo::SID), true, |_| false).is_empty(), "no cards, none open");
 }
 
+/// F12's provenance (Shady #83 P2-1, P2-2), at the event boundary: what an
+/// attach or a replaced history brings is the baseline (never told); a
+/// wait card that comes after, live or appended, is an arrival, once per
+/// binding; seen stays seen while its session is held, whatever the card
+/// does meanwhile (gone from the fold and back); a session no longer held
+/// is forgotten (its next attach is its baseline again). Open (ASKED)
+/// cards never arrive.
+#[test]
+fn a_wait_card_arrives_once_after_its_attach() {
+    let (open, asks) = (transcript(ASK_OPEN), transcript(ASKS));
+    let a8 = Key { session: "s".into(), tool_id: "toolu_a8".into(), card: CardId::parse("c0p6r4n").unwrap() };
+    let mut a = Arrivals::default();
+    a.look(Look::Baseline, "s", &open);
+    assert!(a.take().is_empty(), "the attach's: there before; ASK_OPEN's card is open, not waited on");
+    a.look(Look::Live, "s", &asks);
+    assert_eq!(a.take(), vec![a8.clone()], "a wait card come live; its open card never");
+    a.look(Look::Live, "s", &asks);
+    assert!(a.take().is_empty(), "once");
+    // Dropped (a history without it), then back: the same binding.
+    a.look(Look::Live, "s", &open);
+    a.look(Look::Live, "s", &asks);
+    a.look(Look::Baseline, "s", &asks);
+    assert!(a.take().is_empty(), "seen stays seen");
+    // Its session no longer held: forgotten; its next attach is the baseline.
+    a.keep(|s| s != "s");
+    assert_eq!(a.seen(), 0);
+    a.look(Look::Baseline, "s", &asks);
+    assert!(a.take().is_empty(), "an attach brings it: there before");
+    // Another session's baseline, then a live arrival there.
+    a.look(Look::Baseline, "t", &open);
+    a.look(Look::Live, "t", &asks);
+    assert_eq!(a.take().len(), 1);
+    // What each event says.
+    let ev = |v: Value| Event::session(4, "s", 0, decode_event(&v).unwrap(), Arc::new(v));
+    let hist = |update| Event::History { attach_seq: 4, session_id: "s".into(), seq: 0, update };
+    assert_eq!(Look::of(&ev(json!({"ev": "idle"}))), Some((Look::Live, 4)));
+    assert_eq!(Look::of(&hist(HistoryUpdate::Append { base_len: 2, messages: vec![] })), Some((Look::Live, 4)));
+    assert_eq!(Look::of(&hist(HistoryUpdate::Replace { messages: vec![] })), Some((Look::Baseline, 4)), "a resync, /resume, compaction");
+    let attached = crate::demo::attach(ASK_OPEN, 4).remove(0);
+    assert_eq!(Look::of(&attached), Some((Look::Baseline, 4)));
+    assert_eq!(Look::of(&Event::Sessions(Vec::new())), None);
+}
+
+#[test]
+fn notify_cards_off_is_false_or_off() {
+    assert!(!quiet(None));
+    assert!(!quiet(Some(&json!(true))));
+    assert!(!quiet(Some(&json!("on"))));
+    assert!(quiet(Some(&json!(false))));
+    assert!(quiet(Some(&json!("off"))));
+}
+
+/// The rail (§6.1): an attached session's wait card is NEEDS YOU, an open
+/// one ASKED once its turn is over (RUNNING while it runs: the agent works
+/// on), a prompt still NEEDS YOU; ASKED has its word, the accent's mark,
+/// and ranks after RUNNING. A card as last seen (a background tab's) is
+/// neither, and the top bar doesn't count it (Shady #83 P2-3). A session
+/// the window holds nothing of has no badge from cards (F11, §8 #1).
 #[test]
 fn a_waiting_card_is_needs_you_and_an_open_one_asked() {
     let mut m = Model::new(ConnState::Connecting);
@@ -393,11 +453,107 @@ fn heard(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ev
     settle(cx, w, 8);
 }
 
+/// `events` decoded as the client hands them over, on attachment `seq`.
+fn session_events(seq: u64, sid: &str, events: Vec<Value>) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|e| {
+            let ev = decode_event(&e).unwrap_or_else(|err| panic!("{err}: {e}"));
+            Event::session(seq, sid.to_string(), 0, ev, Arc::new(e))
+        })
+        .collect()
+}
+
+/// The history's messages of card `card` asked by call `tool`: the call
+/// and its result.
+fn card_messages(tool: &str, card: &str, input: &Value) -> (Vec<Value>, String) {
+    let (doc, wait) = match cards_spec::parse_input(input).unwrap() {
+        cards_spec::Input::Create { doc, wait } => (doc, wait),
+        cards_spec::Input::Close(_) => unreachable!(),
+    };
+    let result = format!(
+        "{}\nIts answer will come as a user message starting \"[card {card}]\".",
+        cards_spec::Envelope::showing(cards_spec::CardId::parse(card).unwrap(), &doc, wait)
+    );
+    let messages = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_ui", "input": input}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": result}]}),
+    ];
+    (messages, result)
+}
+
+/// A turn on attachment `seq` that asks `input` as card `card` (call
+/// `tool`) and ends, as the daemon streams it, then its history appended
+/// after the first `base_len` messages.
+fn card_turn(seq: u64, sid: &str, base_len: usize, tool: &str, card: &str, input: &Value) -> Vec<Event> {
+    let (messages, result) = card_messages(tool, card, input);
+    let llm = |v: Value| json!({"ev": "stream", "event": v});
+    let mut out = session_events(
+        seq,
+        sid,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": "go"}),
+            llm(json!({"kind": "llm", "llm": "response_start"})),
+            llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": tool})),
+            llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_ui", "tool_id": tool, "input": input})),
+            llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": result})),
+            llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+        ],
+    );
+    out.push(Event::History { attach_seq: seq, session_id: sid.to_string(), seq: 0, update: HistoryUpdate::Append { base_len, messages } });
+    out
+}
+
+/// The attachment on screen: its seq and session.
+fn here(cx: &mut TestAppContext, view: &Entity<AppView>) -> (u64, String) {
+    view.read_with(cx, |v, _| {
+        let l = &v.model.lives[v.panes.cur.live];
+        (l.attachment().expect("attached"), l.active.as_ref().unwrap().session_id.clone())
+    })
+}
+
+fn batch(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, events: Vec<Event>) {
+    view.update(cx, |v, cx| v.apply_batch(events, cx));
+    cx.run_until_parked();
+    play(cx, w, view);
+}
+
+/// The agent asks `input` live as card `card` (call `tool`) on the
+/// attachment on screen, and its turn ends; the round's history lands.
+fn ask_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, card: &str, input: Value) {
+    let (seq, sid) = here(cx, view);
+    let base_len = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    batch(cx, w, view, card_turn(seq, &sid, base_len, tool, card, &input));
+}
+
+/// What the OS was shown, and what was taken down.
+fn told(cx: &mut TestAppContext) -> (Vec<gpui_kit::SystemNotification>, Vec<String>) {
+    (cx.shown_system_notifications(), cx.dismissed_system_notifications().iter().map(|t| t.to_string()).collect())
+}
+
+fn away(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    VisualTestContext::from_window(w, cx).deactivate_window();
+    settle(cx, w, 8);
+    assert!(!view.read_with(cx, |v, _| v.window_active), "the window away");
+}
+
 fn landed(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<(String, String)> {
     view.read_with(cx, |v, _| v.lookout.landed.as_ref().map(|k| (k.session.clone(), k.tool_id.clone())))
 }
 
+fn click_note(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tag: &str) {
+    cx.simulate_system_notification_response(SystemNotificationResponse { tag: tag.to_string().into(), action_id: None });
+    cx.run_until_parked();
+    play(cx, w, view);
+}
+
 const SHIP: &str = "Run the migration on staging now?";
+
+fn wait_card(q: &str) -> Value {
+    json!({"question": q, "wait": true, "options": ["Yes", "No"]})
+}
 
 /// The window's first tab on screen, `ASKS` (a wait card and an open one)
 /// in a background tab, as last seen.
@@ -475,8 +631,172 @@ fn f10_ctrl_shift_j_lands_on_the_oldest_waiting_card(cx: &mut TestAppContext) {
     assert_ne!(first.as_deref(), Some(ASKS));
 }
 
+/// F12: a wait card that comes while the window is away notifies once:
+/// its session's name, its question, a tag of its own, through a task of
+/// its own (Shady #83 P3-2). Its click brings the window up and lands on
+/// the card (scrolled away meanwhile), and one option click answers it.
+/// The answer on its way takes the notification down with the card
+/// (P2-6); not sent, the card waits again, and is never told again
+/// (P2-1). A card an attach brings, an open card, and any card with
+/// `notify.cards` off notify nothing.
+#[gpui_kit::test]
+fn f12_a_wait_card_that_comes_while_away_notifies_once(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    away(cx, w, &view);
+    // An attach's wait card (ASK_FORM's) was there before: nothing.
+    open_tab(cx, w, &view, ASK_FORM);
+    assert!(cx.shown_system_notifications().is_empty(), "an attach's card: no notification");
+    show_tab(cx, w, &view, 1);
+    assert_eq!(shown(cx, &view).as_deref(), Some(ASK_OPEN));
+    assert!(cx.shown_system_notifications().is_empty(), "nor a switch's attach");
+    // An open card comes: nothing.
+    let note = json!({"question": "Keep the old log format too?", "options": ["Yes", "No"]});
+    ask_live(cx, w, &view, "toolu_n1", "c3n9w2a", note);
+    assert!(cx.shown_system_notifications().is_empty(), "ASKED: no notification");
+    // A wait card comes: one, posted from its own task.
+    let cut = json!({"question": "Cut the old log format over tonight?", "wait": true, "options": ["Tonight", "Tomorrow"]});
+    let (seq, sid) = here(cx, &view);
+    let base_len = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    view.update(cx, |v, cx| v.apply_batch(card_turn(seq, &sid, base_len, "toolu_n2", "c3n9w2b", &cut), cx));
+    assert!(cx.shown_system_notifications().is_empty(), "the batch only queues it");
+    cx.run_until_parked();
+    play(cx, w, &view);
+    let (shown_n, _) = told(cx);
+    assert_eq!(shown_n.len(), 1, "one notification: {shown_n:?}");
+    assert_eq!(shown_n[0].title.as_ref(), "Needs you · Relay log levels");
+    assert_eq!(shown_n[0].body.as_ref(), "Cut the old log format over tonight?");
+    assert!(shown_n[0].tag.len() <= 64);
+    let tag = shown_n[0].tag.to_string();
+    wait(cx, w, &view, 500);
+    heard(cx, w, &view, vec![json!({"ev": "idle"})]);
+    assert_eq!(cx.shown_system_notifications().len(), 1, "once");
+    // The list scrolled away from it (the synthetic daemon never had this
+    // card: a switch's re-attach would fold it away), then its click.
+    view.update(cx, |v, cx| {
+        v.panes.cur.list.scroll_to(gpui_kit::ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert!(row(cx, &view, "toolu_n2").is_some_and(|r| !r.1), "out of view");
+    click_note(cx, w, &view, &tag);
+    assert!(view.read_with(cx, |v, _| v.window_active), "the window up");
+    assert_eq!(shown(cx, &view).as_deref(), Some(ASK_OPEN), "its session");
+    assert_eq!(landed(cx, &view), Some((ASK_OPEN.into(), "toolu_n2".into())));
+    let (id, seen) = row(cx, &view, "toolu_n2").expect("its row");
+    assert!(seen, "in view");
+    arm(cx, &view, id);
+    // The synthetic daemon takes the answer and never echoes it: on its way.
+    view.update(cx, |v, _| v.synthetic_tx = Some(async_channel::unbounded().0));
+    click(cx, w, format!("ask-option {id} 1"));
+    let s = sends(cx, &view);
+    assert_eq!(s.len(), 1, "one answer");
+    assert!(s[0].text.starts_with("[card c3n9w2b] "), "{:?}", s[0].text);
+    crate::app::pin_arm_clock(None);
+    // On its way: the card no longer waits, its notification is taken down.
+    play(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.model.presence.get(ASK_OPEN, "toolu_n2").is_none()), "sending: not waiting");
+    assert!(told(cx).1.contains(&tag), "taken down with its card");
+    assert_eq!(view.read_with(cx, |v, _| v.lookout.notes.len()), 0);
+    // Not sent (refused): it waits again, and the OS is not told again.
+    away(cx, w, &view);
+    view.update(cx, |v, cx| {
+        v.model.memos.on(ASK_OPEN, cards_spec::memo::Event::Refused { reason: "not attached" }, Instant::now());
+        cx.notify();
+    });
+    play(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.model.presence.get(ASK_OPEN, "toolu_n2").is_some_and(|c| c.live && c.wait)), "not sent: it waits");
+    heard(cx, w, &view, vec![json!({"ev": "idle"})]);
+    assert_eq!(cx.shown_system_notifications().len(), 1, "the same binding: never told twice");
+    // Off: nothing.
+    view.update(cx, |v, _| v.app_settings.quiet = true);
+    ask_live(cx, w, &view, "toolu_n3", "c3n9w2c", wait_card("And the archive?"));
+    assert_eq!(cx.shown_system_notifications().len(), 1, "notify.cards off: none");
+}
+
+/// Shady #83 P2-1: a history that drops a told card (a rewind) and then
+/// brings the same binding back appended: not new, not told again.
+#[gpui_kit::test]
+fn a_card_dropped_and_brought_back_is_not_new(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    away(cx, w, &view);
+    let base: Vec<Value> = match crate::demo::attach(ASK_OPEN, 1).remove(0) {
+        Event::Attached { attached, .. } => attached.conversation.api_messages,
+        _ => unreachable!(),
+    };
+    let input = wait_card("Roll the relay back?");
+    ask_live(cx, w, &view, "toolu_r1", "c7r1aaa", input.clone());
+    let (shown_n, _) = told(cx);
+    assert_eq!(shown_n.len(), 1);
+    let (seq, sid) = here(cx, &view);
+    let hist = |update| Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update };
+    batch(cx, w, &view, vec![hist(HistoryUpdate::Replace { messages: base.clone() })]);
+    assert!(view.read_with(cx, |v, _| v.model.presence.get(ASK_OPEN, "toolu_r1").is_none()), "dropped");
+    assert!(told(cx).1.contains(&shown_n[0].tag.to_string()), "its notification taken down");
+    let (messages, _) = card_messages("toolu_r1", "c7r1aaa", &input);
+    batch(cx, w, &view, vec![hist(HistoryUpdate::Append { base_len: base.len(), messages })]);
+    assert!(view.read_with(cx, |v, _| v.model.presence.get(ASK_OPEN, "toolu_r1").is_some()), "back");
+    assert_eq!(cx.shown_system_notifications().len(), 1, "the same binding: not new");
+}
+
+/// Shady #83 P2-2, missed: the attach and a wait card that comes live
+/// after it, drained in one pump batch: the card came after the attach,
+/// and is told.
+#[gpui_kit::test]
+fn a_card_in_its_attachs_own_batch_is_told(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| {
+        v.client = None;
+        v.attach_source = Some(Box::new(|sid: &str, seq: u64| {
+            let mut evs = crate::demo::attach(sid, seq);
+            if sid == ASK_OPEN {
+                let base_len = match &evs[0] {
+                    Event::Attached { attached, .. } => attached.conversation.api_messages.len(),
+                    _ => unreachable!(),
+                };
+                evs.extend(card_turn(seq, sid, base_len, "toolu_b1", "c7b1aaa", &wait_card("Bump the relay's log level?")));
+            }
+            evs
+        }));
+    });
+    away(cx, w, &view);
+    open_tab(cx, w, &view, ASK_OPEN);
+    let (shown_n, _) = told(cx);
+    assert_eq!(shown_n.len(), 1, "{shown_n:?}");
+    assert_eq!(shown_n[0].body.as_ref(), "Bump the relay's log level?");
+}
+
+/// Shady #83 P2-2, spurious: a reconnect's snapshot brings a wait card
+/// asked while the link was down: there before, never told. One that
+/// comes live after it is.
+#[gpui_kit::test]
+fn a_reconnects_snapshot_is_not_news(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    away(cx, w, &view);
+    let (seq, sid) = here(cx, &view);
+    let mut evs = crate::demo::attach(ASK_OPEN, seq);
+    if let Event::Attached { attached, reconnect, .. } = &mut evs[0] {
+        let (messages, _) = card_messages("toolu_d1", "c7d1aaa", &wait_card("Asked while you were away?"));
+        attached.conversation.api_messages.extend(messages);
+        attached.conversation.messages_len = attached.conversation.api_messages.len();
+        *reconnect = true;
+    }
+    let mut all = vec![Event::Reattaching { attach_seq: seq, session_id: sid.clone(), reason: "reload".into() }];
+    all.extend(evs);
+    batch(cx, w, &view, all);
+    assert!(view.read_with(cx, |v, _| v.model.presence.get(ASK_OPEN, "toolu_d1").is_some_and(|c| c.live)), "it waits");
+    assert!(cx.shown_system_notifications().is_empty(), "the reconnect's snapshot: there before");
+    ask_live(cx, w, &view, "toolu_d2", "c7d2aaa", wait_card("And now?"));
+    assert_eq!(cx.shown_system_notifications().len(), 1, "a live one after it");
+}
+
 /// Shady #83 P2-3: a background tab's card is as last seen: hollow dot,
-/// never NEEDS YOU or the top bar's count. Meanwhile
+/// never NEEDS YOU, the top bar's count, or a notification. Meanwhile
 /// `change` happens to the session elsewhere; a click on its dot opens
 /// the tab, whose attach says the card no longer waits: nothing lands,
 /// and the last-seen dot goes.
@@ -502,6 +822,7 @@ fn last_seen_then(cx: &mut TestAppContext, change: fn(&mut Vec<Value>), still_op
     let tab = tab_of(cx, &view, ASKS);
     assert_eq!(view.read_with(cx, |v, _| v.model.presence.of(ASKS)), Count { wait: 1, asked: 1 }, "live");
     assert!(has(cx, w, format!("tab {tab} dot")));
+    away(cx, w, &view);
     show_tab(cx, w, &view, 0);
     let meta: SessionMeta = serde_json::from_value(json!({"id": ASKS, "lifecycle": "live"})).unwrap();
     view.read_with(cx, |v, _| {
@@ -511,6 +832,7 @@ fn last_seen_then(cx: &mut TestAppContext, change: fn(&mut Vec<Value>), still_op
         assert!(v.model.attention().all(|s| s.id != ASKS), "not in the top bar's count");
     });
     assert!(has(cx, w, format!("tab {tab} last-seen")) && !has(cx, w, format!("tab {tab} dot")), "hollow");
+    assert!(cx.shown_system_notifications().is_empty(), "never notified");
     // Elsewhere, meanwhile; then its dot.
     changed.set(true);
     click(cx, w, format!("tab {tab} last-seen"));
@@ -523,6 +845,7 @@ fn last_seen_then(cx: &mut TestAppContext, change: fn(&mut Vec<Value>), still_op
     });
     assert!(!has(cx, w, format!("tab {tab} last-seen")), "the last-seen dot gone");
     assert_eq!(has(cx, w, format!("tab {tab} dot")), still_open, "ASKED's dot only for the open card left");
+    assert!(cx.shown_system_notifications().is_empty());
 }
 
 /// The ship card's input, from `ASKS`'s history.
@@ -572,6 +895,70 @@ fn a_last_seen_card_compacted_away_lands_nowhere(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_last_seen_card_gone_with_new_lands_nowhere(cx: &mut TestAppContext) {
     last_seen_then(cx, Vec::clear, false);
+}
+
+/// Shady #83 P2-4: a notification's click is checked before anything
+/// moves. Its card answered (its history says so): the notification was
+/// taken down as the card resolved, and its click does nothing. Its tab
+/// closed: taken down, and its click never opens the tab again. A tag the
+/// window still holds for a card that no longer waits: taken down, and
+/// nothing moves.
+#[gpui_kit::test]
+fn a_stale_notification_click_does_nothing(cx: &mut TestAppContext) {
+    let (w, view) = open(cx);
+    view.update(cx, |v, _| v.client = None);
+    open_tab(cx, w, &view, ASK_OPEN);
+    away(cx, w, &view);
+    let input = wait_card("Ship the relay?");
+    ask_live(cx, w, &view, "toolu_s1", "c7s1aaa", input.clone());
+    let tag1 = told(cx).0[0].tag.to_string();
+    // Answered (elsewhere: its history appended).
+    let (seq, sid) = here(cx, &view);
+    let base_len = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    let cards_spec::Input::Create { doc, .. } = cards_spec::parse_input(&input).unwrap() else { unreachable!() };
+    let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &json!({"choice": "Yes"})).unwrap());
+    let answer = json!({"role": "user", "content": cards_spec::message::build(&CardId::parse("c7s1aaa").unwrap(), &doc, &reply)});
+    let update = HistoryUpdate::Append { base_len, messages: vec![answer] };
+    batch(cx, w, &view, vec![Event::History { attach_seq: seq, session_id: sid, seq: 0, update }]);
+    assert!(told(cx).1.contains(&tag1), "answered: taken down");
+    show_tab(cx, w, &view, 0);
+    let before = (shown(cx, &view), view.read_with(cx, |v, _| v.model.tabs.len()));
+    click_note(cx, w, &view, &tag1);
+    assert_eq!((shown(cx, &view), view.read_with(cx, |v, _| v.model.tabs.len())), before, "a stale click: nothing moves");
+    assert!(view.read_with(cx, |v, _| v.lookout.land.is_none() && !v.window_active), "no landing, the window left where it was");
+    // Its tab closed.
+    show_tab(cx, w, &view, 1);
+    ask_live(cx, w, &view, "toolu_s2", "c7s2aaa", wait_card("And the gateway?"));
+    let tag2 = told(cx).0.last().unwrap().tag.to_string();
+    assert_ne!(tag2, tag1);
+    show_tab(cx, w, &view, 0);
+    assert!(view.read_with(cx, |v, _| v.lookout.notes.card(&tag2).is_some()), "its card as last seen: still up");
+    let ix = view.read_with(cx, |v, _| v.model.tabs.find(ASK_OPEN)).expect("its tab");
+    view.update(cx, |v, cx| {
+        v.close_tab(ix);
+        cx.notify();
+    });
+    play(cx, w, &view);
+    assert!(told(cx).1.contains(&tag2), "its tab closed: taken down");
+    click_note(cx, w, &view, &tag2);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.model.tabs.find(ASK_OPEN), None, "never opened again");
+        assert!(v.lookout.land.is_none());
+    });
+    assert_ne!(shown(cx, &view).as_deref(), Some(ASK_OPEN), "never attached again");
+    // A tag still held for a card that no longer waits (a click racing its
+    // resolution): checked first, taken down, nothing moves.
+    let gone = Key { session: ASK_OPEN.into(), tool_id: "toolu_s2".into(), card: CardId::parse("c7s2aaa").unwrap() };
+    let note = crate::notify::note(&gone, "Relay log levels", "And the gateway?");
+    let tag3 = note.tag.clone();
+    view.update(cx, |v, cx| v.lookout.notes.post(gone, note, cx));
+    cx.run_until_parked();
+    click_note(cx, w, &view, &tag3);
+    view.read_with(cx, |v, _| {
+        assert!(v.lookout.notes.card(&tag3).is_none(), "taken down");
+        assert_eq!(v.model.tabs.find(ASK_OPEN), None);
+        assert!(v.lookout.land.is_none());
+    });
 }
 
 /// Shady #83 P2-8: Ctrl+Shift+J while a field composes (an IME's marked

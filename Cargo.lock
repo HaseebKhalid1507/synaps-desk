@@ -6619,6 +6619,7 @@ dependencies = [
  "async-channel",
  "cards-spec",
  "chrono",
+ "futures-lite",
  "gpui-kit",
  "gpui-pre",
  "libc",
@@ -6627,6 +6628,7 @@ dependencies = [
  "serde_json",
  "synaps-client",
  "windows-sys 0.61.2",
+ "zbus 6.2.1",
 ]
 
 [[package]]
