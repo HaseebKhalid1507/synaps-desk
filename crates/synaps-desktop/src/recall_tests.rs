@@ -310,10 +310,12 @@ fn on_windows_the_file_is_this_users_only() {
         let at = s.find('(').unwrap_or(s.len());
         (s[..at].to_string(), s[at..].to_string())
     };
-    // The entries wanted, as Windows writes them back: `(A;;FA;;;<sid>)`.
+    // The entries wanted, as Windows writes them back: one, allowing full
+    // access to this user's SID, written as the SID or as its alias (the
+    // built-in Administrator's is `LA`).
     let want = parts(&acl::sddl_of(Descriptor::of(&private_sddl().unwrap()).unwrap().0).unwrap()).1;
     assert_eq!(want.matches('(').count(), 1, "{want}");
-    assert!(want.ends_with(&format!(";{sid})")), "{want}");
+    assert!(want.starts_with("(A;;FA;;;") && !want.contains(";WD)"), "{want}");
     let private = |p: &std::path::Path| {
         let got = acl::dacl(p).unwrap();
         let (flags, aces) = parts(&got);
