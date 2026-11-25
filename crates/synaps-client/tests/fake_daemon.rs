@@ -444,6 +444,13 @@ async fn a_lag_notice_and_check_again_ask_for_the_history_on_this_connection_alo
     let q = conn.recv_cmd().await;
     assert_eq!(messages(&q), (Some("query".into()), Some("messages".into())), "the history, on this connection");
     client.on(seq).resync().unwrap();
+    // `resync()` only queues the command. The connection thread takes it
+    // and the reply below in no set order (a queue and a socket), and if
+    // the reply comes first, a resync after it rightly asks again. A
+    // command queued after the resync is taken after it: once this submit
+    // is on the wire, the resync was taken with the query still out.
+    client.submit("y").unwrap();
+    assert_eq!(conn.recv_cmd().await["cmd"], "submit", "Check again with the history asked for asks nothing more");
     conn.event(40, json!({"ev": "query_result", "id": q["id"], "value": now})).await;
     history(&events).await;
     client.on(seq).resync().unwrap();
