@@ -8177,6 +8177,13 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
         let changes: Vec<usize> = (1..wraps.len()).filter(|&i| wraps[i] != wraps[i - 1]).collect();
         assert!(changes.len() <= 1, "{fold}: rewrapped {} times: {wraps:?}", changes.len());
         assert!(!changes.is_empty(), "{fold}: 1100 px crosses a wrap width either way");
+        // Either way the flight lands (Shady #96 A-1: the old widening
+        // check's `expect` was this guarantee): the panel at rest and its
+        // motion done before `fly`'s bound, the one rewrap before that.
+        let landed = moving.iter().position(|m| !m).expect("it landed");
+        let rest = !moving.last().copied().unwrap_or(true) && !motion_pending(cx, &view).0;
+        assert!(rest && frames < 400, "{fold}: it landed ({frames} frames, {moving:?})");
+        assert!(changes[0] <= landed + 1, "{fold}: rewrapped before it landed ({} {landed})", changes[0]);
         if fold {
             // The pane widens: the landed wrap in the flight's first frame
             // (`wraps` has the frame before the flight first), revealed.
