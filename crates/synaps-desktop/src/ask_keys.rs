@@ -11,6 +11,10 @@
 //!   answer a prompt), and a batch is frozen, the pane's cards in that
 //!   order. Ctrl+J while a prompt holds the keys goes on to the cards, so
 //!   the two take turns.
+//! - **D3's ways in** (Ctrl+Shift+J, a WAITING row, a tab dot, the top
+//!   bar's JUMP) name one card, and enter that card once they land on it
+//!   ([`AppView::enter_card`], from `card_landed`): from the composer,
+//!   another pane, another tab or session.
 //! - **Activation.** The entry names one card ([`Painted`], its scope).
 //!   Its keys act from the first frame that paints its ring in view. A key
 //!   before that ends the entry, and a printable one is typed into the
@@ -27,12 +31,14 @@
 //!   (Shift+Enter, Ctrl+Enter) does nothing. A press is a key-down after
 //!   that key's key-up ([`Press`]), whether or not the platform says the
 //!   key-down repeats (macOS loses that on Shift+Tab, Esc and the
-//!   arrows). So with Ctrl+J: held, it jumps once. A field's Enter, Esc
-//!   and Tab are bindings of its input, which run before any key listener
-//!   and never say whether the key repeats: Tab has none on an entered
-//!   card (`NoAction`), and comes as a key; an Enter acts at its
-//!   `PressEnter`, and an Esc at its key-down, only once that key-down
-//!   said ([`FieldKey`]).
+//!   arrows). Every key-down counts, an input's action that took it too
+//!   (a ↓ held in the composer, then Ctrl+J): each is stamped before any
+//!   binding runs. So with Ctrl+J and Ctrl+Shift+J: held, it jumps once.
+//!   A field's Enter, Esc and Tab are bindings of its input, which run
+//!   before any key listener and never say whether the key repeats: Tab
+//!   has none on an entered card (`NoAction`), and comes as a key; an
+//!   Enter acts at its `PressEnter`, and an Esc at its key-down, only once
+//!   that key-down said ([`FieldKey`]).
 //! - **In a field**, the field keeps its keys: digits, Space and arrows
 //!   edit, and an IME composition owns every key. Enter in a one-line
 //!   field goes forward: it sends a whole form, else moves to the next
@@ -121,10 +127,17 @@ pub(crate) struct Entry {
     pub(crate) seen: Rc<Cell<bool>>,
 }
 
-/// Every key's presses, window-wide ([`Press`]), as the root's capture
-/// stamps each key-down and key-up: whether the last key-down was a new
-/// press, not a repeat or a key still held from before; and whether it
-/// may act on an entered card.
+/// Every key's presses, window-wide ([`Press`]): whether the last key-down
+/// was a new press, not a repeat or a key still held from before; and
+/// whether it may act on an entered card.
+///
+/// Every key-down is stamped once, before any binding runs
+/// ([`Presses::intercept`], from the window's keystroke interceptor): GPUI
+/// runs a key's bindings before any key listener, and an input's action
+/// that takes the key (the composer's `MoveDown` for ↓) ends it there, so
+/// the root's capture never hears that key-down (Shady #86 R3-1). The
+/// root's capture ([`Presses::down`]) then reads that stamp, adding what
+/// only the event says (whether it repeats), and stamps each key-up.
 #[derive(Default)]
 pub(crate) struct Presses {
     keys: HashMap<String, Press>,
@@ -147,11 +160,22 @@ pub(crate) struct Presses {
 /// that went through the input context's `doCommandBySelector:` with
 /// `is_held: false`, so a held Shift+Tab would go round the card.
 ///
-/// One exception, for that dropped key-up: after a Cmd chord of the key
-/// (Cmd+2, a tab), a key-down that types text (`2`, Enter, Tab, Space:
-/// one that never goes through that callback, so it says when it
-/// repeats) is a press. Else the `2` that answers a card after Cmd+2
-/// would be lost. A key-up this window never saw (it was let go in
+/// One exception, for the key-up AppKit drops when a key is let go while
+/// Cmd is held: after a Cmd chord of the key (Cmd+2, a tab), its next
+/// key-down that types text is a press, once (the one after it is not).
+/// Else the `2` that answers a card after Cmd+2 would be lost. A key that
+/// types text can come through that callback too, its repeat bit lost
+/// (`gpui-pre-macos 0.3.12 window.rs:2759–2787`, Shady #86 P3-1): any key
+/// mid IME composition; and a printable one (a digit, Space; not Enter or
+/// Tab, control characters) while an IME source is active and the focused
+/// input prefers it. A text key is no proof of a trustworthy repeat bit,
+/// then; the exception is sound only where a card acts on such a key. On
+/// the entered card itself, whose focus has no input handler, neither
+/// case can happen: the key says when it repeats. In its fields, digits
+/// and Space edit and never act, and an Enter or an Esc acts only with no
+/// composition ([`FieldKey`]), the one way Enter comes through there.
+/// Anything else that reads [`Presses::last`] for a text key would need
+/// its own reason. A key-up this window never saw (it was let go in
 /// another window) costs the next press of that key, once.
 #[derive(Debug, Default)]
 struct Press {
@@ -159,6 +183,11 @@ struct Press {
     up: Option<Instant>,
     /// The last key-down was a Cmd chord: its key-up may never come.
     cmd: bool,
+    /// The last key-down as [`Presses::intercept`] stamped it (whether it
+    /// was a new press), until the root's capture hears it. An input's
+    /// action may have taken it: then nothing does, and the next key-down
+    /// is stamped over it.
+    unheard: Option<bool>,
 }
 
 impl Press {
@@ -181,6 +210,7 @@ impl Press {
         if self.down.is_some() {
             self.up = Some(now);
         }
+        self.unheard = None;
     }
 }
 
@@ -219,12 +249,34 @@ fn bare(ks: &Keystroke) -> bool {
 }
 
 impl Presses {
-    /// Key `ks` went down at `now` (`held`: the platform says it is a
-    /// repeat). A pending Enter's or Esc's key-down says whether it acts;
-    /// any other key-down ends it.
+    /// Key `ks` went down at `now`, before any binding (the window's
+    /// keystroke interceptor, [`AppView::intercept_keys`]): every key-down,
+    /// whoever takes it. Whether it repeats, the root's capture says
+    /// ([`Presses::down`]). A modifier alone (GPUI's keystroke for a tap of
+    /// Shift, as it is let go) is no key-down.
+    pub(crate) fn intercept(&mut self, ks: &Keystroke, now: Instant) {
+        if ks.is_modifier_key() {
+            return;
+        }
+        let (cmd, text) = (ks.modifiers.platform, ks.key_char.is_some());
+        let p = self.keys.entry(ks.key.clone()).or_default();
+        let new = p.press(now, false, cmd, text);
+        p.unheard = Some(new);
+    }
+
+    /// Key `ks` went down at `now`, as the root's capture hears it (`held`:
+    /// the platform says it is a repeat): the key-down stamped before its
+    /// bindings ran, not stamped again. One never stamped (GPUI replays a
+    /// key held back for a longer binding with no interceptor) is stamped
+    /// here. A pending Enter's or Esc's key-down says whether it acts; any
+    /// other key-down ends it.
     pub(crate) fn down(&mut self, ks: &Keystroke, now: Instant, held: bool) {
         let (cmd, text) = (ks.modifiers.platform, ks.key_char.is_some());
-        self.last = self.keys.entry(ks.key.clone()).or_default().press(now, held, cmd, text);
+        let p = self.keys.entry(ks.key.clone()).or_default();
+        self.last = match p.unheard.take() {
+            Some(new) => new && !held,
+            None => p.press(now, held, cmd, text),
+        };
         self.acts = self.last && bare(ks);
         let acts = self.acts;
         self.field = self.field.take().filter(|f| ks.key == f.key && f.acts.is_none()).map(|f| FieldKey { acts: Some(acts), ..f });
@@ -239,8 +291,6 @@ impl Presses {
 
 /// A card's binding, as D3 names one to enter ([`AppView::enter_card`]):
 /// the call that asked it and the card id the history binds it to.
-// D3's (Shady #83 P2-7): until its chords and rows land, only tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub(crate) tool_id: String,
@@ -270,6 +320,23 @@ fn start_on(doc: &cards_spec::CardDoc) -> Option<usize> {
 }
 
 impl AppView {
+    /// Every key-down of `window`, stamped before any binding runs
+    /// ([`Presses::intercept`]): GPUI's keystroke interceptors run ahead of
+    /// a key's actions (`gpui-pre 0.3.12 window.rs:6361`; its bindings at
+    /// 6438), as the kit's own inputs use one to see the keys their
+    /// actions take (`gpui-base 0.9.1 input/base/state.rs:943–953`). Every
+    /// interceptor runs, whatever another did (`window.rs:2798–2817`).
+    /// Another window's keys are its own.
+    pub(crate) fn intercept_keys(window: &Window, cx: &mut Context<Self>) -> Subscription {
+        let (me, at) = (cx.weak_entity(), window.window_handle());
+        cx.intercept_keystrokes(move |ev, window, cx| {
+            if window.window_handle() == at {
+                let now = crate::app::input_now();
+                let _ = me.update(cx, |v, _| v.ask_presses.intercept(&ev.keystroke, now));
+            }
+        })
+    }
+
     /// The open cards of store `live`'s session as this desk may answer
     /// them: bound, the latest call of their tool id, and no answer of
     /// this desk's on its way (its receipt is drawn instead). With their
@@ -358,8 +425,7 @@ impl AppView {
     /// other cards in Ctrl+J's order ([`crate::waiting::batch_from`]).
     /// True if it was entered; false, and nothing changes, if not. A
     /// session in a background tab or another window is the caller's to
-    /// bring forward first.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// bring forward first: D3's jumps land first ([`AppView::card_landed`]).
     pub(crate) fn enter_card(&mut self, session: &str, binding: &Binding, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let all = self.waiting_here(false);
         let shows = |pane: PaneId| {
@@ -508,33 +574,10 @@ impl AppView {
         line.or(long).map(Spot::Field)
     }
 
-    /// An IME composition in the entered card's input that has the keys.
+    /// An IME composition in the entered card's input that has the keys
+    /// (the window's one rule: [`AppView::composing_now`]).
     fn ask_composing(&self, window: &mut Window, cx: &mut App) -> bool {
-        self.panes.cur.ask.entry.is_some() && self.ime_composing(window, cx)
-    }
-
-    /// The input with the keys is mid IME composition (it has marked
-    /// text): the pane's composer, or a card's field. Its keys are the
-    /// IME's, Ctrl+J's included (§6.1: composition owns every key).
-    pub(crate) fn ime_composing(&self, window: &mut Window, cx: &mut App) -> bool {
-        let marked = |r: Option<std::ops::Range<usize>>| r.is_some();
-        let c = &self.panes.cur.composer;
-        if c.read(cx).focus_handle(cx).is_focused(window) {
-            return marked(c.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
-        }
-        for d in self.card_drafts.values() {
-            for i in d.note.iter().chain(d.lines.values()) {
-                if i.read(cx).focus_handle(cx).is_focused(window) {
-                    return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
-                }
-            }
-            for i in d.longs.values() {
-                if i.read(cx).focus_handle(cx).is_focused(window) {
-                    return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
-                }
-            }
-        }
-        false
+        self.panes.cur.ask.entry.is_some() && self.composing_now(window, cx)
     }
 
     /// As a pane's frame begins: an entry whose card, session or keys went
@@ -586,7 +629,13 @@ impl AppView {
                     self.panes.cur.list.scroll_by(px(by));
                 }
             }
+            // Not laid out (above or below the view). GPUI's reveal only
+            // anchors (`gpui-pre 0.3.12 elements/list.rs:680–709`; not
+            // `scroll_to`, which stops following at 664–677): a list
+            // following its tail would snap back to the end at its next
+            // layout, the card never painted, its keys never live.
             None => {
+                self.panes.cur.list.pause_following_tail();
                 self.panes.cur.scroller.touch();
                 self.panes.cur.list.scroll_to_reveal_item(ix);
             }
@@ -957,7 +1006,7 @@ impl AppView {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::Press;
+    use super::{Press, Presses};
 
     /// [`Press`]: a key-down is a press after the key's key-up, 30 ms or
     /// more before, and not when it says it repeats; never without a
@@ -991,5 +1040,45 @@ mod tests {
         let mut esc = Press::default();
         esc.press(t0, false, true, false);
         assert!(!esc.press(ms(50), false, false, false), "after Cmd+Esc, an Esc with no text and no key-up: a repeat");
+    }
+
+    fn key(k: &'static str) -> gpui_kit::Keystroke {
+        gpui_kit::Keystroke::parse(k).expect("a keystroke").with_simulated_ime()
+    }
+
+    /// [`Presses`] (Shady #86 R3-1): each key-down is stamped once, before
+    /// its bindings ([`Presses::intercept`]); the root's capture reads that
+    /// stamp ([`Presses::down`]) and adds only what the event says. A
+    /// key-down an input's action took (no capture hears it) still counts:
+    /// the next one, with no key-up between, is a repeat. One the
+    /// interceptor never saw (GPUI's replay of a key held back for a longer
+    /// binding) is stamped by the capture. A lone modifier is no key-down.
+    #[test]
+    fn every_key_down_is_stamped_once_before_its_bindings() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut p = Presses::default();
+        let down = key("down");
+        p.intercept(&down, t0);
+        p.down(&down, t0, false);
+        assert!(p.last && p.acts, "a new press, stamped once (heard: not stamped again)");
+        p.up("down", ms(10));
+        p.intercept(&down, ms(100));
+        assert!(p.keys["down"].unheard.is_some(), "stamped, not yet heard");
+        p.intercept(&down, ms(600));
+        p.down(&down, ms(600), false);
+        assert!(!p.last, "the one before it an action took: no key-up since, a repeat");
+        p.up("down", ms(700));
+        p.intercept(&down, ms(800));
+        p.down(&down, ms(800), true);
+        assert!(!p.last, "it says it repeats");
+        p.up("down", ms(900));
+        p.down(&down, ms(1000), false);
+        assert!(p.last, "never intercepted (a replay): stamped here, a press");
+        p.down(&down, ms(1100), false);
+        assert!(!p.last, "and not stamped twice: the next, no key-up between, a repeat");
+        let shift = gpui_kit::Keystroke { key: "shift".into(), key_char: None, modifiers: Default::default() };
+        p.intercept(&shift, ms(1200));
+        assert!(!p.keys.contains_key("shift"), "a modifier alone: no key-down");
     }
 }
