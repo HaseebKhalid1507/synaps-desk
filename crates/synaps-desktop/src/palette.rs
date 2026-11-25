@@ -971,7 +971,9 @@ impl AppView {
                 }
             }
             Act::App(a) => self.app_act(a, window, cx),
-            Act::Card(session, tool_id) => self.go_to_card(session, tool_id, window, cx),
+            Act::Card(session, tool_id) => {
+                self.go_to_card(session, tool_id, window, cx);
+            }
             Act::Engine(name) => {
                 self.run_command(name, arg);
             }

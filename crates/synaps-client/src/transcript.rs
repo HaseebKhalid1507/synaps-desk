@@ -500,6 +500,8 @@ pub struct Transcript {
     /// The cards' fold the rows draw: the history's, then the live turn's
     /// on top ([`Transcript::cards`]).
     card_fold: cards_spec::fold::Fold,
+    /// The fold's revision ([`Transcript::cards_rev`]).
+    card_rev: u64,
     /// The length and hash of the history folded ([`Transcript::history_settled`]).
     mirror: crate::history::HistoryMirror,
     /// The latest `Conversation` digest since the attach (`None`: the
@@ -553,6 +555,14 @@ impl Transcript {
     /// ([`Transcript::history_cards`]).
     pub fn cards(&self) -> &cards_spec::fold::Fold {
         &self.card_fold
+    }
+
+    /// Changes whenever the cards of [`Transcript::cards`] change, and is
+    /// never the same for two transcripts' folds (one counter for the
+    /// process): what is built from the cards is built again only when
+    /// this moves.
+    pub fn cards_rev(&self) -> u64 {
+        self.card_rev
     }
 
     /// The agent cards' fold of the history alone, without the live turn:
@@ -1390,10 +1400,16 @@ impl Transcript {
         // No card called anywhere and none drawn: nothing to fold (a
         // session without cards pays only this, no row read).
         if self.cards.is_empty() && !self.live_cards && self.card_rows == 0 {
+            if !self.card_fold.cards().is_empty() {
+                self.card_rev = next_card_rev();
+            }
             self.card_fold = cards_spec::fold::Fold::default();
             return;
         }
         let (mut want, fold) = crate::cards::rows(&self.cards, &self.items[live..]);
+        if fold.cards() != self.card_fold.cards() {
+            self.card_rev = next_card_rev();
+        }
         self.card_fold = fold;
         self.card_rows = want.len();
         let mut changed = Vec::new();
@@ -2471,4 +2487,11 @@ mod outcome_tests {
         t.load_attached(&a).unwrap();
         assert_eq!(t.resolved_outcome(1), None, "an attach starts over (prompt ids may start over)");
     }
+}
+
+/// The next fold revision ([`Transcript::cards_rev`]): process-wide, so a
+/// revision names one fold of one transcript.
+fn next_card_rev() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

@@ -2669,8 +2669,6 @@ impl AppView {
         }));
         // The dash poll waits while the window is in the background.
         subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
-        // A card's notification clicked: this window, that card (D3).
-        crate::presence::listen(window, cx);
         // A worker's view polls only while the window shows.
         subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
         crate::views::view_fallbacks(cx.weak_entity(), window.window_handle(), cx);
@@ -2693,7 +2691,7 @@ impl AppView {
             allow_all_focus,
             visible: window.is_visible(),
         };
-        match (client, synthetic) {
+        let mut v = match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
@@ -2716,7 +2714,10 @@ impl AppView {
                 v
             }
             (None, None) => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
-        }
+        };
+        // A card's notification clicked: this window, that card (D3).
+        crate::presence::listen(&mut v, window, cx);
+        v
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
@@ -10089,8 +10090,13 @@ impl Render for AppView {
                 }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
-                // Ctrl+Shift+J: the oldest waiting card in any open session (D3).
-                if crate::presence::is_jump(&ev.keystroke) && !ev.is_held && this.jump_waiting(window, cx) {
+                // Ctrl+Shift+J: the first waiting card in any open session (D3);
+                // not while a field composes (the IME's keys).
+                if crate::presence::is_jump(&ev.keystroke)
+                    && !ev.is_held
+                    && !this.composing_now(window, cx)
+                    && this.jump_waiting(window, cx)
+                {
                     cx.stop_propagation();
                     return;
                 }

@@ -849,7 +849,7 @@ impl AppView {
                 // Built once per prompt, with the card (`sync_card` ran first).
                 let card = self.current_card().filter(|_| l == self.panes.cur.live).map(|c| c.gist.clone());
                 card.unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
-            } else if let Some(c) = self.model.presence.cards().iter().find(|c| c.wait && c.session == s.id) {
+            } else if let Some(c) = self.model.presence.cards().iter().find(|c| c.live && c.wait && c.session == s.id) {
                 // An agent card waits there (D3): its question.
                 c.question.clone().into()
             } else {
@@ -956,10 +956,13 @@ impl AppView {
                     )))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         // Only a card waits there: to the card (D3).
-                        let card = this.model.presence.cards().iter().find(|c| c.wait && c.session == id).map(|c| c.tool_id.clone());
+                        let card =
+                            this.model.presence.cards().iter().find(|c| c.live && c.wait && c.session == id).map(|c| c.tool_id.clone());
                         let prompts = this.model.sessions.iter().find(|s| s.id == id).is_some_and(|s| s.awaiting_input > 0);
-                        if let Some(tool_id) = card.filter(|_| !prompts) {
-                            return this.go_to_card(id.clone(), tool_id, window, cx);
+                        if let Some(tool_id) = card.filter(|_| !prompts)
+                            && this.go_to_card(id.clone(), tool_id, window, cx)
+                        {
+                            return;
                         }
                         for fx in this.model.open_row(&RowAction::Attach(id.clone())) {
                             this.effect(fx);

@@ -64,6 +64,7 @@ mod motion;
 mod named;
 mod overlay;
 mod palette;
+mod notify;
 mod palettes;
 mod pane;
 mod presence;
