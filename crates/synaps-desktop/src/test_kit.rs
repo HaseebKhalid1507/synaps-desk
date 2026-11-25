@@ -28,6 +28,8 @@ mod held_tests;
 mod key_clock_tests;
 #[path = "keys_tests.rs"]
 mod keys_tests;
+#[path = "remember_tests.rs"]
+mod remember_tests;
 #[path = "send_tests.rs"]
 mod send_tests;
 

@@ -114,6 +114,8 @@ pub(crate) enum Pick {
     Right,
     /// The cards' OS notifications: on or off (D3).
     Notify,
+    /// The cards' remembered choices: on or off (D4, [`crate::recall`]).
+    Remember,
     Range,
     Host,
 }
@@ -242,6 +244,10 @@ impl AppView {
             Pick::Notify => {
                 self.app_settings.quiet = value == "off";
                 self.save_app(NOTIFY, Some(value.to_string()), cx);
+            }
+            Pick::Remember => {
+                self.set_recall(value == "on", cx);
+                self.save_app(crate::recall::SETTING, Some(value.to_string()), cx);
             }
             Pick::Range => {
                 if let Some(r) = Range::parse(value) {
@@ -1062,6 +1068,56 @@ impl AppView {
             ),
             tag: None,
             under: Vec::new(),
+        });
+        // Forget while anything may be there: off (the file unread), a
+        // choice remembered, the file there (an unreadable one too), or a
+        // removal or a sweep that failed, said under the row.
+        let forget: AnyElement = if !self.recall.offers_forget() {
+            mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
+        } else {
+            div()
+                .id("recall-forget")
+                .debug_selector(|| "recall-forget".into())
+                .cursor_pointer()
+                .child(mono("forget remembered choices", 12., p.dim))
+                .hover(|d| d.text_color(p.ink))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.forget_card_choices(cx);
+                    this.views_changed(cx);
+                }))
+                .into_any_element()
+        };
+        rows.push(Row {
+            id: "app-recall".into(),
+            label: "Remember card choices".into(),
+            key: crate::recall::SETTING,
+            help: "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. The highlight is only a starting point: nothing is ticked or sent for you, and Enter sends what's ticked (on a one-choice card, the option highlighted). Only which option you picked is kept, on this machine, never a note or a field's text.",
+            control: h_flex()
+                .gap(px(12.))
+                .items_center()
+                .child(forget)
+                .child(self.choice(
+                    crate::recall::SETTING,
+                    Pick::Remember,
+                    vec!["on".into(), "off".into()],
+                    Some(if self.recall.on() { "on" } else { "off" }),
+                    None,
+                    p,
+                    cx,
+                ))
+                .into_any_element(),
+            tag: None,
+            under: self
+                .recall
+                .not_removed()
+                .map(|why| {
+                    mono(format!("couldn't remove {why}"), 12., p.err)
+                        .whitespace_normal()
+                        .debug_selector(|| "recall-failed".into())
+                        .into_any_element()
+                })
+                .into_iter()
+                .collect(),
         });
         for (rail, label, key, id) in
             [(true, "Sessions rail", "rail_collapsed", "app-rail"), (false, "Right panel", "right_collapsed", "app-right")]

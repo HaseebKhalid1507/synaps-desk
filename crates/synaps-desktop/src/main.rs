@@ -70,6 +70,7 @@ mod palettes;
 mod pane;
 mod presence;
 mod rail;
+mod recall;
 #[cfg(test)]
 mod receipt_tests;
 mod scroll;
@@ -364,6 +365,10 @@ fn main() {
                 v.theme_profile = profile_name.clone();
                 v.config_theme = v.config_choice().0.into();
                 v.app_settings = settings_view::AppSettings::load(theme::settings_path().as_deref());
+                // Agent cards' remembered choices: read now unless turned off
+                // (and what a crash left beside the file swept, off this thread).
+                let remember = recall::enabled(theme::settings_path().and_then(|p| theme::load_value(&p, recall::SETTING)).as_ref());
+                v.start_recall(remember, recall::path(), cx);
                 v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
                 v.dash.socket = launch.endpoint.as_ref().map(|e| e.resolve());
                 v.dash.launch = launch;

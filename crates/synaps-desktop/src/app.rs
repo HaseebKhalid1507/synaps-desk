@@ -2374,6 +2374,9 @@ pub struct AppView {
     pub(crate) card_drafts: HashMap<(String, String), crate::answer::Draft>,
     /// Receipts opened to show the whole answer, by session and call.
     pub(crate) card_open: HashSet<(String, String)>,
+    /// The desk's memory of card choices ([`crate::recall`]): on, with
+    /// no file, until the launch reads the settings (tests keep it so).
+    pub(crate) recall: crate::recall::Recall,
     /// The card memos' clock, while an answer waits on it
     /// ([`AppView::arm_card_tick`]).
     pub(crate) card_tick: Option<Task<()>>,
@@ -2987,6 +2990,7 @@ impl AppView {
             card_sends: Vec::new(),
             card_drafts: HashMap::new(),
             card_open: HashSet::new(),
+            recall: crate::recall::Recall::new(true, None),
             card_tick: None,
             memo_seen: 0,
             ask_presses: Default::default(),
