@@ -25,7 +25,9 @@
 //! so one may hold a bidi control, a tab or an invisible.
 //!
 //! Nothing here takes a click or a key (D2a and D2b answer). A card is a
-//! static row: no frame is asked for, at rest or otherwise.
+//! static row: no frame is asked for, at rest or otherwise. A card the
+//! keys entered (D2b, [`crate::ask_keys`]) draws its ring, the user's bar
+//! down its edge, the option Enter takes, and its keys in the footer.
 
 use cards_spec::Lines;
 use cards_spec::memo::State as MemoState;
@@ -292,6 +294,9 @@ impl AppView {
             (None, _) => Vec::new(),
         };
         let can = act.is_some_and(|x| x.can);
+        // Entered from the keys (D2b): where they are on it.
+        let keys = self.panes.cur.ask.entry.as_ref().filter(|e| e.painted.tool_id == a.tool_id && Some(&e.painted.id) == a.id.as_ref());
+        let (hi, spot) = keys.map_or((None, None), |e| (e.hi, Some(&e.spot)));
         let mark: AnyElement = if a.wait && open {
             div().debug_selector(move || format!("ask-needs {id}")).child(glyph::draw(Glyph::Needs, p.acc)).into_any_element()
         } else {
@@ -393,6 +398,10 @@ impl AppView {
                     )
                     .children(hint)
                     .children(note)
+                    .when(hi == Some(i), |d| {
+                        d.bg(p.hover)
+                            .child(div().absolute().top_0().left_0().size(px(1.)).debug_selector(move || format!("ask-hi {id} {n}")))
+                    })
                     .child(div().flex_1())
                     .when(suggested(doc, &o.label), |d| {
                         d.child(
@@ -443,10 +452,15 @@ impl AppView {
                 let value: AnyElement = match (&f.kind, &value) {
                     (FieldKind::Check, v) => {
                         let on = *v == FieldValue::Check(true);
+                        let at = spot.is_some_and(|s| *s == crate::ask_keys::Spot::Field(f.id.clone()));
                         let row = h_flex()
                             .id(("ask-check", id * 64 + f.id.len() as u64))
                             .gap(px(8.))
                             .items_center()
+                            .when(at, |d| {
+                                let fid = f.id.clone();
+                                d.bg(p.hover).debug_selector(move || format!("ask-at {id} {fid}"))
+                            })
                             .child(
                                 div()
                                     .flex_none()
@@ -551,9 +565,16 @@ impl AppView {
             Some(x) => match (&x.line, sends, &reply) {
                 (Some(l), _, _) => (l.clone(), true),
                 (None, true, Some(Err(needs))) if draft.is_some() => (needs.clone(), false),
+                _ if keys.is_some() => (how_keys(doc, hi.is_some()), false),
                 _ => (how_click(doc).to_string(), false),
             },
         };
+        // A batch (F13): which of how many, and the next one's question.
+        let batch = keys.filter(|e| e.batch.len() > 1).map(|e| {
+            let (k, n) = (e.at + 1, e.batch.len());
+            let next = e.batch.get(e.at + 1).map(|c| format!(" · next: {}", question_line(&c.doc.question))).unwrap_or_default();
+            div().text_color(p.acc).debug_selector(move || format!("ask-batch {id} {k} of {n}")).child(format!("{k} of {n}{next}"))
+        });
         let foot = (a.state != State::Pending).then(|| {
             let buttons = act.map(|x| {
                 let skip = {
@@ -593,6 +614,7 @@ impl AppView {
                         .line_height(line(m.meta))
                         .text_color(if warn { p.prose_t } else { p.dim_t })
                         .debug_selector(move || format!("ask-footer {id}"))
+                        .children(batch)
                         .child(text),
                 )
                 .children(buttons)
@@ -604,6 +626,8 @@ impl AppView {
             .pt(px(pad_y(m)))
             .pb(px(pad_y(m)))
             .debug_selector(move || format!("ask-card {id}"))
+            .when(keys.is_some(), |d| d.key_context(crate::ask_keys::ASK_ENTERED))
+            .when_some(keys, |d, e| d.relative().child(ring(e, id, p)))
             .child(head)
             .child(question)
             .children(detail)
@@ -611,6 +635,69 @@ impl AppView {
             .children(fields)
             .children(foot)
     }
+}
+
+/// How to answer an entered card from the keys, its footer's line
+/// ([`crate::ask_keys`]); `hi`: an option is highlighted (Enter takes it).
+pub(crate) fn how_keys(doc: &CardDoc, hi: bool) -> String {
+    let n = doc.options.len();
+    let digits = match n {
+        0 => None,
+        1 => Some("1 picks".to_string()),
+        n => Some(format!("1–{} pick", n.min(9))),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    match doc.mode() {
+        Mode::Quick => {
+            if hi {
+                parts.push("Enter answers".into());
+            }
+            parts.extend(digits);
+        }
+        Mode::Form => {
+            parts.extend(digits);
+            if doc.multi || doc.fields.iter().any(|f| f.kind == FieldKind::Check) {
+                parts.push("Space ticks".into());
+            }
+            if !doc.fields.is_empty() {
+                parts.push("Tab moves".into());
+            }
+            parts.push("Enter sends".into());
+        }
+    }
+    parts.push("0 skips".into());
+    parts.push("Esc back to your message".into());
+    parts.join(" · ")
+}
+
+/// An entered card's ring: the user's bar down its left edge, and the
+/// probe whose paint in view activates its keys (and says it is still in
+/// view, each frame).
+fn ring(e: &crate::ask_keys::Entry, id: u64, p: &Palette) -> impl IntoElement {
+    let (shown, seen) = (e.shown.clone(), e.seen.clone());
+    div()
+        .absolute()
+        .inset_0()
+        .debug_selector(move || format!("ask-keys {id}"))
+        .child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(p.acc))
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, (), window, _| {
+                    let in_view = bounds.intersect(&window.content_mask().bounds);
+                    if in_view.size.width > px(0.) && in_view.size.height > px(0.) {
+                        // Activated: one more frame, for its first field to
+                        // fill to take the keys ([`AppView::sync_ask`]).
+                        if !shown.replace(true) {
+                            window.request_animation_frame();
+                        }
+                        seen.set(true);
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
 }
 
 /// What an answer says, whole: each pick, the note, then each field's
@@ -919,19 +1006,7 @@ impl AppView {
         }
         if whole(a) {
             let act = Painted::of(a).filter(|_| a.state == State::Open).zip(session.as_ref()).map(|(painted, _)| {
-                let why = match l.input_gate() {
-                    Err(e) => Some(read_only(e, l)),
-                    Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
-                    // Dropped events: the history in again, and the slot
-                    // said, first.
-                    Ok(()) if crate::deliver::recovering(&l.transcript) => {
-                        Some(session.as_deref().map_or(crate::deliver::RESYNCING, |s| self.model.memos.gap(s)).to_string())
-                    }
-                    // The live turn's alone: its controls wait for the
-                    // history to confirm its binding (Shady #81 P2-1).
-                    Ok(()) if !painted.confirmed(&l.transcript) => Some(crate::deliver::CONFIRMING.to_string()),
-                    Ok(()) => None,
-                };
+                let why = self.ask_why(&painted, session.as_deref());
                 Act { painted, pane, can: why.is_none(), line: why.or(said) }
             });
             return self.card(a, id, p, m, act.as_ref(), cx).into_any_element();
@@ -950,6 +1025,27 @@ impl AppView {
                 .into_any_element()
         } else {
             r.into_any_element()
+        }
+    }
+
+    /// Why the controls of the open card `painted` (of `session`) don't act
+    /// now, a click's or a key's alike, or `None`: read-only, a known
+    /// compaction, dropped events, or a binding the history hasn't
+    /// confirmed.
+    pub(crate) fn ask_why(&self, painted: &Painted, session: Option<&str>) -> Option<String> {
+        let l = &self.model.lives[self.panes.cur.live];
+        match l.input_gate() {
+            Err(e) => Some(read_only(e, l)),
+            Ok(()) if l.transcript.compacting() => Some(crate::deliver::COMPACTING.to_string()),
+            // Dropped events: the history in again, and the slot said,
+            // first.
+            Ok(()) if crate::deliver::recovering(&l.transcript) => {
+                Some(session.map_or(crate::deliver::RESYNCING, |s| self.model.memos.gap(s)).to_string())
+            }
+            // The live turn's alone: its controls wait for the history to
+            // confirm its binding (Shady #81 P2-1).
+            Ok(()) if !painted.confirmed(&l.transcript) => Some(crate::deliver::CONFIRMING.to_string()),
+            Ok(()) => None,
         }
     }
 
