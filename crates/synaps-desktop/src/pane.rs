@@ -1218,11 +1218,17 @@ impl crate::app::AppView {
         let evened = self.panes.tree.split_as(at, side, new).as_ref() != Some(&tree);
         self.panes.fly_split(&tree, at, side, new);
         // A split that evened out its row or column (`Node::split`): each
-        // pane lands where the tree puts it, the closing ones' shares still
-        // going to 0.
+        // pane lands where the tree puts it (the tree itself with no pane
+        // closing: ratios fitted to its rounded rects can lay a column out
+        // 1 px off, a second rewrap as it lands), the closing ones' shares
+        // still going to 0.
         if evened && let Some(f) = self.panes.flight.as_mut() {
             let (w, h) = area;
-            f.to = f.to.fitted(&tree.rects(crate::split::Rect { x: 0., y: 0., w, h }), &f.ghosts);
+            f.to = if f.ghosts.is_empty() && f.to.same_shape(&tree) {
+                tree.clone()
+            } else {
+                f.to.fitted(&tree.rects(crate::split::Rect { x: 0., y: 0., w, h }), &f.ghosts)
+            };
         }
         self.panes.tree = tree;
         self.panes.grab = None;
