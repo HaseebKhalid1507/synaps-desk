@@ -3,8 +3,12 @@
 //! format, an unreadable one, atomic and ordered writes, this user's only,
 //! a Forget no save undoes), off reading and writing nothing, and a card's
 //! recall fixed at first sight, for as long as it is open.
+//!
+//! Shady #93 round 2: a Forget not yet done, or whose removal failed,
+//! bars every load (no read: empty) until the file is confirmed gone, and
+//! the next save retries it first (R2 P2-1).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use cards_spec::{Answer, CardDoc, CardId, Choice, Reply};
@@ -487,4 +491,141 @@ fn the_setting_is_on_unless_false_or_off() {
     assert!(enabled(Some(&json!("on"))));
     assert!(!enabled(Some(&json!(false))));
     assert!(!enabled(Some(&json!("off"))));
+}
+
+/// What holds `path`'s removal back while it is kept, the file left there
+/// and readable: on Unix its folder made read-only, on Windows the file
+/// held open, shared for reading only.
+pub(crate) struct Held {
+    #[cfg(unix)]
+    dir: PathBuf,
+    #[cfg(windows)]
+    _file: std::fs::File,
+}
+
+pub(crate) fn held(path: &Path) -> Held {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = path.parent().expect("a folder").to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let held = Held { dir };
+        assert!(std::fs::File::create(held.dir.join(".probe")).is_err(), "a read-only folder holds nothing back (root?)");
+        held
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(path)
+            .expect("the file, held");
+        Held { _file: file }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+fn tag() -> Value {
+    json!({"question": "Tag the release?", "wait": true, "options": ["Tag it", "Not yet"]})
+}
+
+fn deploy() -> Value {
+    json!({"question": "Deploy to prod?", "wait": true, "options": ["Deploy", "Hold"]})
+}
+
+/// The file's choices, by key.
+fn on_file(path: &Path) -> Store {
+    Store::parse(&std::fs::read_to_string(path).expect("the file")).expect("readable").0
+}
+
+/// A Forget not yet done (Shady #93 R2 P2-1): Off then On, or a new
+/// memory of the same file, reads nothing back and starts empty; a choice
+/// made then, saved before or after the removal ran, is all the file and
+/// the memory hold. Once the file is confirmed gone, On reads it again.
+#[test]
+fn a_forget_not_yet_done_bars_every_load_whichever_lands_first() {
+    let (ship, tag, deploy) = (doc(ship()), doc(tag()), doc(deploy()));
+    for removal_first in [true, false] {
+        let d = dir(&format!("barred-{removal_first}"));
+        let path = d.join(super::FILE);
+        let mut r = Recall::new(true, Some(path.clone()));
+        assert!(r.remember(CWD, &ship, &one("Run it now")) && r.remember(CWD, &tag, &one("Tag it")));
+        let (p, g, t, s) = r.snapshot().unwrap();
+        assert!(save(&p, g, &t, &s).unwrap());
+        assert_eq!(on_file(&path).len(), 2);
+        // Accepted; its removal not run yet.
+        let (_, forget) = r.forget().unwrap();
+        r.set_on(false);
+        r.set_on(true);
+        assert_eq!((r.reads, r.len()), (1, 0), "on again before the removal ran: not read, empty");
+        let again = Recall::new(true, Some(path.clone()));
+        assert_eq!((again.reads, again.len()), (0, 0), "nor by a new memory of the file");
+        assert!(r.at(&sight("s", "toolu_f1"), Some(CWD), &ship, open).is_empty(), "a fresh card recalls nothing");
+        assert!(r.remember(CWD, &deploy, &one("Deploy")));
+        let (p, g, t, s) = r.snapshot().unwrap();
+        if removal_first {
+            remove(&path, forget).unwrap();
+            assert!(save(&p, g, &t, &s).unwrap());
+        } else {
+            assert!(save(&p, g, &t, &s).unwrap());
+            remove(&path, forget).unwrap();
+        }
+        let kept = on_file(&path);
+        assert_eq!(kept.len(), 1, "removal first: {removal_first}");
+        assert!(kept.get(&Asked::of(CWD, &deploy).unwrap().key).is_some(), "only what came after the Forget");
+        assert_eq!(r.len(), 1);
+        r.set_on(false);
+        r.set_on(true);
+        assert_eq!((r.reads, r.len()), (2, 1), "confirmed gone: read again, what came after only");
+        assert!(r.at(&sight("s", "toolu_f2"), Some(CWD), &ship, open).is_empty());
+        assert!(r.at(&sight("s", "toolu_f3"), Some(CWD), &tag, open).is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// A Forget whose removal failed (Shady #93 R2 P2-1): the file, still
+/// there with what was forgotten, is never read back (On, a new memory of
+/// it); the next save retries the removal first and writes nothing while
+/// it fails; once it succeeds, the file holds only what came after, and
+/// On reads again.
+#[test]
+fn a_failed_removal_bars_every_load_and_the_next_save_retries_it() {
+    let (ship, tag, deploy) = (doc(ship()), doc(tag()), doc(deploy()));
+    let d = dir("barred-failed");
+    let path = d.join(super::FILE);
+    let mut r = Recall::new(true, Some(path.clone()));
+    assert!(r.remember(CWD, &ship, &one("Run it now")) && r.remember(CWD, &tag, &one("Tag it")));
+    let (p, g, t, s) = r.snapshot().unwrap();
+    assert!(save(&p, g, &t, &s).unwrap());
+    let hold = held(&path);
+    let (_, forget) = r.forget().unwrap();
+    assert!(remove(&path, forget).is_err(), "held back: not removed");
+    r.set_on(false);
+    r.set_on(true);
+    assert_eq!((r.reads, r.len()), (1, 0), "failed: not read back, empty");
+    assert_eq!(Recall::new(true, Some(path.clone())).reads, 0, "nor by a new memory of the file");
+    assert!(r.remember(CWD, &deploy, &one("Deploy")));
+    let (p, g, t, s) = r.snapshot().unwrap();
+    assert!(save(&p, g, &t, &s).is_err(), "the save retries the removal first: still held back, nothing written");
+    assert_eq!(on_file(&path).len(), 2, "the forgotten file, untouched and unread");
+    drop(hold);
+    let (p, g, t, s) = r.snapshot().unwrap();
+    assert!(save(&p, g, &t, &s).unwrap(), "retried: removed, then written");
+    let kept = on_file(&path);
+    assert_eq!(kept.len(), 1);
+    assert!(kept.get(&Asked::of(CWD, &deploy).unwrap().key).is_some());
+    r.set_on(false);
+    r.set_on(true);
+    assert_eq!((r.reads, r.len()), (2, 1), "confirmed gone: read again");
+    let _ = std::fs::remove_dir_all(d);
 }

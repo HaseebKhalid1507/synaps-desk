@@ -51,9 +51,14 @@
 //!   memory and removes the file. Accepted at the click, it runs to its
 //!   end on a task of its own: after a save already writing, never undone
 //!   by an older save, Off or a closed window ([`accept_forget`],
-//!   [`remove`]). Settings offers it while anything may be there, and
-//!   says so if the removal failed. It is this desk process's: another
-//!   one running keeps what it read, and may write it back.
+//!   [`remove`]). Until the file is confirmed gone
+//!   (removed, or replaced by a save made after it), the process holds a
+//!   barrier ([`barred`]): no load reads the file (On, a new memory of
+//!   it: they start empty), and a removal that failed is retried at the
+//!   next load or save, before anything else. Settings offers it while
+//!   anything may be there, and says so if the removal failed. It is this
+//!   desk process's: another one running keeps what it read, and may write
+//!   it back.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -258,10 +263,19 @@ fn next_generation() -> u64 {
 /// snapshot that comes after a newer one does nothing.
 static WRITTEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Mutex::default);
 
+/// A file's newest Forget: its number, and whether the file is confirmed
+/// gone since (removed, or replaced by a save numbered after it).
+#[derive(Clone, Copy, Debug)]
+struct Forgot {
+    at: u64,
+    gone: bool,
+}
+
 /// Per file, the newest Forget accepted: a save numbered before it never
-/// writes, whenever it runs. Held only for a look, never across a write:
-/// the UI thread raises it at the click, never waiting on the disk.
-static FORGOTTEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Mutex::default);
+/// writes, whenever it runs; until its file is confirmed gone, no load
+/// reads it. Held only for a look, never across a write: the UI thread
+/// raises it at the click, never waiting on the disk.
+static FORGOTTEN: LazyLock<Mutex<HashMap<PathBuf, Forgot>>> = LazyLock::new(Mutex::default);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -272,20 +286,47 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// cancelled too late; its removal ([`remove`]) runs after a save already
 /// writing.
 pub(crate) fn accept_forget(path: &Path) -> u64 {
-    let generation = next_generation();
     let mut f = lock(&FORGOTTEN);
-    let at = f.entry(path.to_path_buf()).or_default();
-    *at = (*at).max(generation);
+    // Numbered under the lock: a save numbered after it sees it.
+    let generation = next_generation();
+    f.insert(path.to_path_buf(), Forgot { at: generation, gone: false });
     generation
+}
+
+/// The Forget of `path` not yet confirmed done (pending, or its removal
+/// failed): its number. While there is one, no load reads the file.
+pub(crate) fn barred(path: &Path) -> Option<u64> {
+    lock(&FORGOTTEN).get(path).filter(|f| !f.gone).map(|f| f.at)
+}
+
+/// Forget `generation`'s file is gone: unless a newer Forget came since,
+/// loads read it again.
+fn confirm(path: &Path, generation: u64) {
+    if let Some(f) = lock(&FORGOTTEN).get_mut(path)
+        && f.at == generation
+    {
+        f.gone = true;
+    }
+}
+
+/// The file at `path` removed (one gone already: done). The caller holds
+/// the write lock.
+fn clear(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Write snapshot `generation` to `path` (true), unless memory was turned
 /// off before it began (`stop`), a Forget came after it, or a newer
-/// snapshot is there (false). Atomic: a new temporary file of this
-/// process beside it, this user's only ([`create_private`]), synced,
-/// renamed over it (and on Unix the folder synced); the temporary file
-/// never outlives a failure. One write at a time. Off the UI thread
-/// ([`AppView::save_recall`]).
+/// snapshot is there (false). A Forget before it not yet confirmed done
+/// (pending, or its removal failed) is done first: the file removed
+/// ([`clear`]), or nothing is written (its error). Atomic: a new
+/// temporary file of this process beside it, this user's only
+/// ([`create_private`]), synced, renamed over it (and on Unix the folder
+/// synced); the temporary file never outlives a failure. One write at a
+/// time. Off the UI thread ([`AppView::save_recall`]).
 pub(crate) fn save(path: &Path, generation: u64, text: &str, stop: &AtomicBool) -> std::io::Result<bool> {
     save_then(path, generation, text, stop, || {})
 }
@@ -295,9 +336,15 @@ pub(crate) fn save(path: &Path, generation: u64, text: &str, stop: &AtomicBool) 
 pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicBool, between: impl FnOnce()) -> std::io::Result<bool> {
     use std::io::Write as _;
     let mut written = lock(&WRITTEN);
-    let forgotten = lock(&FORGOTTEN).get(path).is_some_and(|f| *f > generation);
-    if forgotten || stop.load(Ordering::SeqCst) || written.get(path).is_some_and(|g| *g >= generation) {
+    let forgot = lock(&FORGOTTEN).get(path).copied();
+    if forgot.is_some_and(|f| f.at > generation) || stop.load(Ordering::SeqCst) || written.get(path).is_some_and(|g| *g >= generation) {
         return Ok(false);
+    }
+    if let Some(f) = forgot.filter(|f| !f.gone) {
+        clear(path)?;
+        let w = written.entry(path.to_path_buf()).or_default();
+        *w = (*w).max(f.at);
+        confirm(path, f.at);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -327,20 +374,19 @@ pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicB
     Ok(true)
 }
 
-/// Remove the file at `path`: Forget `generation`'s removal. After a save
-/// already writing (the lock), never cancelled (its task is its own). A
-/// snapshot newer than the Forget already there is left: it holds only
-/// what was chosen after it.
+/// Remove the file at `path` ([`clear`]): Forget `generation`'s removal,
+/// or its retry. After a save already writing (the
+/// lock), never cancelled (its task is its own). A snapshot newer than the
+/// Forget already there is left: it holds only what was chosen after it.
+/// Done, the file is confirmed gone ([`barred`] no more); failed, the
+/// barrier stays.
 pub(crate) fn remove(path: &Path, generation: u64) -> std::io::Result<()> {
     let mut written = lock(&WRITTEN);
-    if written.get(path).is_some_and(|g| *g >= generation) {
-        return Ok(());
+    if !written.get(path).is_some_and(|g| *g >= generation) {
+        clear(path)?;
+        written.insert(path.to_path_buf(), generation);
     }
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    written.insert(path.to_path_buf(), generation);
+    confirm(path, generation);
     Ok(())
 }
 
@@ -376,6 +422,14 @@ pub(crate) type Sight = (String, String, CardId);
 /// ([`Recall::at`]).
 const SWEEP: usize = 64;
 
+/// The disk work a load leaves for a task ([`AppView::tidy_recall`]): a
+/// Forget not yet confirmed done (`retry`, its number) retried.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Tidy {
+    pub(crate) path: PathBuf,
+    pub(crate) retry: Option<u64>,
+}
+
 /// The window's memory of card choices.
 pub(crate) struct Recall {
     on: bool,
@@ -410,6 +464,8 @@ pub(crate) struct Recall {
     forgot: u64,
     /// Why the last Forget could not remove the file, until one does.
     pub(crate) failed: Option<String>,
+    /// What the last load left to do on the disk.
+    tidy: Option<Tidy>,
 }
 
 impl Recall {
@@ -430,6 +486,7 @@ impl Recall {
             saved: 0,
             forgot: 0,
             failed: None,
+            tidy: None,
         };
         if on {
             r.load();
@@ -437,12 +494,26 @@ impl Recall {
         r
     }
 
+    /// Read the file, unless a Forget of it is not yet confirmed done: then
+    /// nothing is read (empty), and its removal is retried ([`Tidy`]).
     fn load(&mut self) {
-        let Some(path) = self.path.as_deref() else { return };
-        self.reads += 1;
-        let there;
-        (self.store, self.said, there) = read(path);
-        self.on_disk |= there;
+        let Some(path) = self.path.clone() else { return };
+        let retry = barred(&path);
+        if let Some(at) = retry {
+            self.forgot = self.forgot.max(at);
+            log::info!(target: "synaps_desktop::card", "card choices {}: a Forget not yet done; not read, starting empty", path.display());
+        } else {
+            self.reads += 1;
+            let there;
+            (self.store, self.said, there) = read(&path);
+            self.on_disk |= there;
+        }
+        self.tidy = Some(Tidy { path, retry });
+    }
+
+    /// What the last load left to do on the disk, taken.
+    pub(crate) fn take_tidy(&mut self) -> Option<Tidy> {
+        self.tidy.take()
     }
 
     pub(crate) fn on(&self) -> bool {
@@ -462,9 +533,10 @@ impl Recall {
         !self.on || !self.store.is_empty() || self.on_disk || self.failed.is_some()
     }
 
-    /// Turned on (the file read) or off (what was read let go, a save not
-    /// begun stopped; never a Forget). What open cards recalled stays:
-    /// one first seen off recalls nothing, on again too.
+    /// Turned on (the file read, unless a Forget is not yet done) or off
+    /// (what was read let go, a save not begun stopped, nothing left to do
+    /// on the disk; never a Forget). What open cards recalled stays: one
+    /// first seen off recalls nothing, on again too.
     pub(crate) fn set_on(&mut self, on: bool) {
         if on == self.on {
             return;
@@ -476,6 +548,7 @@ impl Recall {
             self.load();
         } else {
             self.save = None;
+            self.tidy = None;
             self.stop.store(true, Ordering::SeqCst);
             self.stop = Arc::default();
         }
@@ -549,6 +622,13 @@ impl Recall {
             }
             Err(why) => self.failed = Some(why),
         }
+    }
+
+    /// A save is done: if it confirmed the file gone (a Forget's removal
+    /// retried first), a failure said is no more (true: Settings changed).
+    pub(crate) fn saved(&mut self) -> bool {
+        let gone = self.path.as_deref().is_some_and(|p| barred(p).is_none());
+        gone && self.failed.take().is_some()
     }
 
     /// The file's next snapshot: its path, number and text, and what stops
@@ -634,21 +714,39 @@ impl AppView {
         }
     }
 
-    /// The memory's file, written as it stands off the UI thread.
+    /// The memory's file, written as it stands off the UI thread; Settings
+    /// hears if that removed a forgotten file a Forget couldn't.
     pub(crate) fn save_recall(&mut self, cx: &mut Context<Self>) {
         let Some((path, generation, text, stop)) = self.recall.snapshot() else { return };
         self.recall.writes += 1;
-        self.recall.save = Some(cx.background_spawn(async move {
+        let write = cx.background_spawn(async move {
             if let Err(e) = save(&path, generation, &text, &stop) {
                 log::warn!(target: "synaps_desktop::card", "card choices {}: not saved ({e})", path.display());
             }
+        });
+        self.recall.save = Some(cx.spawn(async move |this, cx| {
+            write.await;
+            let _ = this.update(cx, |v, cx| {
+                if v.recall.saved() {
+                    v.views_changed(cx);
+                }
+            });
         }));
+    }
+
+    /// What the last load left to do on the disk, off the UI thread: a
+    /// Forget not yet done retried (Settings hears how it went).
+    pub(crate) fn tidy_recall(&mut self, cx: &mut Context<Self>) {
+        if let Some(Tidy { path, retry: Some(generation) }) = self.recall.take_tidy() {
+            self.run_removal(path, generation, cx);
+        }
     }
 
     /// Settings' "Remember card choices": on or off, saved with THIS APP's
     /// keys.
     pub(crate) fn set_recall(&mut self, on: bool, cx: &mut Context<Self>) {
         self.recall.set_on(on);
+        self.tidy_recall(cx);
         cx.notify();
     }
 
@@ -663,6 +761,13 @@ impl AppView {
             cx.notify();
             return;
         };
+        self.run_removal(path, generation, cx);
+        cx.notify();
+    }
+
+    /// Forget `generation`'s removal of `path` (or its retry), to its end
+    /// on a task of its own; Settings hears how it went.
+    fn run_removal(&mut self, path: PathBuf, generation: u64, cx: &mut Context<Self>) {
         let removal = cx.background_spawn(async move {
             let done = remove(&path, generation);
             match &done {
@@ -679,10 +784,9 @@ impl AppView {
             });
         })
         .detach();
-        cx.notify();
     }
 }
 
 #[cfg(test)]
 #[path = "recall_tests.rs"]
-mod tests;
+pub(crate) mod tests;

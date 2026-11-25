@@ -16,6 +16,10 @@
 //! while it is open, the setting turned, past 1,024 other cards, in two
 //! panes on its session (P2-2).
 //!
+//! Shady #93 round 2: On before a Forget is done, or after its removal
+//! failed, reads nothing back; the retry, at On or at the next save,
+//! removes it (R2 P2-1).
+//!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
 //! are D2a's and D2b's ([`super::answer_tests`], [`super::keys_tests`]).
@@ -897,4 +901,147 @@ fn two_panes_on_one_session_keep_one_recall(cx: &mut TestAppContext) {
     press(cx, w, "ctrl-j");
     assert!(entered(cx, w, a1));
     assert_eq!(hi(cx, &view), Some(1), "entered there: on it too");
+}
+
+/// The doc `input` asks, and its answer `values`.
+fn answered(input: &Value, values: Value) -> (std::sync::Arc<cards_spec::CardDoc>, cards_spec::Reply) {
+    let doc = painted(input, "toolu_any", "c0any00").doc;
+    let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &values).unwrap());
+    (doc, reply)
+}
+
+fn tag_input() -> Value {
+    json!({"question": "Tag the release?", "wait": true, "options": ["Tag it", "Not yet"]})
+}
+
+fn deploy_input() -> Value {
+    json!({"question": "Deploy to prod?", "wait": true, "options": ["Deploy", "Hold"]})
+}
+
+/// The file's keys.
+fn keys_on_file(path: &std::path::Path) -> Vec<String> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("the file")).expect("JSON");
+    v["choices"].as_array().expect("choices").iter().map(|e| e["key"].as_str().unwrap().to_string()).collect()
+}
+
+/// The session on screen's folder.
+fn folder(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].cwd().expect("its folder").to_string())
+}
+
+/// `input`'s question in `cwd`, as the file keys it.
+fn key_of(cwd: &str, input: &Value) -> String {
+    crate::recall::Asked::of(cwd, &painted(input, "toolu_any", "c0any00").doc).unwrap().key
+}
+
+/// Two questions remembered and on file: the ship card answered through
+/// the chat, and the tag question's choice; the file's path.
+fn two_on_file(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, card: &str, input: &Value, name: &str) -> PathBuf {
+    let path = remembering(cx, view, name);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    reached(cx, w, view, &message(card, input, json!({"choice": "Run it now"})));
+    let (doc, reply) = answered(&tag_input(), json!({"choice": "Tag it"}));
+    view.update(cx, |v, cx| {
+        let cwd = v.model.lives[v.panes.cur.live].cwd().unwrap().to_string();
+        assert!(v.recall.remember(&cwd, &doc, &reply));
+        v.save_recall(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(keys_on_file(&path).len(), 2);
+    path
+}
+
+/// Forget, then Off and On before its removal ran (Shady #93 R2 P2-1): On
+/// reads nothing back and starts empty, a fresh card recalls nothing, and
+/// a choice made then is all the file and the memory hold once the
+/// removal and its save have run.
+#[gpui_kit::test]
+fn on_before_a_forget_is_done_reads_nothing_back(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_x1", "c1xxx01", &input);
+    let path = two_on_file(cx, w, &view, "c1xxx01", &input, "forget-on");
+    let r0 = reads(cx, &view);
+    let (doc, reply) = answered(&deploy_input(), json!({"choice": "Deploy"}));
+    view.update(cx, |v, cx| {
+        v.forget_card_choices(cx);
+        v.settings_pick(Pick::Remember, "off", cx);
+        v.settings_pick(Pick::Remember, "on", cx);
+        assert_eq!((v.recall.reads, v.recall.len()), (r0, 0), "on before the removal ran: not read, empty");
+        assert!(v.recalled(&painted(&input, "toolu_x2", "c2xxx02")).is_empty(), "a fresh card recalls nothing");
+        let cwd = v.model.lives[v.panes.cur.live].cwd().unwrap().to_string();
+        assert!(v.recall.remember(&cwd, &doc, &reply));
+        v.save_recall(cx);
+    });
+    cx.run_until_parked();
+    let cwd = folder(cx, &view);
+    assert_eq!(keys_on_file(&path), vec![key_of(&cwd, &deploy_input())], "only what came after the Forget");
+    assert_eq!(kept(cx, &view).0, 1);
+    let id = asks_again(cx, w, &view, "toolu_x3", "c3xxx03", &input);
+    assert!(marked(cx, w, id).is_empty(), "forgotten");
+}
+
+/// A Forget whose removal failed (Shady #93 R2 P2-1): Off and On read
+/// nothing back (the file still there, readable), start empty and retry
+/// the removal; while it fails Settings says so; once it succeeds the file
+/// is gone and Settings says nothing more.
+#[gpui_kit::test]
+fn a_failed_forget_is_retried_at_on_and_never_read_back(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_y1", "c1yyy01", &input);
+    let path = two_on_file(cx, w, &view, "c1yyy01", &input, "forget-fails-on");
+    let hold = crate::recall::tests::held(&path);
+    settings(cx, w, &view);
+    click_forget(cx, w);
+    assert!(path.exists() && has(cx, w, "recall-failed".into()), "held back: not removed, said");
+    let r0 = reads(cx, &view);
+    let toggle = |cx: &mut TestAppContext| {
+        view.update(cx, |v, cx| {
+            v.settings_pick(Pick::Remember, "off", cx);
+            v.settings_pick(Pick::Remember, "on", cx);
+        });
+        cx.run_until_parked();
+        settle(cx, w, 8);
+    };
+    toggle(cx);
+    assert_eq!((reads(cx, &view), kept(cx, &view).0), (r0, 0), "on again: not read back, empty");
+    assert_eq!(keys_on_file(&path).len(), 2, "the file, still there");
+    assert!(has(cx, w, "recall-failed".into()), "the retry failed too: still said");
+    drop(hold);
+    toggle(cx);
+    assert!(!path.exists(), "on again: the retry removed it");
+    assert_eq!((reads(cx, &view), kept(cx, &view).0), (r0, 0));
+    assert!(!has(cx, w, "recall-failed".into()), "nothing more to say");
+}
+
+/// A Forget whose removal failed, then a choice confirmed (Shady #93 R2
+/// P2-1): its save retries the removal first; the file then holds only
+/// that choice, and Settings no longer says the removal failed.
+#[gpui_kit::test]
+fn a_failed_forget_is_retried_by_the_next_save(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_z1", "c1zzz01", &input);
+    let path = two_on_file(cx, w, &view, "c1zzz01", &input, "forget-fails-save");
+    let hold = crate::recall::tests::held(&path);
+    settings(cx, w, &view);
+    click_forget(cx, w);
+    assert!(path.exists() && has(cx, w, "recall-failed".into()));
+    drop(hold);
+    let (doc, reply) = answered(&deploy_input(), json!({"choice": "Deploy"}));
+    view.update(cx, |v, cx| {
+        let cwd = v.model.lives[v.panes.cur.live].cwd().unwrap().to_string();
+        assert!(v.recall.remember(&cwd, &doc, &reply));
+        v.save_recall(cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let cwd = folder(cx, &view);
+    assert_eq!(keys_on_file(&path), vec![key_of(&cwd, &deploy_input())], "only what came after the Forget");
+    assert!(!has(cx, w, "recall-failed".into()), "removed by the save's retry: nothing more to say");
+    let r0 = reads(cx, &view);
+    view.update(cx, |v, cx| {
+        v.settings_pick(Pick::Remember, "off", cx);
+        v.settings_pick(Pick::Remember, "on", cx);
+    });
+    assert_eq!((reads(cx, &view), kept(cx, &view).0), (r0 + 1, 1), "confirmed gone: read again");
 }
