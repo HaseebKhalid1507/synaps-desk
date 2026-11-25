@@ -556,6 +556,9 @@ pub(crate) enum Family {
     Unread,
     /// Opening: the one state that is yours (the accent).
     Open,
+    /// An agent card open (ASKED, D3): the accent's mark, as the open
+    /// card's own dot ([`crate::ask`]).
+    Ask,
     /// The composer foot's READY.
     Ready,
 }
@@ -580,6 +583,8 @@ pub(crate) fn ink(f: Family, g: Ground, p: &Palette) -> (Hsla, Hsla) {
     use Family as F;
     use Ground as G;
     match (g, f) {
+        (G::Canvas, F::Ask) => (p.dim, p.focus),
+        (G::Card, F::Ask) => (p.dim_k, p.focus_k),
         (G::Canvas, F::Run) => (p.run, p.run_mark),
         (G::Canvas, F::Warn) => (p.warn, p.warn_mark),
         (G::Canvas, F::Err) => (p.err, p.err),
@@ -597,7 +602,7 @@ pub(crate) fn ink(f: Family, g: Ground, p: &Palette) -> (Hsla, Hsla) {
         (G::User, F::Ok) => (p.ok, p.ok),
         (G::User, F::Ready) => (p.ready, p.ready),
         // The word is the hint's ("opening…"); `you` is not floored on `user`.
-        (G::User, F::Open) => (p.dim_u, p.you_mark),
+        (G::User, F::Open | F::Ask) => (p.dim_u, p.you_mark),
         (G::User, _) => (p.dim_u, p.dim_u),
         (G::Chrome, F::Run) => (p.run_ch, p.run_mark_ch),
         (G::Chrome, F::Warn) => (p.warn_ch, p.warn_mark_ch),
@@ -605,7 +610,7 @@ pub(crate) fn ink(f: Family, g: Ground, p: &Palette) -> (Hsla, Hsla) {
         (G::Chrome, F::Ok) => (p.ok_ch, p.ok_ch),
         (G::Chrome, F::Rest) => (p.dim_ch, p.rest_mark),
         (G::Chrome, F::Unread) => (p.unread_ch, p.unread_mark_ch),
-        (G::Chrome, F::Open) => (p.open_ch, p.focus_ch),
+        (G::Chrome, F::Open | F::Ask) => (p.open_ch, p.focus_ch),
         (G::Chrome, F::Ready) => (p.ready_ch, p.ready_mark_ch),
         (G::Card, F::Run) => (p.run_k, p.run_mark_k),
         (G::Card, F::Warn) => (p.warn_k, p.warn_mark),
@@ -622,6 +627,7 @@ pub(crate) fn session(st: State) -> (Option<Glyph>, Family) {
     match st {
         State::NeedsYou => (Some(Glyph::Needs), Family::Warn),
         State::Running => (Some(Glyph::Run), Family::Run),
+        State::Asked => (Some(Glyph::Needs), Family::Ask),
         State::Workers => (Some(Glyph::Workers), Family::Run),
         State::Unread => (Some(Glyph::Unread), Family::Unread),
         State::Idle => (Some(Glyph::Idle), Family::Rest),

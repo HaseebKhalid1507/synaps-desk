@@ -839,6 +839,12 @@ impl AppView {
         let n = self.model.attention().count();
         let first = self.model.ticker();
         let jump_to = self.model.jump_target().map(str::to_string);
+        // The card whose question JUMP's session shows (D3): its binding,
+        // as painted, is the one a click goes to.
+        let jump_card = jump_to
+            .as_deref()
+            .and_then(|id| self.model.presence.cards().iter().find(|c| c.live && c.wait && c.session == id))
+            .map(crate::presence::Open::key);
         let what: Option<SharedString> = first.map(|s| {
             // The prompt of the store that holds that session (Shady #36 L6:
             // never this pane's for another pane's session).
@@ -849,6 +855,9 @@ impl AppView {
                 // Built once per prompt, with the card (`sync_card` ran first).
                 let card = self.current_card().filter(|_| l == self.panes.cur.live).map(|c| c.gist.clone());
                 card.unwrap_or_else(|| prompt_gist(&pr.title, &pr.prompt).into())
+            } else if let Some(c) = self.model.presence.cards().iter().find(|c| c.live && c.wait && c.session == s.id) {
+                // An agent card waits there (D3): its question.
+                c.question.clone().into()
             } else {
                 s.title.clone().filter(|t| !t.is_empty() && s.name.is_some()).unwrap_or_default().into()
             }
@@ -951,7 +960,14 @@ impl AppView {
                         size::META,
                         p.prose_ch,
                     )))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // Only a card waits there: to the card it shows (D3).
+                        let prompts = this.model.sessions.iter().find(|s| s.id == id).is_some_and(|s| s.awaiting_input > 0);
+                        if let Some(k) = jump_card.clone().filter(|_| !prompts)
+                            && this.go_to_card(k, window, cx)
+                        {
+                            return;
+                        }
                         for fx in this.model.open_row(&RowAction::Attach(id.clone())) {
                             this.effect(fx);
                         }
@@ -1949,7 +1965,7 @@ impl AppView {
         let gone = row.gone && meta.is_none();
         let title_color = match st {
             _ if gone => p.dim_ch,
-            State::NeedsYou | State::Running | State::Workers | State::Unread => p.ink,
+            State::NeedsYou | State::Running | State::Asked | State::Workers | State::Unread => p.ink,
             _ if shown => p.ink,
             State::Parked | State::Locked => p.dim_ch,
             _ if row.fresh => p.dim_ch,

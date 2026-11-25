@@ -86,6 +86,10 @@ pub mod label {
     pub const NEED_YOU: &str = "N E E D   Y O U";
     /// An agent card's head ([`crate::ask`]).
     pub const QUESTION: &str = "Q U E S T I O N";
+    /// A session with an agent card open (D3: the rail, its tab).
+    pub const ASKED: &str = "A S K E D";
+    /// The palette's open cards (D3).
+    pub const WAITING: &str = "W A I T I N G";
     pub const JUMP: &str = "J U M P";
     pub const SYSTEMS: &str = "S Y S T E M S";
     pub const CONTEXT: &str = "C O N T E X T";

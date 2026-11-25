@@ -22,15 +22,19 @@ use crate::model::Model;
 use crate::named::{ResumeRequest, RowAction, home_short, parse_rfc3339, relative, short_model};
 
 /// What a row is doing. Precedence, first match wins: OPENING › NEEDS YOU ›
-/// RUNNING › WORKERS › LOCKED › UNREAD › IDLE › PARKED › SAVED.
+/// RUNNING › ASKED › WORKERS › LOCKED › UNREAD › IDLE › PARKED › SAVED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum State {
     /// A resume or an attach is on its way (the client's own).
     Opening,
-    /// `awaiting_input > 0`: a question, a secret or a tool confirmation.
+    /// `awaiting_input > 0`: a question, a secret or a tool confirmation;
+    /// or an agent card the agent waits on (an attached session's, D3).
     NeedsYou,
     /// `busy`: a turn or a compaction.
     Running,
+    /// Its turn over, an agent card open (not waited on): an attached
+    /// session's (D3, [`crate::presence`]).
+    Asked,
     /// Not busy, background workers (subagents) still running: never
     /// IDLE ([`crate::model::Model::workers`]).
     Workers,
@@ -54,6 +58,7 @@ impl State {
             State::Opening => Some(label::OPENING),
             State::NeedsYou => Some(label::NEEDS_YOU),
             State::Running => Some(label::RUNNING),
+            State::Asked => Some(label::ASKED),
             State::Workers => Some(label::WORKERS),
             State::Locked => Some(label::LOCKED),
             State::Unread => Some(label::UNREAD),
@@ -67,6 +72,7 @@ impl State {
             State::Opening => "opening",
             State::NeedsYou => "needs you",
             State::Running => "running",
+            State::Asked => "asked",
             State::Workers => "workers running",
             State::Locked => "locked",
             State::Unread => "unread",
@@ -864,9 +870,16 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
         State::Opening => ("opening".to_string(), "attach sent, waiting for the daemon".to_string()),
         State::NeedsYou => {
             let n = m.lives.on(&s.id).map_or(s.awaiting_input, |l| l.transcript.pending_prompts().len());
+            let cards = m.presence.of(&s.id).wait;
             let turn = if age.is_empty() { String::new() } else { format!(" · turn began {age} ago") };
-            ("needs you".into(), format!("{}{turn}", plural(n.max(1), "prompt", "prompts")))
+            let what = match (n, cards) {
+                (0, c) => plural(c.max(1), "card waits on you", "cards wait on you"),
+                (n, 0) => plural(n, "prompt", "prompts"),
+                (n, c) => format!("{} · {}", plural(n, "prompt", "prompts"), plural(c, "card", "cards")),
+            };
+            ("needs you".into(), format!("{what}{turn}"))
         }
+        State::Asked => ("asked".into(), plural(m.presence.of(&s.id).asked, "card open", "cards open")),
         State::Workers => {
             let n = m.workers(s);
             let idle = if age.is_empty() { String::new() } else { format!(" · idle {age}") };

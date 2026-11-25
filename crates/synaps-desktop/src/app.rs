@@ -103,7 +103,7 @@ pub(crate) const NEW_SESSION: &str = "New session";
 /// numbers, and everything the list built from them (rows, folds, measured
 /// heights and scroll position).
 pub(crate) struct TabCache {
-    transcript: Transcript,
+    pub(crate) transcript: Transcript,
     pub(crate) stats: Stats,
     rows: Vec<RowCache>,
     disp: Vec<Disp>,
@@ -2259,6 +2259,8 @@ pub struct AppView {
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
+    /// Open agent cards across sessions (D3): a jump's landing.
+    pub(crate) lookout: crate::presence::Lookout,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
     /// The right panel's cache countdown: its next redraw (or status ask),
@@ -2905,6 +2907,7 @@ impl AppView {
             chip_bounds: Default::default(),
             view_seen: None,
             window_active: true,
+            lookout: Default::default(),
             watch_poll: None,
             warm_tick: None,
             visible: i.visible,
@@ -3012,6 +3015,8 @@ impl AppView {
         // waits on it.
         self.cards_moved(cx);
         self.arm_card_tick(cx);
+        // Open cards across sessions: the rail, the tabs (D3).
+        self.sync_presence(cx);
         // An idle daemon's poll changes nothing: no frame, unless
         // the rail's ages have a new minute to show.
         if self.model.view_dirty || self.rail.minute() != crate::chrome::now_secs() / 60 {
@@ -9100,6 +9105,8 @@ impl AppView {
             self.panes.cur.jump_card = None;
             self.reveal_card(window, cx);
         }
+        // Ctrl+Shift+J, WAITING, a tab dot: its card (D3).
+        self.land_card(window, cx);
         // Seen every frame while attached, shown or not: a card that comes
         // back (from a worker's view, Settings) is not new; another
         // session's, or one a reconnect brings again, is history (the
@@ -9623,6 +9630,8 @@ impl Render for AppView {
             let me = cx.entity();
             crate::pane::pane_script(&me, how, window, cx);
         }
+        // Open cards across sessions (D3): a tab closed or left since.
+        self.sync_presence(cx);
         // Every pane's state first: the focused one's, then the others'
         // (each as the pane acted on).
         self.pane_sync(window, cx);
@@ -10125,6 +10134,16 @@ impl Render for AppView {
                 }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, input_now(), ev.is_held);
+                // Ctrl+Shift+J: the first waiting card in any open session (D3);
+                // not while a field composes (the IME's keys).
+                if crate::presence::is_jump(&ev.keystroke)
+                    && !ev.is_held
+                    && !this.composing_now(window, cx)
+                    && this.jump_waiting(window, cx)
+                {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
                 // or another pane's (split.md §7).
                 let m = &ev.keystroke.modifiers;
