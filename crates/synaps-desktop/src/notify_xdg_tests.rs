@@ -62,11 +62,14 @@ fn to(m: &Message) -> String {
     m.header().destination().map(|x| x.to_string()).unwrap_or_default()
 }
 
+/// `Notify`'s arguments: app, replaces, icon, summary, body, actions,
+/// hints, timeout.
+type NotifyArgs = (String, u32, String, String, String, Vec<String>, HashMap<String, zbus::OwnedVariant>, i32);
+
 /// `Notify`'s body: its summary and body text.
 fn notify_text(m: &Message) -> (String, String) {
     let b = m.body();
-    let (_, _, _, title, body, _, _, _): (String, u32, String, String, String, Vec<String>, HashMap<String, zbus::OwnedVariant>, i32) =
-        b.deserialize().expect("Notify's body");
+    let (_, _, _, title, body, _, _, _): NotifyArgs = b.deserialize().expect("Notify's body");
     (title, body)
 }
 
@@ -246,7 +249,7 @@ fn a_restart_reuses_ids_and_nothing_crosses_over(cx: &mut TestAppContext) {
     assert!(clicks(&rx).is_empty(), "wrong sender, wrong path: ignored");
     s.clicked(1, ":1.10");
     spin(cx);
-    assert_eq!(clicks(&rx), [t1.clone()], "A's click on A's id");
+    assert_eq!(clicks(&rx), std::slice::from_ref(&t1), "A's click on A's id");
     // A restarts as B, which counts from 1 again and reads no markup.
     s.owned(None);
     s.owned(Some(":1.11"));
@@ -275,7 +278,7 @@ fn a_restart_reuses_ids_and_nothing_crosses_over(cx: &mut TestAppContext) {
     s.clicked(1, ":1.10");
     s.clicked(1, ":1.11");
     spin(cx);
-    assert_eq!(clicks(&rx), [t2.clone()], "only B's click on B's id");
+    assert_eq!(clicks(&rx), [t2], "only B's click on B's id");
     // A reply from someone else to a call out: ignored. B hands over to C
     // while t3's Notify is out at B; C's capabilities are answered first by
     // an impostor.
@@ -356,7 +359,7 @@ fn a_signal_flood_while_a_call_waits(cx: &mut TestAppContext) {
     assert!(done.load(Ordering::SeqCst), "the reader got through 300 signals to the reply");
     s.clicked(7, ":1.10");
     spin(cx);
-    assert_eq!(clicks(&rx), [t1.clone()], "the reply was read: id 7 is t1's");
+    assert_eq!(clicks(&rx), [t1], "the reply was read: id 7 is t1's");
     s.hold = false;
     post(cx, &mut n, 2, "second?");
     let calls = s.serve(cx);
