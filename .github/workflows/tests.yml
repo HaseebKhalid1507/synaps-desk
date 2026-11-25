@@ -148,7 +148,10 @@ jobs:
         shell: bash
         run: |
           mkdir report
-          f=$(find "$RUNNER_TEMP/run" target -path '*nextest/ci/junit.xml' 2>/dev/null | head -n 1)
+          # A search root may be missing after an early failure: `find`
+          # then fails, and under `-e -o pipefail` the step would exit
+          # before writing the marker (Shady #87).
+          f=$(find "$RUNNER_TEMP/run" target -path '*nextest/ci/junit.xml' 2>/dev/null | head -n 1 || true)
           if [ -z "$f" ]; then
             echo "attempt ${{ github.run_attempt }} wrote no JUnit file" > report/no-junit
             exit 1
