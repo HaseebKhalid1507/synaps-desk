@@ -10109,11 +10109,13 @@ impl Render for AppView {
                 // Every key: an entered agent card's act on new presses only.
                 this.ask_presses.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
-                // or another pane's (split.md §7).
+                // or another pane's (split.md §7). Not mid IME composition,
+                // which owns every key (D2b).
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "j"
                     && m.control
                     && !(m.alt || m.shift || m.platform || m.function)
+                    && !this.ime_composing(window, cx)
                     && (!this.model.lives[this.panes.cur.live].transcript.pending_prompts().is_empty()
                         || this.waiting_pane().is_some()
                         || this.ask_waits()

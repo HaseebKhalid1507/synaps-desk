@@ -4,7 +4,8 @@
 //! the keys §7 counts; §7's negative tests (digits in a field, an IME
 //! composition, a key repeat, a key before the card was painted, a mouse
 //! answer inside a batch), each sending nothing; and the keys never
-//! resolve a prompt, nor does Esc deny one (§5.1).
+//! resolve a prompt, nor does Esc deny one (§5.1). And D3's way in,
+//! [`AppView::enter_card`]: one card, by its binding.
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`): exactly one `Submit` or `Steer`, its text and
@@ -14,7 +15,7 @@
 //!
 //! The window helpers are D2a's ([`super::answer_tests`]).
 
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, EntityInputHandler as _, Focusable as _, TestAppContext, VisualTestContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, EntityInputHandler, Focusable as _, TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 
 use super::answer_tests::{
@@ -67,6 +68,43 @@ fn press(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     up(cx, w, k);
     settle(cx, w, 8);
     std::thread::sleep(std::time::Duration::from_millis(40));
+}
+
+/// `events` heard, and drawn as they land (a test window draws when the
+/// update flushes), but no frame after: what a key meets at once.
+fn hear_now(cx: &mut TestAppContext, view: &Entity<AppView>, events: Vec<Value>) {
+    let (seq, sid) = attachment(cx, view);
+    view.update(cx, |v, cx| {
+        let batch = events
+            .into_iter()
+            .map(|e| {
+                let ev = synaps_client::protocol::decode_event(&e).unwrap_or_else(|err| panic!("{err}: {e}"));
+                synaps_client::Event::session(seq, sid.clone(), 0, ev, std::sync::Arc::new(e))
+            })
+            .collect();
+        v.apply_batch(batch, cx);
+    });
+    cx.run_until_parked();
+}
+
+/// The session's input is another client's (`other`), or this window's.
+fn owned(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, other: bool) {
+    view.update(cx, |v, cx| {
+        let a = v.model.lives[v.panes.cur.live].active.as_mut().unwrap();
+        a.input = if other { synaps_client::ClientInput::Exclusive } else { synaps_client::ClientInput::Shared };
+        a.owner = Some(if other { a.client + 1 } else { a.client });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+}
+
+/// D3's way in: `AppView::enter_card(session, binding)` on the card that
+/// call `tool` bound to card id `card`, as D3's chord or row would call it.
+fn enter_card(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, session: &str, tool: &str, card: &str) -> bool {
+    let b = crate::ask_keys::Binding { tool_id: tool.into(), card: cards_spec::CardId::parse(card).expect("a card id") };
+    let entered = cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.enter_card(session, &b, window, cx))).expect("the window");
+    settle(cx, w, 8);
+    entered
 }
 
 /// Text typed into whatever input has the keys.
@@ -633,12 +671,16 @@ fn an_entered_card_answered_elsewhere_hands_the_keys_back(cx: &mut TestAppContex
     press(cx, w, "ctrl-j");
     assert!(entered(cx, w, id));
     let text = message("c3kelse", &input, json!({"choice": "release"}));
-    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 44, "trigger": "user", "user_text": text})]);
+    // A key on the frame the answer lands: no frame between.
+    hear_now(cx, &view, vec![json!({"ev": "turn_started", "turn_baseline": 44, "trigger": "user", "user_text": text})]);
+    press(cx, w, "2");
+    assert!(sends(cx, &view).is_empty(), "the key at once: nothing sent");
+    assert_eq!(composer_text(cx, &view), "2", "the key at once: the composer's");
     assert!(!entered(cx, w, id), "answered elsewhere: no longer entered");
     assert_eq!(keys_at(cx, w, &view), (true, false));
     press(cx, w, "1");
     assert!(sends(cx, &view).is_empty());
-    assert_eq!(composer_text(cx, &view), "1");
+    assert_eq!(composer_text(cx, &view), "21");
 }
 
 /// The keys on a card this window can't answer (another client owns the
@@ -649,23 +691,14 @@ fn keys_on_a_card_this_window_cannot_answer_send_nothing(cx: &mut TestAppContext
     let (w, view, _events) = open(cx, crate::demo::ASKS);
     at_rest(cx, w, &view);
     let (ship, _) = card(cx, &view, SHIP);
-    let owned = |cx: &mut TestAppContext, other: bool| {
-        view.update(cx, |v, cx| {
-            let a = v.model.lives[v.panes.cur.live].active.as_mut().unwrap();
-            a.input = if other { synaps_client::ClientInput::Exclusive } else { synaps_client::ClientInput::Shared };
-            a.owner = Some(if other { a.client + 1 } else { a.client });
-            cx.notify();
-        });
-        settle(cx, w, 8);
-    };
-    owned(cx, true);
+    owned(cx, w, &view, true);
     press(cx, w, "ctrl-j");
     assert!(entered(cx, w, ship), "entered: its footer says why it can't be answered");
     for k in ["1", "enter", "0"] {
         press(cx, w, k);
     }
     assert!(sends(cx, &view).is_empty(), "read-only: nothing sent");
-    owned(cx, false);
+    owned(cx, w, &view, false);
     press(cx, w, "1");
     assert_eq!(texts(cx, &view), vec![message("c0p6r4n", &ship_input(), json!({"choice": "Run it now"}))]);
 }
@@ -721,4 +754,123 @@ fn ctrl_j_takes_the_focused_panes_card_first(cx: &mut TestAppContext) {
     press(cx, w, "ctrl-j");
     assert!(entered(cx, w, plan), "this pane's card");
     assert!(!entered(cx, w, ship), "not the other pane's, first in reading order");
+}
+
+/// A card scrolled out of view in a window at rest (a jump: one frame,
+/// nothing else animating) still hands the keys back: the frame that
+/// didn't paint it asks for one more, whose start ends the entry. A key
+/// after it is the composer's, never an answer to a card out of sight.
+#[gpui_kit::test]
+fn a_key_after_the_card_scrolled_away_at_rest_is_the_composers(cx: &mut TestAppContext) {
+    let input = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"]});
+    let (w, view, id, _events) = asked(cx, "toolu_kw", "c5kaway", &input);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    show(cx, w, &view, 0);
+    assert!(!has(cx, w, format!("ask-card {id}")), "out of view");
+    press(cx, w, "1");
+    assert!(sends(cx, &view).is_empty(), "nothing sent");
+    assert_eq!(composer_text(cx, &view), "1", "the composer's");
+}
+
+/// Read-only, a multi pick's keys change nothing either: no option ticks,
+/// as no click would (its controls have no listener then). Once the
+/// window can answer, a digit ticks, and Enter sends only that.
+#[gpui_kit::test]
+fn keys_on_a_read_only_multi_pick_tick_nothing(cx: &mut TestAppContext) {
+    let input = json!({"question": "Which suites?", "wait": true, "multi": true, "options": ["Unit", "Integration", "Load", "Chaos"]});
+    let (w, view, id, _events) = asked(cx, "toolu_kq", "c7kronl", &input);
+    owned(cx, w, &view, true);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    press(cx, w, "1");
+    press(cx, w, "2");
+    press(cx, w, "enter");
+    assert!(sends(cx, &view).is_empty(), "read-only: nothing sent");
+    owned(cx, w, &view, false);
+    press(cx, w, "3");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c7kronl", &input, json!({"choice": ["Load"]}))], "only what was ticked once it could");
+}
+
+/// D3's way in (Shady #83 P2-7): `enter_card(session, binding)` enters the
+/// card named, not the first that waits. Checked again first, nothing
+/// changes when it isn't open there now: the id's earlier call (answered,
+/// the history's binding moved on), another session. The card named is
+/// entered with its pane's other card after it (the batch rule); Enter
+/// answers it: one `Submit` of its text on its attachment. The batch goes
+/// on; the card answered (its answer on its way, the memo's) isn't
+/// entered again.
+#[gpui_kit::test]
+fn enter_card_enters_the_card_named_and_a_key_answers_it(cx: &mut TestAppContext) {
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    at_rest(cx, w, &view);
+    let (ship, _) = card(cx, &view, SHIP);
+    let (suites, _) = card(cx, &view, SUITES);
+    let (seq, sid) = attachment(cx, &view);
+    assert!(!enter_card(cx, w, &view, &sid, "toolu_a6", "c5h8k2v"), "the id's earlier call: not its binding now");
+    assert!(!enter_card(cx, w, &view, "20990101-000000-none", "toolu_a7", "c5h8k2v"), "another session");
+    assert!(!entered(cx, w, suites) && !entered(cx, w, ship), "nothing entered");
+    assert_eq!(keys_at(cx, w, &view), (true, false), "the keys where they were");
+    assert!(enter_card(cx, w, &view, &sid, "toolu_a7", "c5h8k2v"));
+    assert!(entered(cx, w, suites), "the card named, not Ctrl+J's first (the migration's)");
+    assert!(has(cx, w, format!("ask-batch {suites} 1 of 2")), "its pane's other card after it");
+    press(cx, w, "enter");
+    let text = message("c5h8k2v", &suites_input(), json!({"choice": ["Unit", "Integration"]}));
+    assert_eq!(
+        sends(cx, &view),
+        vec![Outgoing { seq, busy: false, card: cards_spec::CardId::parse("c5h8k2v").unwrap(), text }],
+        "one Submit, on its attachment"
+    );
+    assert!(entered(cx, w, ship), "the batch goes on");
+    press(cx, w, "escape");
+    assert!(!enter_card(cx, w, &view, &sid, "toolu_a7", "c5h8k2v"), "answered: not entered again");
+    assert_eq!(keys_at(cx, w, &view), (true, false));
+}
+
+/// `enter_card` with a confirm prompt pending: the card, never the prompt
+/// (§5.1). A card answered "always" by key leaves the prompt pending, and
+/// Esc from the card doesn't deny it.
+#[gpui_kit::test]
+fn enter_card_never_answers_a_prompt(cx: &mut TestAppContext) {
+    let input = json!({"question": "Go ahead?", "wait": true, "options": ["yes", "always"]});
+    let (w, view, id, _events) = asked(cx, "toolu_kp", "c8kprmt", &input);
+    prompt(cx, w, &view);
+    let sid = attachment(cx, &view).1;
+    assert!(enter_card(cx, w, &view, &sid, "toolu_kp", "c8kprmt"));
+    assert!(entered(cx, w, id));
+    press(cx, w, "escape");
+    prompt_pending(cx, &view, "Esc");
+    assert!(enter_card(cx, w, &view, &sid, "toolu_kp", "c8kprmt"));
+    press(cx, w, "2");
+    assert_eq!(texts(cx, &view), vec![message("c8kprmt", &input, json!({"choice": "always"}))]);
+    prompt_pending(cx, &view, "answered always");
+}
+
+/// Ctrl+J mid IME composition in the composer is the IME's (§6.1: it owns
+/// every key; Shady #83): no card is entered, the composition stays.
+/// Committed, Ctrl+J enters, and Enter answers.
+#[gpui_kit::test]
+fn ctrl_j_mid_composition_is_the_imes(cx: &mut TestAppContext) {
+    let input = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"], "default": "main"});
+    let (w, view, id, _events) = asked(cx, "toolu_kj", "c9kjime", &input);
+    let c = view.read_with(cx, |v, _| v.panes.cur.composer.clone());
+    cx.update_window(w, |_, window, cx| {
+        c.update(cx, |s, cx| EntityInputHandler::replace_and_mark_text_in_range(s, None, "か", None, window, cx))
+    })
+    .expect("the window");
+    settle(cx, w, 8);
+    press(cx, w, "ctrl-j");
+    assert!(!entered(cx, w, id), "mid-composition: no card");
+    assert_eq!(keys_at(cx, w, &view), (true, false), "the composer keeps the keys");
+    let marked = cx
+        .update_window(w, |_, window, cx| c.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)))
+        .expect("the window");
+    assert!(marked.is_some(), "the composition stays");
+    cx.update_window(w, |_, window, cx| c.update(cx, |s, cx| EntityInputHandler::unmark_text(s, window, cx))).expect("the window");
+    settle(cx, w, 8);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id), "committed: Ctrl+J enters");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c9kjime", &input, json!({"choice": "main"}))]);
 }

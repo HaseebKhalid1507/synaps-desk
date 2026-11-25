@@ -125,8 +125,16 @@ impl Presses {
     }
 }
 
+/// A card's binding, as D3 names one to enter ([`AppView::enter_card`]):
+/// the call that asked it and the card id the history binds it to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) tool_id: String,
+    pub(crate) card: cards_spec::CardId,
+}
+
 /// What waits in a visible pane ([`crate::waiting`]'s key).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Here {
     Prompt,
     Card(PaneId, Painted),
@@ -210,6 +218,50 @@ impl AppView {
         let Some(first) = crate::waiting::order(all.clone()).into_iter().next() else { return false };
         let Here::Card(pane, _) = first.key else { return false };
         let batch: Vec<Painted> = crate::waiting::batch(all, first.place)
+            .into_iter()
+            .filter_map(|h| match h {
+                Here::Card(_, p) => Some(p),
+                Here::Prompt => None,
+            })
+            .collect();
+        if pane != self.panes.focused {
+            self.focus_pane(pane, crate::pane::KeysTo::Follow, cx);
+        }
+        self.in_pane(pane, |v| v.enter_ask(batch, 0, window, cx));
+        true
+    }
+
+    /// One card entered, by name: D3's way in (Ctrl+Shift+J, a Waiting
+    /// row in Ctrl+P, a tab dot, an OS notification's click), never a
+    /// "first that waits" jump, and never a prompt (§5.1: those keep their
+    /// own path). `binding` is checked again, now: shown in one of this
+    /// window's visible panes as `session`'s, and still open there as this
+    /// desk may answer it: the fold's current binding of its call, no
+    /// answer of this desk's on its way (the memo), the pane not on a
+    /// view or a worker's. Then it is entered as Ctrl+J enters one: its
+    /// pane focused, its row brought into view, its keys live from its
+    /// first paint (§7), and a batch frozen of it and then its pane's
+    /// other cards in Ctrl+J's order ([`crate::waiting::batch_from`]).
+    /// True if it was entered; false, and nothing changes, if not. A
+    /// session in a background tab or another window is the caller's to
+    /// bring forward first.
+    pub(crate) fn enter_card(&mut self, session: &str, binding: &Binding, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let all = self.waiting_here(false);
+        let shows = |pane: PaneId| {
+            let live = self.panes.get(pane).map(|p| p.live);
+            live.and_then(|l| self.model.lives[l].active.as_ref()).is_some_and(|a| a.session_id == session)
+        };
+        let found = all.iter().find_map(|w| match &w.key {
+            Here::Card(pane, p) if p.tool_id == binding.tool_id && p.id == binding.card && shows(*pane) => {
+                Some((*pane, w.place, w.key.clone()))
+            }
+            _ => None,
+        });
+        let Some((pane, place, first)) = found else {
+            log::info!(target: "synaps_desktop::card", "card {}: not entered: not open on screen", binding.card);
+            return false;
+        };
+        let batch: Vec<Painted> = crate::waiting::batch_from(all, place, first)
             .into_iter()
             .filter_map(|h| match h {
                 Here::Card(_, p) => Some(p),
@@ -344,17 +396,28 @@ impl AppView {
 
     /// An IME composition in the entered card's input that has the keys.
     fn ask_composing(&self, window: &mut Window, cx: &mut App) -> bool {
-        let Some(e) = self.panes.cur.ask.entry.as_ref() else { return false };
-        let Some(d) = self.card_drafts.get(&(e.session.clone(), e.painted.tool_id.clone())) else { return false };
+        self.panes.cur.ask.entry.is_some() && self.ime_composing(window, cx)
+    }
+
+    /// The input with the keys is mid IME composition (it has marked
+    /// text): the pane's composer, or a card's field. Its keys are the
+    /// IME's, Ctrl+J's included (§6.1: composition owns every key).
+    pub(crate) fn ime_composing(&self, window: &mut Window, cx: &mut App) -> bool {
         let marked = |r: Option<std::ops::Range<usize>>| r.is_some();
-        for i in d.note.iter().chain(d.lines.values()) {
-            if i.read(cx).focus_handle(cx).is_focused(window) {
-                return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
-            }
+        let c = &self.panes.cur.composer;
+        if c.read(cx).focus_handle(cx).is_focused(window) {
+            return marked(c.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
         }
-        for i in d.longs.values() {
-            if i.read(cx).focus_handle(cx).is_focused(window) {
-                return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
+        for d in self.card_drafts.values() {
+            for i in d.note.iter().chain(d.lines.values()) {
+                if i.read(cx).focus_handle(cx).is_focused(window) {
+                    return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
+                }
+            }
+            for i in d.longs.values() {
+                if i.read(cx).focus_handle(cx).is_focused(window) {
+                    return marked(i.update(cx, |s, cx| EntityInputHandler::marked_text_range(s, window, cx)));
+                }
             }
         }
         false

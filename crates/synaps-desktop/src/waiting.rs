@@ -52,12 +52,35 @@ pub(crate) fn batch<K>(items: Vec<Waiting<K>>, place: usize) -> Vec<K> {
     order(items).into_iter().filter(|w| w.place == place && w.waits != Waits::Prompt).map(|w| w.key).collect()
 }
 
+/// The batch a targeted entry freezes (D3's: Ctrl+Shift+J, a Waiting row,
+/// a tab dot, a notification): the card named, `first`, then the rest of
+/// [`batch`] at `place`, so its pane's other cards still follow in order.
+pub(crate) fn batch_from<K: PartialEq>(items: Vec<Waiting<K>>, place: usize, first: K) -> Vec<K> {
+    let rest: Vec<K> = batch(items, place).into_iter().filter(|k| *k != first).collect();
+    std::iter::once(first).chain(rest).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn w(waits: Waits, place: usize, age: u64, key: &'static str) -> Waiting<&'static str> {
         Waiting { waits, place, age, key }
+    }
+
+    /// A targeted entry: the card named first, then its place's batch
+    /// without it, in order; never a prompt, never another place's.
+    #[test]
+    fn a_targeted_batch_starts_at_the_card_named() {
+        let v = vec![
+            w(Waits::Prompt, 0, 0, "p"),
+            w(Waits::Open, 0, 1, "o"),
+            w(Waits::Wait, 0, 5, "w2"),
+            w(Waits::Wait, 0, 2, "w1"),
+            w(Waits::Wait, 1, 0, "x"),
+        ];
+        assert_eq!(batch_from(v.clone(), 0, "w2"), ["w2", "w1", "o"]);
+        assert_eq!(batch_from(v, 0, "o"), ["o", "w1", "w2"]);
     }
 
     fn keys(v: Vec<Waiting<&'static str>>) -> Vec<&'static str> {
