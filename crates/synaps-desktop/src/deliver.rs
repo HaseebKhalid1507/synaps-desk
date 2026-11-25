@@ -98,7 +98,12 @@
 //! confirmed, with Resend. Bounded by the memo's own wait for a settled
 //! view ([`CHECK_WAIT`]): past it an answer the gap holds says it couldn't
 //! be confirmed and that the agent may still have it ([`MAY_HAVE_IT`]),
-//! an open card's controls that the chat hasn't caught up ([`UNCHECKED`]),
+//! and so does one queued or held before the gap, whose words say the
+//! slot has it and which no clock moves (Shady #81 round 6: a held answer
+//! whose `Dequeued` was dropped said "it goes in after the agent's next
+//! turn" for good; [`Memos::unchecked`]; the memo's state is kept, for the
+//! first settled view to settle); an open card's controls say that the
+//! chat hasn't caught up ([`UNCHECKED`]),
 //! and "Check again" ([`crate::model::Model::check_again`]) stands where
 //! Resend would be: it asks for the history again on this connection,
 //! which can settle the history, not the slot. No Resend while the slot
@@ -253,11 +258,14 @@ fn settled(t: &Transcript) -> bool {
 
 /// A session whose events the daemon dropped, until the history asked for
 /// again lands ([`synaps_client::Transcript::resyncing`]): since when (the
-/// first view that showed it), and whether that is [`CHECK_WAIT`] ago.
+/// first view that showed it), whether that is [`CHECK_WAIT`] ago, and
+/// whether it ever was (`waited`: what the cards said then stands while
+/// "Check again" checks).
 #[derive(Clone, Copy, Debug)]
 struct Gap {
     since: Instant,
     over: bool,
+    waited: bool,
 }
 
 /// An answer the engine took in, until a history settles it (the
@@ -327,15 +335,27 @@ impl Memos {
         self.gaps.get(session).is_some_and(|g| g.over)
     }
 
-    /// An answer of `session` the engine took in, its turn ended since, on
-    /// a view recovering past [`CHECK_WAIT`]: no settled view has said
-    /// whether the turn's end saved it, so the card can't say it is in
-    /// the chat; nor can a Resend be checked. It says so
-    /// ([`Memos::words`]).
+    /// An answer of `session` whose card can't say where it is, on a view
+    /// recovering from dropped events (the module's "Dropped events"):
+    /// - taken in, its turn ended since, past [`CHECK_WAIT`]: no settled
+    ///   view has said whether the turn's end saved it, so the card can't
+    ///   say it is in the chat; nor can a Resend be checked;
+    /// - queued or held, once the gap's wait has run out, and while "Check
+    ///   again" checks: those words say the engine's slot has it, and no
+    ///   event since the gap has said so. A cancellation's `Dequeued` may
+    ///   be among what was dropped, and no clock moves either state: held
+    ///   said "it goes in after the agent's next turn" for good (Shady #81
+    ///   round 6). The memo's state stays as it was, and its evidence (a
+    ///   held entry's `Idle`): the first settled view after the gap
+    ///   settles it as ever.
+    ///
+    /// It says so ([`Memos::words`]), with no Resend or Retry.
     pub(crate) fn unchecked(&self, session: &str, e: &Entry) -> bool {
-        e.state == State::InChat
-            && self.over(session)
-            && self.taken.get(session).is_some_and(|v| v.iter().any(|k| k.card == e.card && k.ended))
+        match e.state {
+            State::InChat => self.over(session) && self.taken.get(session).is_some_and(|v| v.iter().any(|k| k.card == e.card && k.ended)),
+            State::Queued | State::Held => self.gaps.get(session).is_some_and(|g| g.waited),
+            _ => false,
+        }
     }
 
     /// Run `f` on `session`'s memo, if it has one (an event for a session
@@ -409,7 +429,7 @@ impl Memos {
     fn follow_gap(&mut self, session: &str, t: &Transcript, now: Instant) {
         if recovering(t) {
             if !self.gaps.contains_key(session) {
-                self.gaps.insert(session.to_string(), Gap { since: now, over: false });
+                self.gaps.insert(session.to_string(), Gap { since: now, over: false, waited: false });
                 self.changes += 1;
             }
         } else if self.gaps.remove(session).is_some() {
@@ -472,7 +492,7 @@ impl Memos {
     /// sent) the cause line under it.
     pub(crate) fn words(&self, session: &str, e: &Entry) -> (&'static str, Option<String>) {
         if self.unchecked(session, e) {
-            return ("not confirmed", Some(MAY_HAVE_IT.into()));
+            return ("not confirmed", Some(self.answer_gap(session).into()));
         }
         let word = match e.state {
             State::Sending => "sending…",
@@ -505,7 +525,7 @@ impl Memos {
     /// another [`CHECK_WAIT`].
     pub(crate) fn check_again(&mut self, session: &str, now: Instant) {
         if let Some(g) = self.gaps.get_mut(session).filter(|g| g.over) {
-            *g = Gap { since: now, over: false };
+            *g = Gap { since: now, over: false, waited: true };
             self.changes += 1;
         }
     }
@@ -518,6 +538,7 @@ impl Memos {
         }
         for g in self.gaps.values_mut().filter(|g| !g.over && now.saturating_duration_since(g.since) >= CHECK_WAIT) {
             g.over = true;
+            g.waited = true;
             self.changes += 1;
         }
     }

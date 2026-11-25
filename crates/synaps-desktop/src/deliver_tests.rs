@@ -1114,3 +1114,109 @@ fn a_cancelled_compaction_dequeues_ours_in_order_through_dropped_events() {
         }
     }
 }
+
+/// Shady #81 round 6: an answer the engine's slot had before the gap, and
+/// no event since that says the slot. `held`: the turn ended with it in
+/// the slot (F21's way), a compaction started that it rides; the owner
+/// cancels: `CompactionCancelled`, `Dequeued` with ours (dropped), `Idle`
+/// (SynapsCLI `189a5a19`, `actor.rs:3508-3518`). `queued`: a turn streams,
+/// and the rest of it is dropped. The history asked for again, without
+/// it. Within the wait its words stand. Past it they would say the slot
+/// has it for good (no clock moves either state): it says it couldn't be
+/// confirmed and the agent may still have it, with no Resend, the memo's
+/// state as it was. "Check again" checks for another wait, and the card
+/// says it is checking, not held again; that history lands, and nothing
+/// is decided; past the wait it says so again. Then an event on this
+/// stream settles it as ever (`end`): a digest with ours (held or queued
+/// again), a digest with the slot empty (held: the `Idle` kept, not
+/// confirmed, with Resend), another cancel's `Dequeued` and `Idle` (not
+/// confirmed, the agent stopped before reading it, with Resend), or a
+/// history with it in (answered).
+#[test]
+fn an_answer_held_before_dropped_events_says_it_couldnt_be_confirmed_past_the_wait() {
+    for kind in ["held", "queued"] {
+        for end in ["ours", "empty", "dequeued", "history"] {
+            if kind == "queued" && end == "empty" {
+                // The turn's `Idle` dropped: the memo waits for the next
+                // (the module's residual (a)), the gap over.
+                continue;
+            }
+            let what = format!("{kind}, {end}");
+            let held = kind == "held";
+            let mut m = one();
+            ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
+            let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
+            ev(&mut m, 1, S, json!({"ev": "steered", "text": out.text, "delivered": true}));
+            let mut now = history();
+            now.push(json!({"role": "user", "content": "go on"}));
+            ev(&mut m, 1, S, digest(&now, Some(&out.text)));
+            replace(&mut m, 1, S, now.clone());
+            if held {
+                ev(&mut m, 1, S, json!({"ev": "idle"}));
+                ev(&mut m, 1, S, json!({"ev": "compaction_started", "source": "auto", "disclosure": ""}));
+            }
+            let (word, st) = if held {
+                ("held · it goes in after the agent's next turn", State::Held)
+            } else {
+                ("queued · the agent reads it at its next step", State::Queued)
+            };
+            assert_eq!(m.memos.get_state(S, CARD), Some(st), "{what}: before the gap");
+            lagged(&mut m, 5);
+            if held {
+                ev(&mut m, 1, S, json!({"ev": "compaction_cancelled"}));
+                ev(&mut m, 1, S, json!({"ev": "idle"}));
+            }
+            replace(&mut m, 1, S, now.clone());
+            assert!(!m.lives[LiveId::FIRST].transcript.slot_known(), "{what}: no word on the slot");
+            let p = painted(&m, LiveId::FIRST);
+            let may = |m: &Model| m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards());
+            let t0 = Instant::now();
+            m.tick_cards(t0 + Duration::from_secs(5));
+            assert_eq!(words(&m, LiveId::FIRST, S), (word, None), "{what}: within the wait");
+            m.tick_cards(t0 + Duration::from_secs(11));
+            assert_eq!(words(&m, LiveId::FIRST, S), ("not confirmed", Some(MAY_HAVE_IT.to_string())), "{what}: past it");
+            assert_eq!(m.memos.get_state(S, CARD), Some(st), "{what}: nothing decided");
+            assert!(!may(&m), "{what}: no Resend");
+            assert_eq!(m.resend_card(LiveId::FIRST, &p, t0), Err(UNCHECKED.into()), "{what}: nothing sent");
+            let fx = m.check_again(LiveId::FIRST, t0 + Duration::from_secs(12));
+            assert!(matches!(fx, Some(Effect::Resync(1))), "{what}: Check again: the history again, {fx:?}");
+            assert_eq!(words(&m, LiveId::FIRST, S), ("not confirmed", Some(RESYNCING.to_string())), "{what}: checking, not {kind} again");
+            replace(&mut m, 1, S, now.clone());
+            assert_eq!(words(&m, LiveId::FIRST, S), ("not confirmed", Some(RESYNCING.to_string())), "{what}: its history decides nothing");
+            assert_eq!(m.resend_card(LiveId::FIRST, &p, t0), Err(RESYNCING.into()), "{what}: nothing sent");
+            m.tick_cards(t0 + Duration::from_secs(23));
+            assert_eq!(words(&m, LiveId::FIRST, S), ("not confirmed", Some(MAY_HAVE_IT.to_string())), "{what}: past the wait again");
+            assert_eq!(m.memos.get_state(S, CARD), Some(st), "{what}: still nothing decided");
+            match end {
+                "ours" => drop(ev(&mut m, 1, S, digest(&now, Some(&out.text)))),
+                "empty" => drop(ev(&mut m, 1, S, digest(&now, None))),
+                "dequeued" => {
+                    ev(&mut m, 1, S, json!({"ev": "dequeued", "text": out.text}));
+                    ev(&mut m, 1, S, json!({"ev": "idle"}));
+                }
+                _ => {
+                    now.push(json!({"role": "user", "content": out.text}));
+                    replace(&mut m, 1, S, now.clone());
+                }
+            }
+            match end {
+                "ours" => {
+                    assert_eq!(words(&m, LiveId::FIRST, S), (word, None), "{what}: the slot has it");
+                    assert!(!may(&m), "{what}: no Resend");
+                }
+                "history" => {
+                    assert_eq!(words(&m, LiveId::FIRST, S), ("answered", None), "{what}: in the chat");
+                    assert!(!may(&m), "{what}: no Resend");
+                }
+                _ => {
+                    let trigger = if end == "empty" { Trigger::Idle } else { Trigger::Dequeued };
+                    let lost = Some(Cause::Lost(trigger).line());
+                    assert_eq!(state(&m, LiveId::FIRST, S), Some((State::Unconfirmed, lost)), "{what}: not confirmed");
+                    assert!(may(&m), "{what}: Resend");
+                    let again = m.resend_card(LiveId::FIRST, &p, t0).expect("Resend sends");
+                    assert_eq!(again.text, out.text, "{what}: once");
+                }
+            }
+        }
+    }
+}

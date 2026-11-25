@@ -727,12 +727,8 @@ fn a_cards_options_measured_or_clipped_off_screen_arm_once_in_view(cx: &mut Test
 /// (empty).
 fn resynced(cx: &mut TestAppContext, view: &Entity<AppView>, history_only: bool) {
     let (seq, sid) = attachment(cx, view);
-    let messages = match crate::demo::attach(crate::demo::ASKS, seq).pop() {
-        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
-        other => panic!("{other:?}"),
-    };
-    let d = json!({"ev": "conversation", "digest": {"messages_len": messages.len(),
-        "messages_hash": synaps_client::history::messages_hash(&messages), "queued_message": null}});
+    let messages = demo_history(seq);
+    let d = slot_digest(&messages, None);
     let update = synaps_client::HistoryUpdate::Replace { messages };
     view.update(cx, |v, cx| {
         let mut batch = vec![synaps_client::Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update }];
@@ -741,6 +737,20 @@ fn resynced(cx: &mut TestAppContext, view: &Entity<AppView>, history_only: bool)
         }
         v.apply_batch(batch, cx)
     });
+}
+
+/// The demo session's history, as an attach on `seq` gives it.
+fn demo_history(seq: u64) -> Vec<Value> {
+    match crate::demo::attach(crate::demo::ASKS, seq).pop() {
+        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The session's digest of `messages`, the engine's slot holding `queued`.
+fn slot_digest(messages: &[Value], queued: Option<&str>) -> Value {
+    json!({"ev": "conversation", "digest": {"messages_len": messages.len(),
+        "messages_hash": synaps_client::history::messages_hash(messages), "queued_message": queued}})
 }
 
 /// Shady #81 round 3: the daemon dropped events for this desk (its lag
@@ -823,5 +833,56 @@ fn past_the_wait_a_card_offers_check_again_not_resend(cx: &mut TestAppContext) {
     resynced(cx, &view, false);
     settle(cx, w, 8);
     assert!(has(cx, w, format!("ask-resend {id}")), "a digest says the slot: Resend");
+    crate::app::pin_arm_clock(None);
+}
+
+/// Shady #81 round 6: an answer held before dropped events (the turn
+/// ended with it in the engine's slot), and nothing since says the slot:
+/// a cancellation's `Dequeued` among what was dropped, its `Idle` heard,
+/// then the history asked for again. Past the wait its row doesn't say
+/// "held" for good: not confirmed, the agent may still have it, with
+/// "Check again" and no Resend; while that checks, it says so, not held
+/// again. A digest after the gap says the slot has it: held.
+#[gpui_kit::test]
+fn past_the_wait_a_held_answer_says_it_couldnt_be_confirmed(cx: &mut TestAppContext) {
+    const HELD: &str = "held · it goes in after the agent's next turn";
+    let (w, view, _events) = open(cx, crate::demo::ASKS);
+    let (id, ix) = card(cx, &view, SHIP);
+    show(cx, w, &view, ix);
+    arm(cx, &view, id, true);
+    click(cx, w, &view, format!("ask-option {id} 3"));
+    let out = sends(cx, &view).pop().expect("one click answers");
+    let messages = demo_history(attachment(cx, &view).0);
+    let echo = json!({"ev": "steered", "text": out.text, "delivered": true});
+    heard(cx, w, &view, vec![echo, slot_digest(&messages, Some(&out.text)), json!({"ev": "idle"})]);
+    assert!(has(cx, w, format!("ask-state {id} {HELD}")), "held");
+    let gap = vec![
+        json!({"ev": "compaction_started", "source": "auto", "disclosure": ""}),
+        json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"}),
+        json!({"ev": "compaction_cancelled"}),
+        json!({"ev": "idle"}),
+    ];
+    heard(cx, w, &view, gap);
+    resynced(cx, &view, true);
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-state {id} {HELD}")), "within the wait");
+    let t0 = Instant::now();
+    view.update(cx, |v, cx| {
+        v.model.tick_cards(t0 + Duration::from_secs(11));
+        v.cards_moved(cx);
+    });
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-state {id} not confirmed")), "past it: it couldn't be confirmed");
+    assert!(!has(cx, w, format!("ask-state {id} {HELD}")), "not held for good");
+    assert!(has(cx, w, format!("ask-check {id}")), "Check again");
+    assert!(!has(cx, w, format!("ask-resend {id}")) && !has(cx, w, format!("ask-retry {id}")), "no Resend");
+    arm(cx, &view, id, true);
+    click(cx, w, &view, format!("ask-check {id}"));
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("ask-state {id} not confirmed")), "checking again: not held again");
+    assert!(!has(cx, w, format!("ask-check {id}")), "checking again");
+    assert_eq!(sends(cx, &view).len(), 1, "nothing sent");
+    heard(cx, w, &view, vec![slot_digest(&messages, Some(&out.text))]);
+    assert!(has(cx, w, format!("ask-state {id} {HELD}")), "a digest says the slot has it: held");
     crate::app::pin_arm_clock(None);
 }

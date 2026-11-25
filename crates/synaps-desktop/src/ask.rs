@@ -835,8 +835,9 @@ impl AppView {
         // An answer of this desk's on its way, or not confirmed.
         if let Some((s, e)) = entry.filter(|(_, e)| e.state != MemoState::InChat || whole(a)) {
             let (word, cause) = self.model.memos.words(s, e);
-            // Taken in, its turn over, and no settled view since dropped
-            // events: not confirmed, and nothing to offer until one settles.
+            // Taken in, its turn over, or queued or held, and no settled
+            // view since dropped events: not confirmed, and nothing to
+            // offer but "Check again" until one settles.
             let unchecked = self.model.memos.unchecked(s, e);
             let lost = matches!(e.state, MemoState::Unconfirmed | MemoState::NotSent) || unchecked;
             let look = Look {
