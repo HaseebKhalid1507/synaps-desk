@@ -9,14 +9,16 @@
 //! the composer, another pane, another tab or session; the oldest wait
 //! card first; with a confirm prompt pending, the card and never the
 //! prompt, and Esc from the card never denies it. A held Ctrl+Shift+J
-//! jumps once, a repeat X11 or macOS doesn't flag included.
+//! jumps once, a repeat X11 or macOS doesn't flag included. A card's OS
+//! notification (#89), clicked: entered the same way; a stale one moves
+//! nothing.
 //!
 //! The window and key helpers are D2a's and D2b's ([`super::answer_tests`],
 //! [`super::keys_tests`]). The client stays (its sends are the view's
 //! record) except while a session is brought forward: the demo answers
 //! the attach then.
 
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, SystemNotificationResponse, TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 
 use super::answer_tests::{SHIP, ask_live, attachment, card, heard, land, llm, message, open, play, sends, showing};
@@ -400,4 +402,72 @@ fn ctrl_j_to_a_card_above_the_tail_then_a_digit_sends_one_submit(cx: &mut TestAp
 #[gpui_kit::test]
 fn ctrl_shift_j_to_a_card_above_the_tail_then_a_digit_sends_one_submit(cx: &mut TestAppContext) {
     a_card_above_the_tail(cx, "ctrl-shift-j");
+}
+
+/// The window away (another app in front): what a card's notification is
+/// for.
+fn away(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    VisualTestContext::from_window(w, cx).deactivate_window();
+    settle(cx, w, 8);
+    assert!(!view.read_with(cx, |v, _| v.window_active), "the window away");
+}
+
+/// A click on notification `tag`, as the OS reports it (#89's
+/// `AppView::notification_clicked`).
+fn click_note(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tag: &str) {
+    cx.simulate_system_notification_response(SystemNotificationResponse { tag: tag.to_string().into(), action_id: None });
+    cx.run_until_parked();
+    play(cx, w, view);
+}
+
+/// F12 by a notification (#89, then D2b's entry): the window away, a wait
+/// card comes and the OS is told. Its click brings the window up, lands
+/// on the card and enters it; a digit answers: exactly one `Submit`.
+/// Then a stale click, a tag still held for that binding (a click racing
+/// its answer): checked before anything moves, so no window raised, no
+/// landing, nothing entered, and the keys stay where they were; a digit
+/// sends nothing more.
+#[gpui_kit::test]
+fn a_notification_click_then_a_digit_sends_one_submit(cx: &mut TestAppContext) {
+    // The platform shows notifications for a named app (as `main`).
+    cx.update(|cx| cx.set_app_identity("synaps-desktop", "Synaps"));
+    let (w, view, _events) = open(cx, crate::demo::IDLE_CPU);
+    at_rest(cx, w, &view);
+    away(cx, w, &view);
+    let input = wait_card("Which branch, told?");
+    ask_live(cx, w, &view, "toolu_e9", "c9note1", input.clone());
+    let (id, _) = card(cx, &view, "Which branch, told?");
+    let told = cx.shown_system_notifications();
+    assert_eq!(told.len(), 1, "one notification: {told:?}");
+    let tag = told[0].tag.to_string();
+    assert!(!entered(cx, w, id), "told, not entered");
+    click_note(cx, w, &view, &tag);
+    assert!(view.read_with(cx, |v, _| v.window_active), "the window up");
+    assert!(entered(cx, w, id), "the notification's card, entered");
+    assert_eq!(keys_at(cx, w, &view), (false, false), "the keys left the composer, never for the window");
+    press(cx, w, "2");
+    let seq = attachment(cx, &view).0;
+    let text = message("c9note1", &input, json!({"choice": "release"}));
+    one_submit(cx, &view, seq, &text, "by a notification");
+    // On its way: taken down. The same binding's tag, still held (posted
+    // again as a click races its answer), then clicked.
+    play(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.lookout.notes.card(&tag).is_none()), "answered: taken down");
+    let key = view.read_with(cx, |v, _| v.lookout.landed.clone()).expect("the card it landed on");
+    let note = crate::notify::note(&key, "Relay log levels", "Which branch, told?");
+    assert_eq!(note.tag, tag, "the same binding's tag");
+    view.update(cx, |v, cx| v.lookout.notes.post(key, note, cx));
+    cx.run_until_parked();
+    away(cx, w, &view);
+    let before = keys_at(cx, w, &view);
+    click_note(cx, w, &view, &tag);
+    view.read_with(cx, |v, _| {
+        assert!(v.lookout.notes.card(&tag).is_none(), "stale: taken down");
+        assert!(v.lookout.land.is_none() && v.lookout.entering.is_none(), "no landing, no entry waiting");
+        assert!(!v.window_active, "no window raised");
+    });
+    assert!(!entered(cx, w, id), "nothing entered");
+    assert_eq!(keys_at(cx, w, &view), before, "the keys where they were");
+    press(cx, w, "3");
+    one_submit(cx, &view, seq, &text, "a stale click, then a digit: nothing more");
 }

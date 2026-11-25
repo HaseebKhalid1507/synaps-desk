@@ -2732,7 +2732,11 @@ impl AppView {
             async move { gone.wait().await }
         }));
         // The dash poll waits while the window is in the background.
-        subs.push(cx.observe_window_activation(window, |this, window, cx| this.window_activated(window.is_window_active(), cx)));
+        // And a card a notification landed on is entered as it comes up.
+        subs.push(cx.observe_window_activation(window, |this, window, cx| {
+            this.window_activated(window.is_window_active(), cx);
+            this.landed_up(window, cx);
+        }));
         // A worker's view polls only while the window shows.
         subs.push(cx.observe_window_visibility(window, |this, v, _, cx| this.visibility_changed(v.is_visible(), cx)));
         // Every key-down, before any binding: an agent card's keys act on

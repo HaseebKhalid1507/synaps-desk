@@ -397,6 +397,9 @@ pub(crate) struct Lookout {
     /// The last card a jump landed on ([`AppView::card_landed`] enters
     /// it, if it is still open there).
     pub landed: Option<Key>,
+    /// A card landed on while the window was not active (a notification's
+    /// click raised it): entered as it comes up ([`AppView::landed_up`]).
+    pub entering: Option<Land>,
     /// Each source's (live, fold revision), the memos' changes, and the
     /// sessions held: unchanged, the presence is as it was.
     derived: Option<Derived>,
@@ -689,8 +692,40 @@ impl AppView {
     /// entry focuses and asks for the frame that paints it, as a key's
     /// would. Recorded either way; a binding no longer open there is not
     /// entered, and the keys stay where they were.
+    ///
+    /// The window not active (a notification's click asked for it to come
+    /// up): entered once it is ([`AppView::landed_up`]). Its activation is
+    /// on its way on every platform (`gpui-pre-linux 0.3.12`
+    /// `x11/window.rs:1530`, a request to the window manager;
+    /// `wayland/window.rs:1867`, a token the compositor may refuse), and an
+    /// entry in a window not active is left at its next frame
+    /// ([`AppView::sync_ask`]).
     pub(crate) fn card_landed(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
         self.lookout.landed = Some(k.clone());
+        if !window.is_window_active() {
+            self.lookout.entering = Some(Land { key: k, at: Instant::now() });
+            return;
+        }
+        self.lookout.entering = None;
+        self.enter_landed(k, window, cx);
+    }
+
+    /// The window came up: the card a landing left for it is entered, as
+    /// [`AppView::card_landed`] would have (the binding checked again
+    /// there). One older than [`LAND_WAIT`] is dropped: the window came up
+    /// for something else.
+    pub(crate) fn landed_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() {
+            return;
+        }
+        let Some(t) = self.lookout.entering.take() else { return };
+        if t.at.elapsed() <= LAND_WAIT {
+            self.enter_landed(t.key, window, cx);
+        }
+    }
+
+    /// Binding `k` entered once this frame is drawn ([`AppView::enter_card`]).
+    fn enter_landed(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
         let binding = crate::ask_keys::Binding { tool_id: k.tool_id, card: k.card };
         cx.defer_in(window, move |this, window, cx| {
             this.enter_card(&k.session, &binding, window, cx);
