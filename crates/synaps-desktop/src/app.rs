@@ -2734,6 +2734,7 @@ impl AppView {
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
+            executor: cx.background_executor().clone(),
             composer,
             pane_subs,
             find_input,
@@ -2748,7 +2749,6 @@ impl AppView {
             focus,
             allow_all_focus,
             visible: window.is_visible(),
-            executor: cx.background_executor().clone(),
         };
         match (client, synthetic) {
             (Some((c, rx)), _) => {
