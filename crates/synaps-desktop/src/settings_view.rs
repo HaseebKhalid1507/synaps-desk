@@ -63,9 +63,6 @@ pub(crate) struct AppSettings {
     /// Where the model picker's favourites and logins come from
     /// (`pickers.source`, [`crate::model_list::Source`]).
     pub pickers: crate::model_list::Source,
-    /// No OS notification for a waiting agent card (`notify.cards`: `false`
-    /// or `"off"`; [`crate::presence`]). Unset: they notify.
-    pub quiet: bool,
 }
 
 impl AppSettings {
@@ -78,13 +75,9 @@ impl AppSettings {
             usage_host: get("usage_host").filter(|h| h != "all"),
             split: split_env().unwrap_or_else(|| path.is_none_or(theme::load_split)),
             pickers: crate::model_list::Source::parse(path.and_then(|p| theme::load_value(p, crate::model_list::SETTING)).as_ref()),
-            quiet: crate::presence::quiet(path.and_then(|p| theme::load_value(p, NOTIFY)).as_ref()),
         }
     }
 }
-
-/// The settings file's key for the cards' OS notifications.
-pub(crate) const NOTIFY: &str = "notify.cards";
 
 /// `SYNAPS_DESK_SPLIT=1` or `=0`: split panes on or off for this run,
 /// whatever the file says; unset (or anything else): the file's.
@@ -112,8 +105,6 @@ pub(crate) enum Pick {
     Motion,
     Rail,
     Right,
-    /// The cards' OS notifications: on or off (D3).
-    Notify,
     Range,
     Host,
 }
@@ -238,10 +229,6 @@ impl AppView {
                 if (value == "folded") != folded {
                     self.toggle_panel(rail, cx);
                 }
-            }
-            Pick::Notify => {
-                self.app_settings.quiet = value == "off";
-                self.save_app(NOTIFY, Some(value.to_string()), cx);
             }
             Pick::Range => {
                 if let Some(r) = Range::parse(value) {
@@ -1043,23 +1030,6 @@ impl AppView {
                     cx,
                 ),
             },
-            tag: None,
-            under: Vec::new(),
-        });
-        rows.push(Row {
-            id: "app-notify".into(),
-            label: "Card notifications".into(),
-            key: NOTIFY,
-            help: "An OS notification when an agent waits on a card while the window, or its session, is not in front.",
-            control: self.choice(
-                NOTIFY,
-                Pick::Notify,
-                vec!["on".into(), "off".into()],
-                Some(if self.app_settings.quiet { "off" } else { "on" }),
-                None,
-                p,
-                cx,
-            ),
             tag: None,
             under: Vec::new(),
         });

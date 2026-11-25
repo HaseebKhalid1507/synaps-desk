@@ -2219,7 +2219,7 @@ pub struct AppView {
     pub(crate) chip_bounds: Rc<RefCell<ChipBounds>>,
     view_seen: Option<(u64, theme::Choice)>,
     pub(crate) window_active: bool,
-    /// Open agent cards across sessions (D3): a jump's landing, the OS told.
+    /// Open agent cards across sessions (D3): a jump's landing.
     pub(crate) lookout: crate::presence::Lookout,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
@@ -2691,7 +2691,7 @@ impl AppView {
             allow_all_focus,
             visible: window.is_visible(),
         };
-        let mut v = match (client, synthetic) {
+        match (client, synthetic) {
             (Some((c, rx)), _) => {
                 let mut v = Self::blank(inputs, Some(c), ConnState::Connecting, subs);
                 v.pump(rx, cx);
@@ -2714,10 +2714,7 @@ impl AppView {
                 v
             }
             (None, None) => Self::blank(inputs, None, ConnState::Off("offline".into()), subs),
-        };
-        // A card's notification clicked: this window, that card (D3).
-        crate::presence::listen(&mut v, window, cx);
-        v
+        }
     }
 
     fn blank(i: Inputs, client: Option<Client>, conn: ConnState, subs: Vec<Subscription>) -> Self {
@@ -2978,7 +2975,7 @@ impl AppView {
         // waits on it.
         self.cards_moved(cx);
         self.arm_card_tick(cx);
-        // Open cards across sessions: the rail, the tabs, the OS (D3).
+        // Open cards across sessions: the rail, the tabs (D3).
         self.sync_presence(cx);
         // An idle daemon's poll changes nothing: no frame, unless
         // the rail's ages have a new minute to show.
@@ -9061,7 +9058,7 @@ impl AppView {
             self.panes.cur.jump_card = None;
             self.reveal_card(window, cx);
         }
-        // Ctrl+Shift+J, WAITING, a notification, a tab dot: its card (D3).
+        // Ctrl+Shift+J, WAITING, a tab dot: its card (D3).
         self.land_card(window, cx);
         // Seen every frame while attached, shown or not: a card that comes
         // back (from a worker's view, Settings) is not new; another

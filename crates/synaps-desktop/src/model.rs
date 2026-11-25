@@ -399,9 +399,6 @@ pub struct Model {
     /// The open agent cards of the sessions this window holds (D3,
     /// [`crate::presence`]): NEEDS YOU and ASKED ([`Model::fact`]).
     pub(crate) presence: crate::presence::Presence,
-    /// Which wait cards came live, as the events brought them (F12's
-    /// provenance, [`crate::presence::Arrivals`]).
-    pub(crate) arrivals: crate::presence::Arrivals,
     pub named: Named,
     /// The favourite sessions (desktop only, per daemon): the rail's
     /// FAVOURITES. Never sent to the daemon.
@@ -489,7 +486,6 @@ impl Model {
             left: Vec::new(),
             memos: Default::default(),
             presence: Default::default(),
-            arrivals: Default::default(),
             named: Named { daemon: "the daemon's machine".into(), ..Named::default() },
             favs: Default::default(),
             tabs: Tabs::default(),
@@ -1454,20 +1450,6 @@ impl Model {
 
     /// Apply one event.
     pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
-        // The wait cards it brings, as it left its attachment's fold: the
-        // attach's (there before) or come live (D3's notifications).
-        let look = crate::presence::Look::of(&ev);
-        let effects = self.apply_event(ev);
-        if let Some((how, seq)) = look
-            && let Some(lid) = self.lives.ids().into_iter().find(|l| self.lives[*l].current(seq))
-            && let Some(a) = self.lives[lid].active.as_ref()
-        {
-            self.arrivals.look(how, &a.session_id, &self.lives[lid].transcript);
-        }
-        effects
-    }
-
-    fn apply_event(&mut self, ev: Event) -> Vec<Effect> {
         if let Some(effects) = self.left_event(&ev) {
             return effects;
         }
