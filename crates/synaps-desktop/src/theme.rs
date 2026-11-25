@@ -2101,8 +2101,9 @@ pub fn load_layout(path: &Path, key: &str) -> Option<Layout> {
 /// The split layout saved under `key` (`layout.<key>`, v1) in settings
 /// `v`, if it is whole (architecture §5): another version, a tree that
 /// does not parse ([`LayoutNode`]), more than [`crate::pane::PANES_MAX`]
-/// panes or more across or down than the caps, a pane no leaf names or
-/// one named twice, a pane that is not a tab list: none, and the tabs are
+/// panes (the only cap: a tree too wide or tall for the window folds, the
+/// 2026-11-25 note under split.md §0), a pane no leaf names or one named
+/// twice, a pane that is not a tab list: none, and the tabs are
 /// read instead ([`load_restore`]). Never panics.
 fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
     let l = v.get("layout")?.get(key)?;
@@ -2113,11 +2114,7 @@ fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
     let panes: Vec<crate::tabs::Saved> = l.get("panes")?.as_array()?.iter().map(saved_of).collect::<Option<_>>()?;
     let mut leaves = tree.leaves();
     leaves.sort_unstable();
-    if panes.is_empty()
-        || panes.len() > crate::pane::PANES_MAX
-        || leaves != (0..panes.len()).collect::<Vec<_>>()
-        || !crate::split::fits_caps(&tree)
-    {
+    if panes.is_empty() || panes.len() > crate::pane::PANES_MAX || leaves != (0..panes.len()).collect::<Vec<_>>() {
         return None;
     }
     let focused = l.get("focused").and_then(serde_json::Value::as_u64).map(|f| f as usize).filter(|&f| f < panes.len()).unwrap_or(0);
@@ -3709,15 +3706,9 @@ mod tests {
             ),
             ("a pane no leaf names", format!(r#"{{"v": 1, "tree": {{"pane": 0}}, "panes": {two}}}"#)),
             (
-                "more than 4 panes",
+                "more than 9 panes",
                 format!(
-                    r#"{{"v": 1, "tree": {{"split": "row", "ratios": [0.2, 0.2, 0.2, 0.2, 0.2], "kids": [{{"pane": 0}}, {{"pane": 1}}, {{"pane": 2}}, {{"pane": 3}}, {{"pane": 4}}]}}, "panes": [{pane}, {pane}, {pane}, {pane}, {pane}]}}"#
-                ),
-            ),
-            (
-                "4 across",
-                format!(
-                    r#"{{"v": 1, "tree": {{"split": "row", "ratios": [0.25, 0.25, 0.25, 0.25], "kids": [{{"pane": 0}}, {{"pane": 1}}, {{"pane": 2}}, {{"pane": 3}}]}}, "panes": [{pane}, {pane}, {pane}, {pane}]}}"#
+                    r#"{{"v": 1, "tree": {{"split": "row", "ratios": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], "kids": [{{"pane": 0}}, {{"pane": 1}}, {{"pane": 2}}, {{"pane": 3}}, {{"pane": 4}}, {{"pane": 5}}, {{"pane": 6}}, {{"pane": 7}}, {{"pane": 8}}, {{"pane": 9}}]}}, "panes": [{pane}, {pane}, {pane}, {pane}, {pane}, {pane}, {pane}, {pane}, {pane}, {pane}]}}"#
                 ),
             ),
             ("a pane that is not a tab list", format!(r#"{{"v": 1, "tree": {row}, "panes": [{pane}, 7]}}"#)),

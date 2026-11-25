@@ -339,6 +339,11 @@ actions!(
         FocusPane2,
         FocusPane3,
         FocusPane4,
+        FocusPane5,
+        FocusPane6,
+        FocusPane7,
+        FocusPane8,
+        FocusPane9,
         FocusNextPane,
         FocusPrevPane,
         MoveTabNextPane,
@@ -348,11 +353,12 @@ actions!(
 
 /// The split panes' keys (split.md §9): Ctrl+\ splits right (down if the
 /// pane is narrow), Ctrl+Shift+\ down (spelled both ways, as AppKit may
-/// report the shifted key as `|`); Alt+1–4 focus pane N in reading order
-/// (Ctrl+1–4 on macOS, whose Cmd+1–8 are the tab keys); F6 / Shift+F6
+/// report the shifted key as `|`); Alt+1–9 focus pane N in reading order
+/// (Ctrl+1–9 on macOS, whose Cmd+1–9 are the tab keys), one per pane up
+/// to [`crate::pane::PANES_MAX`]; F6 / Shift+F6
 /// the next / previous pane; Ctrl+Alt+→ / ← move the active tab to the
 /// next / previous pane. Cmd on macOS for the splits and the moves.
-pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 11] {
+pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 16] {
     use PaneKey::*;
     if mac {
         [
@@ -363,6 +369,11 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 11] {
             ("ctrl-2", Nth(1)),
             ("ctrl-3", Nth(2)),
             ("ctrl-4", Nth(3)),
+            ("ctrl-5", Nth(4)),
+            ("ctrl-6", Nth(5)),
+            ("ctrl-7", Nth(6)),
+            ("ctrl-8", Nth(7)),
+            ("ctrl-9", Nth(8)),
             ("f6", Next),
             ("shift-f6", Prev),
             ("cmd-alt-right", MoveNext),
@@ -377,6 +388,11 @@ pub(crate) const fn pane_keys(mac: bool) -> [(&'static str, PaneKey); 11] {
             ("alt-2", Nth(1)),
             ("alt-3", Nth(2)),
             ("alt-4", Nth(3)),
+            ("alt-5", Nth(4)),
+            ("alt-6", Nth(5)),
+            ("alt-7", Nth(6)),
+            ("alt-8", Nth(7)),
+            ("alt-9", Nth(8)),
             ("f6", Next),
             ("shift-f6", Prev),
             ("ctrl-alt-right", MoveNext),
@@ -518,7 +534,12 @@ pub fn bind_keys(cx: &mut App) {
             PaneKey::Nth(0) => KeyBinding::new(k, FocusPane1, c),
             PaneKey::Nth(1) => KeyBinding::new(k, FocusPane2, c),
             PaneKey::Nth(2) => KeyBinding::new(k, FocusPane3, c),
-            PaneKey::Nth(_) => KeyBinding::new(k, FocusPane4, c),
+            PaneKey::Nth(3) => KeyBinding::new(k, FocusPane4, c),
+            PaneKey::Nth(4) => KeyBinding::new(k, FocusPane5, c),
+            PaneKey::Nth(5) => KeyBinding::new(k, FocusPane6, c),
+            PaneKey::Nth(6) => KeyBinding::new(k, FocusPane7, c),
+            PaneKey::Nth(7) => KeyBinding::new(k, FocusPane8, c),
+            PaneKey::Nth(_) => KeyBinding::new(k, FocusPane9, c),
             PaneKey::Next => KeyBinding::new(k, FocusNextPane, c),
             PaneKey::Prev => KeyBinding::new(k, FocusPrevPane, c),
             PaneKey::MoveNext => KeyBinding::new(k, MoveTabNextPane, c),
@@ -9702,7 +9723,7 @@ impl Render for AppView {
         for id in self.panes.ids().into_iter().filter(|i| *i != focused) {
             self.in_pane(id, |v| v.pane_sync(window, cx));
         }
-        // A drop whose edge was refused (a 5th pane): why, on the focused
+        // A drop whose edge was refused (a 10th pane): why, on the focused
         // composer, once its tab is the composer's.
         if let Some(why) = self.dnd.note.take() {
             self.split_refused(why, cx);
@@ -10160,6 +10181,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &FocusPane2, _, cx| this.focus_nth(1, cx)))
             .on_action(cx.listener(|this, _: &FocusPane3, _, cx| this.focus_nth(2, cx)))
             .on_action(cx.listener(|this, _: &FocusPane4, _, cx| this.focus_nth(3, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane5, _, cx| this.focus_nth(4, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane6, _, cx| this.focus_nth(5, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane7, _, cx| this.focus_nth(6, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane8, _, cx| this.focus_nth(7, cx)))
+            .on_action(cx.listener(|this, _: &FocusPane9, _, cx| this.focus_nth(8, cx)))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| this.focus_step(false, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| this.focus_step(true, cx)))
             // Once a press: the key-down decides ([`OnceKey`]).
@@ -10945,7 +10971,7 @@ mod tests {
                 assert_eq!(card_key_on(&k, mac), None, "{k:?}");
             }
             let nth: Vec<usize> = keys.iter().filter_map(|&(_, w)| if let PaneKey::Nth(n) = w { Some(n) } else { None }).collect();
-            assert_eq!(nth, (0..4).collect::<Vec<_>>());
+            assert_eq!(nth, (0..crate::pane::PANES_MAX).collect::<Vec<_>>(), "one focus key per pane");
         }
         for mac in [false, true] {
             let card = |k: &'static str| card_key_on(&parse_any(k), mac);

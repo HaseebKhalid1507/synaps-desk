@@ -28,8 +28,9 @@ use crate::named::ResumeRequest;
 use crate::theme::Metrics;
 use crate::turns::{self, Disp, Layout, Summaries};
 
-/// The most panes a window splits into (split/architecture.md §2.1).
-pub(crate) const PANES_MAX: usize = 4;
+/// The most panes a window splits into (split/architecture.md §2.1; 9,
+/// one per focus key, Alt+1–9: the 2026-11-25 note under split.md §0).
+pub(crate) const PANES_MAX: usize = 9;
 
 /// A pane's id: stable for its life (split/architecture.md §2.1).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -671,12 +672,22 @@ impl Panes {
 
     /// A split's flight to `tree` (split.md §10): `new` grows beside `at`
     /// from the split line, every other pane from where it is drawn (a
-    /// pane still growing or closing carries on).
-    pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
+    /// pane still growing or closing carries on). A split that evened out
+    /// its row or column ([`crate::split::Node::split`]) lands each pane
+    /// there, in `area`.
+    pub(crate) fn fly_split(
+        &mut self,
+        tree: &crate::split::Node,
+        at: PaneId,
+        side: crate::split::Side,
+        new: PaneId,
+        area: crate::split::Rect,
+    ) {
         use crate::split::Flight;
+        let evened = self.tree.split_as(at, side, new).as_ref() != Some(tree);
         self.hand_over();
         let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
-        // A closing pane's id handed out again (all four in use): its share
+        // A closing pane's id handed out again (all nine in use): its share
         // keeps closing under a ghost's id, its ground only (its content
         // goes: [`crate::app::AppView::reap_closing`]), and no pane moves
         // for it (Shady #42 r2-L1).
@@ -689,6 +700,13 @@ impl Panes {
         }
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
+                // Evened: where `tree` puts each pane, the closing ones'
+                // shares still going to 0.
+                let to = match (evened, ghosts.is_empty()) {
+                    (false, _) => to,
+                    (true, true) => tree.clone(),
+                    (true, false) => to.fitted(&tree.rects(area), &ghosts),
+                };
                 grow.push(new);
                 Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
             }
@@ -1208,7 +1226,8 @@ impl crate::app::AppView {
         // Its share grows from the split line on `sheet` (split.md §10),
         // the panes from where they are drawn. A divider held goes with
         // the layout it was found in (Shady #42 M2).
-        self.panes.fly_split(&tree, at, side, new);
+        let (w, h) = area;
+        self.panes.fly_split(&tree, at, side, new, crate::split::Rect { x: 0., y: 0., w, h });
         self.panes.tree = tree;
         self.panes.grab = None;
         self.panes.rest.push(pane);
@@ -2185,21 +2204,142 @@ async fn film6(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowConte
 }
 
 /// The splits that make `n` panes (split.md §4): 2 side by side, 3
-/// across, 4 as 2×2. Each: the pane to focus first (reading order), and
-/// the side (`None`: right, or down if narrow).
+/// across, 4 as 2×2; 5 across (Ctrl+\ four times: right, or down where
+/// the window is too narrow), then each of the top row's panes split down
+/// in reading order up to 9. Each: the pane to focus first (reading
+/// order), and the side (`None`: right, or down if narrow).
 pub(crate) fn shape(n: usize) -> Vec<(Option<usize>, Option<crate::split::Side>)> {
     use crate::split::Side;
     match n {
         0 | 1 => vec![],
         2 => vec![(None, None)],
         3 => vec![(None, None), (None, None)],
-        _ => vec![(None, None), (None, Some(Side::Down)), (Some(0), Some(Side::Down))],
+        4 => vec![(None, None), (None, Some(Side::Down)), (Some(0), Some(Side::Down))],
+        _ => {
+            let mut v = vec![(None, None); 4];
+            v.extend((0..n.min(PANES_MAX) - 5).map(|i| (Some(i), Some(Side::Down))));
+            v
+        }
     }
+}
+
+/// The demo's sessions the narrow panes' stills show, one a pane: a card
+/// waiting with its workers, a running turn's chips, agent cards, folded
+/// runs, a form.
+const ACROSS: [&str; 5] = [crate::demo::SID, crate::demo::FLAKY, crate::demo::ASKS, crate::demo::IDLE_CPU, crate::demo::ASK_FORM];
+
+/// `across:<n>` (the 2026-11-25 note under split.md §0: narrow panes'
+/// stills): both panels at their strips, `n` panes side by side, evened,
+/// each on another of [`ACROSS`]; the first with two more tabs.
+async fn across(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, n: usize) {
+    use crate::app::Open;
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    let act = |cx: &mut AsyncWindowContext, f: &dyn Fn(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            f(v, window, cx);
+            cx.notify();
+        });
+    };
+    act(cx, &|v, _, cx| fold_both(v, cx));
+    sleep(0.8).await;
+    for _ in 1..n {
+        act(cx, &|v, w, cx| v.split_pane(Some(crate::split::Side::Right), w, cx));
+        sleep(0.6).await;
+    }
+    act(cx, &|v, _, _| {
+        let (w, h) = v.centre.get();
+        v.panes.tree.equalise_all(crate::split::Rect { x: 0., y: 0., w, h });
+        v.panes.drawn = v.panes.tree.clone();
+    });
+    sleep(0.6).await;
+    for i in 0..n {
+        act(cx, &|v, _, cx| {
+            v.focus_nth(i, cx);
+            v.open_tab(
+                Open::Attach { session_id: ACROSS[i % ACROSS.len()].into(), fallback: None, open: false },
+                crate::tabs::Place::Current,
+            );
+        });
+        sleep(0.8).await;
+    }
+    for s in [crate::demo::IDLE_CPU, crate::demo::LEGACY] {
+        act(cx, &|v, _, cx| {
+            v.focus_nth(0, cx);
+            v.open_tab(Open::Attach { session_id: s.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        });
+        sleep(0.8).await;
+    }
+    act(cx, &|v, _, cx| {
+        v.focus_nth(0, cx);
+        v.focus_tab(0);
+    });
+    sleep(1.5).await;
+}
+
+/// Both panels to their strips (on their flights), whatever they were.
+fn fold_both(v: &mut crate::app::AppView, cx: &mut Context<crate::app::AppView>) {
+    if !v.panels.rail_collapsed {
+        v.toggle_panel(true, cx);
+    }
+    if !v.panels.right_collapsed {
+        v.toggle_panel(false, cx);
+    }
+}
+
+/// `filmwide` (the 2026-11-25 note under split.md §0; capture at 2560 ×
+/// 1080): both panels at their strips, Ctrl+\ five times (six across,
+/// each split on `sheet`), the rail opened and folded (its flight with six
+/// panes), a split down, Alt+1–7 around, then the panes closed back to
+/// one; each step marked on stderr.
+async fn film_wide(view: &WeakEntity<crate::app::AppView>, cx: &mut AsyncWindowContext, ex: &BackgroundExecutor, t0: Instant) {
+    let mark = |what: &str| eprintln!("PANES {what} {:.3}", t0.elapsed().as_secs_f64());
+    let sleep = |s: f64| ex.timer(std::time::Duration::from_secs_f64(s));
+    let act = |cx: &mut AsyncWindowContext, f: &dyn Fn(&mut crate::app::AppView, &mut Window, &mut Context<crate::app::AppView>)| {
+        let _ = view.update_in(cx, |v, window, cx| {
+            f(v, window, cx);
+            cx.notify();
+        });
+    };
+    act(cx, &|v, _, cx| fold_both(v, cx));
+    sleep(1.5).await;
+    for i in 0..5 {
+        mark(&format!("split {}", i + 2));
+        act(cx, &|v, w, cx| v.split_pane(None, w, cx));
+        sleep(1.2).await;
+        let s = ACROSS[(i + 1) % ACROSS.len()];
+        act(cx, &|v, _, _| {
+            v.open_tab(crate::app::Open::Attach { session_id: s.into(), fallback: None, open: false }, crate::tabs::Place::Current)
+        });
+        sleep(0.8).await;
+    }
+    for what in ["rail open", "rail fold", "rail open", "rail fold"] {
+        mark(what);
+        act(cx, &|v, _, cx| v.toggle_panel(true, cx));
+        sleep(1.4).await;
+    }
+    mark("split down");
+    act(cx, &|v, w, cx| {
+        v.focus_nth(2, cx);
+        v.split_pane(Some(crate::split::Side::Down), w, cx);
+    });
+    sleep(1.4).await;
+    for i in [0, 6, 3, 5] {
+        mark(&format!("focus {}", i + 1));
+        act(cx, &|v, _, cx| v.focus_nth(i, cx));
+        sleep(0.6).await;
+    }
+    while view.update(cx, |v, _| v.panes.len()).unwrap_or(1) > 1 {
+        mark("close");
+        act(cx, &|v, w, cx| v.app_act(crate::palette::AppAct::ClosePane, w, cx));
+        sleep(1.2).await;
+    }
+    mark("done");
 }
 
 /// `SYNAPS_DESK_PANES=<n>|film` (benches and evidence, with split panes
 /// on): once the first session is attached, `n` panes on it (2: side by
-/// side; 3: three across; 4: 2×2), or the film's scene, each step marked
+/// side; 3: three across; 4: 2×2; 5–9: [`shape`]), `across:<n>` ([`across`])
+/// or `filmwide` ([`film_wide`]), or the film's scene, each step marked
 /// on stderr (`PANES <what> <s>`): split right, the right pane opens
 /// another session, split down, focus by F6, Shift+F6 and Alt+1, a draft
 /// per pane, then the panes close one by one (each collapses). `film3b`
@@ -2252,6 +2392,17 @@ pub(crate) fn pane_script(view: &Entity<crate::app::AppView>, how: String, windo
             if how == "film6" {
                 sleep(5.0).await;
                 film6(&view, cx, &ex, t0).await;
+                return;
+            }
+            if let Some(n) = how.strip_prefix("across:").and_then(|n| n.parse::<usize>().ok()) {
+                sleep(1.5).await;
+                across(&view, cx, &ex, n).await;
+                mark("across");
+                return;
+            }
+            if how == "filmwide" {
+                sleep(5.0).await;
+                film_wide(&view, cx, &ex, t0).await;
                 return;
             }
             if how == "film4" || how == "film4b" {
