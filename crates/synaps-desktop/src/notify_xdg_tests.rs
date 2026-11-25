@@ -2,7 +2,9 @@
 //! window's side ([`Xdg`] under [`Notes`]), the task ([`run`]) and its
 //! state ([`Bus`]) are the production code; only the socket is fake. It
 //! hands the task what it would read, through a queue of 64 whose writer
-//! waits while it is full (zbus's reader), and a scripted bus and
+//! waits while it is full (zbus's reader); its writes can stall (a bus
+//! that stops reading us: the write stays pending until let go), and a
+//! scripted bus and
 //! notification server ([`Server`]) answers what the task writes, as
 //! `dbus-daemon` routes it: a call to a name nobody owns is the bus
 //! daemon's error. Time is the test executor's, moved by hand: `spin` runs
@@ -16,32 +18,46 @@ use super::*;
 use crate::notify::{Notes, note, tag_of};
 use crate::presence::Key;
 
-/// The fake socket: what the task wrote, and the reader's queue.
+/// The fake socket: what the task wrote, and the reader's queue. Its
+/// writes stall while `stall` is set (each one started then waits for a
+/// `go`); both channels close once the task has dropped every handle on
+/// the connection (the in-progress write too).
 struct Fake {
     wrote: async_channel::Receiver<Message>,
     feed: async_channel::Sender<zbus::Result<Message>>,
+    stall: Arc<AtomicBool>,
+    go: async_channel::Sender<()>,
 }
 
 /// A dial that connects at once to a fake socket (once), or never.
 fn fake(connects: bool) -> (Dial, Fake) {
     let (out_tx, wrote) = async_channel::unbounded::<Message>();
     let (feed, in_rx) = async_channel::bounded::<zbus::Result<Message>>(64);
+    let (go, gone_on) = async_channel::unbounded::<()>();
+    let stall = Arc::new(AtomicBool::new(false));
+    let stalls = stall.clone();
     let slot = Arc::new(Mutex::new(Some((out_tx, in_rx))));
     let dial: Dial = Arc::new(move || {
         let s = slot.lock().unwrap().take();
+        let (stalls, gone_on) = (stalls.clone(), gone_on.clone());
         Box::pin(async move {
             if !connects {
                 std::future::pending::<()>().await;
             }
             let (out, rx) = s.ok_or_else(|| zbus::Error::Failure("dialled twice".into()))?;
             let send = Box::new(move |m: Message| -> Sending {
-                let out = out.clone();
-                Box::pin(async move { out.send(m).await.map_err(|_| zbus::Error::Failure("hung up".into())) })
+                let (out, stalled, go) = (out.clone(), stalls.load(Ordering::SeqCst), gone_on.clone());
+                Box::pin(async move {
+                    if stalled {
+                        go.recv().await.map_err(|_| zbus::Error::Failure("hung up".into()))?;
+                    }
+                    out.send(m).await.map_err(|_| zbus::Error::Failure("hung up".into()))
+                })
             });
             Ok(Wire { send, recv: Box::pin(rx) })
         })
     });
-    (dial, Fake { wrote, feed })
+    (dial, Fake { wrote, feed, stall, go })
 }
 
 /// Everything runnable run; the clock left where it is.
@@ -97,6 +113,21 @@ struct Server {
 impl Server {
     fn new(f: Fake, owner: &str, markup: bool) -> Self {
         Server { f, owner: Some(owner.into()), markup, caps_fail: false, next: 1, hold: false, held: Vec::new(), log: Vec::new() }
+    }
+
+    /// Writes from now on stall (or don't).
+    fn stall(&self, on: bool) {
+        self.f.stall.store(on, Ordering::SeqCst);
+    }
+
+    /// One stalled write let through.
+    fn go(&self) {
+        self.f.go.try_send(()).unwrap();
+    }
+
+    /// The connection dropped by the task: no handle on it left.
+    fn dropped(&self) -> bool {
+        self.f.feed.is_closed() && self.f.wrote.is_closed()
     }
 
     fn put(&self, m: Message) {
@@ -480,6 +511,189 @@ fn no_service_is_started_once_then_followed(cx: &mut TestAppContext) {
     let notify = named(&calls, "Notify");
     assert_eq!(notify.len(), 1, "only the new card: {calls:?}");
     assert_eq!(to(notify[0]), ":1.20");
+}
+
+/// A window's notes on a fake bus with one card's notification up (A's
+/// id 1), and where its clicks come.
+fn one_up(cx: &mut TestAppContext) -> (Server, Notes, async_channel::Receiver<String>) {
+    let (dial, f) = fake(true);
+    let mut s = Server::new(f, ":1.10", true);
+    let (mut n, rx) = notes(dial);
+    post(cx, &mut n, 0, "up?");
+    s.serve(cx);
+    (s, n, rx)
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// `Notify`s written: to whom, and the question.
+fn told(calls: &[Message]) -> Vec<(String, String)> {
+    named(calls, "Notify").iter().map(|m| (to(m), notify_text(m).1)).collect()
+}
+
+/// Shady #89 N1. A write the bus never takes (it stopped reading us) has
+/// a bound of its own, apart from any reply: past `WRITE_WAIT` the task
+/// ends and drops the connection, the stalled write with it, and never
+/// writes to it again.
+#[gpui_kit::test]
+fn a_stalled_write_abandons_its_connection(cx: &mut TestAppContext) {
+    let (s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    post(cx, &mut n, 1, "stuck?");
+    spin(cx);
+    cx.executor().advance_clock(WRITE_WAIT - ms(1));
+    spin(cx);
+    assert!(!s.dropped(), "not yet");
+    cx.executor().advance_clock(ms(1));
+    spin(cx);
+    assert!(s.dropped(), "past WRITE_WAIT: the connection dropped, the stalled write with it");
+}
+
+/// N1. The window gone mid-write, the close of what is up waiting behind
+/// it: the task ends at the write's bound, and the close is never written
+/// on a stream cut mid-message (that notification stays: the residual).
+#[gpui_kit::test]
+fn the_window_gone_mid_write_ends_at_the_writes_bound(cx: &mut TestAppContext) {
+    let (mut s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    post(cx, &mut n, 1, "stuck?");
+    spin(cx);
+    cx.executor().advance_clock(ms(2000));
+    let gone = cx.update(|cx| n.teardown(cx));
+    spin(cx);
+    assert!(!gone.done(), "the write may still finish");
+    cx.executor().advance_clock(WRITE_WAIT - ms(2000));
+    spin(cx);
+    assert!(gone.done(), "ended at the write's bound");
+    assert!(s.dropped());
+    assert!(s.serve(cx).is_empty(), "nothing written after the cut");
+}
+
+/// N1. The teardown's own bound: the write in progress finishes after the
+/// window went, and its reply never comes. The task ends `LEAVE_WAIT`
+/// after the window went, not `CALL_WAIT` after that write.
+#[gpui_kit::test]
+fn a_teardown_ends_by_leave_wait(cx: &mut TestAppContext) {
+    let (mut s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    s.hold = true;
+    post(cx, &mut n, 1, "slow?");
+    spin(cx);
+    cx.executor().advance_clock(ms(1000));
+    let gone = cx.update(|cx| n.teardown(cx));
+    spin(cx);
+    cx.executor().advance_clock(ms(3000));
+    s.stall(false);
+    s.go();
+    let calls = s.serve(cx);
+    assert_eq!(told(&calls).len(), 1, "the write in progress went on: {calls:?}");
+    assert_eq!(named(&calls, "CloseNotification").iter().map(|c| close_id(c)).collect::<Vec<_>>(), [1], "t0 closed");
+    cx.executor().advance_clock(LEAVE_WAIT - ms(3000) - ms(1));
+    spin(cx);
+    assert!(!gone.done(), "t1's id might still come");
+    cx.executor().advance_clock(ms(1));
+    spin(cx);
+    assert!(gone.done(), "LEAVE_WAIT after the window went: ended, t1's reply unheard");
+    assert!(s.dropped());
+}
+
+/// N1. A write that is slow but finishes counts its reply's `CALL_WAIT`
+/// from then: its id still counts.
+#[gpui_kit::test]
+fn a_slow_write_counts_its_reply_from_the_write(cx: &mut TestAppContext) {
+    let (mut s, mut n, rx) = one_up(cx);
+    s.stall(true);
+    s.hold = true;
+    let t1 = post(cx, &mut n, 1, "slow?");
+    s.serve(cx);
+    cx.executor().advance_clock(WRITE_WAIT - ms(1));
+    s.stall(false);
+    s.go();
+    s.serve(cx);
+    assert_eq!(s.held.len(), 1, "written at last");
+    cx.executor().advance_clock(CALL_WAIT - ms(1));
+    s.release(0, 9);
+    s.clicked(9, ":1.10");
+    spin(cx);
+    assert_eq!(clicks(&rx), [t1], "its reply counted from its write: id 9 is t1's");
+    assert!(!s.dropped());
+}
+
+/// Shady #89 N2. The window goes with three `Notify`s built behind a
+/// stalled write: they are taken back, whole; only the one being written
+/// goes on, and it is closed when its id comes.
+#[gpui_kit::test]
+fn the_window_gone_takes_back_what_is_built(cx: &mut TestAppContext) {
+    let (mut s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    for k in 1..=3 {
+        post(cx, &mut n, k, &format!("q{k}?"));
+    }
+    spin(cx);
+    let gone = cx.update(|cx| n.teardown(cx));
+    spin(cx);
+    s.stall(false);
+    s.go();
+    let calls = s.serve(cx);
+    assert_eq!(told(&calls), [(":1.10".to_string(), "q1?".to_string())], "nothing written after the window went but that write: {calls:?}");
+    let mut closed: Vec<u32> = named(&calls, "CloseNotification").iter().map(|c| close_id(c)).collect();
+    closed.sort();
+    assert_eq!(closed, [1, 2], "t0, and t1 when its id came");
+    spin(cx);
+    assert!(gone.done());
+}
+
+/// N2. A card resolves while its `Notify` is built, behind a stalled
+/// write: never written, nothing to close.
+#[gpui_kit::test]
+fn a_resolved_card_takes_back_its_notify(cx: &mut TestAppContext) {
+    let (mut s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    post(cx, &mut n, 1, "q1?");
+    let t2 = post(cx, &mut n, 2, "q2?");
+    spin(cx);
+    cx.update(|cx| n.retire(&t2, cx));
+    spin(cx);
+    s.stall(false);
+    s.go();
+    let calls = s.serve(cx);
+    assert_eq!(told(&calls), [(":1.10".to_string(), "q1?".to_string())], "t2's taken back: {calls:?}");
+    assert!(named(&calls, "CloseNotification").is_empty(), "{calls:?}");
+}
+
+/// N2 (Shady #89's epoch caveat). The owner changes while a `Notify` is
+/// built for it, behind a stalled write: never written to the old owner,
+/// told to the new one.
+#[gpui_kit::test]
+fn a_new_owner_gets_what_was_only_built_for_the_old(cx: &mut TestAppContext) {
+    let (mut s, mut n, _rx) = one_up(cx);
+    s.stall(true);
+    post(cx, &mut n, 1, "q1?");
+    post(cx, &mut n, 2, "q2?");
+    spin(cx);
+    s.owned(Some(":1.11"));
+    spin(cx);
+    s.stall(false);
+    s.go();
+    let calls = s.serve(cx);
+    assert_eq!(
+        told(&calls),
+        [(":1.10".to_string(), "q1?".to_string()), (":1.11".to_string(), "q2?".to_string())],
+        "q1 was being written to A; q2, only built, goes to B: {calls:?}"
+    );
+}
+
+/// Shady #89 N3. The summary on the bus holds no link a server would offer.
+#[gpui_kit::test]
+fn the_summary_on_the_bus_holds_no_link(cx: &mut TestAppContext) {
+    let (dial, f) = fake(true);
+    let mut s = Server::new(f, ":1.10", true);
+    let (mut n, _rx) = notes(dial);
+    cx.update(|cx| n.post(key(0), note(&key(0), "https://x.io www.y.org", "q?"), cx));
+    let calls = s.serve(cx);
+    assert_eq!(notify_text(named(&calls, "Notify")[0]).0, "Needs you · https:\u{2060}//x.\u{2060}io www.\u{2060}y.\u{2060}org");
 }
 
 /// The production dial ([`session`]) on a real, private session bus,

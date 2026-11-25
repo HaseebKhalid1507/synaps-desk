@@ -50,6 +50,26 @@ fn the_os_gets_one_bounded_line_of_plain_text() {
     assert_ne!(tag_of(&key(1)), tag_of(&Key { card: cards_spec::CardId::parse("czzzzzz").unwrap(), ..key(1) }));
 }
 
+/// Shady #89 N3. A Linux summary holds nothing a server takes for a link
+/// (dunst offers to open a summary's `<a href>`, `<img src>`, and any
+/// `http(s)://`, `ftp(s)://`, `news://`, `file://`, `mailto:` or `www.`
+/// text): a word joiner after every `:`, `.` and `<`, the text otherwise
+/// as it was.
+#[test]
+fn a_linux_summary_offers_no_link() {
+    let n = note(&key(1), r#"<a href="https://example.com">release</a>"#, "q");
+    assert_eq!(n.title, r#"Needs you · <a href="https://example.com">release</a>"#, "a session's name as typed");
+    for t in [n.title.as_str(), "WWW.Example.org <IMG src=x> MAILTO:a@b file:///etc news://n ftps://f"] {
+        let s = xdg_summary(t);
+        assert_eq!(s.replace('\u{2060}', ""), t, "the same text");
+        let low = s.to_lowercase();
+        for pat in ["<a", "<img", "://", "www.e", "mailto:a"] {
+            assert!(!low.contains(pat), "{pat} in {s:?}");
+        }
+        assert!(s.char_indices().all(|(i, c)| !matches!(c, ':' | '.' | '<') || s[i + c.len_utf8()..].starts_with('\u{2060}')), "{s:?}");
+    }
+}
+
 /// A transport that remembers.
 #[derive(Default)]
 struct Fake {

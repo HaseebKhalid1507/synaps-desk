@@ -9,9 +9,12 @@
 //! default-ignorable marks) and bounded. On Linux the body is markup to a
 //! server that says so (`body-markup`): there `&`, `<` and `>` are
 //! escaped ([`xdg_body`]); macOS and Windows draw text as given. The
-//! summary is plain text by the spec, sent as it is: a server that
-//! formats it as markup anyway (dunst's `markup = full`) may style a
-//! session name's tags, never act on them.
+//! summary is plain text by the spec; on Linux nothing in it reads as a
+//! link either ([`xdg_summary`]: dunst offers to open the URLs it finds
+//! in a summary). How a server formats a summary (dunst's `markup =
+//! full` styles tags) is its own, outside this guarantee; so is what it
+//! does with links in the body, which is the question as the card shows
+//! it.
 //!
 //! **The transports** ([`Transport`]), each one the window's, taken down
 //! with it ([`Notes::teardown`], from the view's release and the app's
@@ -76,6 +79,25 @@ pub(crate) fn label(s: &str) -> String {
 /// question (one line, bounded: [`crate::ask::question_line`]).
 pub(crate) fn note(k: &Key, session: &str, question: &str) -> Note {
     Note { tag: tag_of(k), title: format!("Needs you · {}", label(session)), body: crate::ask::question_line(question) }
+}
+
+/// A Linux notification's summary: plain text by the spec, and nothing
+/// in it a server can take for a link (Shady #89 N3). dunst gathers the
+/// URLs of a summary and a body (`<a href>`, `<img src>`, and any text
+/// from `http://`, `https://`, `ftp://`, `ftps://`, `news://`, `file://`,
+/// `mailto:` or `www.`) and offers to open them. A word joiner (U+2060:
+/// no width, no break) after every `:`, `.` and `<` breaks each of those
+/// patterns and shows the same text.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn xdg_summary(title: &str) -> String {
+    let mut out = String::with_capacity(title.len() + 8);
+    for ch in title.chars() {
+        out.push(ch);
+        if matches!(ch, ':' | '.' | '<') {
+            out.push('\u{2060}');
+        }
+    }
+    out
 }
 
 /// A Linux notification's body: escaped for a server that reads it as

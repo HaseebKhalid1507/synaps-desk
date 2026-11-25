@@ -13,16 +13,27 @@
 //! while it writes (a write in progress is polled alongside, never
 //! dropped half-written), and while it tears down.
 //!
-//! **Bounded, cancellable lifetimes.** A call not answered within
-//! [`CALL_WAIT`] has failed; one not yet written is dropped with it. At
-//! most [`CALLS_MAX`] calls are out; what waits beyond that is state
-//! (which notifications the window wants), not messages: the window's
-//! side ([`Xdg`]) only writes the set of notes it wants (at most
-//! [`NOTES_MAX`]) and wakes the task, coalesced. The window gone (its
-//! side dropped) is heard on any turn, mid-call too: nothing queued is
-//! shown, every notification up is closed, and the task ends once those
-//! calls are answered or [`CALL_WAIT`] passes. Connecting is bounded by
-//! [`CONNECT_WAIT`] and by the window's going.
+//! **Bounded, cancellable lifetimes.** A call is built (its message in
+//! [`Bus::out`]), then written (one write at a time), then answered. Each
+//! step has its own bound. Built and not yet written, it can be taken
+//! back whole: nothing of it reached the bus. A write in progress can't
+//! (part of the message may be on the socket, and a byte stream cut
+//! mid-message is garbage to the bus): it has [`WRITE_WAIT`], and past
+//! that the task ends and the connection is dropped with it, never
+//! written to again (Shady #89 N1). Written, a call not answered within
+//! [`CALL_WAIT`] of its write has failed. At most [`CALLS_MAX`] calls are
+//! out; what waits beyond that is state (which notifications the window
+//! wants), not messages: the window's side ([`Xdg`]) only writes the set
+//! of notes it wants (at most [`NOTES_MAX`]) and wakes the task,
+//! coalesced. A card resolved while its `Notify` is only built takes it
+//! back. The window gone (its side dropped) is heard on any turn, mid-call
+//! and mid-write too, and before the next write: every call built and not
+//! yet written is taken back but the closes (no `Notify` is written after
+//! it, N2), every notification up is closed, and a `Notify` already on its
+//! way is closed when its id comes. The task ends once those calls are
+//! answered, or [`LEAVE_WAIT`] after the window went, whatever is still
+//! out. Connecting is bounded by [`CONNECT_WAIT`] and by the window's
+//! going.
 //!
 //! **Ids belong to the server that issued them** (its unique bus name,
 //! the owner epoch). The task adds its match rules, then asks who owns
@@ -38,16 +49,25 @@
 //! nothing is closed at, or routed from, its successor, whose counter may
 //! well hand the same numbers to another app. A `Notify` in flight across
 //! the change is not shown again either (told once): its id, when it
-//! comes, is the old owner's, and forgotten. With no owner, the bus is
+//! comes, is the old owner's, and forgotten. One only built for the old
+//! owner is taken back and told to the new one; a close or a
+//! `GetCapabilities` only built for it is dropped. The owner is its
+//! unique name, which the bus never gives another connection: the same
+//! server losing the name and taking it back is the same issuer, its ids
+//! its own. With no owner, the bus is
 //! asked to start one (`StartServiceByName`, D-Bus activation) once per
 //! new notification; still none, it is not told.
 //!
 //! **The residuals.** A replaced server that keeps running keeps showing
 //! what it showed; its clicks are ignored and its notifications aren't
 //! closed (they would have to be closed by an id the new owner doesn't
-//! issue). A bus lost (the stream ends, a write fails) ends the task;
-//! notifications up then stay with the server, and the next one posted
-//! connects again. The process killed outright closes nothing.
+//! issue). A bus lost (the stream ends, a write fails) or a connection
+//! abandoned (a write past [`WRITE_WAIT`], a teardown past [`LEAVE_WAIT`])
+//! ends the task; what it showed then stays with the server, unclosed,
+//! and a `Notify` on its way may still be shown, with no id to close it
+//! by. The next one posted connects again. "At most [`NOTES_MAX`] up" is
+//! the notes this window owns; those cases can leave more on the server.
+//! The process killed outright closes nothing.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -62,15 +82,21 @@ use gpui_kit::{App, BackgroundExecutor, Task};
 use zbus::Message;
 use zbus::message::Type;
 
-use super::{Gone, NOTES_MAX, Note, Transport, xdg_body};
+use super::{Gone, NOTES_MAX, Note, Transport, xdg_body, xdg_summary};
 
 pub(crate) const XDG_NAME: &str = "org.freedesktop.Notifications";
 pub(crate) const XDG_PATH: &str = "/org/freedesktop/Notifications";
 pub(crate) const BUS: &str = "org.freedesktop.DBus";
 pub(crate) const BUS_PATH: &str = "/org/freedesktop/DBus";
 
-/// A call not answered in this long has failed.
+/// A call not answered in this long (from when it was written) has failed.
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(5);
+/// A write still in progress after this long: the bus isn't reading us,
+/// and the connection is abandoned (Shady #89 N1).
+pub(crate) const WRITE_WAIT: Duration = Duration::from_secs(5);
+/// The window gone this long: the task ends, whatever is still out (its
+/// connection abandoned with it).
+pub(crate) const LEAVE_WAIT: Duration = Duration::from_secs(5);
 /// The session bus not reached in this long: no notifications this time.
 pub(crate) const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// At most this many calls out at once.
@@ -229,23 +255,24 @@ pub(crate) async fn run(
         let w = w.clone();
         Box::pin(async move { w.recv().await.is_ok() })
     };
-    let mut bus = Bus::new(ex.now());
+    let mut bus = Bus::new();
     let mut woke = Some(wake(&woken));
     let mut fresh = true;
-    let mut sending: Option<Sending> = None;
+    let mut sending: Option<Writing> = None;
     let mut timer: Option<(Instant, Task<()>)> = None;
     loop {
         let now = ex.now();
+        // The window gone (its side dropped the wake): heard before
+        // anything more is written, so nothing more is shown.
+        if woke.is_some() && woken.is_closed() {
+            woke = None;
+            fresh = false;
+            bus.leave(now);
+        }
         if fresh {
             fresh = false;
-            // The window gone since it woke the task: nothing more shown.
-            if woken.is_closed() {
-                woke = None;
-                bus.leave(now);
-            } else {
-                let w = want.lock().unwrap_or_else(PoisonError::into_inner).clone();
-                bus.want(&w, now);
-            }
+            let w = want.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            bus.want(&w);
         }
         for tag in bus.clicked.drain(..) {
             let _ = clicks.try_send(tag);
@@ -253,19 +280,19 @@ pub(crate) async fn run(
         if sending.is_none()
             && let Some(m) = bus.out.pop_front()
         {
-            sending = Some(send(m));
+            sending = Some(Writing { serial: m.primary_header().serial_num(), until: now + WRITE_WAIT, write: send(m) });
         }
         if sending.is_none() && bus.done() {
             return;
         }
-        let due = bus.deadline();
+        let due = bus.deadline().into_iter().chain(sending.as_ref().map(|w| w.until)).min();
         if timer.as_ref().map(|t| t.0) != due {
             timer = due.map(|d| (d, ex.timer(d.saturating_duration_since(now))));
         }
         let turn = std::future::poll_fn(|cx| {
             let mut t = Turn::default();
-            if let Some(s) = sending.as_mut()
-                && let Poll::Ready(r) = s.as_mut().poll(cx)
+            if let Some(w) = sending.as_mut()
+                && let Poll::Ready(r) = w.write.as_mut().poll(cx)
             {
                 t.sent = Some(r);
             }
@@ -294,14 +321,15 @@ pub(crate) async fn run(
         .await;
         let now = ex.now();
         if let Some(r) = turn.sent {
-            sending = None;
+            let w = sending.take().expect("a write was polled");
             if let Err(e) = r {
                 return log::warn!(target: "synaps_desktop::card", "notifications: the session bus took no more: {e}");
             }
+            bus.written(w.serial, now);
         }
         for m in turn.heard {
             match m {
-                Ok(m) => bus.heard(&m, now),
+                Ok(m) => bus.heard(&m),
                 Err(e) => log::debug!(target: "synaps_desktop::card", "notifications: {e}"),
             }
         }
@@ -323,7 +351,25 @@ pub(crate) async fn run(
             timer = None;
             bus.late(now);
         }
+        // A write that never finishes, and a teardown that never ends,
+        // end here: the connection goes with the task (every handle on it
+        // is the task's; zbus's own tasks hold none), never written to
+        // again after a write cut short.
+        if sending.as_ref().is_some_and(|w| w.until <= now) {
+            return log::warn!(target: "synaps_desktop::card", "notifications: a write to the session bus stalled; its connection abandoned");
+        }
+        if bus.over(now) {
+            return log::warn!(target: "synaps_desktop::card", "notifications: still out when the window had gone {LEAVE_WAIT:?}: abandoned");
+        }
     }
+}
+
+/// The message being written: which call it is, and until when it may
+/// take ([`WRITE_WAIT`]).
+struct Writing {
+    serial: NonZeroU32,
+    until: Instant,
+    write: Sending,
 }
 
 /// Who owns the service, as far as the task knows.
@@ -350,12 +396,13 @@ enum Caps {
     Markup(bool),
 }
 
-/// A call out: its serial, whom it went to, until when its reply counts.
+/// A call out: its serial, whom it went to, until when its reply counts
+/// (`None`: not written yet; [`CALL_WAIT`] counts from its write).
 #[derive(Debug)]
 struct Call {
     serial: NonZeroU32,
     to: String,
-    until: Instant,
+    until: Option<Instant>,
     what: What,
 }
 
@@ -401,13 +448,13 @@ pub(crate) struct Bus {
     pub(crate) clicked: Vec<String>,
     /// `StartServiceByName` tried for what is queued.
     started: bool,
-    /// The window is gone.
-    leaving: bool,
+    /// When the window went.
+    left: Option<Instant>,
 }
 
 impl Bus {
     /// The match rules, then who owns the service.
-    fn new(now: Instant) -> Self {
+    fn new() -> Self {
         let mut b = Bus {
             owner: Owner::Ask(false),
             calls: Vec::new(),
@@ -416,7 +463,7 @@ impl Bus {
             closes: VecDeque::new(),
             clicked: Vec::new(),
             started: false,
-            leaving: false,
+            left: None,
         };
         let svc = format!("type='signal',sender='{XDG_NAME}',path='{XDG_PATH}',interface='{XDG_NAME}'");
         for rule in [
@@ -424,22 +471,33 @@ impl Bus {
             format!("{svc},member='NotificationClosed'"),
             format!("type='signal',sender='{BUS}',path='{BUS_PATH}',interface='{BUS}',member='NameOwnerChanged',arg0='{XDG_NAME}'"),
         ] {
-            b.call(BUS, BUS_PATH, BUS, "AddMatch", &rule, What::Rule, now);
+            b.call(BUS, BUS_PATH, BUS, "AddMatch", &rule, What::Rule);
         }
-        b.pump(now);
+        b.pump();
         b
     }
 
     /// The window wants `notes` up: new ones queued, those it no longer
     /// wants closed (or dropped, never sent).
-    fn want(&mut self, notes: &[Note], now: Instant) {
+    fn want(&mut self, notes: &[Note]) {
+        // A card resolved while its `Notify` waits to be written: taken
+        // back, never sent.
+        let unwanted: Vec<String> = self
+            .tags
+            .iter()
+            .filter(|t| matches!(t.state, State::Sending) && !notes.iter().any(|n| n.tag == t.note.tag))
+            .map(|t| t.note.tag.clone())
+            .collect();
+        if !unwanted.is_empty() {
+            self.take_back(|c| matches!(&c.what, What::Notify { tag, .. } if unwanted.contains(tag)));
+        }
         let mut kept = Vec::with_capacity(self.tags.len());
         for mut t in self.tags.drain(..) {
             t.wanted = notes.iter().any(|n| n.tag == t.note.tag);
             match t.state {
                 _ if t.wanted => kept.push(t),
                 State::Up { owner, id } => self.closes.push_back((owner, id)),
-                // Closed when its id comes.
+                // Written, or being written: closed when its id comes.
                 State::Sending => kept.push(t),
                 State::Queued | State::Done => {}
             }
@@ -451,12 +509,16 @@ impl Bus {
                 self.started = false;
             }
         }
-        self.pump(now);
+        self.pump();
     }
 
     /// The window is gone: nothing more is shown; what is up is closed.
+    /// Every call built and not yet written is taken back but the closes
+    /// (a `Notify` with it, its note dropped); only a call already written,
+    /// or being written, is followed, until [`LEAVE_WAIT`] at most.
     fn leave(&mut self, now: Instant) {
-        self.leaving = true;
+        self.left = Some(now);
+        self.take_back(|c| !matches!(c.what, What::Close));
         let mut kept = Vec::new();
         for mut t in self.tags.drain(..) {
             t.wanted = false;
@@ -467,33 +529,70 @@ impl Bus {
             }
         }
         self.tags = kept;
-        self.pump(now);
+        self.pump();
     }
 
     /// Done: the window gone and nothing left out or to send.
     fn done(&self) -> bool {
-        self.leaving && self.calls.is_empty() && self.out.is_empty() && self.closes.is_empty()
+        self.leaving() && self.calls.is_empty() && self.out.is_empty() && self.closes.is_empty()
     }
 
-    /// When the next call out fails, unanswered.
+    fn leaving(&self) -> bool {
+        self.left.is_some()
+    }
+
+    /// The window gone [`LEAVE_WAIT`] ago: time to end, done or not.
+    fn over(&self, now: Instant) -> bool {
+        self.left.is_some_and(|t| now >= t + LEAVE_WAIT)
+    }
+
+    /// When the next written call fails, unanswered, or the teardown ends.
     fn deadline(&self) -> Option<Instant> {
-        self.calls.iter().map(|c| c.until).min()
+        self.calls.iter().filter_map(|c| c.until).chain(self.left.map(|t| t + LEAVE_WAIT)).min()
     }
 
-    /// The calls past [`CALL_WAIT`] failed; one not yet written dropped.
+    /// Call `serial` is written: its reply counts for [`CALL_WAIT`].
+    fn written(&mut self, serial: NonZeroU32, now: Instant) {
+        if let Some(c) = self.calls.iter_mut().find(|c| c.serial == serial) {
+            c.until = Some(now + CALL_WAIT);
+        }
+    }
+
+    /// Calls built and not yet written (those `which` picks) taken back:
+    /// their messages out of [`Bus::out`], their bookkeeping with them. A
+    /// `Notify` taken back is queued again (nothing of it was sent).
+    fn take_back(&mut self, which: impl Fn(&Call) -> bool) {
+        let unsent = |s: NonZeroU32| self.out.iter().any(|m| m.primary_header().serial_num() == s);
+        let back: Vec<NonZeroU32> =
+            self.calls.iter().filter(|c| c.until.is_none() && which(c) && unsent(c.serial)).map(|c| c.serial).collect();
+        if back.is_empty() {
+            return;
+        }
+        self.out.retain(|m| !back.contains(&m.primary_header().serial_num()));
+        let (gone, kept): (Vec<Call>, Vec<Call>) = self.calls.drain(..).partition(|c| back.contains(&c.serial));
+        self.calls = kept;
+        for c in gone {
+            if let What::Notify { tag, .. } = c.what
+                && let Some(t) = self.tags.iter_mut().find(|t| t.note.tag == tag && matches!(t.state, State::Sending))
+            {
+                t.state = State::Queued;
+            }
+        }
+    }
+
+    /// The written calls past [`CALL_WAIT`] failed.
     fn late(&mut self, now: Instant) {
-        let (late, out): (Vec<Call>, Vec<Call>) = self.calls.drain(..).partition(|c| c.until <= now);
+        let (late, out): (Vec<Call>, Vec<Call>) = self.calls.drain(..).partition(|c| c.until.is_some_and(|u| u <= now));
         self.calls = out;
         for c in late {
-            self.out.retain(|m| m.primary_header().serial_num() != c.serial);
             log::warn!(target: "synaps_desktop::card", "notifications: {:?} to {} unanswered", c.what, c.to);
-            self.answered(c, Err("unanswered".into()), now);
+            self.answered(c, Err("unanswered".into()));
         }
-        self.pump(now);
+        self.pump();
     }
 
     /// One message from the bus.
-    fn heard(&mut self, m: &Message, now: Instant) {
+    fn heard(&mut self, m: &Message) {
         let h = m.header();
         match m.message_type() {
             Type::MethodReturn | Type::Error => {
@@ -511,15 +610,15 @@ impl Bus {
                 } else {
                     Err(h.error_name().map_or_else(|| "an error".to_string(), |e| e.to_string()))
                 };
-                self.answered(c, r, now);
+                self.answered(c, r);
             }
-            Type::Signal => self.signal(m, now),
+            Type::Signal => self.signal(m),
             Type::MethodCall => {}
         }
-        self.pump(now);
+        self.pump();
     }
 
-    fn signal(&mut self, m: &Message, now: Instant) {
+    fn signal(&mut self, m: &Message) {
         let h = m.header();
         let (Some(from), Some(path), Some(iface), Some(member)) = (h.sender(), h.path(), h.interface(), h.member()) else { return };
         let (from, path) = (from.as_str(), path.as_str());
@@ -528,7 +627,7 @@ impl Bus {
                 if let Ok((name, _old, new)) = m.body().deserialize::<(String, String, String)>()
                     && name == XDG_NAME
                 {
-                    self.owned_by((!new.is_empty()).then_some(new), now);
+                    self.owned_by((!new.is_empty()).then_some(new));
                 }
             }
             (XDG_NAME, "ActionInvoked") if path == XDG_PATH => {
@@ -558,7 +657,7 @@ impl Bus {
     /// The service's owner is now `new` (`None`: nobody). Every id of the
     /// one before is forgotten, with no call: none of them means anything
     /// to `new`. `new`'s capabilities are asked anew.
-    fn owned_by(&mut self, new: Option<String>, now: Instant) {
+    fn owned_by(&mut self, new: Option<String>) {
         let same = match (&self.owner, &new) {
             (Owner::Some(e), Some(n)) => e.name == *n,
             (Owner::None, None) => true,
@@ -568,6 +667,12 @@ impl Bus {
             return;
         }
         log::info!(target: "synaps_desktop::card", "notification service owner: {}", new.as_deref().unwrap_or("none"));
+        // Built for the old owner and not yet written: never written (a
+        // `Notify` queued again, for the new one).
+        if let Owner::Some(old) = &self.owner {
+            let old = old.name.clone();
+            self.take_back(|c| c.to == old);
+        }
         for t in &mut self.tags {
             if matches!(t.state, State::Up { .. }) {
                 t.state = State::Done;
@@ -581,11 +686,11 @@ impl Bus {
             }
             None => Owner::None,
         };
-        self.pump(now);
+        self.pump();
     }
 
     /// Call `c`'s reply (`Err`: an error, or none in time).
-    fn answered(&mut self, c: Call, r: Result<&Message, String>, now: Instant) {
+    fn answered(&mut self, c: Call, r: Result<&Message, String>) {
         match c.what {
             What::Rule => {
                 if let Err(e) = r {
@@ -593,8 +698,8 @@ impl Bus {
                 }
             }
             What::Owner => match r {
-                Ok(m) => self.owned_by(m.body().deserialize::<String>().ok(), now),
-                Err(_) => self.owned_by(None, now),
+                Ok(m) => self.owned_by(m.body().deserialize::<String>().ok()),
+                Err(_) => self.owned_by(None),
             },
             What::Start => {
                 if let Err(e) = r {
@@ -622,7 +727,7 @@ impl Bus {
                 }
                 let current = matches!(&self.owner, Owner::Some(e) if e.name == owner);
                 let ix = self.tags.iter().position(|t| t.note.tag == tag && matches!(t.state, State::Sending));
-                let wanted = ix.is_some_and(|ix| self.tags[ix].wanted) && !self.leaving;
+                let wanted = ix.is_some_and(|ix| self.tags[ix].wanted) && !self.leaving();
                 match (id, ix) {
                     (Some(id), Some(ix)) if current && wanted => self.tags[ix].state = State::Up { owner, id },
                     (id, ix) => {
@@ -635,7 +740,7 @@ impl Bus {
                             self.closes.push_back((owner, id));
                         }
                         if let Some(ix) = ix {
-                            if self.tags[ix].wanted && !self.leaving {
+                            if self.tags[ix].wanted && !self.leaving() {
                                 self.tags[ix].state = State::Done;
                             } else {
                                 self.tags.remove(ix);
@@ -651,7 +756,7 @@ impl Bus {
     /// As many calls out as [`CALLS_MAX`] allows: closes first, then who
     /// owns the service and what it does, then the queued notes (or, with
     /// no owner, one try at starting one).
-    fn pump(&mut self, now: Instant) {
+    fn pump(&mut self) {
         let extra = self.closes.len().saturating_sub(CLOSES_MAX);
         if extra > 0 {
             log::warn!(target: "synaps_desktop::card", "notifications: {extra} closes dropped");
@@ -659,22 +764,22 @@ impl Bus {
         }
         while self.calls.len() < CALLS_MAX {
             if let Some((owner, id)) = self.closes.pop_front() {
-                self.call(&owner, XDG_PATH, XDG_NAME, "CloseNotification", &id, What::Close, now);
+                self.call(&owner, XDG_PATH, XDG_NAME, "CloseNotification", &id, What::Close);
                 continue;
             }
-            if self.leaving {
+            if self.leaving() {
                 return;
             }
             let queued = self.tags.iter().position(|t| matches!(t.state, State::Queued));
             match &mut self.owner {
                 Owner::Ask(sent @ false) => {
                     *sent = true;
-                    self.call(BUS, BUS_PATH, BUS, "GetNameOwner", &XDG_NAME, What::Owner, now);
+                    self.call(BUS, BUS_PATH, BUS, "GetNameOwner", &XDG_NAME, What::Owner);
                 }
                 Owner::Some(Epoch { name, caps: Caps::Ask(sent @ false) }) => {
                     *sent = true;
                     let name = name.clone();
-                    self.call(&name, XDG_PATH, XDG_NAME, "GetCapabilities", &(), What::Caps(name.clone()), now);
+                    self.call(&name, XDG_PATH, XDG_NAME, "GetCapabilities", &(), What::Caps(name.clone()));
                 }
                 Owner::Some(Epoch { name, caps: Caps::Markup(markup) }) => {
                     let Some(ix) = queued else { return };
@@ -682,8 +787,9 @@ impl Bus {
                     self.tags[ix].state = State::Sending;
                     let n = self.tags[ix].note.clone();
                     let hints: HashMap<&str, zbus::Variant> = HashMap::new();
-                    let body = ("Synaps", 0u32, "", n.title.as_str(), xdg_body(&n.body, markup), vec!["default", "Open"], hints, -1i32);
-                    self.call(&name, XDG_PATH, XDG_NAME, "Notify", &body, What::Notify { tag: n.tag, owner: name.clone() }, now);
+                    let body =
+                        ("Synaps", 0u32, "", xdg_summary(&n.title), xdg_body(&n.body, markup), vec!["default", "Open"], hints, -1i32);
+                    self.call(&name, XDG_PATH, XDG_NAME, "Notify", &body, What::Notify { tag: n.tag, owner: name.clone() });
                 }
                 Owner::None => {
                     if queued.is_none() || self.calls.iter().any(|c| matches!(c.what, What::Start)) {
@@ -700,23 +806,23 @@ impl Bus {
                         return;
                     }
                     self.started = true;
-                    self.call(BUS, BUS_PATH, BUS, "StartServiceByName", &(XDG_NAME, 0u32), What::Start, now);
+                    self.call(BUS, BUS_PATH, BUS, "StartServiceByName", &(XDG_NAME, 0u32), What::Start);
                 }
                 Owner::Ask(true) | Owner::Some(Epoch { caps: Caps::Ask(true), .. }) => return,
             }
         }
     }
 
-    /// A call written out: remembered by serial until its reply, or
-    /// [`CALL_WAIT`].
+    /// A call built, for the task to write: remembered by serial until its
+    /// reply, or [`CALL_WAIT`] after its write.
     #[allow(clippy::too_many_arguments)]
-    fn call<B>(&mut self, to: &str, path: &str, iface: &str, member: &str, body: &B, what: What, now: Instant)
+    fn call<B>(&mut self, to: &str, path: &str, iface: &str, member: &str, body: &B, what: What)
     where
         B: serde::Serialize + zbus::DynamicType,
     {
         match Message::method_call(path, member).destination(to).interface(iface).build(body) {
             Ok(m) => {
-                self.calls.push(Call { serial: m.primary_header().serial_num(), to: to.to_string(), until: now + CALL_WAIT, what });
+                self.calls.push(Call { serial: m.primary_header().serial_num(), to: to.to_string(), until: None, what });
                 self.out.push_back(m);
             }
             // Not built (a name the bus gave that zbus refuses): that note
