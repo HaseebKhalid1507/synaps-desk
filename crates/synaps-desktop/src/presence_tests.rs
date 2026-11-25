@@ -375,8 +375,8 @@ fn show_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
     play(cx, w, view);
 }
 
-/// A key pressed and let go, then 40 ms (as `ui_tests::tap`: the app reads
-/// a press of the same key within 30 ms of its release as a repeat).
+/// A key pressed and let go, then the input clock past a repeat's window
+/// (as `ui_tests::tap`: the next key-down is a new press).
 fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
     let down = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
@@ -395,7 +395,7 @@ fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     .expect("the window");
     cx.run_until_parked();
     settle(cx, w, 8);
-    std::thread::sleep(Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 fn has(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> bool {

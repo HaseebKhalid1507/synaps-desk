@@ -965,6 +965,46 @@ impl CardChord {
     }
 }
 
+/// The time every key-down and key-up is stamped with for [`FoldKeys`]
+/// (the fold, tab and move keys, the card chord's Enter, Esc and Space):
+/// the monotonic clock. A test's is its own ([`next_press`]): it stands
+/// still until the test moves it, so whether a key-down is a press or a
+/// repeat never rests on how long the machine took to draw the frames
+/// between two keys (with optimized dependencies two presses one frame
+/// apart came within [`FoldKeys::PAIR`], and read as a repeat).
+pub(crate) fn input_now() -> Instant {
+    let now = Instant::now();
+    #[cfg(test)]
+    let now = INPUT_CLOCK.with(|c| {
+        let at = c.get().unwrap_or(now);
+        c.set(Some(at));
+        at
+    });
+    now
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPUT_CLOCK: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Tests: the input clock ([`input_now`]) moves on `by`, and nothing else
+/// does (no frame, no wall time). A GPUI test runs the view on its own
+/// thread, so the clock is that test's.
+#[cfg(test)]
+pub(crate) fn advance_input_clock(by: Duration) {
+    let now = input_now();
+    INPUT_CLOCK.with(|c| c.set(Some(now + by)));
+}
+
+/// Tests: the next key-down is a new press, not a repeat: the input clock
+/// moves 40 ms, past [`FoldKeys::PAIR`], as a hand that lets a key go and
+/// presses it again.
+#[cfg(test)]
+pub(crate) fn next_press() {
+    advance_input_clock(FoldKeys::PAIR + Duration::from_millis(10));
+}
+
 /// A pane map's cell (split.md §4, §6): `prose` where its pane is lit,
 /// else `rest_mark`, the chrome's mark at rest, which reads on the chrome,
 /// a raised (selected or hovered) row and a pressed one in every theme
@@ -4276,7 +4316,7 @@ impl AppView {
     /// A once-per-press key's key-down, after its action: a press acts, a
     /// repeat does not.
     fn once_key(&mut self, k: OnceKey, held: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let now = Instant::now();
+        let now = input_now();
         match k {
             OnceKey::MovePane(back) => {
                 if self.move_keys.press(now, held) {
@@ -10094,7 +10134,7 @@ impl Render for AppView {
                     return;
                 }
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
-                this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
+                this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, input_now(), ev.is_held);
                 // Ctrl+Shift+J: the first waiting card in any open session (D3);
                 // not while a field composes (the IME's keys).
                 if crate::presence::is_jump(&ev.keystroke)
@@ -10321,14 +10361,14 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ToggleFavourite, window, cx| this.fav_key_pressed(window, cx)))
             .map(|d| tab_actions(d, cx))
             .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
-                let k = &ev.keystroke.key;
-                this.panes.cur.chord.up(k, Instant::now());
+                let (k, now) = (&ev.keystroke.key, input_now());
+                this.panes.cur.chord.up(k, now);
                 if k.eq_ignore_ascii_case("b") {
-                    this.fold_keys.release(Instant::now());
+                    this.fold_keys.release(now);
                 } else if k.eq_ignore_ascii_case("t") || k.eq_ignore_ascii_case("w") {
-                    this.tab_keys.release(Instant::now());
+                    this.tab_keys.release(now);
                 } else if k == "left" || k == "right" {
-                    this.move_keys.release(Instant::now());
+                    this.move_keys.release(now);
                 }
                 if is_tab_key(k) {
                     this.tab_key_up(cx);
@@ -11132,6 +11172,34 @@ mod tests {
         k.release(ms(2200));
         assert!(k.press(ms(2400), false), "after a key-up, everywhere");
         assert!(!k.press(ms(2430), true));
+    }
+
+    /// The pair's edge: pressed again 29 ms after its key-up, a repeat; at
+    /// 30 ms and after, a press ([`FoldKeys::PAIR`]).
+    #[test]
+    fn a_press_from_the_pair_after_the_key_up() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        for (gap, press) in [(29, false), (30, true), (31, true)] {
+            let mut k = FoldKeys::default();
+            assert!(k.press(ms(0), false));
+            k.release(ms(100));
+            assert_eq!(k.press(ms(100 + gap), false), press, "{gap} ms after the key-up");
+        }
+    }
+
+    /// A test's input clock stands still until the test moves it, and
+    /// moves by exactly that: the wall's time does not move it.
+    #[test]
+    fn the_input_clock_is_the_tests() {
+        use super::{advance_input_clock, input_now, next_press};
+        let t = input_now();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(input_now(), t, "the wall's 2 ms did not move it");
+        advance_input_clock(Duration::from_millis(29));
+        assert_eq!(input_now(), t + Duration::from_millis(29));
+        next_press();
+        assert_eq!(input_now(), t + Duration::from_millis(69), "a new press: 40 ms on");
     }
 
     /// H3: the card shows a long prompt whole, and AUTHORIZE waits until
