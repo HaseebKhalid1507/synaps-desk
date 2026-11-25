@@ -9,9 +9,12 @@
 //! wins; Keep, Esc and the answer already given send nothing (a
 //! multi-select's picks as a set, Shady #94 P2-2); Tab on a form's
 //! receipt opens nothing; a change never resolves a permission prompt
-//! (§5.1). A change of an answer taken in, or not confirmed, stays on its
-//! way when that answer's history lands after it is sent, through a gap
-//! too, and a later answer of another desk's still wins (Shady #94 P2-1).
+//! (§5.1). A change of an answer taken in stays on its way when that
+//! answer's history lands after it is sent, through a gap too, however
+//! many changes back, counted (an answer given twice); an answer never
+//! taken in, or one whose turn lost it, isn't expected, and another
+//! desk's answer of its text wins, as does a copy past the count, or
+//! after the change (Shady #94 P2-1, rounds 1 and 2).
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`). Keys go in as new presses (`keys_tests::press`,
@@ -605,7 +608,8 @@ fn tab_on_a_forms_receipt_opens_nothing(cx: &mut TestAppContext) {
 
 /// The session's history as the view holds it, a quiet session that
 /// asked `input` as card `card_id` (call `tool`, [`asked`]), with `more`
-/// sent after it: as the history asked for again gives it.
+/// sent after it: as the history asked for again gives it. The view may
+/// hold some of `more` already.
 fn history_with(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, card_id: &str, input: &Value, more: &[&str]) -> Vec<Value> {
     let (seq, _) = attachment(cx, view);
     let mut h = match crate::demo::attach(crate::demo::IDLE_CPU, seq).pop() {
@@ -614,7 +618,7 @@ fn history_with(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, car
     };
     h.extend(super::answer_tests::asked_messages(tool, card_id, input, None));
     let held = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
-    assert_eq!(h.len(), held, "the history held");
+    assert!((h.len()..=h.len() + more.len()).contains(&held), "the history held: {held}, from {}", h.len());
     h.extend(more.iter().map(|t| json!({"role": "user", "content": t})));
     h
 }
@@ -665,6 +669,11 @@ fn taken_in_then_changed(cx: &mut TestAppContext, tool: &str, card_id: &str) -> 
 /// B, on its way, is still this desk's: no change offered, nor Resend,
 /// and its entry (one for the session, whatever pane shows it) in flight.
 fn still_out(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, row: u64, card_id: &str, what: &str) {
+    out_of(cx, w, view, row, card_id, 2, what);
+}
+
+/// [`still_out`], `n` answers sent in all.
+fn out_of(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, row: u64, card_id: &str, n: usize, what: &str) {
     assert!(!has(cx, w, format!("ask-change {row}")) && !has(cx, w, format!("ask-change {row} off")), "{what}: no change offered");
     assert!(!has(cx, w, format!("ask-resend {row}")) && !has(cx, w, format!("ask-resend {row} off")), "{what}: no Resend");
     view.read_with(cx, |v, _| {
@@ -672,7 +681,7 @@ fn still_out(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entit
         let st = v.model.memos.get_state(&sid, card_id);
         assert!(st.is_some_and(|s| !matches!(s, State::InChat | State::Unconfirmed | State::NotSent)), "{what}: B in flight ({st:?})");
     });
-    assert_eq!(sends(cx, view).len(), 2, "{what}: nothing more sent");
+    assert_eq!(sends(cx, view).len(), n, "{what}: nothing more sent");
 }
 
 /// Shady #94 P2-1: an answer taken in (A), its history still to come, is
@@ -746,41 +755,422 @@ fn a_change_keeps_its_way_through_a_gap_when_the_answer_it_changes_lands(cx: &mu
     crate::app::pin_arm_clock(None);
 }
 
-/// P2-1, the answer not confirmed: A (no echo in 10 s) is changed, B. A
-/// did reach the chat, and its history lands late, before anything of
-/// B's: B is still on its way. An answer this desk didn't send, another
-/// desk's change (C), lands after it: the later answer wins, B's entry is
-/// dropped, and the card shows C, with no Resend of B over it.
-#[gpui_kit::test]
-fn a_change_of_an_answer_not_confirmed_keeps_its_way_and_a_later_one_wins(cx: &mut TestAppContext) {
+/// The history after what the view holds, `more`, lands, and a digest
+/// says it is the session's, the engine's slot empty: a settled view.
+fn lands_settled(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, tool: &str, card_id: &str, more: &[&str]) {
+    let held = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.cards().card(tool).map_or(0, |c| c.answers.len()));
+    land(cx, w, view, more.iter().map(|t| json!({"role": "user", "content": t})).collect());
+    let texts: Vec<String> = view.read_with(cx, |v, _| {
+        v.model.lives[v.panes.cur.live].transcript.cards().card(tool).unwrap().answers.iter().map(|a| a.text.clone()).collect()
+    });
+    assert_eq!(texts.len(), held + more.len(), "the card's answers");
+    let all: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let h = history_with(cx, view, tool, card_id, &branch(), &all);
+    heard(cx, w, view, vec![slot_digest(&h, None)]);
+    play(cx, w, view);
+    view.read_with(cx, |v, _| assert!(v.model.lives[v.panes.cur.live].transcript.history_settled(), "settled"));
+}
+
+/// The card shows the history's latest answer, the fold's receipt
+/// (`answered` for its first, `changed` past it), with nothing of this
+/// desk's out: no entry, no Resend, a change offered, and `n` answers
+/// sent in all.
+fn shows_theirs(
+    cx: &mut TestAppContext,
+    w: gpui_kit::AnyWindowHandle,
+    view: &Entity<AppView>,
+    row: u64,
+    card_id: &str,
+    n: usize,
+    what: &str,
+) {
+    let word = view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        let c = t.cards().bound(&id(card_id)).unwrap();
+        if c.answers.len() > 1 { "changed" } else { "answered" }
+    });
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        assert_eq!(v.model.memos.get_state(&sid, card_id), None, "{what}: our entry dropped");
+    });
+    assert!(has(cx, w, format!("ask-state {row} {word}")), "{what}: the card shows the latest, theirs ({word})");
+    assert!(!has(cx, w, format!("ask-resend {row}")) && !has(cx, w, format!("ask-resend {row} off")), "{what}: no Resend over it");
+    assert!(has(cx, w, format!("ask-change {row}")), "{what}: a change offered");
+    assert_eq!(sends(cx, view).len(), n, "{what}: nothing more sent");
+}
+
+/// Shady #94 round 2, P2-1 (A): an answer never said to be taken in is
+/// not expected. A (no echo in 10 s) is not confirmed, and changed (B).
+/// Run `lost` (B lost too, or not yet), then another desk sends an
+/// answer byte for byte A's, the history settles with it, the slot
+/// empty, and the clock checks B: that answer is the later one, and
+/// wins. No Resend of B over it.
+fn not_taken_in(
+    cx: &mut TestAppContext,
+    tool: &str,
+    card_id: &str,
+    lost: impl FnOnce(&mut TestAppContext, gpui_kit::AnyWindowHandle, &Entity<AppView>, u64),
+) {
     let input = branch();
-    let (w, view, row, _events) = asked(cx, "toolu_d3", "cd3uncf", &input);
+    let (w, view, row, _events) = asked(cx, tool, card_id, &input);
     nothing_waits_elsewhere(cx, &view);
     press(cx, w, "ctrl-j");
     press(cx, w, "1");
-    let a = message("cd3uncf", &input, json!({"choice": "main"}));
+    let a = message(card_id, &input, json!({"choice": "main"}));
     unconfirmed(cx, w, &view);
     assert!(has(cx, w, format!("ask-resend {row}")) && has(cx, w, format!("ask-change {row}")), "A not confirmed");
     arm(cx, &view, row, true);
     click(cx, w, &view, format!("ask-change {row}"));
     arm(cx, &view, row, true);
     click(cx, w, &view, format!("ask-option {row} 3"));
-    let b = changed("cd3uncf", &input, json!({"choice": "hotfix"}));
+    let b = changed(card_id, &input, json!({"choice": "hotfix"}));
     assert_eq!(texts(cx, &view), vec![a.clone(), b.clone()]);
-    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
-    play(cx, w, &view);
-    assert!(has(cx, w, format!("ask-state {row} sending…")), "A's history, late: B still on its way");
-    still_out(cx, w, &view, row, "cd3uncf", "A's history");
-    let c = changed("cd3uncf", &input, json!({"choice": "release"}));
-    land(cx, w, &view, vec![json!({"role": "user", "content": c})]);
+    lost(cx, w, &view, row);
+    lands_settled(cx, w, &view, tool, card_id, &[&a]);
+    unconfirmed(cx, w, &view);
+    shows_theirs(cx, w, &view, row, card_id, 2, "their A");
+    crate::app::pin_arm_clock(None);
+}
+
+#[gpui_kit::test]
+fn an_answer_not_taken_in_is_not_expected_and_a_copy_of_it_wins(cx: &mut TestAppContext) {
+    not_taken_in(cx, "toolu_d3", "cd3uncf", |cx, w, _view, row| {
+        assert!(has(cx, w, format!("ask-state {row} sending…")), "B on its way");
+    });
+}
+
+#[gpui_kit::test]
+fn an_answer_not_taken_in_is_not_expected_once_its_change_is_lost_too(cx: &mut TestAppContext) {
+    not_taken_in(cx, "toolu_d5", "cd5lost", |cx, w, view, row| {
+        unconfirmed(cx, w, view);
+        assert!(has(cx, w, format!("ask-resend {row}")), "B not confirmed, nothing over it: Resend");
+    });
+}
+
+/// B, taken in in its turn too, the history still before A: the slot
+/// cleared on the old history. The receipt reads `changed`, and offers
+/// a change.
+fn taken_in(
+    cx: &mut TestAppContext,
+    w: gpui_kit::AnyWindowHandle,
+    view: &Entity<AppView>,
+    row: u64,
+    tool: &str,
+    card_id: &str,
+    text: &str,
+) {
+    let old = history_with(cx, view, tool, card_id, &branch(), &[]);
+    heard(
+        cx,
+        w,
+        view,
+        vec![
+            json!({"ev": "steered", "text": text, "delivered": true}),
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": text}}),
+            slot_digest(&old, None),
+        ],
+    );
+    assert!(has(cx, w, format!("ask-state {row} changed")), "taken in, its history to come");
+    assert!(has(cx, w, format!("ask-change {row}")), "a change offered");
+}
+
+/// A change by mouse to option `option` (from 1), its `values`: sent,
+/// on its way. Returns its text.
+fn change_to(
+    cx: &mut TestAppContext,
+    w: gpui_kit::AnyWindowHandle,
+    view: &Entity<AppView>,
+    row: u64,
+    card_id: &str,
+    option: usize,
+    values: Value,
+) -> String {
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-change {row}"));
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-option {row} {option}"));
+    let text = changed(card_id, &branch(), values);
+    assert_eq!(texts(cx, view).last(), Some(&text), "sent");
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "on its way");
+    text
+}
+
+/// Its echo and its delivery: in the chat, `changed`.
+fn echoed_and_delivered(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, row: u64, text: &str) {
+    heard(cx, w, view, vec![json!({"ev": "steered", "text": text, "delivered": true})]);
+    heard(cx, w, view, vec![json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": text}})]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "taken in");
+}
+
+/// The card's answers in the history, in order.
+fn answers(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str) -> Vec<String> {
+    view.read_with(cx, |v, _| {
+        v.model.lives[v.panes.cur.live].transcript.cards().card(tool).unwrap().answers.iter().map(|a| a.text.clone()).collect()
+    })
+}
+
+/// Shady #94 round 2, P2-1 (B): a third answer keeps the chain. A is
+/// taken in, changed (B), and B is taken in too, the history still before
+/// A throughout; B is changed (C). C expects both: the history with A,
+/// then with B, lands before anything of C's, settled, and C is still on
+/// its way (no fourth change, no Resend). C's echo, delivery and history
+/// settle it: `changed`, A, B, C in the history, three answers sent.
+#[gpui_kit::test]
+fn a_third_answer_expects_both_before_it(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_d6", "cd6chan");
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, id);
+    taken_in(cx, w, &view, row, tool, id, &b);
+    let c = change_to(cx, w, &view, row, id, 2, json!({"choice": "release"}));
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    out_of(cx, w, &view, row, id, 3, "[A]");
+    lands_settled(cx, w, &view, tool, id, &[&b]);
+    out_of(cx, w, &view, row, id, 3, "[A, B]");
+    echoed_and_delivered(cx, w, &view, row, &c);
+    lands_settled(cx, w, &view, tool, id, &[&c]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "[A, B, C]: C, the latest");
+    assert_eq!(answers(cx, &view, tool), [a, b, c], "A, B, C");
+    assert_eq!(sends(cx, &view).len(), 3, "three answers sent");
+    crate::app::pin_arm_clock(None);
+}
+
+/// The chain counts, not just matches: A, B (`hotfix`), C (`release`),
+/// then D, `hotfix` again, B's text byte for byte, each taken in before
+/// the next, the history still before A. The history with A and B lands:
+/// that B is the one expected, not D, which is still on its way; nor is
+/// D's own arrival matched by B's text while it is to come. D is taken in
+/// and changed (E, `main`) once the history holds A and B: E expects C
+/// and D (B's text, a second time), and their history lands before
+/// anything of E's: E is still on its way. Then E settles: five answers.
+#[gpui_kit::test]
+fn a_chain_counts_an_answer_given_twice(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_d7", "cd7twce");
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, id);
+    taken_in(cx, w, &view, row, tool, id, &b);
+    let c = change_to(cx, w, &view, row, id, 2, json!({"choice": "release"}));
+    taken_in(cx, w, &view, row, tool, id, &c);
+    let d = change_to(cx, w, &view, row, id, 3, json!({"choice": "hotfix"}));
+    assert_eq!(d, b, "D is B's text");
+    lands_settled(cx, w, &view, tool, id, &[&a, &b]);
+    out_of(cx, w, &view, row, id, 4, "[A, B]: D");
+    echoed_and_delivered(cx, w, &view, row, &d);
+    let e = change_to(cx, w, &view, row, id, 1, json!({"choice": "main"}));
+    lands_settled(cx, w, &view, tool, id, &[&c, &d]);
+    out_of(cx, w, &view, row, id, 5, "[A, B, C, D]: E");
+    echoed_and_delivered(cx, w, &view, row, &e);
+    lands_settled(cx, w, &view, tool, id, &[&e]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "E, the latest");
+    assert_eq!(answers(cx, &view, tool), [a, b.clone(), c, b, e], "A, B, C, D (B's text), E");
+    assert_eq!(sends(cx, &view).len(), 5);
+    crate::app::pin_arm_clock(None);
+}
+
+/// A taken in, changed (B, on its way); the history lands, settled, with
+/// `got(A, B)`: an answer of A's text past the one expected, or after B,
+/// is another's and later. It wins: B's entry dropped, the card shows it.
+fn a_copy_lands(cx: &mut TestAppContext, tool: &str, card_id: &str, got: impl FnOnce(&str, &str) -> Vec<String>) {
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, card_id);
+    let more = got(&a, &b);
+    let more: Vec<&str> = more.iter().map(String::as_str).collect();
+    lands_settled(cx, w, &view, tool, card_id, &more);
+    shows_theirs(cx, w, &view, row, card_id, 2, &format!("{} answers", more.len()));
+    unconfirmed(cx, w, &view);
+    shows_theirs(cx, w, &view, row, card_id, 2, "checked");
+    crate::app::pin_arm_clock(None);
+}
+
+/// [A, A]: the second is past the count expected.
+#[gpui_kit::test]
+fn a_copy_past_the_one_expected_wins(cx: &mut TestAppContext) {
+    a_copy_lands(cx, "toolu_d8", "cd8copy", |a, _| vec![a.into(), a.into()]);
+}
+
+/// [B, A]: history order, not the order clicked: A after B is the later.
+#[gpui_kit::test]
+fn a_copy_after_the_change_wins(cx: &mut TestAppContext) {
+    a_copy_lands(cx, "toolu_d9", "cd9aftr", |a, b| vec![b.into(), a.into()]);
+}
+
+/// [A, B, A].
+#[gpui_kit::test]
+fn a_copy_after_both_wins(cx: &mut TestAppContext) {
+    a_copy_lands(cx, "toolu_e1", "ce1both", |a, b| vec![a.into(), b.into(), a.into()]);
+}
+
+/// The chain through a gap (Shady #81 rounds 4–7): A and B taken in, C
+/// on its way; the daemon drops events for this desk, and the history
+/// asked for again lands with A, nothing since saying the engine's slot;
+/// then B. C is still this desk's: no change, no Resend. C's echo, a
+/// digest saying the slot holds it, its delivery and its history settle
+/// it: three answers sent.
+#[gpui_kit::test]
+fn a_chain_keeps_its_way_through_a_gap(cx: &mut TestAppContext) {
+    let input = branch();
+    let (tool, id) = ("toolu_e2", "ce2gapc");
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, id);
+    taken_in(cx, w, &view, row, tool, id, &b);
+    let c = change_to(cx, w, &view, row, id, 2, json!({"choice": "release"}));
+    heard(cx, w, &view, vec![json!({"ev": "system_notice", "text": "event stream lagged; 6 dropped"})]);
+    let with_a = history_with(cx, &view, tool, id, &input, &[&a]);
+    let (seq, sid) = attachment(cx, &view);
+    let update = synaps_client::HistoryUpdate::Replace { messages: with_a };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx));
     play(cx, w, &view);
     view.read_with(cx, |v, _| {
-        let sid = v.card_session().unwrap();
-        assert_eq!(v.model.memos.get_state(&sid, "cd3uncf"), None, "C, later: B's entry dropped");
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        assert!(!t.resyncing() && !t.slot_known(), "the history asked for again; the slot unknown");
     });
-    assert!(has(cx, w, format!("ask-state {row} changed")), "the card shows C");
-    assert!(!has(cx, w, format!("ask-resend {row}")), "no Resend of B over it");
+    out_of(cx, w, &view, row, id, 3, "the gap's history, [A]");
+    land(cx, w, &view, vec![json!({"role": "user", "content": b})]);
+    play(cx, w, &view);
+    out_of(cx, w, &view, row, id, 3, "[A, B], the slot unknown");
+    heard(cx, w, &view, vec![json!({"ev": "steered", "text": c, "delivered": true})]);
+    out_of(cx, w, &view, row, id, 3, "C's echo, the slot unknown");
+    let with_ab = history_with(cx, &view, tool, id, &input, &[&a, &b]);
+    heard(cx, w, &view, vec![slot_digest(&with_ab, Some(&c))]);
+    out_of(cx, w, &view, row, id, 3, "the slot holds C");
+    heard(cx, w, &view, vec![json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": c}})]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "C taken in");
+    lands_settled(cx, w, &view, tool, id, &[&c]);
+    assert!(has(cx, w, format!("ask-state {row} changed")), "C's history");
+    assert_eq!(answers(cx, &view, tool), [a, b, c]);
+    assert_eq!(sends(cx, &view).len(), 3, "nothing sent again");
+    crate::app::pin_arm_clock(None);
+}
+
+/// A taken in, changed (B), B taken in; then the turn ends without
+/// either (a failed turn's repair): its last history, settled, is the
+/// old one, then its `Idle`. B is not confirmed, the turn's end its
+/// cause, with Resend (nothing in the card over it); A, which B expected,
+/// the turn's end lost too.
+fn both_lost(cx: &mut TestAppContext, tool: &str, card_id: &str) -> (Asked, String, String) {
+    let ((w, view, row, events), a, b) = taken_in_then_changed(cx, tool, card_id);
+    taken_in(cx, w, &view, row, tool, card_id, &b);
+    let old = history_with(cx, &view, tool, card_id, &branch(), &[]);
+    heard(cx, w, &view, vec![slot_digest(&old, None), json!({"ev": "idle"})]);
+    play(cx, w, &view);
+    unconfirmed(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} not confirmed")), "B: the turn ended without it");
+    assert!(has(cx, w, format!("ask-resend {row}")), "B: Resend");
+    ((w, view, row, events), a, b)
+}
+
+/// Then another desk's answer, byte for byte A's, lands, settled. B's
+/// entry saw A expected: the memo reads this one as that, so B stays not
+/// confirmed, but A was lost, and this one is another's, later than B:
+/// Resend is off, as it is whenever its gate doesn't hold, and a press of
+/// it sends nothing; it would put B over it. A change is offered.
+#[gpui_kit::test]
+fn an_answer_a_turn_lost_is_another_desks_when_it_shows(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_e3", "ce3miss");
+    let ((w, view, row, _events), a, _b) = both_lost(cx, tool, id);
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    assert!(has(cx, w, format!("ask-state {row} not confirmed")), "B, as the memo has it");
+    assert!(!has(cx, w, format!("ask-resend {row}")) && has(cx, w, format!("ask-resend {row} off")), "no Resend over theirs");
+    assert!(has(cx, w, format!("ask-change {row}")), "a change offered");
+    let (lid, painted) = painted(cx, &view, tool);
+    let got = view.update(cx, |v, _| v.model.resend_card(lid, &painted, Instant::now()));
+    assert!(got.is_err(), "Resend pressed: nothing ({got:?})");
     assert_eq!(sends(cx, &view).len(), 2);
+    crate::app::pin_arm_clock(None);
+}
+
+/// Or B is changed (C) first: C expects neither, A lost and B not
+/// confirmed. Another desk's answer of A's text lands, settled: it is
+/// the later, and wins over C. No Resend.
+#[gpui_kit::test]
+fn an_answer_a_turn_lost_is_not_expected(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_e4", "ce4miss");
+    let ((w, view, row, _events), a, _b) = both_lost(cx, tool, id);
+    change_to(cx, w, &view, row, id, 2, json!({"choice": "release"}));
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    shows_theirs(cx, w, &view, row, id, 3, "their A");
+    unconfirmed(cx, w, &view);
+    shows_theirs(cx, w, &view, row, id, 3, "checked");
+    crate::app::pin_arm_clock(None);
+}
+
+/// Call `tool`'s card as the rows draw it, and its store: what a press
+/// names.
+fn painted(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str) -> (crate::live::LiveId, crate::deliver::Painted) {
+    view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        let ask = t.items().iter().find_map(|i| match i.card.as_deref() {
+            Some(synaps_client::cards::CardRow::Ask(a)) if a.tool_id == tool => Some(a),
+            _ => None,
+        });
+        (v.panes.cur.live, crate::deliver::Painted::of(ask.unwrap()).unwrap())
+    })
+}
+
+/// What a change expected came, and it is not another's: A taken in,
+/// changed (B); A's history lands, settled, and B gets no echo. B is not
+/// confirmed, with Resend (A is this desk's, older), and still once the
+/// turn ends: A came, and no turn's end lost it.
+#[gpui_kit::test]
+fn a_change_whose_expected_answer_came_can_be_resent(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_e6", "ce6came");
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, id);
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    unconfirmed(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} not confirmed")), "B lost");
+    assert!(has(cx, w, format!("ask-resend {row}")), "Resend: A is ours, older");
+    let with_a = history_with(cx, &view, tool, id, &branch(), &[&a]);
+    heard(cx, w, &view, vec![slot_digest(&with_a, None), json!({"ev": "idle"})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-resend {row}")), "the turn's end: still Resend");
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-resend {row}"));
+    assert_eq!(texts(cx, &view), vec![a, b.clone(), b], "B sent again");
+    crate::app::pin_arm_clock(None);
+}
+
+/// Retry too: A taken in, changed (B) with no connection, so B is not
+/// sent; the turn then ends without A. Retry shows, nothing over B. Then
+/// another desk's answer of A's text lands, settled: Retry is off, and a
+/// press of it sends nothing.
+#[gpui_kit::test]
+fn an_answer_a_turn_lost_is_another_desks_and_retry_keeps_off(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_e5", "ce5retr");
+    let input = branch();
+    let (w, view, row, _events) = asked(cx, tool, id, &input);
+    nothing_waits_elsewhere(cx, &view);
+    busy(cx, w, &view);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "1");
+    let a = message(id, &input, json!({"choice": "main"}));
+    let old = history_with(cx, &view, tool, id, &input, &[]);
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "steered", "text": a, "delivered": true}),
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": a}}),
+            slot_digest(&old, None),
+        ],
+    );
+    assert!(has(cx, w, format!("ask-state {row} answered")), "A taken in");
+    let client = view.update(cx, |v, _| {
+        v.synthetic = false;
+        v.client.take()
+    });
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-change {row}"));
+    arm(cx, &view, row, true);
+    click(cx, w, &view, format!("ask-option {row} 3"));
+    assert!(has(cx, w, format!("ask-state {row} not sent")), "B not sent");
+    view.update(cx, |v, _| v.client = client);
+    heard(cx, w, &view, vec![slot_digest(&old, None), json!({"ev": "idle"})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-retry {row}")), "nothing over B: Retry");
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    assert!(has(cx, w, format!("ask-state {row} not sent")), "B, as the memo has it");
+    assert!(!has(cx, w, format!("ask-retry {row}")) && has(cx, w, format!("ask-retry {row} off")), "no Retry over theirs");
+    let sent = sends(cx, &view).len();
+    let (lid, painted) = painted(cx, &view, tool);
+    let got = view.update(cx, |v, _| v.model.retry_card(lid, &painted, Instant::now()));
+    assert!(got.is_err(), "Retry pressed: nothing ({got:?})");
+    assert_eq!(sends(cx, &view).len(), sent, "nothing sent");
     crate::app::pin_arm_clock(None);
 }
 

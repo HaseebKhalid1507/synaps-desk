@@ -66,6 +66,30 @@
 //! read as unknown for the rest of the turn, and the memo's checking
 //! state gives up on a settled view in 10 s, a check that isn't this one.
 //!
+//! **Changes (D4).** A change replaces the card's entry, and with it this
+//! desk's only record of the answer it changes. An answer the engine took
+//! in (above) is in its conversation, and its history may land after the
+//! change is sent: read as an answer this desk didn't know of, it would
+//! drop the change's entry while it is on its way (Shady #94 P2-1). So a
+//! change expects its predecessors: each answer to the card the engine
+//! took in, since the last attach, that the card's answers don't show yet,
+//! whatever number of changes back (A, B, then C expects A and B). Each is
+//! counted, not just matched: it is one occurrence of its text, one past
+//! those the answers held, with the answers expected before it, when it
+//! was sent ([`Expected::nth`]); a further one is another's, and the later
+//! answer wins as ever. Nothing else is expected: an answer never said to
+//! be taken in (not confirmed, not sent) may never come, and expecting it
+//! would read another desk's identical answer as this one's old one. The
+//! memo matches an entry's answers to those it saw, in order
+//! (`cards_spec::memo`): the expected ones follow the history's there, in
+//! the order the engine took them in, and the history's place in them is
+//! the count's. An expected answer's turn may end without it, like any
+//! taken in (above): its next settled view is the word on it. Then no
+//! later change expects it, and an answer of its text in the card is
+//! another's, which the entry it was expected in counts as its own: that
+//! entry has no Resend or Retry, which would put this desk's answer over
+//! it.
+//!
 //! **Dropped events.** A desk that falls behind the session's broadcast
 //! isn't cut off: the daemon drops what it missed, says so ("event stream
 //! lagged; N dropped", SynapsCLI `189a5a19`, `daemon/conn.rs:719-728`) and
@@ -277,6 +301,33 @@ struct Taken {
     ended: bool,
 }
 
+/// An answer to a card that an entry for it, a change, replaced, which
+/// the engine took in and the card's answers didn't show yet when the
+/// change was sent: the change expects it (the module's "Changes").
+#[derive(Clone, Debug)]
+struct Expected {
+    /// Its message, exactly.
+    text: String,
+    reply: Reply,
+    /// It is this occurrence of `text` in the card's answers (from 1): one
+    /// past those its entry saw when it was sent, the answers then and
+    /// those it expected. Fewer: still to come; more: another's.
+    nth: usize,
+    /// An `Idle` or an attach came since it was taken in: the next settled
+    /// view is the daemon's word on it.
+    ended: bool,
+    /// That view didn't show it: the turn's end lost it.
+    missed: bool,
+}
+
+/// What the entry for `card` whose message is `text` expects.
+#[derive(Debug)]
+struct Chain {
+    card: CardId,
+    text: String,
+    expects: Vec<Expected>,
+}
+
 /// The window's card memos, by session id.
 #[derive(Debug, Default)]
 pub(crate) struct Memos {
@@ -291,6 +342,9 @@ pub(crate) struct Memos {
     /// By session, events the daemon dropped and the history asked for
     /// again not in yet (the module's "Dropped events").
     gaps: HashMap<String, Gap>,
+    /// By session, the answers each change expects, until its entry goes
+    /// (the module's "Changes").
+    chains: HashMap<String, Vec<Chain>>,
     /// Bumped whenever an entry changes, or what a session's cards say of
     /// a gap: cards drawn from it are measured again.
     changes: u64,
@@ -383,14 +437,65 @@ impl Memos {
     }
 
     /// Forget what the turn's end missed for each entry of `session` that
-    /// moved on (sent again, or gone).
+    /// moved on (sent again, or gone), and what an entry gone, or replaced,
+    /// expected.
     fn tidy(&mut self, session: &str) {
-        let Some(missed) = self.missed.get_mut(session) else { return };
         let m = self.by.get(session);
+        if let Some(chains) = self.chains.get_mut(session) {
+            chains.retain(|c| !c.expects.is_empty() && m.and_then(|m| m.get(&c.card)).is_some_and(|e| e.text == c.text));
+            if chains.is_empty() {
+                self.chains.remove(session);
+            }
+        }
+        let Some(missed) = self.missed.get_mut(session) else { return };
         missed.retain(|id| m.and_then(|m| m.get(id)).is_some_and(|e| matches!(e.state, State::InChat | State::Unconfirmed)));
         if missed.is_empty() {
             self.missed.remove(session);
         }
+    }
+
+    /// What `session`'s entry `e` expects (the module's "Changes").
+    fn chain(&self, session: &str, e: &Entry) -> Option<&Chain> {
+        self.chains.get(session)?.iter().find(|c| c.card == e.card && c.text == e.text)
+    }
+
+    /// What a new entry for `card` of `session` expects: of this desk's
+    /// answers to it the engine took in since the last attach, those the
+    /// card's answers don't show yet and no turn's end has settled. The
+    /// entry it replaces, so taken in, and what that entry expected, so
+    /// on back (the module's "Changes"). The press is on a settled view
+    /// ([`Painted::settled`], and no gap: [`recovering`]): an answer whose
+    /// turn ended since and that the card doesn't show, the view says, is
+    /// one the turn's end lost.
+    fn expects(&self, session: &str, card: &Card) -> Vec<Expected> {
+        let Some(e) = card.id.as_ref().and_then(|id| self.by.get(session)?.get(id)).filter(|e| e.answers(card)) else {
+            return Vec::new();
+        };
+        let count = |text: &str| card.answers.iter().filter(|a| a.text == text).count();
+        let mut out: Vec<Expected> = self
+            .chain(session, e)
+            .into_iter()
+            .flat_map(|c| &c.expects)
+            .filter(|x| !x.ended && !x.missed && count(&x.text) < x.nth)
+            .cloned()
+            .collect();
+        let taken = self.taken.get(session).and_then(|v| v.iter().find(|k| k.card == e.card));
+        let nth = e.seen.iter().filter(|t| **t == e.text).count() + 1;
+        if e.state == State::InChat && taken.is_some_and(|k| !k.ended) && count(&e.text) < nth {
+            out.push(Expected { text: e.text.clone(), reply: e.reply.clone(), nth, ended: false, missed: false });
+        }
+        out
+    }
+
+    /// Whether `card`'s answers in `fold` show one of the text of an answer
+    /// its entry expected that a turn's end lost: another's, which that
+    /// entry's memo counts as the one it expected. No Resend or Retry then:
+    /// it would put this desk's answer over a later one (the module's
+    /// "Changes").
+    pub(crate) fn doubtful(&self, session: &str, card: &CardId, fold: &Fold) -> bool {
+        let (Some(e), Some(c)) = (self.by.get(session).and_then(|m| m.get(card)), fold.bound(card)) else { return false };
+        self.chain(session, e)
+            .is_some_and(|ch| ch.expects.iter().any(|x| x.missed && c.answers.iter().filter(|a| a.text == x.text).count() >= x.nth))
     }
 
     /// An event of `session`'s attachment. An attach ends what was taken
@@ -400,6 +505,13 @@ impl Memos {
     pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
         if ev == Heard::Attached {
             self.taken.remove(session);
+        }
+        // So with what each change expects: the next settled view is the
+        // daemon's word on it.
+        if matches!(ev, Heard::Attached | Heard::Idle) {
+            for x in self.chains.get_mut(session).into_iter().flatten().flat_map(|c| &mut c.expects) {
+                x.ended = true;
+            }
         }
         self.with(session, |m| m.on(ev, now));
         match ev {
@@ -457,6 +569,7 @@ impl Memos {
     /// history shows it, or its turn ended and the history, settled,
     /// doesn't (missed). Forget it too once no entry holds it in the chat.
     fn prune(&mut self, session: &str, t: &Transcript) {
+        self.prune_chains(session, t);
         let Some(taken) = self.taken.get_mut(session) else { return };
         let m = self.by.get(session);
         let settled = settled(t);
@@ -481,6 +594,29 @@ impl Memos {
                 v.push(id);
             }
         }
+    }
+
+    /// Settle what each change of `session` expects on `t`: one the
+    /// history shows has come; one whose turn ended, on a settled view
+    /// that doesn't, the turn's end lost (the module's "Changes").
+    fn prune_chains(&mut self, session: &str, t: &Transcript) {
+        let Some(chains) = self.chains.get_mut(session) else { return };
+        let settled = settled(t);
+        for c in chains.iter_mut() {
+            let card = t.history_cards().bound(&c.card);
+            let count = |text: &str| card.map_or(0, |c| c.answers.iter().filter(|a| a.text == text).count());
+            c.expects.retain_mut(|x| {
+                if x.missed {
+                    return true;
+                }
+                if count(&x.text) >= x.nth {
+                    return false;
+                }
+                x.missed = x.ended && settled;
+                true
+            });
+        }
+        self.tidy(session);
     }
 
     /// Why `session`'s entry `e` is unconfirmed or not sent: its own
@@ -562,34 +698,28 @@ impl Memos {
     /// A press on `card` of `session` with `reply`: the text to send, or
     /// `None` (it can't be answered, or an answer to it is out).
     ///
-    /// A change (D4) replaces this desk's last entry for the card, and
-    /// with it the only record of that answer. One the engine took in (in
-    /// the chat, its history still to come), or one not confirmed, may
-    /// still land in the history, ahead of the change: so the change's
-    /// entry counts it among the answers it saw, and its arrival reads as
-    /// ours and older, not as an answer this desk didn't know of, which
-    /// would drop the change's entry while it is on its way (Shady #94
-    /// P2-1). One that lands after the change is still the later answer.
+    /// A change (D4) replaces this desk's last entry for the card: the new
+    /// entry sees the card's answers, then those it expects ([`Memos::expects`],
+    /// the module's "Changes"), whose arrival is then this desk's, and older.
     pub(crate) fn press(&mut self, session: &str, card: &Card, reply: Reply, now: Instant) -> Option<String> {
-        let m = self.by.entry(session.to_string()).or_default();
-        let before = card
-            .id
-            .as_ref()
-            .and_then(|id| m.get(id))
-            .filter(|e| e.answers(card) && matches!(e.state, State::InChat | State::Unconfirmed) && !shows(e, card));
-        let card = match before {
-            Some(e) => {
-                let mut c = card.clone();
-                c.answers.push(Answered { text: e.text.clone(), reply: e.reply.clone(), at: usize::MAX });
-                Cow::Owned(c)
-            }
-            None => Cow::Borrowed(card),
+        let expects = self.expects(session, card);
+        let seen = if expects.is_empty() {
+            Cow::Borrowed(card)
+        } else {
+            let mut c = card.clone();
+            c.answers.extend(expects.iter().map(|x| Answered { text: x.text.clone(), reply: x.reply.clone(), at: usize::MAX }));
+            Cow::Owned(c)
         };
-        let text = m.press(&card, reply, now);
-        if text.is_some() {
+        let m = self.by.entry(session.to_string()).or_default();
+        let text = m.press(&seen, reply, now);
+        let empty = m.entries().is_empty();
+        if let (Some(text), Some(id)) = (&text, card.id.as_ref()) {
             self.changes += 1;
+            let chains = self.chains.entry(session.to_string()).or_default();
+            chains.retain(|c| c.card != *id);
+            chains.push(Chain { card: id.clone(), text: text.clone(), expects });
         }
-        if m.entries().is_empty() {
+        if empty {
             self.by.remove(session);
         }
         self.tidy(session);
@@ -598,6 +728,9 @@ impl Memos {
 
     /// Retry `card`, not sent: the same text.
     pub(crate) fn retry(&mut self, session: &str, card: &CardId, fold: &Fold, now: Instant) -> Option<String> {
+        if self.doubtful(session, card, fold) {
+            return None;
+        }
         let mut out: Option<String> = None;
         self.with(session, |m| out = m.retry(card, fold, now));
         out
@@ -606,6 +739,9 @@ impl Memos {
     /// A Resend click on `card`, checked on `t`'s view as it is now.
     pub(crate) fn resend(&mut self, session: &str, card: &CardId, t: &Transcript, now: Instant) -> Resend {
         self.prune(session, t);
+        if self.doubtful(session, card, t.cards()) {
+            return Resend::No;
+        }
         let fold = self.fold(session, t);
         let view = Self::view(&fold, t);
         let mut out = Resend::No;
@@ -621,7 +757,7 @@ impl Memos {
 
     /// Whether Resend shows on `card` (with the window's `input_gate()`).
     pub(crate) fn may_resend(&self, session: &str, card: &CardId, fold: &Fold) -> bool {
-        self.by.get(session).is_some_and(|m| m.may_resend(card, fold))
+        self.by.get(session).is_some_and(|m| m.may_resend(card, fold)) && !self.doubtful(session, card, fold)
     }
 }
 

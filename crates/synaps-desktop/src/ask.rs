@@ -1036,6 +1036,7 @@ impl AppView {
                             session.as_deref().is_some_and(|s| self.model.memos.may_resend(s, &painted.id, l.transcript.cards()))
                         } else {
                             c.answerable()
+                                && !session.as_deref().is_some_and(|s| self.model.memos.doubtful(s, &painted.id, l.transcript.cards()))
                         }
                     });
                 let (name, label) = if resend { ("ask-resend", "Resend") } else { ("ask-retry", "Retry") };
