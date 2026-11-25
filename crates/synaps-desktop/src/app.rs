@@ -490,8 +490,13 @@ pub fn bind_keys(cx: &mut App) {
     keys.push(KeyBinding::new("tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new("shift-tab", CardTab, Some(ALLOW_ALL_CTX)));
     keys.push(KeyBinding::new("tab", MenuTab, Some(MENU_CTX)));
-    keys.push(KeyBinding::new("tab", crate::ask_keys::AskTab, Some(crate::ask_keys::ASK_CTX)));
-    keys.push(KeyBinding::new("shift-tab", crate::ask_keys::AskTabBack, Some(crate::ask_keys::ASK_CTX)));
+    // An entered agent card's Tab and Shift+Tab, on it or in its inputs:
+    // no binding (not the kit's focus cycling, nor an input's indent), so
+    // they come as keys, whose repeats are known (`ask_keys::ask_tab_key`).
+    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX] {
+        keys.push(KeyBinding::new("tab", gpui_kit::NoAction, Some(ctx)));
+        keys.push(KeyBinding::new("shift-tab", gpui_kit::NoAction, Some(ctx)));
+    }
     keys.push(KeyBinding::new("shift-tab", MenuTabBack, Some(MENU_CTX)));
     keys.push(KeyBinding::new(RENAME_KEY, RenameSession, None));
     keys.push(KeyBinding::new(fav_key(mac), ToggleFavourite, None));
@@ -10107,7 +10112,7 @@ impl Render for AppView {
                 // Every Enter, Esc and Space, whoever takes it ([`CardChord`]).
                 this.panes.cur.chord_press = this.panes.cur.chord.down(&ev.keystroke.key, Instant::now(), ev.is_held);
                 // Every key: an entered agent card's act on new presses only.
-                this.ask_presses.down(&ev.keystroke.key, Instant::now(), ev.is_held);
+                this.ask_presses.down(&ev.keystroke, Instant::now(), ev.is_held);
                 // Ctrl+J: to the card, wherever the focus is (polish.md §2.6),
                 // or another pane's (split.md §7). Not mid IME composition,
                 // which owns every key (D2b).
@@ -10122,6 +10127,12 @@ impl Render for AppView {
                         || this.jump_elsewhere().is_some())
                 {
                     cx.stop_propagation();
+                    // Held, one jump: its repeats go nowhere (never on from
+                    // the prompt to a card, nor a batch frozen again).
+                    if !this.ask_presses.last {
+                        log::debug!(target: "synaps_desktop::card", "Ctrl+J: not a new press");
+                        return;
+                    }
                     if this.palette.is_some() {
                         this.close_palette(window, cx);
                     }

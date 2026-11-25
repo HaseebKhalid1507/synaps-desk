@@ -5,7 +5,9 @@
 //! composition, a key repeat, a key before the card was painted, a mouse
 //! answer inside a batch), each sending nothing; and the keys never
 //! resolve a prompt, nor does Esc deny one (§5.1). And D3's way in,
-//! [`AppView::enter_card`]: one card, by its binding.
+//! [`AppView::enter_card`]: one card, by its binding. Held keys act once
+//! at every way in (Shady #86): an Enter in a field or a note, Ctrl+J,
+//! Tab; and Tab goes round the note a pick opens.
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`): exactly one `Submit` or `Steer`, its text and
@@ -873,4 +875,270 @@ fn ctrl_j_mid_composition_is_the_imes(cx: &mut TestAppContext) {
     assert!(entered(cx, w, id), "committed: Ctrl+J enters");
     press(cx, w, "enter");
     assert_eq!(texts(cx, &view), vec![message("c9kjime", &input, json!({"choice": "main"}))]);
+}
+
+/// Where the keys are on the card of call `tool`: `body` (the pane's card
+/// focus), `note`, a text field's id; else `elsewhere`.
+fn keys_in(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str) -> String {
+    cx.update_window(w, |_, window, cx| {
+        let v = view.read(cx);
+        if v.panes.cur.ask.focus.as_ref().is_some_and(|f| f.is_focused(window)) {
+            return "body".to_string();
+        }
+        let Some(d) = v.card_session().and_then(|s| v.card_drafts.get(&(s, tool.to_string()))) else { return "elsewhere".to_string() };
+        if d.note.as_ref().is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window)) {
+            return "note".to_string();
+        }
+        let line = d.lines.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window));
+        line.map(|(id, _)| id.clone()).unwrap_or_else(|| "elsewhere".to_string())
+    })
+    .expect("the window")
+}
+
+/// The note's text on the card of call `tool`.
+fn note_text(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str) -> String {
+    view.read_with(cx, |v, cx| {
+        let sid = v.card_session().expect("attached");
+        v.card_drafts[&(sid, tool.to_string())].note.as_ref().expect("a note").read(cx).value().to_string()
+    })
+}
+
+/// The prompt's keys are live (its card on screen, the window's focus):
+/// where a Ctrl+J pressed again goes on to the agent cards. Frames until
+/// its row has come into view (the motion's time, not the keys').
+fn prompt_keys_live(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    for _ in 0..100 {
+        if view.read_with(cx, |v, _| v.panes.cur.card_keys.get().is_some()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        settle(cx, w, 1);
+    }
+    panic!("the prompt's keys never came live");
+}
+
+/// A form whole as asked: two text fields, prefilled.
+fn deploy_input() -> Value {
+    json!({"question": "Deploy where?", "wait": true, "fields": [
+        {"id": "env", "label": "Environment", "value": "staging"},
+        {"id": "region", "label": "Region", "value": "eu-west-1"}]})
+}
+
+/// Shady #86 P2-1: Enter in a field acts on a new, bare press only, as on
+/// the card. An Enter held from the composer, its repeats reaching the
+/// prefilled field the keys moved to, sends nothing and moves nothing;
+/// nor does Shift+Enter. Let go and pressed again, Enter sends the form,
+/// once.
+#[gpui_kit::test]
+fn a_held_enter_in_a_field_sends_nothing(cx: &mut TestAppContext) {
+    let input = deploy_input();
+    let (w, view, id, _events) = asked(cx, "toolu_he", "c1hfent", &input);
+    down(cx, w, "enter");
+    settle(cx, w, 8);
+    assert!(sends(cx, &view).is_empty(), "an empty composer sends nothing");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    assert_eq!(keys_in(cx, w, &view, "toolu_he"), "body", "a whole form: the keys on the card");
+    press(cx, w, "tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_he"), "env");
+    for n in 1..=2 {
+        repeat(cx, w, "enter");
+        assert!(sends(cx, &view).is_empty(), "repeat {n}: Enter held from the composer, no Submit");
+        assert_eq!(keys_in(cx, w, &view, "toolu_he"), "env", "repeat {n}: and no move");
+    }
+    up(cx, w, "enter");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(cx, w, "shift-enter");
+    assert!(sends(cx, &view).is_empty(), "Shift+Enter is no card's key");
+    assert_eq!(keys_in(cx, w, &view, "toolu_he"), "env");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c1hfent", &input, json!({"fields": {"env": "staging", "region": "eu-west-1"}}))]);
+}
+
+/// P2-1 in the note: an Enter held from the composer, its repeats in the
+/// note the pick opened, sends nothing; pressed again, it sends.
+#[gpui_kit::test]
+fn a_held_enter_in_a_note_sends_nothing(cx: &mut TestAppContext) {
+    let input = json!({"question": "Ship it?", "wait": true, "options": ["Yes", {"label": "Not yet", "note": "What's missing?"}]});
+    let (w, view, id, _events) = asked(cx, "toolu_hn", "c2hnote", &input);
+    down(cx, w, "enter");
+    settle(cx, w, 8);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id));
+    press(cx, w, "2");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hn"), "note");
+    typing(cx, w, "the changelog");
+    repeat(cx, w, "enter");
+    assert!(sends(cx, &view).is_empty(), "Enter held from the composer: no Submit");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hn"), "note");
+    up(cx, w, "enter");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c2hnote", &input, json!({"choice": "Not yet", "note": "the changelog"}))]);
+}
+
+/// P2-1 in a form to fill: Enter in its first field moves to the next;
+/// its repeat there moves nothing more (it went round to the card).
+#[gpui_kit::test]
+fn a_held_enter_in_a_form_to_fill_moves_once(cx: &mut TestAppContext) {
+    let input = json!({"question": "Who reviews the migration?", "wait": true, "fields": [
+        {"id": "who", "label": "Reviewer"}, {"id": "when", "label": "When"}]});
+    let (w, view, _id, _events) = asked(cx, "toolu_hf", "c3hform", &input);
+    press(cx, w, "ctrl-j");
+    assert_eq!(keys_in(cx, w, &view, "toolu_hf"), "who");
+    typing(cx, w, "Ana");
+    down(cx, w, "enter");
+    settle(cx, w, 8);
+    assert_eq!(keys_in(cx, w, &view, "toolu_hf"), "when", "a press: on to the next field");
+    for n in 1..=2 {
+        repeat(cx, w, "enter");
+        assert_eq!(keys_in(cx, w, &view, "toolu_hf"), "when", "repeat {n}: nowhere");
+    }
+    up(cx, w, "enter");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    typing(cx, w, "Friday");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c3hform", &input, json!({"fields": {"who": "Ana", "when": "Friday"}}))]);
+}
+
+/// Shady #86 P2-2: a held Ctrl+J jumps once. At a prompt and a card, it
+/// goes to the prompt, and its repeats never go on to the card; let go
+/// and pressed again, it does.
+#[gpui_kit::test]
+fn a_held_ctrl_j_stays_at_the_prompt(cx: &mut TestAppContext) {
+    let input = json!({"question": "Allow it?", "options": ["yes", "always"]});
+    let (w, view, id, _events) = asked(cx, "toolu_hj", "c4hjump", &input);
+    prompt(cx, w, &view);
+    down(cx, w, "ctrl-j");
+    settle(cx, w, 8);
+    assert_eq!(keys_at(cx, w, &view), (false, true), "the prompt first");
+    prompt_keys_live(cx, w, &view);
+    for n in 1..=3 {
+        repeat(cx, w, "ctrl-j");
+        assert!(!entered(cx, w, id), "repeat {n}: still the prompt");
+        assert_eq!(keys_at(cx, w, &view), (false, true), "repeat {n}");
+    }
+    up(cx, w, "ctrl-j");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id), "a new press: the card");
+    prompt_pending(cx, &view, "Ctrl+J held, then pressed");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// P2-2: the batch a Ctrl+J froze stays while it is held: a card that
+/// comes meanwhile does not join it. A new press freezes a new one.
+#[gpui_kit::test]
+fn a_held_ctrl_j_freezes_one_batch(cx: &mut TestAppContext) {
+    let first = json!({"question": "Which branch?", "wait": true, "options": ["main", "release"], "default": "main"});
+    let (w, view, id, _events) = asked(cx, "toolu_hb", "c5hbtch", &first);
+    down(cx, w, "ctrl-j");
+    settle(cx, w, 8);
+    assert!(entered(cx, w, id));
+    assert!(!has(cx, w, format!("ask-batch {id} 1 of 2")), "a batch of one");
+    let second = json!({"question": "Tag it?", "options": ["yes", "no"]});
+    ask_live(cx, w, &view, "toolu_hb2", "c5hbtc2", second);
+    repeat(cx, w, "ctrl-j");
+    assert!(entered(cx, w, id), "the card stays entered");
+    assert!(!has(cx, w, format!("ask-batch {id} 1 of 2")), "held: the batch as frozen");
+    up(cx, w, "ctrl-j");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(cx, w, "ctrl-j");
+    assert!(has(cx, w, format!("ask-batch {id} 1 of 2")), "a new press: a new batch");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// P2-2: Tab and Shift+Tab move one stop a press, from a field (the
+/// input's Tab) and from the card (its focus's): a repeat moves nothing.
+#[gpui_kit::test]
+fn a_held_tab_moves_one_stop(cx: &mut TestAppContext) {
+    let input = json!({"question": "Who reviews the migration?", "wait": true, "fields": [
+        {"id": "who", "label": "Reviewer"}, {"id": "when", "label": "When"}]});
+    let (w, view, _id, _events) = asked(cx, "toolu_ht", "c6htab0", &input);
+    press(cx, w, "ctrl-j");
+    assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "who");
+    down(cx, w, "tab");
+    settle(cx, w, 8);
+    assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "when");
+    for n in 1..=2 {
+        repeat(cx, w, "tab");
+        assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "when", "a field's Tab held, repeat {n}: one stop");
+    }
+    up(cx, w, "tab");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(cx, w, "shift-tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "who");
+    down(cx, w, "shift-tab");
+    settle(cx, w, 8);
+    assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "body");
+    for n in 1..=2 {
+        repeat(cx, w, "shift-tab");
+        assert_eq!(keys_in(cx, w, &view, "toolu_ht"), "body", "the card's Shift+Tab held, repeat {n}: one stop");
+    }
+    up(cx, w, "shift-tab");
+    assert!(sends(cx, &view).is_empty());
+}
+
+/// Shady #86 P2-3: the note a pick opens is a stop of Tab's round. On a
+/// quick card: the card, the note; both ways, its text kept, nothing sent.
+#[gpui_kit::test]
+fn tab_goes_round_the_note(cx: &mut TestAppContext) {
+    let input = json!({"question": "Ship it?", "wait": true, "options": ["Yes", {"label": "Not yet", "note": "What's missing?"}]});
+    let (w, view, _id, _events) = asked(cx, "toolu_tn", "c7tnote", &input);
+    press(cx, w, "ctrl-j");
+    press(cx, w, "2");
+    assert_eq!(keys_in(cx, w, &view, "toolu_tn"), "note");
+    typing(cx, w, "the change");
+    for (k, at) in [("tab", "body"), ("tab", "note"), ("shift-tab", "body"), ("shift-tab", "note")] {
+        press(cx, w, k);
+        assert_eq!(keys_in(cx, w, &view, "toolu_tn"), at, "{k}");
+    }
+    assert_eq!(note_text(cx, &view, "toolu_tn"), "the change", "the note as written");
+    assert!(sends(cx, &view).is_empty());
+    typing(cx, w, "log");
+    press(cx, w, "enter");
+    assert_eq!(texts(cx, &view), vec![message("c7tnote", &input, json!({"choice": "Not yet", "note": "the changelog"}))]);
+}
+
+/// P2-3 on a form: the card, its pick's note, then its fields, round, both
+/// ways: from the note and from a named field. Each draft kept, nothing
+/// sent until Enter.
+#[gpui_kit::test]
+fn tab_goes_round_a_forms_note_and_fields(cx: &mut TestAppContext) {
+    let input = json!({"question": "Roll it out?", "wait": true,
+        "options": ["Now", {"label": "Later", "note": "When?"}],
+        "fields": [{"id": "owner", "label": "Owner"}, {"id": "ticket", "label": "Ticket", "optional": true}]});
+    let (w, view, _id, _events) = asked(cx, "toolu_tf", "c8tform", &input);
+    press(cx, w, "ctrl-j");
+    assert_eq!(keys_in(cx, w, &view, "toolu_tf"), "owner", "the first field to fill");
+    typing(cx, w, "Ana");
+    press(cx, w, "shift-tab");
+    assert_eq!(keys_in(cx, w, &view, "toolu_tf"), "body");
+    press(cx, w, "2");
+    assert_eq!(keys_in(cx, w, &view, "toolu_tf"), "note", "the pick's note opens");
+    typing(cx, w, "after the freeze");
+    let round = [
+        ("tab", "owner"),
+        ("shift-tab", "note"),
+        ("shift-tab", "body"),
+        ("shift-tab", "ticket"),
+        ("shift-tab", "owner"),
+        ("shift-tab", "note"),
+        ("tab", "owner"),
+        ("tab", "ticket"),
+        ("tab", "body"),
+        ("tab", "note"),
+    ];
+    for (k, at) in round {
+        press(cx, w, k);
+        assert_eq!(keys_in(cx, w, &view, "toolu_tf"), at, "{k} to {at}");
+    }
+    assert_eq!(note_text(cx, &view, "toolu_tf"), "after the freeze");
+    assert_eq!(field_value(cx, &view, "toolu_tf", "owner"), "Ana");
+    assert!(sends(cx, &view).is_empty(), "Tab sends nothing");
+    press(cx, w, "enter");
+    assert_eq!(
+        texts(cx, &view),
+        vec![message("c8tform", &input, json!({"choice": "Later", "note": "after the freeze", "fields": {"owner": "Ana", "ticket": ""}}))]
+    );
 }

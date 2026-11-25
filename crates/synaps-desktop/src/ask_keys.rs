@@ -19,10 +19,17 @@
 //!   `0` skips; ↑ ↓ move the highlight, which starts on the default; Space
 //!   ticks the highlighted option of a multi pick, or the check under the
 //!   keys; Enter answers with the highlighted option, or sends a form; Tab
-//!   and Shift+Tab move between the card and its fields; Esc goes back to
-//!   the composer. Any other printable key goes to the composer, typed.
-//!   Only new presses act: a repeat, or a key held from before, does
-//!   nothing ([`Presses`], the app's `FoldKeys` rule).
+//!   and Shift+Tab go round the card, the note its pick asks for, and its
+//!   fields; Esc goes back to the composer. Any other printable key goes
+//!   to the composer, typed.
+//! - **Only new, bare presses act**, on the card and in its fields alike
+//!   ([`Presses::acts`]): a repeat, a key held from before (the app's
+//!   `FoldKeys` rule), or a chord (Shift+Enter, Ctrl+Enter) does
+//!   nothing. So with Ctrl+J: held, it jumps once. A field's Enter and
+//!   Tab are bindings of its input, which run before any key listener
+//!   and never say whether the key repeats: Tab has none on an entered
+//!   card (`NoAction`), and comes as a key; an Enter acts at its
+//!   `PressEnter` only once its key-down said ([`FieldEnter`]).
 //! - **In a field**, the field keeps its keys: digits, Space and arrows
 //!   edit, and an IME composition owns every key. Enter in a one-line
 //!   field goes forward: it sends a whole form, else moves to the next
@@ -56,11 +63,18 @@ use crate::pane::PaneId;
 use crate::turns::Kind;
 use crate::waiting::{Waiting, Waits};
 
-actions!(ask_keys, [AskTab, AskTabBack]);
-
-/// The key context of the pane's card-mode focus: Tab and Shift+Tab move
-/// between the entered card's controls, ahead of the kit's focus cycling.
+/// The key context of the pane's card-mode focus: Tab and Shift+Tab have
+/// no binding there (`NoAction`: not the kit's focus cycling), so they
+/// come to the pane as keys ([`AppView::ask_tab_key`]).
 pub(crate) const ASK_CTX: &str = "AskCard";
+
+/// The key context of an entered card ([`crate::ask`] draws it): Tab and
+/// Shift+Tab in one of its inputs have no binding (not the input's
+/// indent, nor the kit's focus cycling), and come as keys.
+pub(crate) const ASK_ENTERED: &str = "AskEntered";
+
+/// The entered card's inputs, for their `NoAction` Tab.
+pub(crate) const ASK_INPUT_CTX: &str = "AskEntered > Input";
 
 /// A pane's card mode: the focus that holds its keys (made on the first
 /// entry, then always drawn, so it is never lost to the window's), and
@@ -69,17 +83,16 @@ pub(crate) const ASK_CTX: &str = "AskCard";
 pub(crate) struct CardMode {
     pub(crate) focus: Option<FocusHandle>,
     pub(crate) entry: Option<Entry>,
-    /// The last Enter in one of its inputs came mid-composition (read as
-    /// the key came, before anything committed it): its `PressEnter` is
-    /// the IME's.
-    pub(crate) enter_composing: bool,
 }
 
-/// Where the keys are on the entered card: its options and buttons, or a
-/// field (a check: Space ticks it; a text field: its input has the focus).
+/// Where the keys are on the entered card, each a stop of Tab's round:
+/// its options and buttons, the note its pick asks for (its input has the
+/// focus), or a field (a check: Space ticks it; a text field: its input
+/// has the focus).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Spot {
     Body,
+    Note,
     Field(String),
 }
 
@@ -105,17 +118,52 @@ pub(crate) struct Entry {
     pub(crate) seen: Rc<Cell<bool>>,
 }
 
-/// Every key's presses, window-wide ([`FoldKeys`]): whether the last key
-/// down was a new press, not a repeat or a key still held from before.
+/// Every key's presses, window-wide ([`FoldKeys`]), as the root's capture
+/// stamps each key-down: whether the last was a new press, not a repeat
+/// or a key still held from before; and whether it may act on an entered
+/// card.
 #[derive(Default)]
 pub(crate) struct Presses {
     keys: HashMap<String, FoldKeys>,
     pub(crate) last: bool,
+    /// The last key-down may act on an entered card: a new press, bare.
+    pub(crate) acts: bool,
+    /// An Enter in an input, from its action to its `PressEnter`.
+    pub(crate) enter: Option<FieldEnter>,
+}
+
+/// An Enter in an input, between its action and its `PressEnter`. The
+/// input's Enter binding runs before any key listener (GPUI dispatches a
+/// key's bindings first), and its `PressEnter` is an effect, heard once
+/// the whole key-down is through. So: the action says an Enter came, and
+/// whether mid-composition (read then, before anything commits it); its
+/// own key-down, as [`Presses::down`] stamps it, whether it acts. An
+/// entered card's field goes forward only on that
+/// ([`AppView::ask_field_enter`]); an Enter whose key-down never came (an
+/// action dispatched alone) or was another's acts on nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FieldEnter {
+    pub(crate) composing: bool,
+    pub(crate) acts: Option<bool>,
+}
+
+/// A key a card takes: no modifier, but Shift on Tab (Shift+Tab). A chord
+/// is the app's, or its input's (Shift+Enter, Ctrl+Enter): never a
+/// card's answer.
+fn bare(ks: &Keystroke) -> bool {
+    let m = &ks.modifiers;
+    !(m.control || m.alt || m.platform || m.function) && (!m.shift || ks.key == "tab")
 }
 
 impl Presses {
-    pub(crate) fn down(&mut self, key: &str, now: Instant, held: bool) {
-        self.last = self.keys.entry(key.to_string()).or_default().press(now, held);
+    /// Key `ks` went down at `now` (`held`: the platform says it is a
+    /// repeat). A pending Enter's key-down says whether it acts; any other
+    /// key-down ends it.
+    pub(crate) fn down(&mut self, ks: &Keystroke, now: Instant, held: bool) {
+        self.last = self.keys.entry(ks.key.clone()).or_default().press(now, held);
+        self.acts = self.last && bare(ks);
+        let acts = self.acts;
+        self.enter = self.enter.take().filter(|e| ks.key == "enter" && e.acts.is_none()).map(|e| FieldEnter { acts: Some(acts), ..e });
     }
 
     pub(crate) fn up(&mut self, key: &str, now: Instant) {
@@ -385,16 +433,15 @@ impl AppView {
         self.panes.cur.ask.focus.as_ref().is_some_and(|f| f.is_focused(window)) || self.ask_field_focused(e, window, cx).is_some()
     }
 
-    /// The entered card's input with the keys: `Some(None)` its note,
-    /// `Some(Some(id))` field `id`.
-    fn ask_field_focused(&self, e: &Entry, window: &Window, cx: &App) -> Option<Option<String>> {
+    /// The entered card's input with the keys: its note's, or field `id`'s.
+    fn ask_field_focused(&self, e: &Entry, window: &Window, cx: &App) -> Option<Spot> {
         let d = self.card_drafts.get(&(e.session.clone(), e.painted.tool_id.clone()))?;
         if d.note.as_ref().is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window)) {
-            return Some(None);
+            return Some(Spot::Note);
         }
         let line = d.lines.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window)).map(|(id, _)| id.clone());
         let long = d.longs.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window)).map(|(id, _)| id.clone());
-        line.or(long).map(Some)
+        line.or(long).map(Spot::Field)
     }
 
     /// An IME composition in the entered card's input that has the keys.
@@ -512,9 +559,10 @@ impl AppView {
             return;
         }
         cx.stop_propagation();
-        // Only a new press acts: a repeat, or a key held from before.
-        if !self.ask_presses.last {
-            log::debug!(target: "synaps_desktop::card", "card key {key}: not a new press");
+        // Only a new, bare press acts: not a repeat, a key held from
+        // before, nor a Shift+ one ([`Presses::acts`]).
+        if !self.ask_presses.acts {
+            log::debug!(target: "synaps_desktop::card", "card key {key}: not a new, bare press");
             return;
         }
         match (key, digit) {
@@ -575,7 +623,7 @@ impl AppView {
         let Some(e) = self.panes.cur.ask.entry.as_ref() else { return };
         match e.spot.clone() {
             Spot::Field(id) => self.card_field(&s, row, &painted, &id, window, cx),
-            Spot::Body => {
+            Spot::Body | Spot::Note => {
                 let label = e.hi.filter(|_| painted.doc.multi).and_then(|i| painted.doc.options.get(i)).map(|o| o.label.clone());
                 if let Some(l) = label {
                     self.card_pick(&s, row, &painted, &l, window, cx);
@@ -618,24 +666,30 @@ impl AppView {
     }
 
     /// Tab (or Shift+Tab, `back`) on the entered card: the next (previous)
-    /// of its controls, round: the card itself, then each field.
+    /// of its stops, round: the card itself, the note its pick asks for
+    /// (once open), then each field. What a note or a field holds stays.
     pub(crate) fn ask_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.ask.entry.as_ref() else { return };
-        let mut stops = vec![None];
-        stops.extend(e.painted.doc.fields.iter().map(|f| Some(f.id.clone())));
-        let now = match self.ask_field_focused(e, window, cx) {
-            Some(f) => f,
-            None => match &e.spot {
-                Spot::Body => None,
-                Spot::Field(id) => Some(id.clone()),
-            },
-        };
+        let note = self.ask_note(e);
+        let mut stops = vec![Spot::Body];
+        stops.extend(note.is_some().then_some(Spot::Note));
+        stops.extend(e.painted.doc.fields.iter().map(|f| Spot::Field(f.id.clone())));
+        let now = self.ask_field_focused(e, window, cx).unwrap_or_else(|| e.spot.clone());
         let i = stops.iter().position(|s| *s == now).unwrap_or(0);
         let n = stops.len();
         let to = stops[if back { (i + n - 1) % n } else { (i + 1) % n }].clone();
         match to {
-            Some(id) => self.ask_go(&id, window, cx),
-            None => {
+            Spot::Field(id) => self.ask_go(&id, window, cx),
+            Spot::Note => {
+                if let Some(e) = self.panes.cur.ask.entry.as_mut() {
+                    e.spot = Spot::Note;
+                }
+                if let Some(i) = note {
+                    i.update(cx, |s, cx| s.focus(window, cx));
+                }
+                self.ask_redraw(cx);
+            }
+            Spot::Body => {
                 if let Some(e) = self.panes.cur.ask.entry.as_mut() {
                     e.spot = Spot::Body;
                 }
@@ -674,15 +728,31 @@ impl AppView {
         cx.notify();
     }
 
-    /// Tab or Shift+Tab in one of the entered card's inputs (the input's
-    /// own Tab, captured): the card's next control. An IME composition
-    /// keeps it.
-    fn ask_field_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let holds = self.panes.cur.ask.entry.as_ref().is_some_and(|e| self.ask_field_focused(e, window, cx).is_some());
-        if holds && !self.ask_composing(window, cx) {
-            cx.stop_propagation();
-            self.ask_tab(back, window, cx);
+    /// The note the entered card's pick asks for, once open: its input.
+    fn ask_note(&self, e: &Entry) -> Option<Entity<gpui_kit::component::input::InputState>> {
+        let doc = &e.painted.doc;
+        let d = self.card_drafts.get(&(e.session.clone(), e.painted.tool_id.clone()))?;
+        let asks = !doc.multi && d.picked.iter().any(|l| doc.option(l).is_some_and(|o| o.note.is_some()));
+        d.note.clone().filter(|_| asks)
+    }
+
+    /// Tab or Shift+Tab (`ks`) while the entered card holds the keys, on
+    /// its body or in one of its inputs. No binding takes it there
+    /// ([`ASK_CTX`], [`ASK_INPUT_CTX`]): it comes as a key, so only a new
+    /// press of it moves, as any card key (§7), once the card is painted.
+    /// An IME composition keeps it; a chord (Ctrl+Tab) is the app's.
+    fn ask_tab_key(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ks.modifiers;
+        if m.control || m.alt || m.platform || m.function || !self.ask_holds_keys(window, cx) || self.ask_composing(window, cx) {
+            return;
         }
+        cx.stop_propagation();
+        let shown = self.panes.cur.ask.entry.as_ref().is_some_and(|e| e.shown.get());
+        if !shown || !self.ask_presses.acts {
+            log::debug!(target: "synaps_desktop::card", "card Tab: not a new press, or the card not painted yet");
+            return;
+        }
+        self.ask_tab(m.shift, window, cx);
     }
 
     /// Esc in one of the entered card's inputs (the input's own, captured):
@@ -696,12 +766,20 @@ impl AppView {
     }
 
     /// Enter in a one-line input of row `row`'s card (its `PressEnter`),
-    /// the card entered: forward. A whole form is sent; else the next
-    /// field. An IME composition's Enter is the IME's.
+    /// the card entered and painted: forward. A whole form is sent; else
+    /// the next stop. Only an Enter whose own key-down was a new, bare
+    /// press, and not an IME composition's ([`FieldEnter`]): a repeat, an
+    /// Enter held from before the keys came here, or Shift or Ctrl+Enter
+    /// sends nothing and moves nothing.
     pub(crate) fn ask_field_enter(&mut self, row: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let composing = std::mem::take(&mut self.panes.cur.ask.enter_composing);
+        let enter = self.ask_presses.enter.take();
         let Some((s, r, painted)) = self.ask_target().filter(|(_, r, _)| *r == row) else { return };
-        if composing || !self.ask_holds_keys(window, cx) || self.ask_composing(window, cx) {
+        if enter != Some(FieldEnter { composing: false, acts: Some(true) }) {
+            log::debug!(target: "synaps_desktop::card", "field Enter {enter:?}: not a new, bare press");
+            return;
+        }
+        let shown = self.panes.cur.ask.entry.as_ref().is_some_and(|e| e.shown.get());
+        if !shown || !self.ask_holds_keys(window, cx) || self.ask_composing(window, cx) {
             return;
         }
         let ready = self.card_drafts.get(&(s.clone(), painted.tool_id.clone())).is_some_and(|d| d.reply(&painted.doc, cx).is_ok());
@@ -763,33 +841,30 @@ impl AppView {
             .size_0()
         });
         let focus = self.panes.cur.ask.focus.clone().map(|f| {
-            div()
-                .absolute()
-                .size_0()
-                .track_focus(&f)
-                .key_context(ASK_CTX)
-                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+            div().absolute().size_0().track_focus(&f).key_context(ASK_CTX).on_key_down(cx.listener(
+                move |this, ev: &KeyDownEvent, window, cx| {
                     this.in_pane(pane, |this| this.ask_key(ev, window, cx));
-                }))
-                .on_action(cx.listener(move |this, _: &AskTab, window, cx| {
-                    this.in_pane(pane, |this| this.ask_tab(false, window, cx));
-                }))
-                .on_action(cx.listener(move |this, _: &AskTabBack, window, cx| {
-                    this.in_pane(pane, |this| this.ask_tab(true, window, cx));
-                }))
+                },
+            ))
         });
         d.children(focus)
             .children(gone)
-            // Whether an Enter came mid-composition, as it comes: the
-            // platform may commit the composition before its `PressEnter`.
+            // An Enter in an input, as its action comes, before its key-down
+            // and its `PressEnter` ([`FieldEnter`]); whether mid-composition
+            // is read now, as the platform may commit the composition before
+            // its `PressEnter`.
             .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::Enter, window, cx| {
-                this.in_pane(pane, |this| this.panes.cur.ask.enter_composing = this.ask_composing(window, cx));
+                this.in_pane(pane, |this| {
+                    let composing = this.ask_composing(window, cx);
+                    this.ask_presses.enter = Some(FieldEnter { composing, acts: None });
+                });
             }))
-            .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::IndentInline, window, cx| {
-                this.in_pane(pane, |this| this.ask_field_tab(false, window, cx));
-            }))
-            .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::OutdentInline, window, cx| {
-                this.in_pane(pane, |this| this.ask_field_tab(true, window, cx));
+            // Tab and Shift+Tab on the entered card, its body or an input:
+            // keys, after the root stamped them.
+            .capture_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "tab" {
+                    this.in_pane(pane, |this| this.ask_tab_key(&ev.keystroke, window, cx));
+                }
             }))
             .capture_action(cx.listener(move |this, _: &gpui_kit::base::input::Escape, window, cx| {
                 this.in_pane(pane, |this| this.ask_field_escape(window, cx));

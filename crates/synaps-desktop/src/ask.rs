@@ -626,6 +626,7 @@ impl AppView {
             .pt(px(pad_y(m)))
             .pb(px(pad_y(m)))
             .debug_selector(move || format!("ask-card {id}"))
+            .when(keys.is_some(), |d| d.key_context(crate::ask_keys::ASK_ENTERED))
             .when_some(keys, |d, e| d.relative().child(ring(e, id, p)))
             .child(head)
             .child(question)
