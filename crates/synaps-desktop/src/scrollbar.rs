@@ -51,6 +51,16 @@ pub(crate) const MIN_THUMB: f32 = 24.;
 /// How long a bar stays after a scroll.
 pub(crate) const LINGER: Duration = Duration::from_secs(1);
 
+/// The clock a bar's linger and fade read: the executor's, which their
+/// timers run on. In the app that is the monotonic clock; in a test it is
+/// the test's, which moves only when the test moves it, so how many frames
+/// a fade asks for never rests on how fast the machine drew them. (A
+/// hiding bar's wake-up, [`hiding`], keeps the decay grid's phase: at most
+/// one tick away, whatever the clock.)
+fn now(cx: &App) -> Instant {
+    cx.background_executor().now()
+}
+
 /// What a bar sits on: its thumb's roles.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Ground {
@@ -727,7 +737,7 @@ impl<S: Scrolled> Bar<S> {
         }
         st.ours = false;
         geo.warp = st.warp;
-        let now = Instant::now();
+        let now = now(cx);
         let view = window.current_view();
         if st.last.is_some_and(|l| (l - at).abs() > 0.5) && !self.always {
             st.until = Some(now + LINGER);
@@ -868,7 +878,7 @@ impl<S: Scrolled> Frame<S> {
                 }
                 let (over, on_bar) = (pane.is_hovered(window), strip.as_ref().is_some_and(|h| h.is_hovered(window)));
                 if (over, on_bar) != (s.over, s.on_bar) {
-                    let now = Instant::now();
+                    let now = now(cx);
                     let before = s.look(always, now);
                     (s.over, s.on_bar) = (over, on_bar);
                     if s.look(always, now) != before {
@@ -883,7 +893,7 @@ impl<S: Scrolled> Frame<S> {
                 move |_: &MouseExitEvent, phase, _, cx| {
                     let mut s = state.0.borrow_mut();
                     if phase.bubble() && s.grab.is_none() {
-                        let now = Instant::now();
+                        let now = now(cx);
                         let before = s.look(always, now);
                         (s.over, s.on_bar) = (false, false);
                         if s.look(always, now) != before {
@@ -960,7 +970,7 @@ fn linger(state: BarState, view: EntityId, window: &mut Window, cx: &mut App) {
     window
         .spawn(cx, async move |cx| {
             loop {
-                let wait = state.0.borrow().until.map(|u| u.saturating_duration_since(Instant::now()));
+                let wait = state.0.borrow().until.map(|u| u.saturating_duration_since(cx.background_executor().now()));
                 match wait {
                     Some(w) if !w.is_zero() => cx.background_executor().timer(w).await,
                     _ => break,
@@ -1027,6 +1037,78 @@ mod tests {
         cx.executor().advance_clock(crate::motion::DECAY_TICK + Duration::from_millis(1));
         cx.run_until_parked();
         assert_eq!((woken.get(), state()), (4, (false, 0)));
+    }
+
+    /// A bar's fade and linger read the executor's clock, the one their
+    /// timers run on (here the test's): wall time between two frames moves
+    /// neither. Read off the wall, a bar coming up at Full asked for a frame
+    /// every frame until 90 ms of it had gone, so a step drew as many frames
+    /// as the machine fitted in them (`ui_tests::off_is_static`, run on its
+    /// own: 8 where it allows 2).
+    #[gpui_kit::test]
+    fn the_fade_and_the_linger_run_on_the_tests_clock(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::prelude::*;
+        use gpui_kit::{ScrollHandle, Window, div};
+        struct V {
+            scroll: ScrollHandle,
+            always: BarState,
+            linger: BarState,
+        }
+        impl Render for V {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(div().id("rows").size_full().overflow_y_scroll().track_scroll(&self.scroll).child(div().h(px(4000.))))
+                    .child(super::Bar::new(self.scroll.clone(), &self.always).always())
+                    .child(super::Bar::new(self.scroll.clone(), &self.linger))
+            }
+        }
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let (theme, raw, _, _) = crate::theme::resolve_theme(None, None, None, None, None);
+            crate::theme::apply(crate::theme::Choice { theme, raw, accent: None, text: crate::theme::Panels::default().text_size }, cx);
+            cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        });
+        let (scroll, always, linger) = (ScrollHandle::new(), BarState::default(), BarState::default());
+        let w = cx.add_window({
+            let (scroll, always, linger) = (scroll.clone(), always.clone(), linger.clone());
+            move |_, _| V { scroll, always, linger }
+        });
+        cx.run_until_parked();
+        // One frame drawn; how many frame requests it ran.
+        let frame = |cx: &mut gpui_kit::TestAppContext| {
+            let ran = w.update(cx, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+            cx.run_until_parked();
+            ran
+        };
+        for _ in 0..4 {
+            if always.0.borrow().was {
+                break;
+            }
+            w.update(cx, |_, _, cx| cx.notify()).expect("the window");
+            frame(cx);
+        }
+        assert!(always.0.borrow().was && always.0.borrow().fade.is_some(), "an always-shown bar comes up, fading in");
+        // Its 90 ms twice over on the wall, none on the test's clock.
+        std::thread::sleep(super::SHOW * 2);
+        frame(cx);
+        assert!(always.0.borrow().fade.is_some(), "still fading in: the test's clock has not moved");
+        assert!(frame(cx) > 0, "and it asks for the next frame");
+        cx.executor().advance_clock(super::SHOW);
+        frame(cx);
+        assert!(always.0.borrow().fade.is_none(), "90 ms on the test's clock: in");
+        assert_eq!(frame(cx), 0, "at rest: no frame");
+        // A scroll: the other bar shows for LINGER, on the test's clock.
+        scroll.set_offset(point(px(0.), px(-200.)));
+        w.update(cx, |_, _, cx| cx.notify()).expect("the window");
+        frame(cx);
+        assert!(linger.0.borrow().until.is_some(), "shown after the scroll");
+        cx.executor().advance_clock(LINGER - Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(linger.0.borrow().until.is_some(), "1 ms short of LINGER: still shown");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(linger.0.borrow().until.is_none(), "LINGER on the test's clock: its deadline passed");
     }
 
     /// M7: the bar's colours are the palette's (`theme::palette`, drained
