@@ -18,7 +18,8 @@
 //!
 //! Shady #93 round 2: On before a Forget is done, or after its removal
 //! failed, reads nothing back; the retry, at On or at the next save,
-//! removes it (R2 P2-1).
+//! removes it (R2 P2-1); what a dead writer left beside the file goes at
+//! launch and with a Forget (R2 P2-2).
 //!
 //! Each test's memory has a file of its own (`remembering`); the window's
 //! default (on, no file) is every other test's. The window and key helpers
@@ -1044,4 +1045,37 @@ fn a_failed_forget_is_retried_by_the_next_save(cx: &mut TestAppContext) {
         v.settings_pick(Pick::Remember, "on", cx);
     });
     assert_eq!((reads(cx, &view), kept(cx, &view).0), (r0 + 1, 1), "confirmed gone: read again");
+}
+
+/// Crash leftovers (Shady #93 R2 P2-2): what a dead writer left beside the
+/// file goes at launch with memory on (off, nothing is touched) and with
+/// a Forget; nothing else in the folder is touched.
+#[gpui_kit::test]
+fn crash_leftovers_go_at_launch_and_with_a_forget(cx: &mut TestAppContext) {
+    let input = ship_input();
+    let (w, view, _first, _events) = asked(cx, "toolu_k1", "c1kkk01", &input);
+    let path = remembering(cx, &view, "leftovers");
+    let dir = path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = folder(cx, &view);
+    let text = json!({"version": 1, "choices": [{"key": key_of(&cwd, &input), "pick": [1]}]}).to_string();
+    std::fs::write(&path, &text).unwrap();
+    // A writer that died (no such process) left a snapshot beside it.
+    let leftover = |n: u64| dir.join(format!("{}.tmp.{}.{n}", crate::recall::FILE, u32::MAX));
+    std::fs::write(leftover(1), &text).unwrap();
+    let other = dir.join("settings.json");
+    std::fs::write(&other, "{}").unwrap();
+    view.update(cx, |v, cx| v.start_recall(false, Some(path.clone()), cx));
+    cx.run_until_parked();
+    assert!(leftover(1).exists() && path.exists(), "launched off: nothing touched");
+    view.update(cx, |v, cx| v.start_recall(true, Some(path.clone()), cx));
+    cx.run_until_parked();
+    assert!(!leftover(1).exists(), "launched on: the leftover, gone");
+    assert!(path.exists() && other.exists(), "nothing else touched");
+    assert_eq!(kept(cx, &view).0, 1, "the file, read");
+    std::fs::write(leftover(2), &text).unwrap();
+    settings(cx, w, &view);
+    click_forget(cx, w);
+    assert!(!path.exists() && !leftover(2).exists(), "a Forget: the file and the leftover, gone");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "{}", "nothing else touched");
 }

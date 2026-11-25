@@ -1112,7 +1112,7 @@ impl AppView {
                 .failed
                 .as_ref()
                 .map(|why| {
-                    mono(format!("couldn't remove {}: {why}", crate::recall::FILE), 12., p.err)
+                    mono(format!("couldn't remove {why}"), 12., p.err)
                         .whitespace_normal()
                         .debug_selector(|| "recall-failed".into())
                         .into_any_element()

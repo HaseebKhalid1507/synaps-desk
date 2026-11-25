@@ -37,21 +37,27 @@
 //! - **Where.** `card-choices.json`, next to `settings.json` ([`path`]):
 //!   at most [`CAP`] questions, the least recently answered dropped
 //!   first. Read once at launch (and when the setting is turned on);
-//!   written whole, atomically (a new temporary file, synced, renamed),
-//!   off the UI thread and never from a frame; this user's only from its
-//!   creation ([`create_private`]: mode 0600, or on Windows a protected
-//!   DACL of the user's SID alone). A file that doesn't parse is left for
-//!   the next write to replace: the desk starts empty and the log says
-//!   why. Two desk processes write whole files: the last write wins.
+//!   written whole, atomically (a new temporary file beside it,
+//!   `card-choices.json.tmp.<pid>.<generation>` ([`tmp_of`]), synced,
+//!   renamed), off the UI thread and never from a frame; this user's only
+//!   from its creation ([`create_private`]: mode 0600, or on Windows a
+//!   protected DACL of the user's SID alone). A file that doesn't parse is
+//!   left for the next write to replace: the desk starts empty and the log
+//!   says why. Two desk processes write whole files: the last write wins.
+//! - **Crash leftovers.** A temporary file a writer left when it died is
+//!   removed, with every regular file of exactly that name pattern beside
+//!   the file and nothing else ([`sweep`]: no link followed or removed),
+//!   off the UI thread: at launch and On (memory on), and with every
+//!   Forget.
 //! - **The setting** `cards.remember` (Settings, THIS APP: "Remember card
 //!   choices", on unless `false` or `"off"`): off, the file is neither
 //!   read nor written, a save not begun is dropped, and a card first seen
 //!   off marks nothing (one already open keeps what it showed).
 //! - **Forget** ("Forget remembered choices", on or off) empties the
-//!   memory and removes the file. Accepted at the click, it runs to its
-//!   end on a task of its own: after a save already writing, never undone
-//!   by an older save, Off or a closed window ([`accept_forget`],
-//!   [`remove`]). Until the file is confirmed gone
+//!   memory and removes the file and its crash leftovers. Accepted at the
+//!   click, it runs to its end on a task of its own: after a save already
+//!   writing, never undone by an older save, Off or a closed window
+//!   ([`accept_forget`], [`remove`]). Until the file is confirmed gone
 //!   (removed, or replaced by a save made after it), the process holds a
 //!   barrier ([`barred`]): no load reads the file (On, a new memory of
 //!   it: they start empty), and a removal that failed is retried at the
@@ -309,31 +315,94 @@ fn confirm(path: &Path, generation: u64) {
     }
 }
 
-/// The file at `path` removed (one gone already: done). The caller holds
+/// The temporary file a save of snapshot `generation` writes first:
+/// `<file>.tmp.<pid>.<generation>`, beside it.
+pub(crate) fn tmp_of(path: &Path, generation: u64) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{name}.tmp.{}.{generation}", std::process::id()))
+}
+
+/// Whether `name` is a temporary file of `file`'s ([`tmp_of`]): exactly
+/// `<file>.tmp.<digits>.<digits>`.
+fn is_leftover(name: &str, file: &str) -> bool {
+    let Some(rest) = name.strip_prefix(file).and_then(|r| r.strip_prefix(".tmp.")) else { return false };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    rest.split_once('.').is_some_and(|(pid, generation)| digits(pid) && digits(generation))
+}
+
+/// The temporary files beside `path` that no write is using (the caller
+/// holds the write lock: this process's own are written and renamed, or
+/// removed, under it): every regular file named as one ([`is_leftover`]),
+/// removed. A link or a folder of that name is not followed nor touched,
+/// nor any other name. Each one tried: how many went, or the first
+/// failure.
+pub(crate) fn sweep(path: &Path) -> std::io::Result<usize> {
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else { return Ok(0) };
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        r => r?,
+    };
+    let (mut gone, mut failed) = (0, None);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|n| is_leftover(n, file)) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => gone += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failed.get_or_insert(std::io::Error::new(e.kind(), format!("{}: {e}", name.to_string_lossy())));
+            }
+        }
+    }
+    failed.map_or(Ok(gone), Err)
+}
+
+/// [`sweep`], the write lock held (a load's: at launch, at On).
+pub(crate) fn sweep_leftovers(path: &Path) -> std::io::Result<usize> {
+    let _written = lock(&WRITTEN);
+    sweep(path)
+}
+
+/// The file at `path` removed, and what crashes left beside it
+/// ([`sweep`]): both tried, the first failure returned. The caller holds
 /// the write lock.
 fn clear(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let file = match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(std::io::Error::new(e.kind(), format!("{name}: {e}"))),
         _ => Ok(()),
-    }
+    };
+    let swept = sweep(path);
+    file.and(swept.map(|_| ()))
 }
 
 /// Write snapshot `generation` to `path` (true), unless memory was turned
 /// off before it began (`stop`), a Forget came after it, or a newer
 /// snapshot is there (false). A Forget before it not yet confirmed done
-/// (pending, or its removal failed) is done first: the file removed
-/// ([`clear`]), or nothing is written (its error). Atomic: a new
-/// temporary file of this process beside it, this user's only
-/// ([`create_private`]), synced, renamed over it (and on Unix the folder
-/// synced); the temporary file never outlives a failure. One write at a
-/// time. Off the UI thread ([`AppView::save_recall`]).
+/// (pending, or its removal failed) is done first: the file and its
+/// leftovers removed ([`clear`]), or nothing is written (its error).
+/// Atomic: a new temporary file of this process beside it ([`tmp_of`]),
+/// this user's only ([`create_private`]), synced, renamed over it (and on
+/// Unix the folder synced); a failure removes the temporary file (one
+/// that can't be is said, and swept later). One write at a time. Off the
+/// UI thread ([`AppView::save_recall`]).
 pub(crate) fn save(path: &Path, generation: u64, text: &str, stop: &AtomicBool) -> std::io::Result<bool> {
-    save_then(path, generation, text, stop, || {})
+    save_then(path, generation, text, stop, || Ok(()))
 }
 
 /// [`save`], `between` run once the temporary file is written, before the
-/// rename, the write's lock held (tests: a save caught mid-write).
-pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicBool, between: impl FnOnce()) -> std::io::Result<bool> {
+/// rename, the write's lock held (tests: a save caught mid-write, or
+/// failing there).
+pub(crate) fn save_then(
+    path: &Path,
+    generation: u64,
+    text: &str,
+    stop: &AtomicBool,
+    between: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
     use std::io::Write as _;
     let mut written = lock(&WRITTEN);
     let forgot = lock(&FORGOTTEN).get(path).copied();
@@ -349,19 +418,23 @@ pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicB
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("json.{}.{generation}.tmp", std::process::id()));
-    // One left by a crash goes first: the new one is created, never opened.
+    let tmp = tmp_of(path, generation);
+    // One of this name already (a link, a leftover) goes first: the new
+    // one is created, never opened.
     let _ = std::fs::remove_file(&tmp);
     let done = (|| {
         let mut f = create_private(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
         drop(f);
-        between();
+        between()?;
         std::fs::rename(&tmp, path)
     })();
-    if done.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if done.is_err()
+        && let Err(e) = std::fs::remove_file(&tmp)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!(target: "synaps_desktop::card", "card choices {}: left, not removed ({e})", tmp.display());
     }
     done?;
     #[cfg(unix)]
@@ -374,8 +447,8 @@ pub(crate) fn save_then(path: &Path, generation: u64, text: &str, stop: &AtomicB
     Ok(true)
 }
 
-/// Remove the file at `path` ([`clear`]): Forget `generation`'s removal,
-/// or its retry. After a save already writing (the
+/// Remove the file at `path` and its crash leftovers ([`clear`]): Forget
+/// `generation`'s removal, or its retry. After a save already writing (the
 /// lock), never cancelled (its task is its own). A snapshot newer than the
 /// Forget already there is left: it holds only what was chosen after it.
 /// Done, the file is confirmed gone ([`barred`] no more); failed, the
@@ -422,8 +495,9 @@ pub(crate) type Sight = (String, String, CardId);
 /// ([`Recall::at`]).
 const SWEEP: usize = 64;
 
-/// The disk work a load leaves for a task ([`AppView::tidy_recall`]): a
-/// Forget not yet confirmed done (`retry`, its number) retried.
+/// The disk work a load leaves for a task ([`AppView::tidy_recall`]): the
+/// file's crash leftovers swept, and a Forget not yet confirmed done
+/// (`retry`, its number) retried first.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Tidy {
     pub(crate) path: PathBuf,
@@ -734,11 +808,31 @@ impl AppView {
         }));
     }
 
+    /// The launch's memory: on (the file read now) or off (nothing
+    /// touched), and what that leaves to do on the disk.
+    pub(crate) fn start_recall(&mut self, on: bool, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.recall = Recall::new(on, path);
+        self.tidy_recall(cx);
+    }
+
     /// What the last load left to do on the disk, off the UI thread: a
-    /// Forget not yet done retried (Settings hears how it went).
+    /// Forget not yet done retried (Settings hears how it went), or the
+    /// crash leftovers swept.
     pub(crate) fn tidy_recall(&mut self, cx: &mut Context<Self>) {
-        if let Some(Tidy { path, retry: Some(generation) }) = self.recall.take_tidy() {
-            self.run_removal(path, generation, cx);
+        let Some(Tidy { path, retry }) = self.recall.take_tidy() else { return };
+        match retry {
+            Some(generation) => self.run_removal(path, generation, cx),
+            None => cx
+                .background_spawn(async move {
+                    match sweep_leftovers(&path) {
+                        Ok(0) => {}
+                        Ok(n) => log::info!(target: "synaps_desktop::card", "card choices {}: {n} crash leftovers removed", path.display()),
+                        Err(e) => {
+                            log::warn!(target: "synaps_desktop::card", "card choices {}: crash leftovers not removed ({e})", path.display())
+                        }
+                    }
+                })
+                .detach(),
         }
     }
 

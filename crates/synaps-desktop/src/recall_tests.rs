@@ -6,7 +6,8 @@
 //!
 //! Shady #93 round 2: a Forget not yet done, or whose removal failed,
 //! bars every load (no read: empty) until the file is confirmed gone, and
-//! the next save retries it first (R2 P2-1).
+//! the next save retries it first (R2 P2-1); a Forget removes what a dead
+//! writer left beside the file, and nothing else (R2 P2-2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -286,7 +287,7 @@ fn a_link_in_the_temporary_files_place_is_never_followed() {
     std::fs::write(&victim, "untouched").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
     let g = generation();
-    let tmp = path.with_extension(format!("json.{}.{g}.tmp", std::process::id()));
+    let tmp = super::tmp_of(&path, g);
     std::os::unix::fs::symlink(&victim, &tmp).unwrap();
     assert!(save(&path, g, "{\"version\": 1, \"choices\": []}\n", &go()).unwrap());
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
@@ -359,6 +360,7 @@ fn a_forget_waits_for_a_save_mid_write_and_no_older_save_lands_after() {
         save_then(&p, mid, text, &go(), || {
             inside.0.send(()).unwrap();
             at.1.recv().unwrap();
+            Ok(())
         })
     });
     inside.1.recv().unwrap();
@@ -627,5 +629,84 @@ fn a_failed_removal_bars_every_load_and_the_next_save_retries_it() {
     r.set_on(false);
     r.set_on(true);
     assert_eq!((r.reads, r.len()), (2, 1), "confirmed gone: read again");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// Crash leftovers (Shady #93 R2 P2-2): what a dead writer left beside the
+/// file (`card-choices.json.tmp.<pid>.<generation>`, another process's or
+/// this one's) goes with the file at a Forget; nothing else in the folder
+/// is touched: names that only look like one, a folder of that name, a
+/// link of that name, nor what it points at.
+#[test]
+fn a_forget_removes_crash_leftovers_and_nothing_else() {
+    let d = dir("leftovers");
+    let path = d.join(super::FILE);
+    let mut s = Store::default();
+    s.put("3f9a1c2e4b5d6f70".into(), vec![1]);
+    assert!(save(&path, generation(), &s.to_text(), &go()).unwrap());
+    let f = super::FILE;
+    let dead = [format!("{f}.tmp.{}.7", u32::MAX), format!("{f}.tmp.{}.1", std::process::id())];
+    for n in &dead {
+        std::fs::write(d.join(n), s.to_text()).unwrap();
+    }
+    let alike = [
+        "settings.json".to_string(),
+        format!("{f}.bak"),
+        format!("{f}.tmp"),
+        format!("{f}.tmp.12"),
+        format!("{f}.tmp.1.2.3"),
+        format!("{f}.tmp.x.1"),
+        format!("{f}.tmp..1"),
+        format!("{f}.tmp.1."),
+        format!("{f}.tmp.+1.2"),
+        format!("x{f}.tmp.1.2"),
+        format!("{f}.1.2.tmp"),
+    ];
+    for n in &alike {
+        std::fs::write(d.join(n), "keep").unwrap();
+    }
+    let folder = d.join(format!("{f}.tmp.5.6"));
+    std::fs::create_dir_all(folder.join("inside")).unwrap();
+    #[cfg(unix)]
+    let link = {
+        let victim = d.join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        let link = d.join(format!("{f}.tmp.8.9"));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        link
+    };
+    remove(&path, accept_forget(&path)).unwrap();
+    assert!(!path.exists(), "the file, removed");
+    for n in &dead {
+        assert!(!d.join(n).exists(), "a dead writer's leftover, removed: {n}");
+    }
+    for n in &alike {
+        assert_eq!(std::fs::read_to_string(d.join(n)).unwrap(), "keep", "untouched: {n}");
+    }
+    assert!(folder.join("inside").exists(), "a folder of that name, untouched");
+    #[cfg(unix)]
+    {
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "a link of that name, untouched");
+        assert_eq!(std::fs::read_to_string(d.join("victim")).unwrap(), "untouched");
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// A write that fails once the temporary file is written (Shady #93 R2
+/// P2-2): the file is left as it was, and the temporary file is gone.
+#[test]
+fn a_failed_write_leaves_the_file_and_no_temporary() {
+    let d = dir("write-fails");
+    let path = d.join(super::FILE);
+    let text = "{\"version\": 1, \"choices\": []}\n";
+    assert!(save(&path, generation(), text, &go()).unwrap());
+    let g = generation();
+    let e = save_then(&path, g, "{\"version\": 1, \"choices\": [{\"key\": \"3f9a1c2e4b5d6f70\", \"pick\": [1]}]}\n", &go(), || {
+        Err(std::io::Error::other("injected"))
+    });
+    assert!(e.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "the file as it was");
+    let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec![super::FILE.to_string()], "no temporary file left");
     let _ = std::fs::remove_dir_all(d);
 }
