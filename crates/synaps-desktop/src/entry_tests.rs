@@ -11,7 +11,9 @@
 //! prompt, and Esc from the card never denies it. A held Ctrl+Shift+J
 //! jumps once, a repeat X11 or macOS doesn't flag included. A card's OS
 //! notification (#89), clicked: entered the same way; a stale one moves
-//! nothing.
+//! nothing. A card's entry held for the window to come up gives way to a
+//! newer jump to another pane's card (Shady #92 P2-D1), a rejected click
+//! never.
 //!
 //! The window and key helpers are D2a's and D2b's ([`super::answer_tests`],
 //! [`super::keys_tests`]). The client stays (its sends are the view's
@@ -25,6 +27,7 @@ use super::answer_tests::{SHIP, ask_live, attachment, card, heard, land, llm, me
 use super::keys_tests::{at_rest, composer_text, down, entered, keys_at, keystroke, press, prompt, prompt_pending, ship_input, up};
 use super::settle;
 use crate::app::AppView;
+use crate::presence::Key;
 
 /// The session the focused pane shows.
 fn shown(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
@@ -470,4 +473,137 @@ fn a_notification_click_then_a_digit_sends_one_submit(cx: &mut TestAppContext) {
     assert_eq!(keys_at(cx, w, &view), before, "the keys where they were");
     press(cx, w, "3");
     one_submit(cx, &view, seq, &text, "a stale click, then a digit: nothing more");
+}
+
+/// Shady #92 P2-D1's two panes. `IDLE_CPU` in the first, focused, and its
+/// wait card A, told while the window was away; in the second, `FLAKY`
+/// in front and `ASKS` behind (its card `SHIP`, B, as last seen, and its
+/// notification). A's jump went and landed with the window still away
+/// (its activation on its way, or refused): its entry held for the window
+/// to come up ([`AppView::landed_up`]). A rejected click (a card no longer
+/// open) leaves it held. The client stays: B's attach, when its jump
+/// brings `ASKS` forward, waits for [`b_attached`]. The first pane, A's
+/// row, B's key and tag, and the client's events (kept open).
+fn a_held(
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<AppView>, crate::pane::PaneId, u64, Key, String, async_channel::Receiver<synaps_client::Event>) {
+    cx.update(|cx| cx.set_app_identity("synaps-desktop", "Synaps"));
+    let (w, view, events) = open(cx, crate::demo::IDLE_CPU);
+    let first = view.read_with(cx, |v, _| v.panes.cur.id);
+    view.update(cx, |v, _| v.app_settings.split = true);
+    press(cx, w, "ctrl-\\");
+    play(cx, w, &view);
+    by_the_demo(cx, &view, |cx| {
+        view.update(cx, |v, cx| {
+            let open = crate::app::Open::Attach { session_id: crate::demo::FLAKY.into(), fallback: None, open: false };
+            v.open_tab(open, crate::tabs::Place::Current);
+            cx.notify();
+        });
+        play(cx, w, &view);
+    });
+    open_behind(cx, w, &view, crate::demo::ASKS);
+    assert_eq!(shown(cx, &view).as_deref(), Some(crate::demo::FLAKY), "ASKS behind in the second pane");
+    view.update(cx, |v, cx| v.focus_pane(first, crate::pane::KeysTo::Pane, cx));
+    play(cx, w, &view);
+    at_rest(cx, w, &view);
+    assert_eq!(shown(cx, &view).as_deref(), Some(crate::demo::IDLE_CPU), "the first pane");
+    away(cx, w, &view);
+    let input = wait_card("Which branch, held?");
+    ask_live(cx, w, &view, "toolu_e10", "c10held", input);
+    let a = card_here(cx, &view, "Which branch, held?");
+    let told = cx.shown_system_notifications();
+    assert_eq!(told.len(), 1, "A told: {told:?}");
+    let ka = view.read_with(cx, |v, _| v.lookout.notes.card(&told[0].tag).cloned()).expect("A's binding");
+    // B, as the OS was told of it when it came.
+    let kb = view.read_with(cx, |v, _| {
+        v.model.presence.listed().find(|c| c.session == crate::demo::ASKS && c.question == SHIP).map(|c| c.key()).expect("B waits")
+    });
+    let note = crate::notify::note(&kb, "Asks", SHIP);
+    let tag = note.tag.clone();
+    view.update(cx, |v, cx| v.lookout.notes.post(kb.clone(), note, cx));
+    cx.run_until_parked();
+    // A's jump: it goes, lands, and its entry waits for the window.
+    let went = cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.go_to_card(ka.clone(), window, cx))).expect("the window");
+    assert!(went, "A's jump goes");
+    play(cx, w, &view);
+    let held = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.lookout.entering.as_ref().map(|t| t.key.clone()));
+    assert_eq!(held(cx).as_ref(), Some(&ka), "A landed, held for the window");
+    assert!(!entered(cx, w, a), "not entered while the window is away");
+    // A click on a card no longer open: rejected, A still held.
+    let gone =
+        Key { session: crate::demo::IDLE_CPU.into(), tool_id: "toolu_gone".into(), card: cards_spec::CardId::parse("c10gone").unwrap() };
+    let stale = crate::notify::note(&gone, "Relay log levels", "Gone?");
+    let stale_tag = stale.tag.clone();
+    view.update(cx, |v, cx| v.lookout.notes.post(gone, stale, cx));
+    cx.run_until_parked();
+    click_note(cx, w, &view, &stale_tag);
+    assert_eq!(held(cx).as_ref(), Some(&ka), "a rejected click: A still held");
+    assert!(!view.read_with(cx, |v, _| v.window_active), "no window raised");
+    (w, view, first, a, kb, tag, events)
+}
+
+/// The row of the card asking `question` in the focused pane (D2a's
+/// `card` reads the first pane's).
+fn card_here(cx: &mut TestAppContext, view: &Entity<AppView>, question: &str) -> u64 {
+    view.read_with(cx, |v, _| {
+        let items = v.model.lives[v.panes.cur.live].transcript.items();
+        v.panes.cur.disp.iter().find(|d| {
+            d.kind == crate::turns::Kind::Ask
+                && matches!(items.get(d.item).and_then(|i| i.card.as_deref()), Some(synaps_client::cards::CardRow::Ask(a)) if a.doc.question == question)
+        })
+        .map(|d| d.id)
+        .unwrap_or_else(|| panic!("a card asking {question:?} in the focused pane"))
+    })
+}
+
+/// The window up, B's jump gone and its attach still on its way: A never
+/// entered (the second pane keeps the focus, B's landing waits). B's
+/// attach comes: B lands and is entered; a digit sends exactly one
+/// `Submit`, on B's attachment.
+fn b_attached(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, first: crate::pane::PaneId, a: u64, kb: &Key) {
+    assert!(view.read_with(cx, |v, _| v.window_active), "the window up");
+    view.read_with(cx, |v, _| {
+        assert!(v.lookout.entering.is_none(), "A no longer held");
+        assert_eq!(v.lookout.land.as_ref().map(|t| &t.key), Some(kb), "B's landing waits");
+        assert_ne!(v.panes.focused, first, "B's pane keeps the focus");
+    });
+    assert!(!entered(cx, w, a), "A never entered");
+    let seq = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].wanted()).expect("B's attach on its way");
+    view.update(cx, |v, cx| v.apply_batch(crate::demo::attach(crate::demo::ASKS, seq), cx));
+    cx.run_until_parked();
+    play(cx, w, view);
+    assert_eq!(shown(cx, view).as_deref(), Some(crate::demo::ASKS), "B's session in front");
+    let b = card_here(cx, view, SHIP);
+    assert!(entered(cx, w, b), "B entered");
+    assert!(!entered(cx, w, a), "A never entered");
+    press(cx, w, "3");
+    assert_eq!(attachment(cx, view).0, seq);
+    one_submit(cx, view, seq, &message("c0p6r4n", &ship_input(), json!({"choice": "Don't run it"})), "B, the latest jump");
+}
+
+/// Shady #92 P2-D1, by a notification: A held; B's notification clicked.
+/// Its jump goes (the second pane, `ASKS` brought forward) and asks for
+/// the window, which comes up before B's row is built.
+#[gpui_kit::test]
+fn a_newer_notification_outranks_an_entry_held_for_the_window(cx: &mut TestAppContext) {
+    let (w, view, first, a, kb, tag, _events) = a_held(cx);
+    click_note(cx, w, &view, &tag);
+    b_attached(cx, w, &view, first, a, &kb);
+}
+
+/// Shady #92 P2-D1, by a tab dot: A held; B's tab's dot clicked in the
+/// window still away (its activation after the click, as a click to
+/// focus may bring it), then the window comes up before B's row is built.
+#[gpui_kit::test]
+fn a_newer_tab_dot_outranks_an_entry_held_for_the_window(cx: &mut TestAppContext) {
+    let (w, view, first, a, kb, _tag, _events) = a_held(cx);
+    let tab = view.read_with(cx, |v, _| {
+        let p = v.panes.rest.iter().find(|p| p.id != first).expect("the second pane");
+        p.parked.tabs.iter().find(|t| t.session.as_deref() == Some(crate::demo::ASKS)).map(|t| t.id).expect("B's tab")
+    });
+    click_at(cx, w, format!("tab {tab} last-seen"));
+    cx.update_window(w, |_, window, _| window.activate_window()).expect("the window");
+    cx.run_until_parked();
+    play(cx, w, &view);
+    b_attached(cx, w, &view, first, a, &kb);
 }

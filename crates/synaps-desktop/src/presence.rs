@@ -612,6 +612,11 @@ impl AppView {
     /// before anything moves: exactly that binding must still wait now
     /// ([`AppView::still_open`]); else nothing moves. Never opens or
     /// attaches a session the window no longer holds. Whether it went.
+    /// Gone, it is the latest: a landing still held for the window to come
+    /// up ([`AppView::landed_up`]) is dropped as it goes, not when its row
+    /// lands (its attach may still be on its way as the window comes up).
+    /// Every other way in is a key, which only an active window gets:
+    /// `landed_up` has taken any held landing by then.
     pub(crate) fn go_to_card(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let session = key.session.clone();
         if !self.still_open(&key) {
@@ -632,6 +637,7 @@ impl AppView {
         if l.watch.focus().is_some() && l.is_active(&session) {
             self.leave_worker(false, cx);
         }
+        self.lookout.entering = None;
         self.lookout.land = Some(Land { key, at: Instant::now() });
         cx.notify();
         true
