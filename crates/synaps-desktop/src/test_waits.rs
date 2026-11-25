@@ -148,8 +148,10 @@ pub(crate) fn feed(
 /// [`GATE_STEP`] a look, so its timer comes due; once none waits, it
 /// stands still and only frames are drawn: the test's clock does not
 /// move while the wait is only on the socket (the client's and the
-/// daemon's threads). The gate's own readiness still reads wall time
-/// (a follow-up).
+/// daemon's threads). The gate reads the same clock
+/// (`AppView::gate_now`): a switch within [`crate::tabs::AttachGate::GAP`]
+/// of the last on the test's clock always waits, however long the frames
+/// between them took.
 pub(crate) fn next_attach<T>(cx: &mut TestAppContext, window: AnyWindowHandle, attaches: &mpsc::Receiver<T>, what: &str) -> T {
     let view = app_of(cx, window);
     let stop = Backstop::start();

@@ -2177,6 +2177,8 @@ pub struct AppView {
     lists_seen: u64,
     /// The background tabs' sessions as last seen ([`TAB_CACHE`]).
     pub(crate) tab_cache: Lru<String, TabCache>,
+    /// The clock the attach gates read ([`AppView::gate_now`]).
+    executor: BackgroundExecutor,
     /// Tells Ctrl+T / Ctrl+W / Ctrl+Shift+T presses from their repeats.
     tab_keys: FoldKeys,
     /// Ctrl+Alt+← / →'s presses ([`OnceKey::MovePane`]).
@@ -2732,6 +2734,7 @@ impl AppView {
         let settings_pane = cx.new(|_| crate::views::ViewPane::new(me.clone(), crate::tabs::Kind::Settings));
         let usage_pane = cx.new(|_| crate::views::ViewPane::new(me, crate::tabs::Kind::Usage));
         let inputs = Inputs {
+            executor: cx.background_executor().clone(),
             composer,
             pane_subs,
             find_input,
@@ -2874,6 +2877,7 @@ impl AppView {
             save_job: Arc::default(),
             lists_seen: 0,
             tab_cache: Lru::new(TAB_CACHE, TAB_CACHE_BYTES),
+            executor: i.executor,
             tab_keys: FoldKeys::default(),
             move_keys: FoldKeys::default(),
             pane_yield: None,
@@ -3949,7 +3953,7 @@ impl AppView {
         let (fallback, open) = hint.unwrap_or_else(|| (self.model.tab_fallback(&session), false));
         self.panes.cur.attach_wait = None;
         let restoring = self.model.tabs.current().is_some_and(|t| self.model.tabs.restoring(t.id));
-        if restoring || (self.client.is_some() && self.panes.cur.gate.switch(Instant::now())) {
+        if restoring || (self.client.is_some() && self.panes.cur.gate.switch(self.gate_now())) {
             self.model.showing(self.panes.cur.live, &session);
             // A restored tab attaches once a list has its session (`start_tabs`).
             if !restoring {
@@ -3958,6 +3962,15 @@ impl AppView {
             return;
         }
         self.attach_now(session, fallback, open);
+    }
+
+    /// The attach gate's clock: the executor's, which its timer
+    /// ([`AppView::arm_attach`]) runs on. In the app that is the monotonic
+    /// clock; in a test it is the test's, which moves only when the test
+    /// moves it, so whether a switch waits, and when its attach goes, never
+    /// rests on how long the machine took between two switches.
+    fn gate_now(&self) -> Instant {
+        self.executor.now()
     }
 
     /// More than one store may hold an attachment (split panes): an attach
@@ -4002,7 +4015,7 @@ impl AppView {
         }
         let (at, id) = (self.panes.cur.gate.due(), self.panes.cur.id);
         self.panes.cur.attach_due = Some(cx.spawn(async move |this, cx| {
-            if let Some(left) = at.map(|t| t.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero()) {
+            if let Some(left) = at.map(|t| t.saturating_duration_since(cx.background_executor().now())).filter(|d| !d.is_zero()) {
                 cx.background_executor().timer(left).await;
             }
             let _ = this.update(cx, |v, cx| v.in_pane(id, |v| v.attach_waited(cx)));
@@ -4013,7 +4026,7 @@ impl AppView {
     /// its tab is still the visible one.
     fn attach_waited(&mut self, cx: &mut Context<Self>) {
         self.panes.cur.attach_due = None;
-        if !self.panes.cur.gate.ready(Instant::now()) {
+        if !self.panes.cur.gate.ready(self.gate_now()) {
             return self.arm_attach(cx);
         }
         if let Some((s, fallback, open)) = self.panes.cur.attach_wait.take()
@@ -4028,7 +4041,7 @@ impl AppView {
     /// A tab key, or Ctrl / Cmd, went up: a waiting attach is due
     /// [`crate::tabs::AttachGate::GAP`] from now.
     fn tab_key_up(&mut self, cx: &mut Context<Self>) {
-        self.panes.cur.gate.key_up(Instant::now());
+        self.panes.cur.gate.key_up(self.gate_now());
         if self.panes.cur.attach_wait.is_some() {
             self.arm_attach(cx);
         }
@@ -4320,7 +4333,7 @@ impl AppView {
     /// never on its auto-repeats (a held Ctrl+T is not a burst of new
     /// sessions): their key-down decides ([`OnceKey`]).
     pub(crate) fn tab_key(&mut self, key: TabKey, cx: &mut Context<Self>) {
-        self.panes.cur.gate.key_down(Instant::now());
+        self.panes.cur.gate.key_down(self.gate_now());
         if matches!(key, TabKey::New | TabKey::Close | TabKey::Reopen) {
             self.once = Some(OnceKey::Tab(key));
             cx.propagate();
@@ -8592,6 +8605,7 @@ struct Inputs {
     focus: FocusHandle,
     allow_all_focus: FocusHandle,
     visible: bool,
+    executor: BackgroundExecutor,
 }
 
 /// A pane's rectangle and the frame's look ([`AppView::pane_main`]).
