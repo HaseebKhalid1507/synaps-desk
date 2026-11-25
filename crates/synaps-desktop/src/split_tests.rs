@@ -1934,7 +1934,7 @@ fn a_split_grows_on_sheet_and_its_last_moving_frame_is_the_landed_layout(cx: &mu
         let r = view.read_with(cx, |v, _| v.panes.tree.rects(crate::split::Rect { x: 0., y: 0., w, h }));
         let b = pane_box(cx, window, id);
         assert_eq!(b[3], r.iter().find(|(i, _)| *i == id).expect("in the tree").1.h, "{l:?}: landed on its first frame");
-        key(cx, window, "ctrl-w");
+        press(cx, window, "ctrl-w");
     }
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
@@ -2855,7 +2855,7 @@ fn close_pane_reopens_and_join_keeps_every_tab(cx: &mut TestAppContext) {
     let tabs = pane_tabs(cx, &view);
     assert!(tabs[0].iter().any(|s| s == crate::demo::LEGACY), "Ctrl+Shift+T brings back the closed pane's tab: {tabs:?}");
     // Join: a Settings tab in the other pane comes too.
-    key(cx, window, "ctrl-alt-right");
+    press(cx, window, "ctrl-alt-right");
     frame(cx, window);
     view.update(cx, |v, cx| {
         v.model.tabs.open_view(crate::tabs::Kind::Settings);
