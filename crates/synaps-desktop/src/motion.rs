@@ -311,9 +311,7 @@ pub(crate) fn lift<E: Styled>(el: E, strength: f32) -> E {
 /// slice is drawn at full strength round it), or for a folded panel's strip
 /// in flight: from 0, on its own opaque ground, a crossfade tied to the
 /// panel's width ([`crate::chrome::strip_strength`], fluid.md §3.8), not an
-/// arrival. Raised to [`LIFT`], it would pop in at 64 px. And a flight's
-/// rewrap, from 0: the rows as they were fading out under the rewrapped
-/// ones fading in, over the pane's opaque ground ([`crate::turns::Fade`]).
+/// arrival. Raised to [`LIFT`], it would pop in at 64 px.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn lift_from<E: Styled>(el: E, strength: f32, floor: f32) -> E {
     if strength >= 1. { el } else { el.opacity(strength.max(floor.clamp(0., LIFT))) }

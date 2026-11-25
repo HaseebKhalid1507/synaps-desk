@@ -164,8 +164,6 @@ pub struct Pane {
     /// width, the column's), and that flight's reveal if it widens
     /// ([`crate::turns::Reveal`]); none at rest.
     pub(crate) reveal: Option<((f32, f32, f32), Option<crate::turns::Reveal>)>,
-    /// Its flight's rewrap cross-fading ([`crate::turns::Fade`]).
-    pub(crate) fade: Option<crate::turns::Fade>,
     /// The frame it was last drawn in ([`crate::motion::Motion::frame`])
     /// and its box then: its left edge in the window and its width.
     pub(crate) drawn_box: Option<(u64, (f32, f32))>,
@@ -486,7 +484,6 @@ impl Pane {
             layout_naming: false,
             hang_fx: Default::default(),
             reveal: None,
-            fade: None,
             drawn_box: None,
             metrics_last: Cell::new(None),
             body_line: 0.,
