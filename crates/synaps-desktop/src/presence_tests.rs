@@ -294,8 +294,9 @@ fn show_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
     play(cx, w, view);
 }
 
-/// A key pressed and let go, then 40 ms (as `ui_tests::tap`: the app reads
-/// a press of the same key within 30 ms of its release as a repeat).
+/// A key pressed and let go, then the input clock on past the repeat
+/// window ([`crate::app::next_press`], as `ui_tests::tap`: the app reads a
+/// press of the same key within 30 ms of its release as a repeat).
 fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     let keystroke = gpui_kit::Keystroke::parse_with_os(k, cx.update(|cx| cx.platform_info().os)).expect("a keystroke");
     let down = gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
@@ -314,7 +315,7 @@ fn key(cx: &mut TestAppContext, w: AnyWindowHandle, k: &str) {
     .expect("the window");
     cx.run_until_parked();
     settle(cx, w, 8);
-    std::thread::sleep(Duration::from_millis(40));
+    crate::app::next_press();
 }
 
 fn has(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> bool {
@@ -531,8 +532,9 @@ fn f10_the_tab_dot_then_an_option(cx: &mut TestAppContext) {
 /// F10 by keys (§7: Ctrl+Shift+J, then a key): from another session,
 /// Ctrl+Shift+J shows the session of the first waiting card (a wait card
 /// before an older open one) and lands on it, in view; keyboard entry is
-/// D2b's (the seam records the card). Pressed again (40 ms on, never a
-/// repeat), it stays. With no card open anywhere it does nothing.
+/// D2b's (the seam records the card). Pressed again (a new press:
+/// [`crate::app::next_press`]), it stays. With no card open anywhere it
+/// does nothing.
 #[gpui_kit::test]
 fn f10_ctrl_shift_j_lands_on_the_oldest_waiting_card(cx: &mut TestAppContext) {
     let (w, view) = open(cx);
