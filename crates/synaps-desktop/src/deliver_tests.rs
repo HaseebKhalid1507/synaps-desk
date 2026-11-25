@@ -820,21 +820,24 @@ fn words(m: &Model, lid: LiveId, sid: &str) -> (&'static str, Option<String>) {
 
 /// Shady #81 round 3: the daemon dropped events for this desk and carried
 /// on. Among them the round's checkpoint and the turn's `Done`, its last
-/// digest too or not (`last`: it came after the notice), and with `slot`
-/// the digest that cleared ours from the slot; the turn's `Idle` came. The
-/// history held is no word on it, looked at again (another event, the
-/// clock): answered, no Resend, and a click sends nothing and says why.
-/// The history asked for again, and a digest after the notice (before the
-/// history, `last`, or after it: the slot said on this stream, round 6),
-/// settle it: with ours (`saved`), answered; without, not confirmed, the
+/// digest too or not, and with `slot` the digest that cleared ours from
+/// the slot; the turn's `Idle` came. The history held is no word on it,
+/// looked at again (another event, the clock): answered, no Resend, and a
+/// click sends nothing and says why. The history asked for again, and an
+/// event on this stream after the notice that says the slot (round 6),
+/// settle it: the turn's last digest (`last`: it came after the notice),
+/// a `Dequeued` of a typed steer before the `Idle`, no digest since the
+/// gap (`dequeued`: the history asked for again settles it alone, the
+/// digest from before the gap no word), or a digest after the history
+/// (`after`). With ours (`saved`), answered; without, not confirmed, the
 /// turn's end its cause, with Resend. The history alone decides nothing
 /// that needs the slot.
 #[test]
 fn dropped_events_hold_a_delivered_answer_until_the_history_asked_for_again() {
     for slot in [false, true] {
-        for last in [false, true] {
+        for word in ["last", "dequeued", "after"] {
             for saved in [false, true] {
-                let what = format!("slot {slot}, last {last}, saved {saved}");
+                let what = format!("slot {slot}, {word}, saved {saved}");
                 let mut m = one();
                 ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": "go on"}));
                 let out = press(&mut m, LiveId::FIRST, "Refactor the parser");
@@ -852,8 +855,10 @@ fn dropped_events_hold_a_delivered_answer_until_the_history_asked_for_again() {
                 }
                 lagged(&mut m, 7);
                 assert!(!m.lives[LiveId::FIRST].transcript.history_settled(), "{what}: not settled");
-                if last {
-                    ev(&mut m, 1, S, digest(&end, None));
+                match word {
+                    "last" => drop(ev(&mut m, 1, S, digest(&end, None))),
+                    "dequeued" => drop(ev(&mut m, 1, S, json!({"ev": "dequeued", "text": "a typed note"}))),
+                    _ => {}
                 }
                 ev(&mut m, 1, S, json!({"ev": "idle"}));
                 assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: the Idle");
@@ -865,7 +870,7 @@ fn dropped_events_hold_a_delivered_answer_until_the_history_asked_for_again() {
                 assert!(!m.memos.may_resend(S, &p.id, m.lives[LiveId::FIRST].transcript.cards()), "{what}: no Resend");
                 assert_eq!(m.resend_card(LiveId::FIRST, &p, Instant::now()), Err(RESYNCING.into()), "{what}: nothing sent, and why");
                 replace(&mut m, 1, S, end.clone());
-                if !last {
+                if word == "after" {
                     // No word on the slot since the notice (the one held
                     // may still say ours, `slot`): nothing sends yet.
                     assert_eq!(state(&m, LiveId::FIRST, S), Some((State::InChat, None)), "{what}: the slot unknown");
