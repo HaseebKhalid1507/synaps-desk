@@ -172,6 +172,146 @@ pub fn deltas(total_chars: usize, seed: u64) -> Vec<String> {
     out
 }
 
+// ── blocks (synaps-cards docs/blocks.md v1.3) ─────────────────────────
+
+/// A `cards_block` call's input for `ops`.
+pub fn block_input(ops: Value) -> Value {
+    json!({ "ops": ops })
+}
+
+/// The extension's result for a block call of `ops`: its receipt
+/// (blocks.md §1.6), which binds it.
+pub fn block_receipt(ops: &Value) -> String {
+    match cards_spec::block::parse_call(&block_input(ops.clone())) {
+        Ok(b) => b.receipt().to_string(),
+        Err(e) => format!("cards_block: {e}"),
+    }
+}
+
+/// An assistant message of `blocks` (text, `tool_use`).
+fn said(blocks: Vec<Value>) -> Value {
+    json!({"role": "assistant", "content": blocks})
+}
+
+fn text(t: &str) -> Value {
+    json!({"type": "text", "text": t})
+}
+
+fn tool(id: &str, name: &str, input: Value) -> Value {
+    json!({"type": "tool_use", "id": id, "name": name, "input": input})
+}
+
+fn ops(id: &str, ops: Value) -> Value {
+    tool(id, "cards_block", block_input(ops))
+}
+
+fn results(rs: Vec<(&str, String)>) -> Value {
+    json!({"role": "user", "content": rs.into_iter().map(|(id, r)| json!({"type": "tool_result", "tool_use_id": id, "content": r})).collect::<Vec<_>>()})
+}
+
+/// The card [`blocks_history`] asks, and its id.
+pub const BLOCKS_CARD: &str = "c4f9x2a";
+
+fn lock_card() -> Value {
+    json!({"question": "Which lock wait?", "detail": "p95 of a rotation is 1.1 s; the upstream gives up at 1.5 s.",
+        "options": [{"label": "900 ms", "hint": "under p95"}, "1200 ms", "1500 ms"], "default": "1200 ms"})
+}
+
+/// A session whose agent keeps blocks (blocks.md §1.5), every kind and
+/// most states, as the extension and the history would hold them: a plan
+/// with steps in each state (one failed, one skipped, notes), a status
+/// replaced by another (`r1 · replaced`), an edit preview and a proposal,
+/// a note, a metric with a series, a file, a group of two (`merge`), a
+/// folded diff, a run titled by the agent (`collapse` with `run`), a card
+/// turned into its outcome (`card:` replace), a refused call (a plain
+/// row), a skipped path (the `skipped` chip). Deterministic: tests, the
+/// demo (`--offline`) and the bench read the same.
+pub fn blocks_history() -> Vec<Value> {
+    let edit = json!({"path": "crates/relay/src/token_store.rs",
+        "old_string": "    let cur = self.load(id).await?;\n    let next = self.upstream.rotate(&cur).await?;",
+        "new_string": "    let slot = self.slots.entry(id).or_default().clone();\n    let _held = timeout(self.lock_wait, slot.lock()).await\n        .map_err(|_| Error::Timeout)?;\n    let cur = self.load(id).await?;"});
+    let o1 = json!([
+        {"op":"put","id":"now","kind":"status","title":"Working on","body":{"text":"Reading the relay's token path","detail":"3 of 7 files read","progress":{"n":3,"of":7},"state":"working"}},
+        {"op":"put","id":"plan","kind":"plan","title":"Close the refresh race","body":{"steps":[
+            {"id":"trace","label":"Trace issuance and verification paths","state":"done"},
+            {"id":"lock","label":"Serialize rotate() per session","state":"doing","note":"token_store.rs:118"},
+            {"id":"test","label":"Regression test: 32 concurrent refreshes","state":"todo"},
+            {"id":"bandaid","label":"Drop the retry band-aid","state":"todo"},
+            {"id":"deploy","label":"Deploy to staging","state":"todo"}]}}
+    ]);
+    let o2 = json!([{"op":"collapse","run":true,"summary":"Explored the relay's refresh path"}]);
+    let o3 = json!([
+        {"op":"put","id":"edits","kind":"diff","title":"Serialize rotate()","body":{"file":"crates/relay/src/token_store.rs","state":"editing","from":"edits"}},
+        {"op":"put","id":"file","kind":"file","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}},
+        {"op":"patch","id":"now","set":{"text":"Serializing rotate() per session","detail":"one lock per session id"}},
+        {"op":"patch","id":"plan","state":{"lock":"done","test":"doing"}}
+    ]);
+    let o4 = json!([
+        {"op":"put","id":"cause","kind":"note","title":"Root cause","body":{"text":"Two refreshes read the same token before either rotates it. The second rotation **invalidates** the first one's token, so the client that won the race gets a dead token back.\n\nThe retry band-aid hid it: a retry reads the *new* token."}},
+        {"op":"put","id":"rot","kind":"metric","title":"Upstream rotations per burst","body":{"label":"rotations per 32 refreshes","value":"1.0","was":"2.0","series":[2,2,2,1.5,1,1],"state":"ok"}},
+        {"op":"put","id":"retry","kind":"diff","title":"Drop the band-aid","body":{"file":"crates/relay/src/session.rs","state":"proposed","hunks":[
+            {"id":"h1","at":"Session::refresh()","lines":["-        match self.relay.refresh(&self.token).await {","-            Err(Error::Stale) => self.relay.refresh(&self.token).await,","-            r => r,","-        }","+        self.relay.refresh(&self.token).await"],"state":"open"},
+            {"id":"h2","at":"mod retry;","lines":["-mod retry;"],"state":"open"}]}}
+    ]);
+    let o5 = json!([{"op":"replace","id":"card:c4f9x2a","kind":"note","body":{"text":"Lock wait set to **900 ms**: under p95, and well before the upstream gives up."}}]);
+    let o6 = json!([
+        {"op":"merge","into":"why","title":"Why the cutoff belongs to the session","ids":["cause","rot"]},
+        {"op":"replace","id":"now","kind":"status","title":"Working on","body":{"text":"Running the regression test","detail":"32 concurrent refreshes","progress":{"n":31,"of":32},"state":"working"},"why":"the lock is in"},
+        {"op":"patch","id":"plan","state":{"test":"failed","bandaid":"skipped","deploy":"todo"},"set":{"steps.test.note":"1 of 32 rotated twice"}},
+        {"op":"collapse","id":"edits"}
+    ]);
+    let o7 = json!([{"op":"patch","id":"plan","remove":["steps.nope"]}]);
+    let refused = json!([{"op":"put","id":"x","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"finished"}]}}]);
+    let card = lock_card();
+    let Ok(cards_spec::Input::Create { doc, wait }) = cards_spec::parse_input(&card) else { unreachable!("the demo card validates") };
+    let id = cards_spec::CardId::parse(BLOCKS_CARD).expect("a card id");
+    let showing = format!(
+        "{}\nIts answer will come as a user message starting \"[card {BLOCKS_CARD}]\".",
+        cards_spec::Envelope::showing(id.clone(), &doc, wait)
+    );
+    let answer = cards_spec::message::build(
+        &id,
+        &doc,
+        &cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &json!({"choice": "900 ms"})).expect("an answer")),
+    );
+    vec![
+        json!({"role": "user", "content": "The refresh race is back on staging: two rotations inside one second for the same session. Fix it properly this time and drop the retry band-aid."}),
+        said(vec![text("Looking at the relay's refresh path first."), ops("toolu_b01", o1.clone())]),
+        results(vec![("toolu_b01", block_receipt(&o1))]),
+        said(vec![
+            tool("toolu_r01", "read", json!({"path": "crates/relay/src/token_store.rs"})),
+            tool("toolu_r02", "grep", json!({"pattern": "rotate\\(", "path": "crates/relay"})),
+            tool("toolu_r03", "read", json!({"path": "crates/relay/src/session.rs"})),
+            ops("toolu_b02", o2.clone()),
+        ]),
+        results(vec![
+            ("toolu_r01", "pub async fn rotate(&self, id: SessionId) -> Result<Token> {\n    let cur = self.load(id).await?;".into()),
+            ("toolu_r02", "crates/relay/src/token_store.rs:118:    pub async fn rotate(\ncrates/relay/src/session.rs:61:        self.store.rotate(self.id)".into()),
+            ("toolu_r03", "impl Session {\n    pub async fn refresh(&self) -> Result<Token> {".into()),
+            ("toolu_b02", block_receipt(&o2)),
+        ]),
+        said(vec![text("Two refreshes race on `rotate()`. One lock per session closes it."), tool("toolu_e01", "edit", edit), ops("toolu_b03", o3.clone())]),
+        results(vec![("toolu_e01", "Edited crates/relay/src/token_store.rs".into()), ("toolu_b03", block_receipt(&o3))]),
+        said(vec![ops("toolu_b04", o4.clone()), tool("toolu_c01", "cards_ui", card.clone())]),
+        results(vec![("toolu_b04", block_receipt(&o4)), ("toolu_c01", showing)]),
+        json!({"role": "user", "content": answer}),
+        said(vec![
+            text("900 ms it is."),
+            ops("toolu_b05", o5.clone()),
+            ops("toolu_b06", o6.clone()),
+            ops("toolu_b07", o7.clone()),
+            ops("toolu_b08", refused),
+        ]),
+        results(vec![
+            ("toolu_b05", block_receipt(&o5)),
+            ("toolu_b06", block_receipt(&o6)),
+            ("toolu_b07", block_receipt(&o7)),
+            ("toolu_b08", "cards_block: ops[0].body.steps[0].state: \"finished\" is not a plan state (todo, doing, done, failed, skipped)".into()),
+        ]),
+        said(vec![text("The lock is in and the band-aid is gone. One refresh in 32 still rotated twice: looking at the cutoff next.")]),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

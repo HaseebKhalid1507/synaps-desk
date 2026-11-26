@@ -336,10 +336,18 @@ pub struct Item {
     /// answer's, a close's. Part of `rev`: a row whose card changes (an
     /// answer came, it closed) is changed.
     pub card: Option<Arc<crate::cards::CardRow>>,
-    /// A live card call's input, whole (`ToolUse`): [`ToolCall::input`] is
-    /// a preview, and a card input may be up to 8 KiB (synaps-cards design
-    /// §2.1). A history call's is read from its message.
-    card_input: Option<Arc<Value>>,
+    /// What it draws of the blocks' board ([`crate::blocks`]): a block
+    /// call's fate, the blocks anchored at it, its run's title. Part of
+    /// `rev`: a row whose blocks change is changed.
+    pub blocks: Option<Arc<crate::blocks::RowBlocks>>,
+    /// A card or block call's input, whole ([`crate::blocks::keeps_input`]):
+    /// [`ToolCall::input`] is a preview, and either input may be up to
+    /// 8 KiB (synaps-cards design §2.1, blocks.md §5.1): the live call's
+    /// (`ToolUse`), the history call's from its message.
+    kept_input: Option<Arc<Value>>,
+    /// A live row's response ([`Transcript::rounds`]): the rows of one
+    /// assistant message, which the board reads as one batch of calls.
+    round: u32,
     /// A live row's place in the stream ([`Transcript::came`]; 0: not
     /// yet): its call, once no longer streaming (a user row: its message),
     /// and its result. The cards fold the live turn in this order, not the
@@ -353,9 +361,14 @@ impl Item {
         self.anchor.is_some()
     }
 
-    /// A live card call's whole input.
-    pub(crate) fn card_input(&self) -> Option<&Value> {
-        self.card_input.as_deref()
+    /// A card or block call's whole input.
+    pub(crate) fn kept_input(&self) -> Option<&Value> {
+        self.kept_input.as_deref()
+    }
+
+    /// A live row's response: rows of one assistant message share it.
+    pub(crate) fn round(&self) -> u32 {
+        self.round
     }
 
     /// Its place in the live stream: its call's (or message's), its
@@ -490,6 +503,18 @@ pub struct Transcript {
     card_rows: usize,
     /// The live stream's order so far ([`Item::seq()`]).
     live_seq: u64,
+    /// Responses started ([`Item::round`]).
+    rounds: u32,
+    /// The blocks' input over the history folded so far ([`crate::blocks`]).
+    blocks: crate::blocks::HistoryBlocks,
+    /// The live turn's, as the board reads it, at the last sync.
+    blocks_live: Arc<crate::blocks::Live>,
+    /// The blocks' input's revision ([`Transcript::blocks_rev`]).
+    blocks_rev: u64,
+    /// The board the rows draw, once one is published ([`Transcript::set_drawn`]).
+    drawn: Option<Arc<crate::blocks::Drawn>>,
+    /// The history's epoch and length at the last sync.
+    blocks_seen: (u64, usize),
     /// A card call among the live rows: set as one starts, so a session
     /// without cards reads no row per event ([`Transcript::sync_cards`]).
     /// It may stay set once that row is gone: then the fold just runs.
@@ -568,6 +593,73 @@ impl Transcript {
     /// moved, empty or cloned, share theirs).
     pub fn cards_rev(&self) -> u64 {
         self.card_rev
+    }
+
+    /// The blocks' input's revision (blocks.md §1.7): it moves when the
+    /// board's input does (the history's events, the live turn's as the
+    /// board reads them), and only then, so a desk schedules the board's
+    /// work again only when this moves. One counter for the process.
+    pub fn blocks_rev(&self) -> u64 {
+        self.blocks_rev
+    }
+
+    /// The board's input now ([`crate::blocks::Input`]): `None` with no
+    /// block call in the history or the live turn.
+    pub fn blocks_input(&self) -> Option<crate::blocks::Input> {
+        crate::blocks::Input::of(&self.blocks, self.blocks_live.clone())
+    }
+
+    /// The board the rows draw, the last one published.
+    pub fn drawn(&self) -> Option<&Arc<crate::blocks::Drawn>> {
+        self.drawn.as_ref()
+    }
+
+    /// A finished board for the rows to draw ([`Item::blocks`]; `None`: no
+    /// board, as after a `/clear`): every row whose blocks change is
+    /// touched. Rows are matched by id, so a board folded from an input the
+    /// rows have moved past since draws on the rows still there, until the
+    /// next one lands.
+    pub fn set_drawn(&mut self, drawn: Option<Arc<crate::blocks::Drawn>>) {
+        self.drawn = drawn;
+        self.redraw_blocks();
+    }
+
+    /// Every row's blocks as [`Transcript::drawn`] says; changed rows touched.
+    fn redraw_blocks(&mut self) {
+        let mut changed = Vec::new();
+        for (ix, it) in self.items.iter_mut().enumerate() {
+            let want = self.drawn.as_ref().and_then(|d| d.rows.get(&it.id)).cloned();
+            if it.blocks != want {
+                it.blocks = want;
+                changed.push(ix);
+            }
+        }
+        for ix in changed {
+            self.touch(ix);
+        }
+    }
+
+    /// The board's input again, the live turn's read as the board will
+    /// (cheap: the turn's rows); [`Transcript::blocks_rev`] moves if it
+    /// changed. A row folded again (the history replaced it) draws the last
+    /// board's blocks until the next one lands, so nothing blinks.
+    fn sync_blocks(&mut self) {
+        let start = self.history_end.min(self.items.len());
+        let live_blocks = self.items[start..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::blocks::is_block_tool(&t.name)));
+        let seen = (self.blocks.epoch(), self.blocks.len());
+        let live = if self.blocks.has_blocks() || live_blocks {
+            crate::blocks::live(&self.blocks, &self.items[start..])
+        } else {
+            crate::blocks::Live::default()
+        };
+        if *self.blocks_live != live || self.blocks_seen != seen {
+            self.blocks_live = Arc::new(live);
+            self.blocks_seen = seen;
+            self.blocks_rev = next_card_rev();
+        }
+        if self.drawn.is_some() {
+            self.redraw_blocks();
+        }
     }
 
     /// The agent cards' fold of the history alone, without the live turn:
@@ -824,7 +916,9 @@ impl Transcript {
                 form: None,
                 anchor: None,
                 card: None,
-                card_input: None,
+                blocks: None,
+                kept_input: None,
+                round: self.rounds,
                 seq: [0; 2],
             },
         );
@@ -1000,6 +1094,7 @@ impl Transcript {
                 && o.tool == it.tool
                 && o.event == it.event
                 && o.card == it.card
+                && o.blocks == it.blocks
             {
                 it.rev = o.rev;
             }
@@ -1028,6 +1123,9 @@ impl Transcript {
         let stuck = if same { std::mem::take(&mut self.stuck) } else { Vec::new() };
         // Which calls ran: the same session's calls still are what they were.
         let (past_gate, past_gate_cap) = if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
+        // The same conversation's rows draw its last board until the next
+        // one lands (a reattach folds it again: nothing blinks).
+        let drawn = if carry { self.drawn.take() } else { None };
         *self = Transcript {
             next_id,
             clean_len,
@@ -1041,6 +1139,7 @@ impl Transcript {
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
+            drawn,
             ..Transcript::default()
         };
         self.dirty_from = Some(0);
@@ -1180,6 +1279,7 @@ impl Transcript {
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
         self.after_summary = false;
         self.cards = crate::cards::HistoryCards::default();
+        self.blocks = crate::blocks::HistoryBlocks::default();
         self.cards_dirty = true;
         self.recount = true;
         let notes = self.hold_events(notes, messages);
@@ -1391,6 +1491,7 @@ impl Transcript {
         (self.stamp, self.event_ts) = outer;
         // Its rows are the ones it just pushed (notes go between messages).
         self.cards.message(m, &self.items[first..]);
+        self.blocks.message(m, &self.items[first..]);
         self.cards_dirty = true;
         self.recount = true;
     }
@@ -1401,6 +1502,7 @@ impl Transcript {
         if !std::mem::take(&mut self.cards_dirty) {
             return;
         }
+        self.sync_blocks();
         let live = self.history_end.min(self.items.len());
         if std::mem::take(&mut self.recount) {
             self.live_cards = self.items[live..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::cards::is_card_tool(&t.name)));
@@ -1523,7 +1625,10 @@ impl Transcript {
                                 tail: String::new(),
                                 status: Some(ToolStatus::Running),
                             };
-                            self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
+                            let kept =
+                                crate::blocks::keeps_input(&tool.name).then(|| Arc::new(b.get("input").cloned().unwrap_or(Value::Null)));
+                            let ix = self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
+                            self.items[ix].kept_input = kept;
                         }
                         "tool_result" => {
                             flush(self, &mut text, reuse);
@@ -1829,6 +1934,7 @@ impl Transcript {
         match ev {
             StreamEvent::Llm(l) => match l {
                 LlmEvent::ResponseStart => {
+                    self.rounds += 1;
                     self.end_streaming_text();
                     self.response_start = Some(self.live_end());
                 }
@@ -1880,7 +1986,7 @@ impl Transcript {
                         t.status = Some(ToolStatus::Running);
                     }
                     let card = crate::cards::is_card_tool(tool_name);
-                    self.items[ix].card_input = card.then(|| Arc::new(input.clone()));
+                    self.items[ix].kept_input = crate::blocks::keeps_input(tool_name).then(|| Arc::new(input.clone()));
                     self.live_cards |= card;
                     self.came(ix, false);
                     self.touch(ix);

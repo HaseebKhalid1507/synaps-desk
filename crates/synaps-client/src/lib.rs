@@ -96,6 +96,7 @@
 //! - [`transcript`]: history + live events folded into display rows
 //! - [`synthetic`]: deterministic load for benches
 
+pub mod blocks;
 pub mod cards;
 pub mod client;
 pub mod conn;

@@ -101,14 +101,17 @@ pub(crate) struct HistoryCards {
     /// Each event's row: a call's, a user message's (the row its text is
     /// drawn in); a result has none. Indexed as the fold numbers events.
     rows: Vec<Option<u64>>,
-    /// Each tool id's latest call: whether it is a card call (the results
-    /// `events` keeps are those), and its row.
+    /// Each tool id's latest call: whether `events` keeps its result (a
+    /// card call's or a block call's), and its row.
     calls: HashMap<String, (bool, Option<u64>)>,
     /// Each close that closed a card, as its result came: its call's row
     /// and the card it closed.
     closes: Vec<(u64, Arc<CardDoc>)>,
     /// A card call read.
     called: bool,
+    /// The last message was an assistant's: the next one ends its results
+    /// (`Event::ResultsEnd`, read where `events` reads it).
+    after_assistant: bool,
     fold: Fold,
 }
 
@@ -128,13 +131,12 @@ impl HistoryCards {
         // The tool id of a close this result may close.
         let closing = match e {
             Event::Call { tool_id, name, .. } => {
-                let card = is_card_tool(name);
-                self.called |= card;
-                self.calls.insert(tool_id.clone(), (card, row));
+                self.called |= is_card_tool(name);
+                self.calls.insert(tool_id.clone(), (crate::blocks::keeps_input(name), row));
                 None
             }
             Event::Result { tool_id, .. } => self.fold.close(tool_id).filter(|c| c.pending).map(|_| tool_id.as_str()),
-            Event::User { .. } => None,
+            Event::User { .. } | Event::ResultsEnd => None,
         };
         self.fold.apply(e);
         self.rows.push(row);
@@ -151,8 +153,13 @@ impl HistoryCards {
 
     /// History message `m`, folded into `rows` (its rows, in order).
     pub(crate) fn message(&mut self, m: &Value, rows: &[Item]) {
-        match m["role"].as_str() {
+        let role = m["role"].as_str();
+        let ends = std::mem::replace(&mut self.after_assistant, role == Some("assistant"));
+        match role {
             Some("assistant") => {
+                if ends {
+                    self.push(&Event::ResultsEnd, None);
+                }
                 let mut tools = rows.iter().filter(|i| i.kind == ItemKind::Tool);
                 for e in events(std::slice::from_ref(m)) {
                     let Event::Call { tool_id, .. } = &e else { continue };
@@ -161,14 +168,17 @@ impl HistoryCards {
                 }
             }
             Some("user") => {
-                // The results `events` keeps: a card call's (its tool id's
-                // latest call), which may be in an earlier update.
+                // The results `events` keeps: a card or block call's (its
+                // tool id's latest call), which may be in an earlier update.
                 for b in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     if let Some(id) = b["tool_use_id"].as_str().filter(|id| self.calls.get(*id).is_some_and(|c| c.0))
                         && let Some(text) = result_text(&b["content"])
                     {
                         self.push(&Event::Result { tool_id: id.to_string(), text }, None);
                     }
+                }
+                if ends {
+                    self.push(&Event::ResultsEnd, None);
                 }
                 // Its text, if the host's rule leaves it one string: no
                 // result in a one-message slice (its call is outside it).
@@ -177,7 +187,11 @@ impl HistoryCards {
                     self.push(e, row);
                 }
             }
-            _ => {}
+            _ => {
+                if ends {
+                    self.push(&Event::ResultsEnd, None);
+                }
+            }
         }
     }
 }
@@ -186,7 +200,7 @@ impl HistoryCards {
 /// string, or its text blocks joined with nothing between. (The
 /// transcript's own joins them with a newline: a result split mid-line
 /// would bind here and not there.)
-fn result_text(content: &Value) -> Option<String> {
+pub(crate) fn result_text(content: &Value) -> Option<String> {
     match content {
         Value::String(s) => Some(s.clone()),
         Value::Array(blocks) => {
@@ -214,7 +228,7 @@ pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> (HashMap<u64, CardR
                     continue;
                 };
                 let card = is_card_tool(&t.name);
-                let input = if card { it.card_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
+                let input = if card { it.kept_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
                 events.push((came, Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input }, Some(it.id)));
                 if card && t.status.is_some_and(ToolStatus::is_terminal) {
                     events.push((reported, Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() }, None));
@@ -302,5 +316,14 @@ mod tests {
         assert_eq!(read.fold.cards(), whole.cards());
         assert_eq!(read.rows.len(), events(&history).len());
         assert_eq!(whole.cards().iter().map(|c| (c.state, c.answers.len())).collect::<Vec<_>>(), [(State::Answered, 2), (State::Plain, 0)]);
+        // With block calls (their results kept, blocks.md §1.7): the same.
+        let history = crate::synthetic::blocks_history();
+        let mut read = HistoryCards::default();
+        for m in &history {
+            read.message(m, &[]);
+        }
+        let whole = fold(&events(&history));
+        assert_eq!(read.fold.cards(), whole.cards());
+        assert_eq!(read.rows.len(), events(&history).len());
     }
 }
