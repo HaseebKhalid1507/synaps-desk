@@ -552,7 +552,7 @@ impl AppView {
                         .child(title),
                 )
             })
-            .when_some(file, |d, f| d.child(self.file_head(f, id, b.title.as_deref().is_none_or(str::is_empty), p, m)))
+            .children(file.map(|f| self.file_head(f, id, b.title.as_deref().is_none_or(str::is_empty), p, m)).into_iter().flatten())
             .when(b.skipped.is_some(), |d| {
                 // An op that didn't apply, never the block's state (Shady
                 // #101: `skipped` alone read as the plan's).
@@ -625,10 +625,12 @@ impl AppView {
             })
     }
 
-    /// A file's header (§6.2): its path, `:line` and note. The file's name
-    /// and line keep their room (a title or the note gives way first, then
-    /// the directories); `titled`: no title, the path is it.
-    fn file_head(&self, f: &cards_spec::block::FileBody, id: u64, untitled: bool, p: &Palette, m: &Metrics) -> Div {
+    /// A file's header (§6.2): its directories, its name and `:line`, its
+    /// note, as items of the header's own row. The name and line never
+    /// shrink (a long one ellipsizes at 55 % of the column): the title
+    /// gives way first, then the directories and the note. `untitled`: no
+    /// title, the path is it.
+    fn file_head(&self, f: &cards_spec::block::FileBody, id: u64, untitled: bool, p: &Palette, m: &Metrics) -> Vec<AnyElement> {
         let path = crate::ask::shown(&crate::turns::tilde(&f.path, false), cards_spec::Lines::Single);
         let cut = path.rfind('/').map_or(0, |k| k + 1);
         let (dir, name) = (path[..cut].to_string(), path[cut..].to_string());
@@ -637,50 +639,60 @@ impl AppView {
             None => name,
         };
         let note = f.note.as_deref().filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
-        // At most this much of the header for the name (a long one ellipsizes).
         let most = (self.panes.cur.layout.column * 0.55).round();
+        let gap = Geo::of(m).gap;
         let shown = name.clone();
-        h_flex()
-            .min_w_0()
-            .flex_shrink(1.)
-            .gap(px(8.))
-            .items_center()
-            .child(
-                h_flex()
+        let mut out = Vec::new();
+        if !dir.is_empty() {
+            // Against the name: the row's gap taken back.
+            out.push(
+                div()
                     .min_w_0()
-                    .flex_shrink(1.)
+                    .flex_shrink(4.)
+                    .mr(px(-gap))
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .font_family(fonts::MONO)
                     .text_px(m.mono)
-                    .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
-                    .when(!dir.is_empty(), |d| {
-                        d.child(div().min_w_0().flex_shrink(4.).overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir))
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(most))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_color(p.prose_t)
-                            .debug_selector(move || format!("block-path {id} {shown}"))
-                            .child(name),
-                    ),
-            )
-            .when_some(note, |d, n| {
-                let t = format!("block-file-note {id} {n}");
-                d.child(
+                    .text_color(p.dim_t)
+                    .child(dir)
+                    .into_any_element(),
+            );
+        }
+        out.push(
+            div()
+                .flex_none()
+                .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
+                .child(
                     div()
-                        .min_w_0()
-                        .flex_shrink(1.)
+                        .max_w(px(most))
                         .overflow_hidden()
                         .text_ellipsis()
-                        .font_family(fonts::SANS)
-                        .text_px(m.meta)
-                        .text_color(p.dim_t)
-                        .debug_selector(move || t.clone())
-                        .child(n),
+                        .font_family(fonts::MONO)
+                        .text_px(m.mono)
+                        .text_color(p.prose_t)
+                        .debug_selector(move || format!("block-path {id} {shown}"))
+                        .child(name),
                 )
-            })
+                .into_any_element(),
+        );
+        if let Some(n) = note {
+            let t = format!("block-file-note {id} {n}");
+            out.push(
+                div()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .debug_selector(move || t.clone())
+                    .child(n)
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]

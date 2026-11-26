@@ -692,11 +692,11 @@ fn a_file_header_shows_its_path_line_and_note(cx: &mut TestAppContext) {
             {"op":"put","id":"f4","kind":"file","title":"Session","body":{"path":"crates/relay/src/session.rs","state":"done"}}
         ]);
         put_mid(cx, w, &view, put);
-        for (name, shown, has_note, titled) in [
-            ("f1", "token_store.rs:118", true, false),
-            ("f2", "token_store.rs:118", true, true),
-            ("f3", "session.rs", false, false),
-            ("f4", "session.rs", false, true),
+        for (name, shown, has_note, titled, state) in [
+            ("f1", "token_store.rs:118", true, false, "editing"),
+            ("f2", "token_store.rs:118", true, true, "editing"),
+            ("f3", "session.rs", false, false, "reading"),
+            ("f4", "session.rs", false, true, "done"),
         ] {
             let f = id(cx, &view, name);
             let block = drawn(cx, w, format!("block {f}"));
@@ -719,6 +719,13 @@ fn a_file_header_shows_its_path_line_and_note(cx: &mut TestAppContext) {
                 let n = drawn(cx, w, format!("block-file-note {f} TokenStore::rotate"));
                 assert!(f32::from(n.size.width) > 40. && n.right() <= block.right(), "{width} {name}: the note");
             }
+            // Nothing over the name and line: the note (where it has room)
+            // after them, the rest of the header after the note.
+            if let Some(n) = bounds(cx, w, format!("block-file-note {f} TokenStore::rotate")).filter(|n| n.size.width > px(0.5)) {
+                assert!(n.left() >= path.right() - px(0.5), "{width} {name}: the note after the name ({n:?}, {path:?})");
+            }
+            let word = drawn(cx, w, format!("block-word {f} {state}"));
+            assert!(word.left() >= path.right() - px(0.5), "{width} {name}: the state after the name ({word:?}, {path:?})");
         }
     }
 }
