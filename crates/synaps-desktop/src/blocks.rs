@@ -269,8 +269,9 @@ pub(crate) fn note_cut(text: &str, cpl: f32, open: bool) -> Option<bool> {
 /// The tooltip of the `op skipped` chip.
 pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was skipped: it changed nothing here. Not the block's state.";
 
-/// A metric's value or unit, in mono columns (a wide character takes two).
-fn cols(s: &str) -> usize {
+/// A metric's value or unit, or a path's name, in mono columns (a wide
+/// character takes two).
+pub(crate) fn cols(s: &str) -> usize {
     s.chars().map(|c| if (c as u32) < 0x1100 { 1 } else { 2 }).sum()
 }
 
@@ -434,12 +435,14 @@ impl AppView {
     ) -> Div {
         let b = &s.block;
         let (life, word) = life_of(&b.body, streaming);
-        let file = match &b.body {
-            Body::File(f) => Some(f),
+        // A file's or a diff's path, `:line` and note (a diff has neither).
+        let path = match &b.body {
+            Body::File(f) => Some((f.path.as_str(), f.line, f.note.as_deref())),
+            Body::Diff(d) => Some((d.file.as_str(), None, None)),
             _ => None,
         };
-        // A file's title, if it has one, comes before its path (P2-10).
-        let title = match file {
+        // Its title, if it has one, comes before its path (P2-10).
+        let title = match path {
             Some(_) => b.title.as_deref().filter(|t| !t.is_empty()).map(|t| crate::ask::shown(t, cards_spec::Lines::Single)),
             None => Some(title_of(s)),
         };
@@ -486,12 +489,17 @@ impl AppView {
                 None,
             )))
             .when_some(title, |d, title| {
+                // A file's or a diff's title gives way first: its path is
+                // what it is about (§6.2). A diff's keeps its first
+                // characters (it says what the change is).
+                let floor = match &b.body {
+                    Body::Diff(_) => (title.chars().count() as f32 * m.label * 0.55).min((m.label * 1.65).round()),
+                    _ => 0.,
+                };
                 d.child(
                     div()
-                        .min_w_0()
-                        // A file's title gives way first: its path, line
-                        // and note are its header (§6.2).
-                        .flex_shrink(if file.is_some() { 16. } else { 1. })
+                        .min_w(px(floor))
+                        .flex_shrink(if path.is_some() { 10_000. } else { 1. })
                         .overflow_hidden()
                         .text_ellipsis()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -500,7 +508,11 @@ impl AppView {
                         .child(title),
                 )
             })
-            .children(file.map(|f| self.file_head(f, id, b.title.as_deref().is_none_or(str::is_empty), p, m)).into_iter().flatten())
+            .children(
+                path.map(|(path, line, note)| self.path_head(path, line, note, id, b.title.as_deref().is_none_or(str::is_empty), p, m))
+                    .into_iter()
+                    .flatten(),
+            )
             .when(b.skipped.is_some(), |d| {
                 // An op that didn't apply, never the block's state (Shady
                 // #101: `skipped` alone read as the plan's).
@@ -583,20 +595,31 @@ impl AppView {
             })
     }
 
-    /// A file's header (§6.2): its directories, its name and `:line`, its
-    /// note, as items of the header's own row. The name and line never
-    /// shrink (a long one ellipsizes at 55 % of the column): the title
-    /// gives way first, then the directories and the note. `untitled`: no
-    /// title, the path is it.
-    fn file_head(&self, f: &cards_spec::block::FileBody, id: u64, untitled: bool, p: &Palette, m: &Metrics) -> Vec<AnyElement> {
-        let path = crate::ask::shown(&crate::turns::tilde(&f.path, false), cards_spec::Lines::Single);
+    /// A file's or a diff's path in its header (§6.2): its directories,
+    /// its name and `:line`, a file's note, as items of the header's own
+    /// row. The title gives way first, then the directories and the note;
+    /// the name last, in its middle (its start and its extension and line
+    /// stay), at most 55 % of the column. `untitled`: no title, the path is
+    /// it.
+    #[allow(clippy::too_many_arguments)]
+    fn path_head(
+        &self,
+        path: &str,
+        line: Option<u64>,
+        note: Option<&str>,
+        id: u64,
+        untitled: bool,
+        p: &Palette,
+        m: &Metrics,
+    ) -> Vec<AnyElement> {
+        let path = crate::ask::shown(&crate::turns::tilde(path, false), cards_spec::Lines::Single);
         let cut = path.rfind('/').map_or(0, |k| k + 1);
         let (dir, name) = (path[..cut].to_string(), path[cut..].to_string());
-        let name = match f.line {
+        let name = match line {
             Some(l) => format!("{name}:{l}"),
             None => name,
         };
-        let note = f.note.as_deref().filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
+        let note = note.filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
         let most = (self.panes.cur.layout.column * 0.55).round();
         let gap = Geo::of(m).gap;
         let shown = name.clone();
@@ -606,7 +629,7 @@ impl AppView {
             out.push(
                 div()
                     .min_w_0()
-                    .flex_shrink(4.)
+                    .flex_shrink(100.)
                     .mr(px(-gap))
                     .overflow_hidden()
                     .text_ellipsis()
@@ -618,14 +641,17 @@ impl AppView {
             );
         }
         out.push(
-            div()
-                .flex_none()
+            h_flex()
+                .min_w_0()
+                .flex_shrink(1.)
                 .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
                 .child(
                     div()
+                        .min_w_0()
+                        .flex_shrink(1.)
                         .max_w(px(most))
                         .overflow_hidden()
-                        .text_ellipsis()
+                        .text_ellipsis_middle()
                         .font_family(fonts::MONO)
                         .text_px(m.mono)
                         .text_color(p.prose_t)
@@ -639,7 +665,7 @@ impl AppView {
             out.push(
                 div()
                     .min_w_0()
-                    .flex_shrink(1.)
+                    .flex_shrink(100.)
                     .overflow_hidden()
                     .text_ellipsis()
                     .font_family(fonts::SANS)

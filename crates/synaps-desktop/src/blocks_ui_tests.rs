@@ -855,3 +855,90 @@ fn the_lease_note_reads_whole_at_320_px(cx: &mut TestAppContext) {
         assert_eq!(block.size.height, before.size.height, "{width}/{text}: nothing moved");
     }
 }
+
+/// The session's `edit` call rows: their ids.
+fn edit_rows(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<u64> {
+    view.read_with(cx, |v, _| {
+        let items = v.model.lives[v.panes.cur.live].shown().items();
+        v.panes
+            .cur
+            .disp
+            .iter()
+            .filter(|d| matches!(d.kind, Kind::Work))
+            .filter(|d| items.get(d.item).and_then(|i| i.tool.as_ref()).is_some_and(|t| t.name == "edit"))
+            .map(|d| d.id)
+            .collect()
+    })
+}
+
+/// Row `id` scrolled to the view's top.
+fn show_row(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: u64) {
+    let ix = view.read_with(cx, |v, _| v.panes.cur.disp.iter().position(|d| d.id == id).expect("a row"));
+    view.update(cx, |v, cx| {
+        v.panes.cur.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+}
+
+/// A path in a header keeps its file's name: the folders give way first
+/// (and a tool row's facts, a block's title), then the name ellipsizes in
+/// its middle; nothing cuts it. At 320 px, at the default text step and
+/// the largest: an `edit` call's row (`Edit token_store.rs`, not
+/// `token_store.r`), a diff block untitled and titled, a file block.
+#[gpui_kit::test]
+fn a_path_keeps_its_file_name_at_320(cx: &mut TestAppContext) {
+    for text in [crate::theme::Panels::default().text_size, 22] {
+        let (w, view) = blocks_at(cx, 320. + 2. * crate::app::STRIP, text);
+        let m = view.read_with(cx, |v, _| v.panes.cur.metrics_last.get().expect("drawn"));
+        let whole = |name: &str| crate::blocks::cols(name) as f32 * m.mono * 0.6 - 1.;
+        let rows = edit_rows(cx, &view);
+        assert!(!rows.is_empty(), "the demo's edit calls");
+        for r in rows {
+            show_row(cx, w, &view, r);
+            let target = drawn(cx, w, format!("tool-target {r}"));
+            let name = drawn(cx, w, "tool-file {r} token_store.rs".replace("{r}", &r.to_string()));
+            assert!(
+                name.left() >= target.left() - px(0.5) && name.right() <= target.right() + px(0.5),
+                "{text} row {r}: the name inside its target, not cut ({name:?} in {target:?})"
+            );
+            if text == 22 {
+                // No room for it whole: it has the target's, the facts gone.
+                assert!(name.size.width >= target.size.width - px(0.5) && target.size.width > px(90.), "{text} row {r}: {target:?}");
+            } else {
+                assert!(f32::from(name.size.width) >= whole("token_store.rs"), "{text} row {r}: the name whole ({name:?})");
+            }
+            if let Some(facts) = bounds(cx, w, format!("tool-facts {r}")).filter(|f| f.top() < target.bottom()) {
+                assert!(facts.left() >= name.right() - px(0.5), "{text} row {r}: the facts after the name");
+            }
+        }
+        let put = json!([
+            {"op":"put","id":"d1","kind":"diff","body":{"file":"crates/relay/src/token_store.rs","state":"proposed",
+              "hunks":[{"id":"h1","at":"rotate()","lines":["- let t = 1;","+ let t = 2;"],"state":"open"}]}},
+            {"op":"put","id":"d2","kind":"diff","title":"Drop the band-aid from the relay's session refresh",
+             "body":{"file":"crates/relay/src/session.rs","state":"editing","from":"edits"}},
+            {"op":"put","id":"f1","kind":"file","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}}
+        ]);
+        put_mid(cx, w, &view, put);
+        let most = view.read_with(cx, |v, _| (v.panes.cur.layout.column * 0.55).round());
+        for (name, shown, titled) in [("d1", "token_store.rs", false), ("d2", "session.rs", true), ("f1", "token_store.rs:118", false)] {
+            let b = show_block(cx, w, &view, name);
+            let head = drawn(cx, w, format!("block-head {b}"));
+            let path = drawn(cx, w, format!("block-path {b} {shown}"));
+            assert!(
+                path.left() >= head.left() && path.right() <= head.right() + px(0.5),
+                "{text} {name}: the name inside its header ({path:?} in {head:?})"
+            );
+            if text == 22 {
+                // Short of room, in its middle: never to nothing.
+                assert!(f32::from(path.size.width) >= 6. * m.mono * 0.6, "{text} {name}: `{shown}` stays ({path:?})");
+            } else {
+                assert!(f32::from(path.size.width) >= whole(shown).min(most - 1.), "{text} {name}: `{shown}` whole ({path:?})");
+            }
+            if titled && let Some(t) = bounds(cx, w, format!("block-title {b}")).filter(|t| t.size.width > px(0.5)) {
+                assert!(t.right() <= path.left() + px(0.5), "{text} {name}: the title before the path");
+            }
+        }
+    }
+}
