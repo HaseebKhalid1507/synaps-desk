@@ -1,14 +1,18 @@
 //! Blocks in the transcript (synaps-cards `docs/blocks.md` v1.3, §1.7, §5.1,
 //! D5's tests): the board's input is the same whichever way the history
-//! came (an attach, appends, any split of it, the live turn), so the three
-//! readings agree exactly: the live overlay at the turn's end, the history
-//! once it lands, and a reattach of any split. And what each row draws:
-//! a bound block call no tool row, an unbound one a plain row, blocks at
+//! came (an attach, appends, any split of it, an attach while its turn
+//! streams, the live turn), so the three readings agree exactly: the live
+//! overlay, the history once it lands, and a reattach of any split. Live,
+//! it is read from the protocol's events, never from rows: a result is a
+//! call's final result, its first, in its own round (Shady #101 P1-1); a
+//! delivered steer is a user message (P2-1). And what each row draws: a
+//! bound block call no tool row, an unbound one a plain row, blocks at
 //! their call's row (a converted card's at its card's), a run's title.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cards_spec::board::Event;
 use cards_spec::fold::events;
 use serde_json::{Value, json};
 use synaps_client::blocks::{Drawn, Fate, RowBlocks, Worker};
@@ -45,26 +49,47 @@ fn attach(h: &[Value]) -> Transcript {
     t
 }
 
-/// `messages` as the live stream sends them: a user message that is text
-/// starts a turn; an assistant message is a response (its text, its calls
-/// whole); a message of results reports them. `idle`: the turn ends.
-fn stream(t: &mut Transcript, messages: &[Value], idle: bool) {
-    let mut busy = false;
+/// Attached while its turn streams: the rest of the turn comes live.
+fn attach_streaming(h: &[Value]) -> Transcript {
+    let mut t = Transcript::new();
+    t.load_attached(&attached(h, true)).unwrap();
+    t
+}
+
+/// A result message's text, as `tool_result` sends it.
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(b) => b.iter().filter_map(|b| b["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// `messages` as the live stream sends them: a message of results reports
+/// them; a user message of text starts a turn, or, with `steer` while a
+/// turn runs, is a steer the engine delivered; an assistant message is a
+/// response (its text, its calls whole). `busy`: a turn runs already (an
+/// attach while it streams). `idle`: the turn ends.
+fn stream_with(t: &mut Transcript, messages: &[Value], mut busy: bool, steer: bool, idle: bool) {
     for m in messages {
         let blocks = m["content"].as_array().cloned().unwrap_or_default();
         match m["role"].as_str() {
             Some("user") if blocks.iter().any(|b| b["type"] == "tool_result") => {
                 for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
-                    let text = b["content"].as_str().map(str::to_string).unwrap_or_default();
+                    let text = result_text(&b["content"]);
                     t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": b["tool_use_id"], "result": text})));
                 }
             }
             Some("user") => {
+                let text = m["content"].as_str().unwrap_or_default();
+                if busy && steer {
+                    t.apply(&llm(json!({"kind": "agent", "agent": "steering_delivered", "message": text})));
+                    continue;
+                }
                 if busy {
                     t.apply(&ev(json!({"ev": "idle"})));
                 }
                 busy = true;
-                let text = m["content"].as_str().unwrap_or_default();
                 t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": text})));
             }
             Some("assistant") => {
@@ -90,18 +115,62 @@ fn stream(t: &mut Transcript, messages: &[Value], idle: bool) {
     }
 }
 
-/// `t`'s board, folded (as the desk's worker folds it, off the frame).
-fn fold(t: &Transcript) -> Arc<Drawn> {
-    let input = t.blocks_input().expect("blocks");
-    Arc::new(Worker::default().run(&input, &mut || true).expect("done"))
+fn stream(t: &mut Transcript, messages: &[Value], idle: bool) {
+    stream_with(t, messages, false, false, idle);
 }
 
-/// What `t`'s rows draw, by their call's tool id (rows are numbered per
-/// transcript, tool ids are the history's).
-fn drawn(t: &mut Transcript) -> BTreeMap<String, RowBlocks> {
-    let d = fold(t);
-    t.set_drawn(Some(d));
-    t.items().iter().filter_map(|i| Some((i.tool.as_ref()?.tool_id.clone(), (**i.blocks.as_ref()?).clone()))).collect()
+fn tool_use(id: &str, name: &str, input: Value) -> SessionEvent {
+    llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": name, "tool_id": id, "input": input}))
+}
+
+fn tool_result(id: &str, result: &str) -> SessionEvent {
+    llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": result}))
+}
+
+/// A transcript and its board's worker, as a desk keeps them: the worker
+/// reads on from where it stopped, and every board it finishes is
+/// published to the rows.
+struct Desk {
+    t: Transcript,
+    w: Worker,
+}
+
+impl Desk {
+    fn of(t: Transcript) -> Self {
+        Desk { t, w: Worker::default() }
+    }
+
+    /// The board of the transcript's input now, published.
+    fn fold(&mut self) -> Arc<Drawn> {
+        self.board().expect("blocks")
+    }
+
+    /// The board, if there is one to draw (a block call in the input).
+    fn board(&mut self) -> Option<Arc<Drawn>> {
+        let Some(input) = self.t.blocks_input() else {
+            self.t.set_drawn(None);
+            return None;
+        };
+        let d = Arc::new(self.w.run(&input, &mut || true).expect("done"));
+        self.t.set_drawn(Some(d.clone()));
+        Some(d)
+    }
+
+    /// What the rows draw, by their call's tool id (rows are numbered per
+    /// transcript, tool ids are the history's).
+    fn drawn(&mut self) -> BTreeMap<String, RowBlocks> {
+        self.board();
+        self.t.items().iter().filter_map(|i| Some((i.tool.as_ref()?.tool_id.clone(), (**i.blocks.as_ref()?).clone()))).collect()
+    }
+
+    fn apply(&mut self, ev: &SessionEvent) {
+        self.t.apply(ev);
+    }
+}
+
+/// What a history draws, attached whole.
+fn landed(h: &[Value]) -> BTreeMap<String, RowBlocks> {
+    Desk::of(attach(h)).drawn()
 }
 
 /// The board's input is the history's events, whichever way it came: an
@@ -132,23 +201,43 @@ fn the_input_is_the_historys_events_however_it_came() {
 #[test]
 fn live_history_and_any_split_draw_the_same() {
     let h = blocks_history();
-    let want = drawn(&mut attach(&h));
+    let want = landed(&h);
     assert!(want.values().any(|r| !r.blocks.is_empty()));
     for k in 1..h.len() {
         let mut t = attach(&h[..k]);
         t.apply_update(&HistoryUpdate::Append { base_len: k, messages: h[k..].to_vec() }).unwrap();
-        assert_eq!(drawn(&mut t), want, "a split at {k}");
+        assert_eq!(Desk::of(t).drawn(), want, "a split at {k}");
     }
     for k in (1..h.len()).filter(|&k| h[k]["content"].is_string()) {
-        let mut t = attach(&h[..k]);
-        stream(&mut t, &h[k..], false);
-        assert_eq!(drawn(&mut t), want, "live from {k}");
+        let mut d = Desk::of(attach(&h[..k]));
+        stream(&mut d.t, &h[k..], false);
+        assert_eq!(d.drawn(), want, "live from {k}");
         // The history lands: the same, and no row lost its blocks between.
-        t.apply_update(&HistoryUpdate::Replace { messages: h.clone() }).unwrap();
+        d.t.apply_update(&HistoryUpdate::Replace { messages: h.clone() }).unwrap();
         let carried: BTreeMap<String, RowBlocks> =
-            t.items().iter().filter_map(|i| Some((i.tool.as_ref()?.tool_id.clone(), (**i.blocks.as_ref()?).clone()))).collect();
+            d.t.items().iter().filter_map(|i| Some((i.tool.as_ref()?.tool_id.clone(), (**i.blocks.as_ref()?).clone()))).collect();
         assert_eq!(carried, want, "landed from {k}, before the next board");
-        assert_eq!(drawn(&mut t), want, "landed from {k}");
+        assert_eq!(d.drawn(), want, "landed from {k}");
+    }
+}
+
+/// Shady #101 P1-1's gate, through the real adapter: a history attached
+/// at every message boundary while its turn streams, the rest coming live
+/// (the attached call message's results included), draws the history's
+/// full blocks and fates at every message boundary after, the same as the
+/// history attached that far; and once it lands.
+#[test]
+fn a_streaming_attach_at_any_boundary_draws_the_history_at_every_boundary() {
+    let h = blocks_history();
+    let prefixes: Vec<_> = (0..=h.len()).map(|j| landed(&h[..j])).collect();
+    for k in 1..h.len() {
+        let mut d = Desk::of(attach_streaming(&h[..k]));
+        for j in k + 1..=h.len() {
+            stream_with(&mut d.t, &h[j - 1..j], true, false, false);
+            assert_eq!(d.drawn(), prefixes[j], "attached at {k}, live to {j}");
+        }
+        d.t.apply_update(&HistoryUpdate::Append { base_len: k, messages: h[k..].to_vec() }).unwrap();
+        assert_eq!(d.drawn(), prefixes[h.len()], "attached at {k}, landed");
     }
 }
 
@@ -158,7 +247,7 @@ fn live_history_and_any_split_draw_the_same() {
 /// card's row); the run a `collapse` titled.
 #[test]
 fn rows_draw_the_board() {
-    let d = drawn(&mut attach(&blocks_history()));
+    let d = landed(&blocks_history());
     let call = |id: &str| d.get(id).and_then(|r| r.call);
     assert_eq!(call("toolu_b01"), Some(Fate::Bound));
     assert_eq!(call("toolu_b08"), Some(Fate::Unbound), "refused: a plain row");
@@ -178,28 +267,149 @@ fn rows_draw_the_board() {
     assert!(d["toolu_b03"].blocks[0].block.collapsed, "the agent folded the edits");
 }
 
+/// The demo history, a prompt, and a round calling `toolu_x` to put the
+/// note `x`.
+fn with_call(text: &str) -> (Vec<Value>, Value) {
+    let mut h = blocks_history();
+    let put = json!([{"op":"put","id":"x","kind":"note","body":{"text": text}}]);
+    h.push(json!({"role": "user", "content": "go"}));
+    h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_x", "name": "cards_block", "input": block_input(put.clone())}]}));
+    (h, put)
+}
+
+fn has_block(d: &BTreeMap<String, RowBlocks>, id: &str) -> bool {
+    d.values().flat_map(|r| &r.blocks).any(|s| s.block.id.to_string() == id)
+}
+
 /// Live: a block call whose result hasn't come draws its ops pending (its
 /// bound board has none of them), and no tool row; its result binds it.
 #[test]
 fn a_live_call_is_pending_until_its_result_binds() {
     let h = blocks_history();
-    let mut t = attach(&h);
+    let mut d = Desk::of(attach(&h));
     let put = json!([{"op":"put","id":"live","kind":"status","body":{"text":"Bisecting","state":"working"}}]);
     let next = vec![
         json!({"role": "user", "content": "go on"}),
         json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_l1", "name": "cards_block", "input": block_input(put.clone())},
             {"type": "tool_use", "id": "toolu_l2", "name": "bash", "input": {"command": "sleep 9"}}]}),
     ];
-    stream(&mut t, &next, false);
-    let d = drawn(&mut t);
-    assert_eq!(d["toolu_l1"].call, Some(Fate::Pending));
-    let live = &d["toolu_l1"].blocks[0];
+    stream(&mut d.t, &next, false);
+    let r = d.drawn();
+    assert_eq!(r["toolu_l1"].call, Some(Fate::Pending));
+    let live = &r["toolu_l1"].blocks[0];
     assert!(live.block.pending && live.bound.is_none());
-    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_l1", "result": block_receipt(&put)})));
-    let d = drawn(&mut t);
-    assert_eq!(d["toolu_l1"].call, Some(Fate::Bound));
-    let live = &d["toolu_l1"].blocks[0];
+    d.apply(&tool_result("toolu_l1", &block_receipt(&put)));
+    let r = d.drawn();
+    assert_eq!(r["toolu_l1"].call, Some(Fate::Bound));
+    let live = &r["toolu_l1"].blocks[0];
     assert!(!live.block.pending && live.bound.as_deref() == Some(&*live.block), "bound while the bash call still runs");
+}
+
+/// P1-1 (1): a result that comes after its round has ended (a later
+/// response started) binds nothing: its batch committed it unbound for
+/// good, as the history holding the result that late commits it.
+#[test]
+fn a_result_after_its_round_ended_binds_nothing() {
+    let (h, put) = with_call("late");
+    let mut d = Desk::of(attach(&h[..h.len() - 2]));
+    stream(&mut d.t, &h[h.len() - 2..], false);
+    // The next response starts before the result: the round has ended.
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    d.apply(&llm(json!({"kind": "llm", "llm": "text", "text": "next"})));
+    d.apply(&tool_result("toolu_x", &block_receipt(&put)));
+    let r = d.drawn();
+    assert_eq!(r["toolu_x"].call, Some(Fate::Unbound), "a plain row");
+    assert!(!has_block(&r, "x"), "its ops never apply");
+    let mut late = h.clone();
+    late.push(json!({"role": "assistant", "content": [{"type": "text", "text": "next"}]}));
+    late.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_x", "content": block_receipt(&put)}]}));
+    assert_eq!(r, landed(&late), "as the history that holds it late");
+}
+
+/// P1-1 (2): a call's first result is its result: a refusal and then a
+/// matching receipt for the same id leave it unbound, and a receipt then
+/// a refusal leave it bound, live as once the history (its first) lands.
+#[test]
+fn a_calls_first_result_keeps_it() {
+    let (h, put) = with_call("first");
+    let refusal = "cards_block: refused";
+    for (first, second, fate) in
+        [(refusal.to_string(), block_receipt(&put), Fate::Unbound), (block_receipt(&put), refusal.to_string(), Fate::Bound)]
+    {
+        let mut d = Desk::of(attach(&h[..h.len() - 2]));
+        stream(&mut d.t, &h[h.len() - 2..], false);
+        d.apply(&tool_result("toolu_x", &first));
+        d.apply(&tool_result("toolu_x", &second));
+        let r = d.drawn();
+        assert_eq!(r["toolu_x"].call, Some(fate), "{first} first");
+        assert_eq!(has_block(&r, "x"), fate == Fate::Bound);
+        let mut h2 = h.clone();
+        h2.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_x", "content": first}]}));
+        assert_eq!(r, landed(&h2), "live as landed");
+    }
+}
+
+/// P1-1 (3): streamed output is never a result. A call whose output
+/// streamed a receipt's text and then was cut off (the turn ended, or the
+/// desk detached) has no result: it doesn't bind, pending until the
+/// history says (its result there, the engine's cancel, binds nothing).
+#[test]
+fn a_streamed_result_never_binds() {
+    let (h, put) = with_call("streamed");
+    for detach in [false, true] {
+        let mut d = Desk::of(attach(&h[..h.len() - 2]));
+        stream(&mut d.t, &h[h.len() - 2..], false);
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_result_delta", "tool_id": "toolu_x", "delta": block_receipt(&put)})));
+        if detach {
+            d.t.set_detached();
+        } else {
+            d.apply(&ev(json!({"ev": "idle"})));
+        }
+        let r = d.drawn();
+        assert_ne!(r["toolu_x"].call, Some(Fate::Bound), "detached: {detach}");
+        assert!(r["toolu_x"].blocks.iter().all(|s| s.block.pending && s.bound.is_none()), "never bound");
+    }
+    let mut cut = h.clone();
+    cut.push(
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_x", "content": "Tool execution was cancelled"}]}),
+    );
+    let r = landed(&cut);
+    assert_eq!(r["toolu_x"].call, Some(Fate::Unbound));
+}
+
+/// P1-1 (4): attached while its turn streams, the history ending with the
+/// call: its result comes live, and binds it then, before the history
+/// lands; a second result for it changes nothing.
+#[test]
+fn a_live_result_for_the_attached_call_binds() {
+    let (h, put) = with_call("attached");
+    let mut d = Desk::of(attach_streaming(&h));
+    assert_eq!(d.drawn()["toolu_x"].call, Some(Fate::Pending));
+    d.apply(&tool_result("toolu_x", &block_receipt(&put)));
+    d.apply(&tool_result("toolu_x", "cards_block: refused"));
+    let r = d.drawn();
+    assert_eq!(r["toolu_x"].call, Some(Fate::Bound));
+    assert!(has_block(&r, "x"));
+    let mut h2 = h.clone();
+    h2.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_x", "content": block_receipt(&put)}]}));
+    assert_eq!(r, landed(&h2), "live as landed");
+}
+
+/// A call whose input is still streaming isn't read (its input isn't
+/// whole), and its round isn't over: the round's other call, its result
+/// in, binds and stays in the open batch.
+#[test]
+fn a_call_still_streaming_its_input_is_not_read() {
+    let (h, put) = with_call("partial");
+    let mut d = Desk::of(attach(&h[..h.len() - 2]));
+    stream(&mut d.t, &h[h.len() - 2..], false);
+    d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": "toolu_y"})));
+    d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_delta", "tool_id": "toolu_y", "delta": "{\"ops\":[{\"op\":\"pu"})));
+    d.apply(&tool_result("toolu_x", &block_receipt(&put)));
+    let live = d.t.blocks_input().unwrap().events();
+    assert!(!live.iter().any(|e| matches!(e, Event::Call { tool_id, .. } if tool_id == "toolu_y")), "no partial input");
+    assert!(!matches!(live.last(), Some(Event::ResultsEnd)), "the round isn't over");
+    assert_eq!(d.drawn()["toolu_x"].call, Some(Fate::Bound));
 }
 
 /// A response whose first call reports before the model has finished the
@@ -207,21 +417,19 @@ fn a_live_call_is_pending_until_its_result_binds() {
 /// history will hold them, not the order the events came.
 #[test]
 fn a_rounds_calls_come_before_its_results() {
-    let mut t = attach(&blocks_history());
+    let mut d = Desk::of(attach(&blocks_history()));
     let a = json!([{"op":"put","id":"a","kind":"note","body":{"text":"a"}}]);
     let b = json!([{"op":"put","id":"b","kind":"note","body":{"text":"b"}}]);
-    t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "more"})));
-    t.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    d.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "more"})));
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
     for (id, ops) in [("toolu_x1", &a), ("toolu_x2", &b)] {
-        t.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
-        t.apply(&llm(
-            json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": id, "input": block_input(ops.clone())}),
-        ));
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
+        d.apply(&tool_use(id, "cards_block", block_input(ops.clone())));
         if id == "toolu_x1" {
-            t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": block_receipt(&a)})));
+            d.apply(&tool_result(id, &block_receipt(&a)));
         }
     }
-    t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_x2", "result": block_receipt(&b)})));
+    d.apply(&tool_result("toolu_x2", &block_receipt(&b)));
     let mut h = blocks_history();
     h.push(json!({"role": "user", "content": "more"}));
     h.push(json!({"role": "assistant", "content": [
@@ -230,15 +438,52 @@ fn a_rounds_calls_come_before_its_results() {
     h.push(json!({"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "toolu_x1", "content": block_receipt(&a)},
         {"type": "tool_result", "tool_use_id": "toolu_x2", "content": block_receipt(&b)}]}));
-    assert_eq!(t.blocks_input().unwrap().events(), events(&h));
-    let d = drawn(&mut t);
-    assert_eq!(d["toolu_x1"].blocks[0].block.id.to_string(), "a");
-    assert_eq!(d["toolu_x2"].blocks[0].block.id.to_string(), "b");
+    assert_eq!(d.t.blocks_input().unwrap().events(), events(&h));
+    let r = d.drawn();
+    assert_eq!(r["toolu_x1"].blocks[0].block.id.to_string(), "a");
+    assert_eq!(r["toolu_x2"].blocks[0].block.id.to_string(), "b");
     let silent = |id: &str| {
-        t.items().iter().any(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == id) && i.blocks.as_ref().is_some_and(|b| b.silent()))
+        d.t.items().iter().any(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == id) && i.blocks.as_ref().is_some_and(|b| b.silent()))
     };
     assert!(silent("toolu_x1") && silent("toolu_x2"), "bound: no tool rows of their own");
-    assert!(t.items().iter().filter(|i| i.kind == ItemKind::Tool).count() > 2);
+    assert!(d.t.items().iter().filter(|i| i.kind == ItemKind::Tool).count() > 2);
+}
+
+/// P1-2: what a board publishes doesn't grow with the history's refused
+/// calls: a committed call's fate is published once, and its row keeps
+/// it. Neither does what the transcript stages for the board: once its
+/// worker took the history's events, they are the worker's alone.
+#[test]
+fn refused_calls_grow_no_publication_and_no_second_copy() {
+    let refused = |k: usize| {
+        let ops = json!([{"op":"put","id":"x","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"finished"}]}}]);
+        vec![
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": format!("toolu_n{k}"), "name": "cards_block", "input": block_input(ops)}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": format!("toolu_n{k}"), "content": "cards_block: refused"}]}),
+        ]
+    };
+    let mut sizes = Vec::new();
+    for n in [10, 400] {
+        let mut h = blocks_history();
+        h.push(json!({"role": "user", "content": "again"}));
+        for k in 0..n {
+            h.extend(refused(k));
+        }
+        let mut d = Desk::of(attach(&h));
+        let first = d.fold();
+        assert_eq!(d.drawn()[&format!("toolu_n{}", n - 1)].call, Some(Fate::Unbound), "{n}: a plain row");
+        // The next publication, after a live tick: its rows are the board's.
+        d.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "tick"})));
+        let next = d.fold();
+        sizes.push((first.rows.len(), next.rows.len()));
+        // The transcript stages only what its worker hasn't taken.
+        h.push(json!({"role": "user", "content": "one more"}));
+        d.t.apply_update(&HistoryUpdate::Append { base_len: h.len() - 1, messages: h[h.len() - 1..].to_vec() }).unwrap();
+        let staged = d.t.blocks_input().unwrap().events().len();
+        assert!(staged <= 2, "{n}: {staged} events staged");
+    }
+    assert_eq!(sizes[0].1, sizes[1].1, "a tick's publication doesn't grow with refused calls: {sizes:?}");
+    assert!(sizes[1].1 <= 16, "{sizes:?}");
 }
 
 /// A session with no block call has no board: nothing to fold, and its

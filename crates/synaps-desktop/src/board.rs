@@ -142,7 +142,12 @@ type Folded = (Result<Option<Box<State>>, TooFar>, usize);
 /// A re-fold of `events` to `target`, run to its end or its stop, the
 /// executor given a turn each time the clock is up.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn refold(events: Vec<Event>, generation: cards_spec::block::Generation, target: Target, stop: Arc<AtomicBool>) -> Option<Folded> {
+async fn refold(
+    events: Arc<Vec<Event>>,
+    generation: cards_spec::block::Generation,
+    target: Target,
+    stop: Arc<AtomicBool>,
+) -> Option<Folded> {
     let mut rf = match Refold::to(generation, &events, target) {
         Ok(rf) => rf,
         Err(far) => return Some((Err(far), 0)),
@@ -304,11 +309,24 @@ impl AppView {
             return;
         };
         let (epoch, generation) = (input.epoch, input.generation);
+        let worker = self.model.lives[live].board.worker.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         self.refolds.started += 1;
         let task = cx.spawn(async move |this, cx| {
-            let out = cx.background_spawn(async move { refold(input.events(), generation, target, s).await }).await;
+            let out = cx
+                .background_spawn(async move {
+                    // The history: the worker's journal, shared, not copied
+                    // (a gap: nothing to read). The live turn after it: a
+                    // copy, the re-fold's alone, while it runs.
+                    let journal = worker.lock().unwrap_or_else(PoisonError::into_inner).journal(&input)?;
+                    let events = match input.live.events.is_empty() {
+                        true => journal,
+                        false => Arc::new(journal.iter().chain(&input.live.events).cloned().collect()),
+                    };
+                    refold(events, generation, target, s).await
+                })
+                .await;
             let _ = this.update(cx, |v, cx| v.refold_ended(live, target, epoch, out, cx));
         });
         self.refolds.running = Some(Running { live, target, epoch, stop, _task: task });

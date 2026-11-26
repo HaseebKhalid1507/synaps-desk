@@ -1,5 +1,6 @@
 //! `blocks`: the history read a message at a time is `fold::events` of the
-//! whole; block calls' fates; the worker's slices, stops and epochs.
+//! whole; block calls' fates, in passes; the worker's slices, stops,
+//! epochs and gaps; what it keeps.
 
 use cards_spec::board::Board;
 use cards_spec::fold::events;
@@ -7,6 +8,20 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::synthetic::{block_input, block_receipt, blocks_history};
+
+/// Every block call's fate, its batches read as the worker reads them.
+fn all_fates(events: &[Event]) -> Vec<(usize, Fate)> {
+    let mut out = Vec::new();
+    let mut b = Batch::default();
+    for at in 0..events.len() {
+        if let Some((s, e)) = b.read(events, at) {
+            fates(events, s, e, false, |p, f| out.push((p, f)));
+        }
+    }
+    fates(events, b.start, events.len(), true, |p, f| out.push((p, f)));
+    out.sort_by_key(|g| g.0);
+    out
+}
 
 fn read(history: &[Value]) -> HistoryBlocks {
     let mut h = HistoryBlocks::default();
@@ -81,15 +96,66 @@ fn a_calls_fate_is_its_batchs() {
         call("f"),
         result("e", &ok),
     ];
-    let mut f = Fates::default();
-    for at in 0..events.len() {
-        f.read(&events, at);
-    }
-    let mut got: Vec<(usize, Fate)> = f.done.iter().map(|(&p, &f)| (p, f)).collect();
-    got.extend(f.fates(&events, true));
-    got.sort_by_key(|g| g.0);
     use Fate::*;
-    assert_eq!(got, [(0, Bound), (1, Unbound), (2, Unbound), (4, Unbound), (9, Bound), (10, Pending)]);
+    assert_eq!(all_fates(&events), [(0, Bound), (1, Unbound), (2, Unbound), (4, Unbound), (9, Bound), (10, Pending)]);
+}
+
+/// A batch's fates read in passes of [`PASS`] calls are the fates read a
+/// call at a time over the whole batch (the reference): ids reused across
+/// a pass's end, takeovers by another tool's call, results before and
+/// after a takeover, a second result for an id.
+#[test]
+fn fates_read_in_passes_are_a_call_at_a_times() {
+    let put = json!([{"op":"put","id":"n","kind":"note","body":{"text":"x"}}]);
+    let ok = block_receipt(&put);
+    let reference = |events: &[Event], open: bool| -> Vec<(usize, Fate)> {
+        let mut out = Vec::new();
+        for (pos, e) in events.iter().enumerate() {
+            let Event::Call { tool_id, name, input } = e else { continue };
+            if !is_block_tool(name) {
+                continue;
+            }
+            let mut answer = None;
+            let mut taken = false;
+            for later in &events[pos + 1..] {
+                match later {
+                    Event::Call { tool_id: t, .. } if t == tool_id => {
+                        taken = true;
+                        break;
+                    }
+                    Event::Result { tool_id: t, text } if t == tool_id && answer.is_none() => answer = Some(text.clone()),
+                    _ => {}
+                }
+            }
+            let fate = match (answer, taken) {
+                (_, true) => Fate::Unbound,
+                (None, _) if open => Fate::Pending,
+                (None, _) => Fate::Unbound,
+                (Some(text), _) => {
+                    let b = block::parse_call(input).ok();
+                    if b.is_some_and(|b| Receipt::parse(&text).is_some_and(|r| r.binds(&b))) { Fate::Bound } else { Fate::Unbound }
+                }
+            };
+            out.push((pos, fate));
+        }
+        out
+    };
+    let n = 3 * PASS + 7;
+    let id = |k: usize| format!("t{}", k % (PASS + 3));
+    let mut events: Vec<Event> =
+        (0..n).map(|k| Event::Call { tool_id: id(k), name: "cards_block".into(), input: block_input(put.clone()) }).collect();
+    events.insert(PASS / 2, Event::Call { tool_id: id(1), name: "bash".into(), input: Value::Null });
+    for k in (0..n).step_by(3) {
+        events.push(Event::Result { tool_id: id(k), text: if k % 2 == 0 { ok.clone() } else { "refused".into() } });
+        events.push(Event::Result { tool_id: id(k), text: ok.clone() });
+    }
+    for open in [true, false] {
+        let mut got = Vec::new();
+        fates(&events, 0, events.len(), open, |p, f| got.push((p, f)));
+        got.sort_by_key(|g| g.0);
+        assert_eq!(got, reference(&events, open), "open: {open}");
+        assert!(got.iter().any(|g| g.1 == Fate::Bound) && got.iter().any(|g| g.1 == Fate::Unbound));
+    }
 }
 
 fn input(history: &[Value], live: Live) -> Input {
@@ -200,12 +266,7 @@ fn traces_at_and_past_a_replays_pass() {
         assert_eq!(d, Worker::default().run(&i, &mut || true).unwrap(), "{n}: sliced or whole, the same");
         // Fates: every third refused (unbound), the rest bound; the late
         // result after the batch's end binds nothing.
-        let mut f = Fates::default();
-        for at in 0..events.len() {
-            f.read(&events, at);
-        }
-        let mut fates: Vec<Fate> = f.done.values().copied().collect();
-        fates.extend(f.fates(&events, true).into_iter().map(|x| x.1));
+        let fates: Vec<Fate> = all_fates(&events).into_iter().map(|x| x.1).collect();
         let count = |x: Fate| fates.iter().filter(|f| **f == x).count();
         assert_eq!(count(Fate::Unbound), n.div_ceil(3), "{n}");
         assert_eq!(count(Fate::Bound), 1 + n - n.div_ceil(3), "{n}");
@@ -231,4 +292,98 @@ fn a_history_replaced_during_a_job_starts_over() {
     assert_eq!(d.epoch, new.epoch);
     assert_eq!(d, Worker::default().run(&new, &mut || true).unwrap(), "the new history's board, whole");
     assert_eq!(w.position(), new.history_len);
+}
+
+/// The review's owners (Shady #101 P1-2): many refused calls, many
+/// incarnations put and removed, a batch of more calls than a pass and a
+/// results-only tail. The worker keeps the journal (one copy: the history
+/// stages nothing once taken) and B2's board, bounded; committed fates are
+/// published once and let go once the rows took them; a publication's rows
+/// are the board's and the open batch's, not the history's calls.
+#[test]
+fn the_worker_keeps_one_journal_and_nothing_per_call() {
+    let refused = json!([{"op":"put","id":"x","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"finished"}]}}]);
+    let mut h = big_batch(PASS + 44);
+    for k in 0..300 {
+        let ops = if k % 3 == 0 {
+            refused.clone()
+        } else {
+            json!([{"op":"put","id":format!("b{k}"),"kind":"note","body":{"text":"x"}}, {"op":"remove","id":format!("b{k}")}])
+        };
+        let id = format!("u{k}");
+        h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}]}));
+        let text = if k % 3 == 0 { "cards_block: refused".to_string() } else { block_receipt(&ops) };
+        h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}));
+    }
+    // Rows: one per call, as a transcript's.
+    let mut hb = HistoryBlocks::default();
+    let mut w = Worker::default();
+    let mut row = 0u64;
+    let mut last = None;
+    for (k, m) in h.iter().enumerate() {
+        let rows: Vec<Item> = m["content"]
+            .as_array()
+            .map(|b| b.iter().filter(|b| b["type"] == "tool_use").map(|b| tool_row(&mut row, b["id"].as_str().unwrap())).collect())
+            .unwrap_or_default();
+        hb.message(m, &rows);
+        if (k % 50 == 0 || k + 1 == h.len())
+            && let Some(i) = Input::of(&hb, Arc::new(Live::default()))
+        {
+            let d = w.run(&i, &mut || true).expect("done");
+            hb.took(d.committed_to);
+            last = Some(d);
+        }
+    }
+    let d = last.unwrap();
+    let r = w.retained();
+    assert_eq!(r.journal, hb.len(), "one journal");
+    // `fold::events` keeps the results-only tail's result; the reader, only
+    // the last assistant message's ids (module docs).
+    assert_eq!(hb.len() + 1, events(&h).len());
+    hb.prune();
+    assert_eq!(hb.staged(), 0, "the history keeps no second copy");
+    assert!(d.committed.len() <= 400, "{}: the last publication carries what committed since the one before", d.committed.len());
+    // Taken: the next publication carries nothing of the history's calls.
+    let i = Input::of(&hb, Arc::new(Live::default())).unwrap();
+    let again = w.run(&i, &mut || true).unwrap();
+    assert!(again.committed.is_empty(), "{}", again.committed.len());
+    assert_eq!(w.retained().committed, 0);
+    assert!(again.rows.len() <= 4, "{} rows: the board's", again.rows.len());
+    assert!(r.board_bytes <= cards_spec::board::WORKING_SET_MAX_BYTES + 4096, "{}", r.board_bytes);
+}
+
+fn tool_row(next: &mut u64, id: &str) -> Item {
+    *next += 1;
+    let mut t = crate::transcript::Transcript::new();
+    t.apply(&crate::protocol::SessionEvent::Stream {
+        event: crate::protocol::StreamEvent::Llm(crate::protocol::LlmEvent::ToolUseStart { tool_name: "x".into(), tool_id: id.into() }),
+    });
+    let mut it = t.items()[0].clone();
+    it.id = *next;
+    it
+}
+
+/// A worker started over on a history whose staged events it let go (its
+/// store torn down, the transcript kept) has a gap: nothing drawn, until
+/// the history is folded again (another epoch).
+#[test]
+fn a_gap_draws_nothing_until_another_epoch() {
+    let h = blocks_history();
+    let mut hb = HistoryBlocks::default();
+    for m in &h[..4] {
+        hb.message(m, &[]);
+    }
+    let mut w = Worker::default();
+    w.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).expect("done");
+    for m in &h[4..] {
+        hb.message(m, &[]);
+    }
+    assert!(hb.staged() < hb.len(), "what the worker took is let go");
+    let mut fresh = Worker::default();
+    assert!(fresh.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).is_none());
+    assert!(fresh.gap());
+    assert!(w.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).is_some(), "its own worker reads on");
+    let again = read(&h);
+    assert!(fresh.run(&Input::of(&again, Arc::new(Live::default())).unwrap(), &mut || true).is_some());
+    assert!(!fresh.gap());
 }
