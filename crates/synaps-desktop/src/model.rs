@@ -1742,7 +1742,8 @@ impl Model {
             Event::SessionStatus { attach_seq, value } => {
                 if self.lives[lid].current(attach_seq) && self.cache_expiry {
                     let stats = &mut self.lives[lid].stats;
-                    stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now(), stats.warm.as_ref()));
+                    stats.warm =
+                        Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now(), stats.warm.as_ref(), &stats.daemon));
                     stats.cache_epoch = self.cache_epoch;
                     self.view_dirty = true;
                 }
@@ -3508,6 +3509,47 @@ mod tests {
         assert_eq!(looks, [60, 120, 240], "within the 5m TTL, then none");
     }
 
+    /// Shady #100 R4.1: the actor's end ends its ping. Its first ping
+    /// `(1, 0, 0)` in flight, looked at a minute on and still so; the
+    /// session ends; the same id attached again within the same daemon
+    /// lifetime (an actor made anew, counting its periods from the start):
+    /// its first ping in flight is looked at a minute on, then nothing.
+    #[test]
+    fn an_ended_actor_s_ping_ends_with_it() {
+        use crate::warm::Moment;
+        use std::time::Duration;
+        crate::warm::freeze();
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        attach(&mut m, 1);
+        let status = |seq: u64, period: Value| Event::SessionStatus {
+            attach_seq: seq,
+            value: json!({"keepwarm": {"mode": "auto", "period": period}}),
+        };
+        let flying = json!({"id": 1, "pings": 0, "ledger_usd": 0.0, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true});
+        let mut asked = Vec::new();
+        let mut run = |m: &mut Model, seq: u64, from: u64, to: u64| {
+            for t in from + 1..=to {
+                crate::warm::skew(Duration::from_secs(1), Duration::from_secs(1));
+                let fx = m.panel_due(LiveId::FIRST, Some(seq), Moment::now());
+                if !fx.is_empty() {
+                    assert_eq!(fx, [Effect::Status(seq)], "{t} s: status only");
+                    asked.push(t);
+                    m.apply(status(seq, if seq == 1 { flying.clone() } else { Value::Null }));
+                }
+            }
+        };
+        m.apply(status(1, flying.clone()));
+        run(&mut m, 1, 0, 120);
+        m.apply(session(1, SessionEvent::Ended { reason: Value::Null }));
+        m.apply(Event::Detached { attach_seq: 1, session_id: Some("s".into()), reason: "session ended".into() });
+        run(&mut m, 1, 120, 220);
+        attach(&mut m, 2);
+        m.apply(status(2, flying.clone()));
+        run(&mut m, 2, 220, 700);
+        assert_eq!(asked, [60, 280], "the old ping's look, then the new one's a minute on; then nothing");
+    }
+
     /// `Event::CacheExpiry` for attachment `seq`, the daemon's `value`.
     fn expiry(seq: u64, value: Value) -> Event {
         let reply = match synaps_client::decode_query_reply(&value) {
@@ -4286,11 +4328,21 @@ mod fake_daemon {
         }
     }
 
-    fn welcome(saved: bool) -> Value {
+    /// What the fake's next `Welcome`s say over [`welcome`]'s own (its
+    /// `features`, a reload's `generation`, a cold start's `boot_id`...).
+    type Told = std::sync::Arc<std::sync::Mutex<Value>>;
+
+    fn welcome(saved: bool, told: &Told) -> Value {
         let features: Vec<&str> = if saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
-        json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
+        let mut w = json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
                "sessions": [{"id": A, "model": "m", "lifecycle": "live"}, {"id": B, "model": "m", "lifecycle": "live"}],
-               "progressive_tool_disclosure": false, "generation": 1, "features": features})
+               "progressive_tool_disclosure": false, "generation": 1, "features": features});
+        if let Value::Object(over) = &*told.lock().unwrap() {
+            for (k, v) in over {
+                w[k] = v.clone();
+            }
+        }
+        w
     }
 
     /// The fake's saved sessions (`saved::rows` on #408): the named ones for
@@ -4336,6 +4388,11 @@ mod fake_daemon {
     /// Every control frame but `Hello` and `Attach` goes to the third
     /// receiver.
     fn start_with(name: &str, saved: bool) -> (PathBuf, mpsc::Receiver<Conn>, mpsc::Receiver<Value>) {
+        start_told(name, saved, Told::default())
+    }
+
+    /// [`start_with`], each `Welcome` what `told` says then.
+    fn start_told(name: &str, saved: bool, told: Told) -> (PathBuf, mpsc::Receiver<Conn>, mpsc::Receiver<Value>) {
         let dir = std::env::temp_dir().join(format!("synaps-desktop-fake-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4345,13 +4402,13 @@ mod fake_daemon {
         let (ctl_tx, ctl_rx) = mpsc::channel();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (tx, ctl_tx) = (tx.clone(), ctl_tx.clone());
+                let (tx, ctl_tx, told) = (tx.clone(), ctl_tx.clone(), told.clone());
                 std::thread::spawn(move || {
                     let mut c = Conn { w: stream.try_clone().unwrap(), r: BufReader::new(stream) };
                     if c.recv(T).is_none() {
                         return;
                     }
-                    c.send(welcome(saved));
+                    c.send(welcome(saved, &told));
                     let _ = c.r.get_ref().set_read_timeout(None);
                     let mut line = String::new();
                     while c.r.read_line(&mut line).is_ok_and(|n| n > 0) {
@@ -4458,6 +4515,157 @@ mod fake_daemon {
         m.switch_in(LiveId::FIRST, t, s);
         ui_attach(m, client, sid);
         left
+    }
+
+    /// Shady #100 R4.1's daemon, through the client: it answers
+    /// `cache_expiry`, and each `Welcome` says the lifetime last told
+    /// ([`Lives::tell`]). The test's clock stopped at `t` = 0 s.
+    struct Lives {
+        client: Client,
+        events: async_channel::Receiver<Event>,
+        attaches: mpsc::Receiver<Conn>,
+        told: Told,
+        m: Model,
+        t: u64,
+    }
+
+    impl Lives {
+        /// Lifetime `b-1`, generation 1, pid 40; A shown: its connection and
+        /// attachment.
+        fn start(name: &str) -> (Lives, Conn, u64) {
+            crate::warm::freeze();
+            let told = Told::default();
+            *told.lock().unwrap() = json!({"features": ["owned_sessions", "cache_expiry"], "boot_id": "b-1", "generation": 1, "pid": 40});
+            let (path, attaches, _control) = start_told(name, false, told.clone());
+            let (client, events) = Client::spawn(ClientOptions::new(Endpoint::Socket(path), Identity::new("tester").unwrap())).unwrap();
+            let mut l = Lives { client, events, attaches, told, m: Model::new(ConnState::Connecting), t: 0 };
+            pump(&mut l.m, &l.events, "connected", |m| matches!(m.conn, ConnState::Connected(_)) && m.cache_expiry);
+            ui_attach(&mut l.m, &l.client, A);
+            let a = l.answer(A);
+            let seq = l.m.attachment().unwrap();
+            (l, a, seq)
+        }
+
+        /// The next `Welcome`s say this lifetime.
+        fn tell(&self, boot_id: &str, generation: u64, pid: u32) {
+            let mut told = self.told.lock().unwrap();
+            (told["boot_id"], told["generation"], told["pid"]) = (json!(boot_id), json!(generation), json!(pid));
+        }
+
+        /// `sid`'s attach (or re-attach) answered, and applied.
+        fn answer(&mut self, sid: &'static str) -> Conn {
+            let mut c = self.attaches.recv_timeout(T).unwrap();
+            let was = self.m.active.as_ref().map(|a| a.connection);
+            c.send(json!({"type": "attached", "client": 2, "input_owner": 2, "meta": {"id": sid, "model": "m", "lifecycle": "live"},
+                          "conversation": {"api_messages": [], "messages_len": 0}}));
+            pump(&mut self.m, &self.events, "attached", |m| m.is_active(sid) && m.active.as_ref().map(|a| a.connection) != was);
+            c
+        }
+
+        /// `sid` shown from the tab cache (`cached`), attached: what was
+        /// shown, the connection, the attachment.
+        fn show(&mut self, sid: &'static str, cached: Option<(Transcript, Stats)>) -> ((Transcript, Stats), Conn, u64) {
+            let left = ui_switch(&mut self.m, &self.client, sid, cached);
+            let c = self.answer(sid);
+            (left, c, self.m.attachment().unwrap())
+        }
+
+        /// On to `to` s, a second at a time: the first second the panel's
+        /// timer asks attachment `seq` (status only), or `None`.
+        fn next(&mut self, seq: u64, to: u64) -> Option<u64> {
+            while self.t < to {
+                crate::warm::skew(Duration::from_secs(1), Duration::from_secs(1));
+                self.t += 1;
+                let fx = self.m.panel_due(LiveId::FIRST, Some(seq), crate::warm::Moment::now());
+                if !fx.is_empty() {
+                    assert_eq!(fx, [Effect::Status(seq)], "{} s: status only", self.t);
+                    return Some(self.t);
+                }
+            }
+            None
+        }
+
+        /// Its status: a ping in flight, the first period's first, `(1, 0, 0)`.
+        fn flying(&mut self, seq: u64) {
+            let period = json!({"id": 1, "pings": 0, "ledger_usd": 0.0, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true});
+            self.m.apply(Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto", "period": period}}) });
+        }
+
+        /// Its status: no period (the ping ended unbilled).
+        fn ended(&mut self, seq: u64) {
+            self.m.apply(Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto", "period": null}}) });
+        }
+    }
+
+    /// Shady #100 R4.1 through the client: a ping's looks are one daemon
+    /// lifetime's, as each attach's `Welcome` says it. A's first ping
+    /// `(1, 0, 0)` in flight, slow: looked at 60 and 180 s, its last look
+    /// due at 420. A goes to the tab cache (B shown); the daemon reloads
+    /// (`generation` 2, the pid kept), its actor for A made anew, whose
+    /// first ping says `(1, 0, 0)` again. A shown at 430: that ping is
+    /// looked at a minute on, and seen to end; then nothing. Then, the
+    /// same daemon: a ping looked at once, A to the cache and back before
+    /// its next look keeps that look where it was.
+    #[test]
+    fn a_reloaded_actors_first_ping_is_looked_at_anew() {
+        let (mut l, _a, seq) = Lives::start("reload-ping");
+        l.flying(seq);
+        for look in [60, 180] {
+            assert_eq!(l.next(seq, 1000), Some(look));
+            l.flying(seq);
+        }
+        let (cached, _b, b) = l.show(B, None);
+        l.tell("b-1", 2, 40);
+        assert_eq!(l.next(b, 430), None);
+        let (cached_b, _a, seq) = l.show(A, Some(cached));
+        l.flying(seq);
+        assert_eq!(l.next(seq, 1000), Some(490), "a reload's first ping: a look a minute on");
+        l.ended(seq);
+        assert_eq!(l.next(seq, 1000), None, "seen to end: nothing");
+        // Control: looked at 1060 (the next due at 1180); to the cache and
+        // back at 1100, the same daemon: the look stays.
+        l.flying(seq);
+        assert_eq!(l.next(seq, 2000), Some(1060));
+        l.flying(seq);
+        let (cached, _b, b) = l.show(B, Some(cached_b));
+        assert_eq!(l.next(b, 1100), None);
+        let (_, _a, seq) = l.show(A, Some(cached));
+        l.flying(seq);
+        assert_eq!(l.next(seq, 2000), Some(1180), "a tab return to the same daemon keeps the look where it was");
+        l.client.shutdown().unwrap();
+    }
+
+    /// Shady #100 R4.1 through the client: a ping's looks run out (60, 120,
+    /// 240 s), and stay so across a tab return and a transport reconnect
+    /// to the same daemon; a cold start (another `boot_id` and pid) while
+    /// A is in the tab cache makes its actor anew, whose first ping
+    /// `(1, 0, 0)` is another: looked at a minute on, then nothing.
+    #[test]
+    fn spent_looks_stay_spent_within_one_daemon_lifetime() {
+        let (mut l, _a, seq) = Lives::start("spent-ping");
+        l.flying(seq);
+        for look in [60, 180, 420] {
+            assert_eq!(l.next(seq, 1000), Some(look));
+            l.flying(seq);
+        }
+        let (cached, _b, b) = l.show(B, None);
+        assert_eq!(l.next(b, 500), None);
+        let (cached_b, a, seq) = l.show(A, Some(cached));
+        l.flying(seq);
+        assert_eq!(l.next(seq, 700), None, "a tab return to the same daemon: none");
+        drop(a);
+        let _a = l.answer(A);
+        l.flying(seq);
+        assert_eq!(l.next(seq, 900), None, "a transport reconnect to the same daemon: none");
+        let (cached, _b, b) = l.show(B, Some(cached_b));
+        l.tell("b-2", 1, 41);
+        assert_eq!(l.next(b, 950), None);
+        let (_, _a, seq) = l.show(A, Some(cached));
+        l.flying(seq);
+        assert_eq!(l.next(seq, 2000), Some(1010), "a cold start's first ping: a look a minute on");
+        l.ended(seq);
+        assert_eq!(l.next(seq, 2000), None);
+        l.client.shutdown().unwrap();
     }
 
     /// Apply the client's events to `m` until `n` effects match `want`;

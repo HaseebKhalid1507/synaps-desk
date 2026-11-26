@@ -9534,7 +9534,8 @@ fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
             let now = crate::warm::Moment::now();
             (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
             let stats = &mut v.model.lives[v.panes.cur.live].stats;
-            stats.warm = keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now, None));
+            stats.warm =
+                keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now, None, &Default::default()));
             stats.expiry = answer.map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now));
             cx.notify();
         });

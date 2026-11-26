@@ -7553,6 +7553,8 @@ fn two_panes_on_one_session_look_at_a_ping_in_flight_once(cx: &mut TestAppContex
     assert_eq!(attachment_of(cx, &view, ids[1]), a, "one store, one attachment");
     cache_on(cx, &view);
     crate::warm::freeze();
+    // The daemon its attach came from: each reconnect's is the same one.
+    let daemon = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.daemon.clone());
     let status = |period: Value| Event::SessionStatus { attach_seq: a, value: json!({"keepwarm": {"mode": "auto", "period": period}}) };
     let flying = || status(json!({"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}));
     let no_match = || cache_reply(a, json!({"state": "unknown", "reason": "no_matching_request"}));
@@ -7566,6 +7568,7 @@ fn two_panes_on_one_session_look_at_a_ping_in_flight_once(cx: &mut TestAppContex
             other => panic!("{other:?}"),
         };
         again.connection = 10 + k as u64;
+        again.daemon = daemon.clone();
         let ev = Event::Attached { attach_seq: a, attached: again, mode: synaps_client::AttachMode::Mirror, reconnect: true };
         give(cx, window, &view, vec![ev]);
         assert_eq!(panel_asks(cx, &view), [(a, "status"), (a, "cache_expiry")], "reconnect {k}: both, once");

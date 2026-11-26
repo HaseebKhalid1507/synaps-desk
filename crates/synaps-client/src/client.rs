@@ -1986,6 +1986,7 @@ async fn session_loop(
         let rejected = attached.rejected;
         let connection = sh.connections.fetch_add(1, Ordering::Relaxed) + 1;
         attached.connection = connection;
+        attached.daemon = conn.welcome.life();
         emit(&events, Event::Attached { attach_seq, attached, mode, reconnect: previous.is_some() });
         if rejected.total() > 0 {
             emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "attached".into(), error: rejected.to_string() }));

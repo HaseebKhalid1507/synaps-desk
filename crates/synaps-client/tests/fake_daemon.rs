@@ -70,7 +70,12 @@ struct Fake {
     accepted: mpsc::UnboundedReceiver<Weak<Mutex<OwnedWriteHalf>>>,
     /// Every frame after `Hello` that was not an `Attach`, in order.
     control: mpsc::UnboundedReceiver<Value>,
+    /// What the next connection's `Welcome` says the daemon's lifetime is:
+    /// `boot_id` (empty: not sent), `generation`, `pid`.
+    life: Life,
 }
+
+type Life = Arc<std::sync::Mutex<(String, u64, u32)>>;
 
 /// What the fake daemon is.
 #[derive(Clone, Copy, Default)]
@@ -140,6 +145,11 @@ fn attached_frame(client: u64) -> Value {
 }
 
 fn welcome(opts: Opts) -> Value {
+    welcome_of(opts, &Arc::new(std::sync::Mutex::new((String::new(), 1, 1))))
+}
+
+/// [`welcome`], from the daemon lifetime `life`.
+fn welcome_of(opts: Opts, life: &Life) -> Value {
     let mut features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
     if opts.pages {
         features.push("session_page");
@@ -147,10 +157,17 @@ fn welcome(opts: Opts) -> Value {
     if opts.expiry {
         features.push("cache_expiry");
     }
-    json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
+    let mut w = json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
            "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"},
                         {"id": SID2, "model": "m", "lifecycle": "live", "journal_id": "20261101-000000-bbbb"}],
-           "progressive_tool_disclosure": false, "generation": 1, "features": features})
+           "progressive_tool_disclosure": false, "generation": 1, "features": features});
+    let (boot_id, generation, pid) = life.lock().unwrap().clone();
+    w["generation"] = json!(generation);
+    w["pid"] = json!(pid);
+    if !boot_id.is_empty() {
+        w["boot_id"] = json!(boot_id);
+    }
+    w
 }
 
 /// The fake's `Rename` (`daemon/rename.rs`): `None` = `Refused`, then close.
@@ -193,17 +210,20 @@ impl Fake {
         let (atx, attaches) = mpsc::unbounded_channel();
         let (ctx, accepted) = mpsc::unbounded_channel();
         let (ftx, control) = mpsc::unbounded_channel();
+        let life: Life = Arc::new(std::sync::Mutex::new((String::new(), 1, 1)));
+        let told = life.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (r, w) = stream.into_split();
                 let w: Writer = Arc::new(Mutex::new(w));
                 let _ = ctx.send(Arc::downgrade(&w));
                 let (atx, ftx) = (atx.clone(), ftx.clone());
+                let hi = welcome_of(opts, &told);
                 tokio::spawn(async move {
                     let mut r = BufReader::new(r).lines();
                     let Ok(Some(hello)) = r.next_line().await else { return };
                     let hello: Value = serde_json::from_str(&hello).unwrap();
-                    write(&w, welcome(opts)).await;
+                    write(&w, hi).await;
                     while let Ok(Some(line)) = r.next_line().await {
                         let f: Value = serde_json::from_str(&line).unwrap();
                         if f["type"] != "attach" {
@@ -286,7 +306,7 @@ impl Fake {
                 });
             }
         });
-        Fake { path, attaches, accepted, control }
+        Fake { path, attaches, accepted, control, life }
     }
 
     fn client(&self) -> (Client, async_channel::Receiver<Event>) {
@@ -1225,6 +1245,50 @@ async fn prompts_are_answered_on_the_wire() {
         matches!(e, Event::Session { event: synaps_client::SessionEvent::PromptResolved { prompt_id: 7 }, .. }).then_some(())
     })
     .await;
+    client.shutdown().unwrap();
+}
+
+/// Each snapshot carries the daemon lifetime its connection's `Welcome`
+/// said: a transport reconnect to the same daemon keeps it; a reload
+/// (`generation`, the pid kept) or a cold start (`boot_id`) is another.
+#[tokio::test]
+async fn a_snapshot_says_which_daemon_lifetime_served_it() {
+    use synaps_client::DaemonLife;
+    let mut fake = Fake::start("daemon-life").await;
+    *fake.life.lock().unwrap() = ("b-1".into(), 3, 40);
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let snapshot = |events: &async_channel::Receiver<Event>| {
+        let events = events.clone();
+        async move {
+            wait(&events, "attached", |e| match e {
+                Event::Attached { attached, .. } => Some(attached.daemon.clone()),
+                _ => None,
+            })
+            .await
+        }
+    };
+    let life = |boot: &str, generation: u64, pid: u32| {
+        let mut l = DaemonLife::default();
+        (l.boot_id, l.generation, l.pid) = (boot.into(), generation, pid);
+        l
+    };
+    let mut conn = fake.next_attach().await;
+    conn.send(attached_frame(2)).await;
+    let first = snapshot(&events).await;
+    assert_eq!(first, life("b-1", 3, 40));
+    for (why, told) in
+        [("a dropped socket, the same daemon", ("b-1", 3, 40)), ("a reload", ("b-1", 4, 40)), ("a cold start", ("b-2", 1, 41))]
+    {
+        *fake.life.lock().unwrap() = (told.0.into(), told.1, told.2);
+        drop(conn);
+        wait(&events, "reattaching", |e| matches!(e, Event::Reattaching { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
+        conn = fake.next_attach().await;
+        conn.send(attached_frame(3)).await;
+        let again = snapshot(&events).await;
+        assert_eq!(again, life(told.0, told.1, told.2), "{why}");
+        assert_eq!(again == first, why.starts_with("a dropped"), "{why}");
+    }
     client.shutdown().unwrap();
 }
 

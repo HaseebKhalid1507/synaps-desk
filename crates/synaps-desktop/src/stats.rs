@@ -142,6 +142,9 @@ pub struct Stats {
     /// Its keep-warm, as its last `Status` said ([`crate::warm`]); kept
     /// across a re-attach of the same session.
     pub warm: Option<crate::warm::Warm>,
+    /// The daemon lifetime of the attach these came on
+    /// (`Attached::daemon`): what a ping in flight is of ([`crate::warm::Flight`]).
+    pub daemon: synaps_client::DaemonLife,
     /// Its prompt cache, as its last `cache_expiry` answer said; kept
     /// across a re-attach of the same session, dropped when the cache is
     /// not what it was (until the daemon answers again).
@@ -202,6 +205,7 @@ impl Stats {
             subagents,
             detached: false,
             warm,
+            daemon: a.daemon.clone(),
             expiry,
             expiry_retried: false,
             keepwarm: Tokens::from_value(&a.conversation.keepwarm_tokens).map(|t| (t, a.conversation.keepwarm_cost)),
@@ -284,6 +288,14 @@ impl Stats {
             SessionEvent::Cleared { .. } | SessionEvent::Resumed { .. } | SessionEvent::CompactionApplied { .. } => {
                 self.context = None;
                 new_cache = true;
+            }
+            // The actor is gone, and its ping with it: one made anew under
+            // this id (within the same daemon lifetime) counts its periods
+            // from the start again (Shady #100 R4.1).
+            SessionEvent::Ended { .. } => {
+                if let Some(w) = self.warm.as_mut() {
+                    w.flight = None;
+                }
             }
             _ if raw["ev"] == "setting_changed" => {
                 if let Some(v) = RuntimeInfo::from_value(&raw["applied"]["view"]) {

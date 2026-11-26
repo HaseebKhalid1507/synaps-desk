@@ -721,6 +721,32 @@ pub struct Welcome {
     pub rejected_sessions: usize,
     pub generation: u64,
     pub features: Vec<String>,
+    /// Minted at the daemon's cold start, kept across its reloads. Empty
+    /// from an older daemon.
+    pub boot_id: String,
+}
+
+impl Welcome {
+    /// The daemon lifetime this welcome came from.
+    pub fn life(&self) -> DaemonLife {
+        DaemonLife { boot_id: self.boot_id.clone(), generation: self.generation, pid: self.pid }
+    }
+}
+
+/// One daemon lifetime, as its `Welcome` says: `boot_id` (a cold start
+/// mints a new one), `generation` (a reload counts one up; Unix keeps the
+/// pid over it) and `pid` (tells cold starts apart on a daemon without
+/// `boot_id`). Another value is another daemon process, whose session
+/// actors are made anew, their own counters (keep-warm period ids, prompt
+/// ids) started over. A transport reconnect to the same daemon keeps it.
+/// It is not an actor's identity: an actor ended and made again under the
+/// same id within one lifetime has the same.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DaemonLife {
+    pub boot_id: String,
+    pub generation: u64,
+    pub pid: u32,
 }
 
 #[derive(Deserialize)]
@@ -738,6 +764,8 @@ struct RawWelcome {
     generation: u64,
     #[serde(default)]
     features: Vec<String>,
+    #[serde(default)]
+    boot_id: String,
 }
 
 impl From<RawWelcome> for Welcome {
@@ -752,6 +780,7 @@ impl From<RawWelcome> for Welcome {
             rejected_sessions,
             generation: w.generation,
             features: w.features,
+            boot_id: w.boot_id,
         }
     }
 }
@@ -1133,6 +1162,11 @@ pub struct Attached {
     /// for these prompts is never sent on a later connection. 0 when the
     /// snapshot did not come from a `Client` (decoded by hand).
     pub connection: u64,
+    /// Not on the wire: the daemon lifetime that connection's `Welcome`
+    /// said. Another than an earlier snapshot's of the same session: its
+    /// actor was made anew (a reload, a restart), whatever its counters
+    /// say. Default when the snapshot did not come from a `Client`.
+    pub daemon: DaemonLife,
 }
 
 /// Per list, how many entries of an `Attached` snapshot did not decode.
@@ -1204,6 +1238,7 @@ impl From<RawAttached> for Attached {
             input_owner: a.input_owner,
             rejected: Rejected { pending_prompts: p, clients: c, roster: r },
             connection: 0,
+            daemon: DaemonLife::default(),
         }
     }
 }

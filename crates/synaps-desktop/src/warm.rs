@@ -21,7 +21,9 @@
 //!   failed), whether it retries or ends the period. The same ping still in
 //!   flight at that look waits twice as long for the next, while one wait
 //!   is within its period's TTL ([`Flight`]). A fallback, at best: a ping
-//!   still in flight after its last look is not looked for again.
+//!   still in flight after its last look is not looked for again. A ping
+//!   is one daemon lifetime's: a reload or a restart's first is another,
+//!   whatever its period's counters say.
 //!
 //! The countdowns cost no idle frames: redrawn when what they say changes,
 //! once a second under ten minutes, once a minute above, only while the
@@ -34,7 +36,7 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
-use synaps_client::{CacheExpiry, CacheReason, CacheState, Event, QueryError, SessionEvent, render_cache_expiry};
+use synaps_client::{CacheExpiry, CacheReason, CacheState, DaemonLife, Event, QueryError, SessionEvent, render_cache_expiry};
 
 /// Under this a countdown shows seconds (and ticks at 1 Hz).
 pub(crate) const SECONDS_UNDER: Duration = Duration::from_secs(600);
@@ -187,8 +189,20 @@ pub(crate) struct Warm {
 /// waits twice as long, from it. No wait is longer than the period's TTL
 /// (no retry is scheduled past it): one ping costs a few asks at most,
 /// status only (R2.1). Then none, for good, whatever else says it (R3.2).
+///
+/// A ping is its period's counters within one daemon lifetime (R4.1): an
+/// actor made anew (the daemon reloaded or restarted) starts them over,
+/// so its first ping says what an old one did. Another [`DaemonLife`] is
+/// another ping, a look anew; a transport reconnect to the same daemon,
+/// or a tab shown again, is the same one and keeps its looks. The actor's
+/// end (`Ended`) ends its ping: one made anew under its id within the same
+/// lifetime counts from the start too. Neither is a SynapsCLI actor id
+/// (it sends none): an actor ended and made anew while no attachment saw
+/// it end, within one daemon lifetime, is not told apart.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Flight {
+    /// The daemon lifetime that said it (its attachment's).
+    life: DaemonLife,
     /// The period's `id`, `pings` and `ledger_usd`: what its booking changes.
     key: (Option<u64>, Option<u64>, Option<u64>),
     /// The answer the look waits from: the first that said this ping, or
@@ -201,19 +215,21 @@ pub(crate) struct Flight {
 }
 
 impl Flight {
-    /// Of the status `period` (in flight), answered at `at`, after `prev`.
-    fn of(period: &Value, at: Moment, prev: Option<&Flight>) -> Flight {
+    /// Of the status `period` (in flight), answered at `at` by daemon
+    /// lifetime `life`, after `prev`.
+    fn of(period: &Value, at: Moment, prev: Option<&Flight>, life: &DaemonLife) -> Flight {
         let key = (period["id"].as_u64(), period["pings"].as_u64(), period["ledger_usd"].as_f64().map(f64::to_bits));
         let ttl = period["ttl_secs"].as_u64().map_or(TTL_MAX, Duration::from_secs);
         let within = |w: Duration| Some(w).filter(|w| *w <= ttl);
-        match prev.filter(|f| f.key == key) {
-            // Another ping (booked, retried, another period): a look anew.
-            None => Flight { key, from: Age::new(at), wait: within(SETTLE), looked: false },
+        match prev.filter(|f| f.life == *life && f.key == key) {
+            // Another ping (booked, retried, another period, another
+            // daemon lifetime's): a look anew.
+            None => Flight { life: life.clone(), key, from: Age::new(at), wait: within(SETTLE), looked: false },
             // Its looks are over, and stay so.
             Some(f) if f.wait.is_none() => f.clone(),
             // Due: looked at. The next twice as long, from here.
             Some(f) if f.wait.is_some_and(|w| f.from.at(at) >= w) => {
-                Flight { key, from: Age::new(at), wait: f.wait.and_then(|w| w.checked_mul(2)).and_then(within), looked: false }
+                Flight { from: Age::new(at), wait: f.wait.and_then(|w| w.checked_mul(2)).and_then(within), looked: false, ..f.clone() }
             }
             // Before it: the look stands, still to be asked.
             Some(f) => Flight { looked: false, ..f.clone() },
@@ -227,14 +243,15 @@ impl Flight {
 }
 
 impl Warm {
-    /// The status `v`, answered at `at`; `prev`: what the store held (the
-    /// same ping still in flight keeps its look, [`Flight`]).
-    pub fn from_status(v: &Value, at: Moment, prev: Option<&Warm>) -> Warm {
+    /// The status `v`, answered at `at` by daemon lifetime `life`; `prev`:
+    /// what the store held (the same ping still in flight keeps its look,
+    /// [`Flight`]).
+    pub fn from_status(v: &Value, at: Moment, prev: Option<&Warm>, life: &DaemonLife) -> Warm {
         let kw = &v["keepwarm"];
         let period = &kw["period"];
         let next_ping = period["next_ping_in_secs"].as_u64().map(Duration::from_secs);
         let in_flight = period.is_object() && (period["in_flight"] == true || next_ping.is_some_and(|d| d.is_zero()));
-        let flight = in_flight.then(|| Flight::of(period, at, prev.and_then(|w| w.flight.as_ref())));
+        let flight = in_flight.then(|| Flight::of(period, at, prev.and_then(|w| w.flight.as_ref()), life));
         Warm {
             at: Age::new(at),
             mode: kw["mode"].as_str().unwrap_or_default().to_string(),
@@ -485,6 +502,11 @@ mod tests {
         Moment { mono: t.mono + d, wall: t.wall + d }
     }
 
+    /// The tests' one daemon lifetime.
+    fn daemon() -> DaemonLife {
+        DaemonLife::default()
+    }
+
     fn says(c: &Cell) -> (&str, Tone) {
         (c.text.as_str(), c.tone)
     }
@@ -492,13 +514,13 @@ mod tests {
     #[test]
     fn reads_the_keep_warm_from_the_status() {
         let t0 = Moment::now();
-        let w = Warm::from_status(&status(), t0, None);
+        let w = Warm::from_status(&status(), t0, None, &daemon());
         assert_eq!((w.mode.as_str(), w.pinned, w.pings, w.spent), ("auto", true, 3, 0.0123));
         assert_eq!(mode_line(&w), "auto · pinned");
         assert_eq!(w.ping_in(after(t0, 600)), Some(Duration::from_secs(2400)));
         // A status that names no `cache` is all it takes: nothing in it is
         // the cache's.
-        let parked = Warm::from_status(&json!({"keepwarm": {}}), t0, None);
+        let parked = Warm::from_status(&json!({"keepwarm": {}}), t0, None, &daemon());
         assert_eq!((mode_line(&parked), parked.next_ping), ("—".to_string(), None));
     }
 
@@ -598,7 +620,7 @@ mod tests {
         assert_eq!(wait(&warm(600), t0), Some(Duration::from_millis(1005)));
         assert_eq!(clock(Duration::from_secs(600)), "10:00");
         // The next ping counts the same way.
-        let mut w = Warm::from_status(&status(), t0, None);
+        let mut w = Warm::from_status(&status(), t0, None, &daemon());
         w.next_ping = Some(Duration::from_secs(42));
         assert_eq!(w.next_change(t0).map(|at| at.duration_since(t0.mono)), Some(Duration::from_millis(1005)));
         // A scheduled ping: its status asked after it is due, not within
@@ -617,15 +639,15 @@ mod tests {
             json!({"next_ping_in_secs": 0}),
             json!({"next_ping_in_secs": 9, "in_flight": true}),
         ] {
-            let mut w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": period}}), t0, None);
+            let mut w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": period}}), t0, None, &daemon());
             assert_eq!(w.refresh_at(t0), Some(t0.mono + SETTLE), "{period}");
             w.asked();
             assert_eq!(w.refresh_at(t0), None, "{period}: once");
         }
         // No period: nothing in flight, nothing scheduled.
-        let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null, "last_end": "4xx"}}), t0, None);
+        let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null, "last_end": "4xx"}}), t0, None, &daemon());
         assert_eq!((w.flight.clone(), w.refresh_at(t0)), (None, None));
-        let mut w = Warm::from_status(&status(), t0, None);
+        let mut w = Warm::from_status(&status(), t0, None, &daemon());
         w.next_ping = None;
         assert_eq!((w.next_change(t0), w.refresh_at(t0)), (None, None));
     }
@@ -643,13 +665,13 @@ mod tests {
         };
         // Each look, answered as it is asked: how long it waited.
         let looks = |v: &Value| {
-            let (mut w, mut t, mut looks) = (Warm::from_status(v, t0, None), t0, Vec::new());
+            let (mut w, mut t, mut looks) = (Warm::from_status(v, t0, None, &daemon()), t0, Vec::new());
             while let Some(at) = w.refresh_at(t) {
                 let wait = at.duration_since(t.mono).as_secs();
                 looks.push(wait);
                 t = after(t, wait);
                 w.asked();
-                w = Warm::from_status(v, t, Some(&w));
+                w = Warm::from_status(v, t, Some(&w), &daemon());
             }
             (looks, w, t)
         };
@@ -658,7 +680,7 @@ mod tests {
         let look = |w: &Warm| w.refresh_at(t).map(|at| at.duration_since(t.mono).as_secs());
         // Booked (pings, or a worst case's ledger), or another period: anew.
         for other in [st(1, 3, 0.5), st(1, 2, 0.75), st(2, 2, 0.5)] {
-            assert_eq!(look(&Warm::from_status(&other, t, Some(&w))), Some(60), "{other}");
+            assert_eq!(look(&Warm::from_status(&other, t, Some(&w), &daemon())), Some(60), "{other}");
         }
         // Scheduled in between (a retry): the next flight starts anew.
         let retry = Warm::from_status(
@@ -666,12 +688,51 @@ mod tests {
             "ttl_secs": 300, "next_ping_in_secs": 15}}}),
             t,
             Some(&w),
+            &daemon(),
         );
         assert_eq!((retry.flight.clone(), look(&retry)), (None, Some(30)));
-        assert_eq!(look(&Warm::from_status(&st(1, 2, 0.5), t, Some(&retry))), Some(60));
+        assert_eq!(look(&Warm::from_status(&st(1, 2, 0.5), t, Some(&retry), &daemon())), Some(60));
         // An hour's period (or one that doesn't say): six looks at most.
         let (hour, ..) = looks(&json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "in_flight": true, "next_ping_in_secs": 0}}}));
         assert_eq!(hour, [60, 120, 240, 480, 960, 1920], "60 s to 32 min");
+    }
+
+    /// Shady #100 R4.1: a ping is its period's counters within one daemon
+    /// lifetime. The old actor's first ping `(1, 0, 0)` looked at 60 and
+    /// 180 s on (its last look due at 420), or all its looks spent: another
+    /// lifetime's `(1, 0, 0)` (a reload's generation, a cold start's boot)
+    /// is another ping, looked at a minute on. The same lifetime's keeps
+    /// the old one's looks: none left.
+    #[test]
+    fn another_daemon_lifetime_s_ping_is_another() {
+        let t0 = Moment::now();
+        let st = json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 0, "ledger_usd": 0.0,
+            "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}});
+        let life = |boot: &str, generation: u64, pid: u32| {
+            let mut l = DaemonLife::default();
+            (l.boot_id, l.generation, l.pid) = (boot.into(), generation, pid);
+            l
+        };
+        let old = life("b-1", 1, 40);
+        let look = |w: &Warm, at: u64| w.refresh_at(after(t0, at)).map(|i| i.duration_since(t0.mono).as_secs());
+        let mut slow = Warm::from_status(&st, t0, None, &old);
+        for at in [60, 180] {
+            slow.asked();
+            slow = Warm::from_status(&st, after(t0, at), Some(&slow), &old);
+        }
+        assert_eq!(look(&slow, 180), Some(420));
+        let mut spent = slow.clone();
+        spent.asked();
+        let spent = Warm::from_status(&st, after(t0, 420), Some(&spent), &old);
+        assert_eq!((spent.flight.as_ref().map(|f| f.wait), look(&spent, 420)), (Some(None), None), "its looks run out");
+        for (prev, what) in [(&slow, "some looks spent"), (&spent, "all spent")] {
+            for new in [life("b-1", 2, 40), life("b-2", 1, 41), life("", 1, 41)] {
+                let again = Warm::from_status(&st, after(t0, 430), Some(prev), &new);
+                assert_eq!(look(&again, 430), Some(490), "{what}, then {new:?}: a look anew");
+            }
+            let same = Warm::from_status(&st, after(t0, 430), Some(prev), &old);
+            assert_eq!(look(&same, 430), None, "{what}, the same lifetime: none left");
+        }
     }
 
     /// Shady #100 R3.1: time spends a ping's looks, not answers. Answers
@@ -685,22 +746,22 @@ mod tests {
         let t0 = Moment::now();
         let st = json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 2, "ledger_usd": 0.5,
             "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}});
-        let mut w = Warm::from_status(&st, t0, None);
+        let mut w = Warm::from_status(&st, t0, None, &daemon());
         for s in 1..=3 {
             // The reconnect's ask, and its answer.
             w.asked();
-            w = Warm::from_status(&st, after(t0, s), Some(&w));
+            w = Warm::from_status(&st, after(t0, s), Some(&w), &daemon());
             assert_eq!(w.refresh_at(after(t0, s)), Some(after(t0, 60).mono), "answer {s}: the look stands");
         }
         assert_eq!(w.refresh_at(after(t0, 59)), Some(after(t0, 60).mono));
         w.asked();
-        w = Warm::from_status(&st, after(t0, 60), Some(&w));
+        w = Warm::from_status(&st, after(t0, 60), Some(&w), &daemon());
         assert_eq!(w.refresh_at(after(t0, 60)), Some(after(t0, 180).mono), "looked: twice as long");
         w.asked();
-        w = Warm::from_status(&st, after(t0, 61), Some(&w));
+        w = Warm::from_status(&st, after(t0, 61), Some(&w), &daemon());
         assert_eq!(w.refresh_at(after(t0, 61)), Some(after(t0, 180).mono), "an early answer again: the look stands");
         w.asked();
-        let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null}}), after(t0, 180), Some(&w));
+        let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null}}), after(t0, 180), Some(&w), &daemon());
         assert_eq!(w.refresh_at(after(t0, 180)), None, "ended: nothing");
     }
 
@@ -715,25 +776,25 @@ mod tests {
             json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": pings, "ledger_usd": 0.5,
                 "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}})
         };
-        let mut w = Warm::from_status(&st(2), t0, None);
+        let mut w = Warm::from_status(&st(2), t0, None, &daemon());
         let (mut t, mut looks) = (t0, Vec::new());
         while let Some(at) = w.refresh_at(t) {
             let wait = at.duration_since(t.mono).as_secs();
             looks.push(wait);
             t = after(t, wait);
             w.asked();
-            w = Warm::from_status(&st(2), t, Some(&w));
+            w = Warm::from_status(&st(2), t, Some(&w), &daemon());
         }
         assert_eq!(looks, [60, 120, 240], "within the 5m TTL");
         for k in 0..100 {
             t = after(t, 3600);
             w.asked();
-            let next = Warm::from_status(&st(2), t, Some(&w));
+            let next = Warm::from_status(&st(2), t, Some(&w), &daemon());
             assert_eq!(next.flight, w.flight, "answer {k}: no further");
             assert_eq!(next.refresh_at(t), None, "answer {k}: nothing asked");
             w = next;
         }
-        let new = Warm::from_status(&st(3), t, Some(&w));
+        let new = Warm::from_status(&st(3), t, Some(&w), &daemon());
         assert_eq!(new.refresh_at(t), Some(after(t, 60).mono), "another ping: a minute on");
     }
 
@@ -745,7 +806,7 @@ mod tests {
     fn a_suspended_machine_wakes_to_the_cache_s_real_age() {
         let t0 = Moment::now();
         let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
-        let mut w = Warm::from_status(&status(), t0, None);
+        let mut w = Warm::from_status(&status(), t0, None, &daemon());
         w.next_ping = Some(Duration::from_secs(120));
         let awake = after(t0, 60);
         assert_eq!(expires(Some(&e), true, awake).text, "about 3:00");
@@ -773,7 +834,7 @@ mod tests {
         let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
         let now = Moment { mono: t0.mono + Duration::from_secs(60), wall: t0.wall - Duration::from_secs(3600) };
         assert_eq!(expires(Some(&e), true, now).text, "about 3:00");
-        assert!(!Warm::from_status(&status(), t0, None).slept(now));
+        assert!(!Warm::from_status(&status(), t0, None, &daemon()).slept(now));
         let far = Moment { mono: t0.mono + Duration::from_secs(86_400), wall: t0.wall - Duration::from_secs(1) };
         assert_eq!(e.warm_left(far), Some(Duration::ZERO));
         assert_eq!(e.next_change(far), None);
@@ -792,7 +853,7 @@ mod tests {
         let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
         assert_eq!(expires(Some(&e), true, at(10, 14)).text, "about 3:46");
         assert_eq!(expires(Some(&e), true, at(11, 11)).text, "about 3:45", "one second on, not three back");
-        let w = Warm::from_status(&status(), t0, None);
+        let w = Warm::from_status(&status(), t0, None, &daemon());
         assert_eq!(w.ping_in(at(10, 14)), Some(Duration::from_secs(2986)));
         assert_eq!(w.ping_in(at(11, 11)), Some(Duration::from_secs(2985)), "the next ping's countdown too");
         // Run out by a wall clock far ahead, then corrected: still run out.
