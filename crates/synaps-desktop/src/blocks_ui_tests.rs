@@ -1,6 +1,7 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
 //! the edit preview's text drawn as D1 draws agent text (P2-9), a file's
-//! header (P2-10), and the `op skipped` chip. Each fails on `653c30c`.
+//! header (P2-10), a metric at 320 px (P2-11), and the `op skipped` chip. Each
+//! fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
@@ -216,6 +217,47 @@ fn a_file_header_shows_its_path_line_and_note(cx: &mut TestAppContext) {
                 let n = drawn(cx, w, format!("block-file-note {f} TokenStore::rotate"));
                 assert!(f32::from(n.size.width) > 40. && n.right() <= block.right(), "{width} {name}: the note");
             }
+        }
+    }
+}
+
+/// P2-11: a metric's legal value and unit (16 characters each, wide ones
+/// too) and `was` stay inside a 320 px pane, at the largest text step too.
+#[gpui_kit::test]
+fn a_long_metric_fits_a_320_px_pane(cx: &mut TestAppContext) {
+    for (width, text) in [(320. + 2. * crate::app::STRIP, 16), (320. + 2. * crate::app::STRIP, 22), (1500., 22)] {
+        let (w, view) = blocks_at(cx, width, text);
+        let wide16 = "ＷＷＷＷＷＷＷＷＷＷＷＷＷＷＷＷ";
+        let put = json!([
+            {"op":"put","id":"m1","kind":"metric","body":{"label":"rotations per 32 refreshes","value":wide16,"unit":"ｍｍｍｍｍｍｍｍｍｍｍｍｍｍｍｍ","was":wide16,"state":"bad"}},
+            {"op":"put","id":"m2","kind":"metric","body":{"label":"latency","value":"1234567890.12345","unit":"milliseconds/op","was":"999999999.999999","series":[1,2,3],"state":"warn"}}
+        ]);
+        put_mid(cx, w, &view, put);
+        let list = view.read_with(cx, |v, _| v.panes.cur.list.viewport_bounds());
+        for name in ["m1", "m2"] {
+            let m = id(cx, &view, name);
+            let block = drawn(cx, w, format!("block {m}"));
+            assert!(block.right() <= list.right() + px(0.5), "{width}/{text} {name}: the block inside the pane ({block:?} in {list:?})");
+            let value = drawn(cx, w, format!("block-value {m}"));
+            assert!(
+                value.left() >= block.left() && value.right() <= block.right() + px(0.5),
+                "{width}/{text} {name}: the value inside its block ({value:?} in {block:?})"
+            );
+            // One line, in the metric's 44 px, the block its structure's
+            // height (§6.2): nothing wraps over the label or the series.
+            let g = view.read_with(cx, |v, _| crate::blocks::Geo::of(&v.panes.cur.metrics_last.get().expect("drawn")));
+            let metric = drawn(cx, w, format!("block-metric {m}"));
+            assert!(metric.right() <= block.right() + px(0.5), "{width}/{text} {name}: the body inside");
+            assert!(
+                value.top() >= metric.top() - px(0.5) && value.bottom() <= metric.top() + px(g.metric + 0.5),
+                "{width}/{text} {name}: the value on its line ({value:?} in {metric:?})"
+            );
+            let series = if name == "m2" { g.series } else { 0. };
+            let pad = view.read_with(cx, |v, _| (6. * v.panes.cur.metrics_last.get().expect("drawn").r).round());
+            assert!(
+                (f32::from(block.size.height) - (g.head + g.metric + series + pad)).abs() < 0.5,
+                "{width}/{text} {name}: the block's height is its structure's ({block:?})"
+            );
         }
     }
 }

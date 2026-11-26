@@ -259,6 +259,11 @@ pub(crate) fn note_lines(text: &str, cpl: f32) -> usize {
 
 /// The tooltip of the `op skipped` chip.
 pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was skipped: it changed nothing here. Not the block's state.";
+
+/// A metric's value or unit, in mono columns (a wide character takes two).
+fn cols(s: &str) -> usize {
+    s.chars().map(|c| if (c as u32) < 0x1100 { 1 } else { 2 }).sum()
+}
 /// An edit preview: its groups, and how many earlier ones folded away.
 pub(crate) type Preview = (Vec<EditGroup>, usize);
 
@@ -802,13 +807,37 @@ impl AppView {
             Body::Metric(mt) => {
                 let value_c = glow(7, bound_value(s, |b| if let Body::Metric(x) = b { Some(x.value.clone()) } else { None }), p.ink);
                 let narrow = !fit.notes;
-                let value = div()
-                    .flex_none()
+                // The value and its unit (16 characters each, legal): one
+                // run at 22 px while it fits its room, else at the label's
+                // size; past that each ellipsizes, the unit first, and the
+                // tooltip has it whole (Shady #101 P2-11).
+                let (value, unit) = (
+                    crate::ask::shown(&mt.value, cards_spec::Lines::Single),
+                    mt.unit.as_deref().map(|u| crate::ask::shown(u, cards_spec::Lines::Single)),
+                );
+                let room = (self.panes.cur.layout.column - g.spine - 2. * g.pad) * if narrow { 1. } else { 0.6 };
+                let big = (22. * m.r).round();
+                let wide = (cols(&value) + unit.as_deref().map_or(0, cols)) as f32 * big * 0.6;
+                let size = if wide <= room { big } else { m.label };
+                let whole = match &mt.was {
+                    Some(w) => {
+                        format!("{value}{} · was {}", unit.clone().unwrap_or_default(), crate::ask::shown(w, cards_spec::Lines::Single))
+                    }
+                    None => format!("{value}{}", unit.clone().unwrap_or_default()),
+                };
+                let run = |d: Div| d.min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap();
+                let value = h_flex()
+                    .id(("block-value", id))
+                    .min_w_0()
+                    .max_w(px(room))
+                    .flex_shrink(1.)
                     .font_family(fonts::MONO)
-                    .text_px((22. * m.r).round())
+                    .text_px(size)
                     .text_color(value_c)
                     .debug_selector(move || format!("block-value {id}"))
-                    .child(format!("{}{}", mt.value, mt.unit.as_deref().unwrap_or_default()));
+                    .child(run(div()).flex_shrink(1.).child(value))
+                    .children(unit.map(|u| run(div()).flex_shrink(2.).child(u)))
+                    .tooltip(move |window, cx| crate::overlay::tip(whole.clone(), window, cx));
                 let label = div()
                     .min_w_0()
                     .overflow_hidden()
