@@ -1995,7 +1995,8 @@ impl Model {
                 // The cache is not what it was: both asked again. Any applied
                 // setting may make the next request another (thinking is in
                 // the cache's identity): its cache is asked again.
-                if self.lives[lid].stats.on_session(&event, &raw) && self.cache_expiry {
+                let news = self.lives[lid].stats.on_session(&event, &raw);
+                if news != crate::stats::CacheNews::Nothing && self.cache_expiry {
                     self.ask_panel(lid, attach_seq, &mut effects);
                 } else if raw["ev"] == "setting_changed" && raw["applied"]["ok"] != false {
                     self.ask_expiry(lid, attach_seq, &mut effects);

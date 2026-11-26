@@ -9702,3 +9702,42 @@ fn an_answer_does_not_outlive_the_daemon_s_cache_query(cx: &mut TestAppContext) 
     restore(cx, &kept);
     assert!(!drawn(cx, "right-cache-expires cold"), "a restored tab's answer is the old daemon's");
 }
+
+/// Shady #100 F4: a keep-warm ping in flight is no poll. The status says
+/// it is due (`next_ping_in_secs: 0`, `in_flight`), and says so again
+/// whenever asked: nothing is asked however long it stays so. Its booking
+/// (an idle `Conversation` whose keep-warm tokens grew: SynapsCLI books
+/// every ping so) asks both once; a digest that books nothing, nothing.
+#[gpui_kit::test]
+fn an_in_flight_ping_is_not_polled_and_its_booking_asks_once(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"));
+    let in_flight = || synaps_client::Event::SessionStatus {
+        attach_seq: seq,
+        value: json!({"keepwarm": {"mode": "auto", "active": true, "session_pings": 2,
+            "period": {"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}}),
+    };
+    let digest = |kw_read: u64| {
+        let v = json!({"ev": "conversation", "digest": {"messages_len": 4, "messages_hash": 1, "cost": 0.5,
+            "tokens": {"input": 100, "output": 50, "cache_read": 900 + kw_read, "cache_creation": 100},
+            "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": kw_read, "cache_creation": 0}}});
+        let e = synaps_client::protocol::decode_event(&v).expect("a digest");
+        synaps_client::Event::session(seq, sid.clone(), 0, e, std::sync::Arc::new(v))
+    };
+    deliver(cx, window, &view, vec![digest(800), in_flight(), cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3000}))]);
+    panel_asks(cx, &view);
+    for _ in 0..5 {
+        pass(cx, window, &view, 31);
+        // Asked: the daemon answers as it stands, the ping still in flight.
+        let asked = panel_asks(cx, &view);
+        if asked.iter().any(|a| a.1 == "status") {
+            deliver(cx, window, &view, vec![in_flight()]);
+        }
+        assert_eq!(asked, [], "no poll while the ping is in flight");
+    }
+    deliver(cx, window, &view, vec![digest(1600)]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "the ping booked: both, once");
+    deliver(cx, window, &view, vec![digest(1600)]);
+    assert_eq!(panel_asks(cx, &view), [], "nothing booked: nothing");
+}

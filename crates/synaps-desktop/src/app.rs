@@ -5046,8 +5046,9 @@ impl AppView {
                     }
                     slept
                 });
-                // A due ping moved the cache's anchor: ask once.
-                let asks = v.model.expiry_query;
+                // Asleep: both asked again. A scheduled ping due: its
+                // status, once (its booking asks both when it is done).
+                let asks = v.model.expiry_query && slept;
                 if (slept || refresh.is_some_and(|r| now.mono >= r))
                     && let (Some(c), Some(seq)) = (&v.client, seq)
                 {
@@ -5065,7 +5066,7 @@ impl AppView {
                         }
                     }
                     if let Some(w) = stats.warm.as_mut() {
-                        w.next_ping = None;
+                        w.refresh = false;
                     }
                 } else if zero.is_some_and(|z| now.mono >= z)
                     && let (Some(c), Some(seq)) = (&v.client, seq)

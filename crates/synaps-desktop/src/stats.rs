@@ -148,10 +148,26 @@ pub struct Stats {
     pub expiry: Option<crate::warm::Expiry>,
     /// A `stale` answer was asked once more (and not answered since).
     pub expiry_retried: bool,
+    /// The keep-warm pings' tokens, as last said (the attach, a digest): a
+    /// digest whose differ says a ping was booked ([`CacheNews::Pinged`]).
+    pub keepwarm: Option<Tokens>,
     /// The model's [`crate::model::Model::cache_epoch`] when `warm` and
     /// `expiry` were answered: a tab's numbers restored under a later one
     /// (the daemon refused the query, or lost it, since) keep neither.
     pub cache_epoch: u64,
+}
+
+/// What a live event says of the session's prompt cache ([`Stats::on_session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheNews {
+    Nothing,
+    /// Not what it was (the history replaced, the model changed): the
+    /// countdown is dropped and the daemon asked again.
+    New,
+    /// A keep-warm ping was booked (an idle digest's keep-warm tokens grew:
+    /// SynapsCLI books every ping it sent, success or not): the daemon is
+    /// asked again, the countdown kept until it answers.
+    Pinged,
 }
 
 impl Stats {
@@ -185,6 +201,7 @@ impl Stats {
             warm,
             expiry,
             expiry_retried: false,
+            keepwarm: Tokens::from_value(&a.conversation.keepwarm_tokens),
             cache_epoch,
         };
         self.subagents.replaying(true);
@@ -217,17 +234,22 @@ impl Stats {
     }
 
     /// A live event; `raw` is the wire event (fields the mirror drops).
-    /// `true`: the session's prompt cache is not what it was (the history
-    /// was replaced, or the model changed): the countdown is dropped, and
-    /// the daemon is asked again.
-    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) -> bool {
+    /// What it says of the session's prompt cache: not what it was (the
+    /// countdown is dropped), or a ping booked.
+    pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) -> CacheNews {
         self.subagents.on_session(ev);
         let mut new_cache = false;
+        let mut pinged = false;
         match ev {
             SessionEvent::Conversation { digest } => {
                 // `keepwarm_tokens` is not on the decoded digest: from the wire event.
-                if let Some(t) = Tokens::conversation(&digest.tokens, &raw["digest"]["keepwarm_tokens"]) {
+                let kw = &raw["digest"]["keepwarm_tokens"];
+                if let Some(t) = Tokens::conversation(&digest.tokens, kw) {
                     self.tokens = Some(t);
+                }
+                if let Some(k) = Tokens::from_value(kw) {
+                    pinged = self.keepwarm.is_some_and(|was| was != k);
+                    self.keepwarm = Some(k);
                 }
                 if let Some(c) = known_cost(digest.cost, self.tokens) {
                     self.cost = Some(c);
@@ -271,8 +293,12 @@ impl Stats {
         }
         if new_cache {
             self.expiry = None;
+            CacheNews::New
+        } else if pinged {
+            CacheNews::Pinged
+        } else {
+            CacheNews::Nothing
         }
-        new_cache
     }
 
     /// Context use, 0..=1, when both the prompt size and the window are known.
@@ -398,8 +424,9 @@ mod tests {
         let (e, raw) = ev(json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": 1, "cost": 0.1,
             "tokens": {"input": 100, "output": 50, "cache_read": 1900, "cache_creation": 100},
             "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": 1800, "cache_creation": 0}}}));
-        s.on_session(&e, &raw);
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Pinged, "a ping booked since the attach");
         assert_eq!(s.tokens.unwrap().cache_read, 100);
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Nothing, "nothing booked since");
         assert!(!s.detached);
         s.on_detached();
         assert!(s.detached);

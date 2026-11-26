@@ -1,6 +1,6 @@
 //! The right panel's prompt cache and keep-warm numbers. Two answers, each
-//! asked on attach, at a turn's end, on a keep-warm notice, once after a due
-//! ping, after a sleep, and when the model or the history changes: never
+//! asked on attach, at a turn's end, on a keep-warm notice or a ping's
+//! booking, after a sleep, and when the model or the history changes: never
 //! polled.
 //!
 //! - **The cache** ([`Expiry`]): the session's `cache_expiry` query
@@ -12,7 +12,9 @@
 //!   change, and once more on `stale`. A daemon that can't answer it shows
 //!   `—`, never `cold`, and no answer it gave before.
 //! - **Keep-warm** ([`Warm`]): the session's `Status` (`keepwarm`,
-//!   `pinned`): mode, pin, pings, spend and next ping.
+//!   `pinned`): mode, pin, pings, spend and next ping. A ping scheduled is
+//!   asked about once after it is due (its schedule only); one in flight
+//!   is not asked about at all: its booking says when it is done.
 //!
 //! The countdowns cost no idle frames: redrawn when what they say changes,
 //! once a second under ten minutes, once a minute above, only while the
@@ -29,11 +31,9 @@ use synaps_client::{CacheExpiry, CacheReason, CacheState, Event, QueryError, Ses
 
 /// Under this a countdown shows seconds (and ticks at 1 Hz).
 pub(crate) const SECONDS_UNDER: Duration = Duration::from_secs(600);
-/// After a due ping, the daemon is asked again this much later (the ping's
-/// new anchor).
+/// A scheduled ping's status is asked this much after it is due.
 const AFTER_PING: Duration = Duration::from_secs(5);
-/// Never asked again sooner than this after the last answer, whatever the
-/// next ping says (a ping held at `0 s` must not become a poll).
+/// ... and never sooner than this after the answer that scheduled it.
 const REFRESH_MIN: Duration = Duration::from_secs(30);
 
 /// The wall clock ran this much further than the monotonic one since a
@@ -143,18 +143,27 @@ pub(crate) struct Warm {
     pub spent: f64,
     /// The active period's next ping, from `at`.
     pub next_ping: Option<Duration>,
+    /// The status is asked once after that ping is due ([`Warm::refresh_at`]):
+    /// a ping scheduled (`next_ping_in_secs` above zero), not asked yet. A
+    /// ping in flight (SynapsCLI says `0`, `in_flight`) schedules none:
+    /// however often that is said, nothing is asked until its booking
+    /// (Shady #100 F4).
+    pub refresh: bool,
 }
 
 impl Warm {
     pub fn from_status(v: &Value, at: Moment) -> Warm {
         let kw = &v["keepwarm"];
+        let period = &kw["period"];
+        let next_ping = period["next_ping_in_secs"].as_u64().map(Duration::from_secs);
         Warm {
             at: Age::new(at),
             mode: kw["mode"].as_str().unwrap_or_default().to_string(),
             pinned: v["pinned"].as_bool().unwrap_or(false),
             pings: kw["session_pings"].as_u64().unwrap_or(0),
             spent: kw["session_keepwarm_usd"].as_f64().or_else(|| v["keepwarm_cost"].as_f64()).unwrap_or(0.),
-            next_ping: kw["period"]["next_ping_in_secs"].as_u64().map(Duration::from_secs),
+            next_ping,
+            refresh: next_ping.is_some_and(|d| !d.is_zero()) && period["in_flight"] != true,
         }
     }
 
@@ -180,11 +189,12 @@ impl Warm {
         self.ping_in(now).and_then(step).map(|d| now.mono + d + Duration::from_millis(5))
     }
 
-    /// When to ask the daemon again: a little after the next ping is due
-    /// (it moves the cache's anchor), and not within [`REFRESH_MIN`] of the
-    /// last answer. `None`: no ping is due.
+    /// When to ask for the status again: a little after the ping it
+    /// schedules is due, and not within [`REFRESH_MIN`] of the answer.
+    /// `None`: no ping scheduled, or asked already.
     pub fn refresh_at(&self, now: Moment) -> Option<Instant> {
-        self.next_ping.map(|d| now.mono + (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.at.at(now)))
+        let d = self.next_ping.filter(|d| self.refresh && !d.is_zero())?;
+        Some(now.mono + (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.at.at(now)))
     }
 }
 
@@ -499,12 +509,27 @@ mod tests {
         let mut w = Warm::from_status(&status(), t0);
         w.next_ping = Some(Duration::from_secs(42));
         assert_eq!(w.next_change(t0).map(|at| at.duration_since(t0.mono)), Some(Duration::from_millis(1005)));
-        // A due ping: asked again after it, at most every 30 s.
+        // A scheduled ping: its status asked after it is due, not within
+        // 30 s of the answer.
         assert_eq!(w.refresh_at(t0), Some(t0.mono + Duration::from_secs(47)));
-        w.next_ping = Some(Duration::ZERO);
-        assert_eq!((w.next_change(t0), w.refresh_at(t0)), (None, Some(t0.mono + REFRESH_MIN)));
+        w.next_ping = Some(Duration::from_secs(3));
+        assert_eq!(w.refresh_at(t0), Some(t0.mono + REFRESH_MIN));
         w.next_ping = Some(Duration::from_secs(3000));
         assert_eq!(w.refresh_at(t0), Some(t0.mono + Duration::from_secs(3005)));
+        // Asked: spent.
+        w.refresh = false;
+        assert_eq!(w.refresh_at(t0), None);
+        // Due or in flight (`0`): nothing scheduled, nothing asked (its
+        // booking says when it is done).
+        for period in [
+            json!({"next_ping_in_secs": 0, "in_flight": true}),
+            json!({"next_ping_in_secs": 0}),
+            json!({"next_ping_in_secs": 9, "in_flight": true}),
+        ] {
+            let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": period}}), t0);
+            assert_eq!(w.refresh_at(t0), None, "{period}");
+        }
+        let mut w = Warm::from_status(&status(), t0);
         w.next_ping = None;
         assert_eq!((w.next_change(t0), w.refresh_at(t0)), (None, None));
     }
