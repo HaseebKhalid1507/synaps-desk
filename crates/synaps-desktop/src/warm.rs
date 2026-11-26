@@ -1,7 +1,8 @@
 //! The right panel's prompt cache and keep-warm numbers. Two answers, each
 //! asked on attach, at a turn's end, on a keep-warm notice or a ping's
 //! booking, after a sleep, and when the model or the history changes: never
-//! polled.
+//! polled. Every ask is the model's ([`crate::model::Model::panel_due`] for
+//! the timer's), each a fresh one with its own `stale` retry.
 //!
 //! - **The cache** ([`Expiry`]): the session's `cache_expiry` query
 //!   (SynapsCLI #462): what its own requests show about the prompt cache,

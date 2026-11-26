@@ -522,7 +522,7 @@ impl Model {
 
     /// Ask store `lid`'s attachment `seq` for the right panel's numbers:
     /// its status, and its cache from a daemon that answers it.
-    pub(crate) fn ask_panel(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+    fn ask_panel(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
         effects.push(Effect::Status(seq));
         self.ask_expiry(lid, seq, effects);
     }
@@ -530,7 +530,7 @@ impl Model {
     /// Ask store `lid`'s attachment `seq` for its cache's evidence: a fresh
     /// ask, the one way every ask but a retry goes (a `stale` answer is
     /// asked once more after it, once).
-    pub(crate) fn ask_expiry(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+    fn ask_expiry(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
         if self.expiry_query {
             self.lives[lid].stats.expiry_retried = false;
             effects.push(Effect::CacheExpiry(seq));
@@ -551,6 +551,66 @@ impl Model {
             }
             s.cache_epoch = self.cache_epoch;
         }
+    }
+
+    /// When store `lid`'s right panel next needs its timer, shown and
+    /// attached as `seq` (`None`: nothing can be asked): a countdown's next
+    /// change, a scheduled ping's status, the cache's zero, or at once after
+    /// a sleep. `None`: nothing counts.
+    pub fn panel_wake(&self, lid: LiveId, seq: Option<u64>, now: crate::warm::Moment) -> Option<std::time::Instant> {
+        let s = &self.lives[lid].stats;
+        let asks = seq.is_some() && self.cache_expiry;
+        let (w, e) = (s.warm.as_ref(), s.expiry.as_ref().filter(|_| self.expiry_query));
+        [
+            w.and_then(|w| w.next_change(now)),
+            e.and_then(|e| e.next_change(now)),
+            w.and_then(|w| w.refresh_at(now)).filter(|_| asks),
+            e.and_then(|e| e.zero_at(now)).filter(|_| asks),
+            w.is_some_and(|w| w.slept(now)).then_some(now.mono),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Store `lid`'s right panel's timer fired at `now`, armed for its
+    /// attachment `seq` (Shady #100 F5, F6): what is due now of what the
+    /// store holds now (an answer since counts on its own) is asked, as
+    /// any fresh ask ([`Model::ask_panel`], [`Model::ask_expiry`]: its own
+    /// `stale` retry), and spent. The store attached otherwise since (a
+    /// reconnect, a switch): nothing asked, nothing spent.
+    pub fn panel_due(&mut self, lid: LiveId, seq: Option<u64>, now: crate::warm::Moment) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let (cache, query) = (self.cache_expiry, self.expiry_query);
+        let l = &mut self.lives[lid];
+        let seq = seq.filter(|&s| cache && l.attachment() == Some(s));
+        let stats = &mut l.stats;
+        // Asleep: what it said is aged by the sleep, read again from here.
+        let slept = stats.warm.as_mut().is_some_and(|w| {
+            let slept = w.slept(now);
+            if slept {
+                w.rebase(now);
+            }
+            slept
+        });
+        let Some(seq) = seq else { return effects };
+        let due = |at: Option<std::time::Instant>| at.is_some_and(|at| now.mono >= at);
+        let ping = stats.warm.as_mut().filter(|w| due(w.refresh_at(now))).map(|w| w.refresh = false).is_some();
+        let zero = query && stats.expiry.as_mut().filter(|e| due(e.zero_at(now))).map(|e| e.zero = false).is_some();
+        if slept {
+            // Asked again: both.
+            self.ask_panel(lid, seq, &mut effects);
+        } else {
+            // A scheduled ping is due: its schedule.
+            if ping {
+                effects.push(Effect::Status(seq));
+            }
+            // The countdown's zero: the cache, once more.
+            if zero {
+                self.ask_expiry(lid, seq, &mut effects);
+            }
+        }
+        effects
     }
 
     /// Ask for the saved lists again (on connect, after a rename, a resume,
@@ -3227,6 +3287,41 @@ mod tests {
         // Another attachment's answer is not this store's.
         m.apply(expiry(7, json!({"state": "cold", "reason": "expired"})));
         assert_eq!(left(&m), Some(200));
+    }
+
+    /// Shady #100 F6, F5 (the model's half): the panel's timer acts for the
+    /// attachment it was armed for only. After a reconnect (another
+    /// attachment) nothing is asked and nothing spent; the new attachment's
+    /// timer asks, each a fresh ask (its own `stale` retry), once.
+    #[test]
+    fn the_panel_timer_acts_for_its_own_attachment_once() {
+        use crate::warm::Moment;
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        let t0 = Moment::now();
+        let later = Moment { mono: t0.mono + std::time::Duration::from_secs(40), wall: t0.wall + std::time::Duration::from_secs(40) };
+        let st = json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "next_ping_in_secs": 10}}});
+        m.apply(Event::SessionStatus { attach_seq: 1, value: st });
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 2})));
+        m.apply(expiry(1, json!({"error": {"code": "stale"}})));
+        assert!(m.lives[LiveId::FIRST].stats.expiry_retried);
+        // Reconnected: attachment 2, the same session (its answers kept).
+        m.want(LiveId::FIRST, 2);
+        m.apply(Event::Attached { attach_seq: 2, attached: attached("s"), mode: AttachMode::Mirror, reconnect: true });
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), later), [], "armed for attachment 1: gone");
+        assert!(m.panel_wake(LiveId::FIRST, Some(2), later).is_some_and(|at| at <= later.mono), "still due for 2");
+        m.lives[LiveId::FIRST].stats.expiry_retried = true;
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(2), later), [Effect::Status(2), Effect::CacheExpiry(2)], "the ping's, the zero's");
+        assert!(!m.lives[LiveId::FIRST].stats.expiry_retried, "a fresh ask: its own retry");
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(2), later), [], "once");
+        // The status says the ping is in flight, as often as asked: no ask.
+        let st = json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "next_ping_in_secs": 0, "in_flight": true}}});
+        m.apply(Event::SessionStatus { attach_seq: 2, value: st });
+        let much_later =
+            Moment { mono: later.mono + std::time::Duration::from_secs(600), wall: later.wall + std::time::Duration::from_secs(600) };
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(2), much_later), []);
     }
 
     /// `Event::CacheExpiry` for attachment `seq`, the daemon's `value`.

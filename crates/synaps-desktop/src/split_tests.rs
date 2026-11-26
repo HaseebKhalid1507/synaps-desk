@@ -7573,3 +7573,52 @@ fn a_lost_cache_query_reaches_every_pane(cx: &mut TestAppContext) {
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// Shady #100 F6: the right panel's timer acts on the store and the
+/// attachment it was armed for, while that store shows, and on what is
+/// due then. Armed for A's zero, B focused before the next frame, it
+/// fires: nothing asked, B's countdown untouched (B asks at its own zero),
+/// A asks once shown again. Armed for an answer replaced before it fires:
+/// the new answer's zero is its own.
+#[gpui_kit::test]
+fn the_cache_timer_acts_only_on_what_it_was_armed_for(cx: &mut TestAppContext) {
+    let (window, view, client, _kept, p0, p1) = two_panes_wide(cx, "cache-timer-owner");
+    let (a, b) = (attachment_of(cx, &view, p0), attachment_of(cx, &view, p1));
+    cache_on(cx, &view);
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    // The caret at rest (no frame of its own: none drawn before the timer).
+    cx.executor().advance_clock(Duration::from_secs(11));
+    frame(cx, window);
+    let warm = |seq: u64, secs: u64| cache_reply(seq, json!({"state": "warm", "warm_for_secs": secs}));
+    give(cx, window, &view, vec![warm(a, 2), warm(b, 5)]);
+    assert_eq!(panel_asks(cx, &view), []);
+    // B focused, and A's timer fires before the next frame.
+    view.update(cx, |v, _| {
+        assert!(v.enter_pane(p1));
+        v.panes.focused = p1;
+    });
+    crate::warm::skew(Duration::from_secs(2), Duration::from_secs(2));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(panel_asks(cx, &view), [], "A's timer with B shown: nothing");
+    frame(cx, window);
+    pass(cx, window, 3);
+    assert_eq!(panel_asks(cx, &view), [(b, "cache_expiry")], "B's own zero");
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert_eq!(panel_asks(cx, &view), [(a, "cache_expiry")], "A's, shown again");
+    // Armed for A's answer, replaced before it fires.
+    give(cx, window, &view, vec![warm(a, 2)]);
+    view.update(cx, |v, _| {
+        let _ = v.model.apply(warm(a, 10));
+    });
+    crate::warm::skew(Duration::from_secs(2), Duration::from_secs(2));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    frame(cx, window);
+    assert_eq!(panel_asks(cx, &view), [], "the new answer counts down");
+    pass(cx, window, 9);
+    assert_eq!(panel_asks(cx, &view), [(a, "cache_expiry")], "at its own zero");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
