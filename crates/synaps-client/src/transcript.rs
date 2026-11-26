@@ -628,6 +628,17 @@ impl Transcript {
         self.blocks.len()
     }
 
+    /// What the history's blocks keep, its worker's fold included, roughly
+    /// (bytes: [`crate::blocks::HistoryBlocks::bytes`]).
+    pub fn blocks_bytes(&self) -> usize {
+        self.blocks.bytes()
+    }
+
+    /// What the history's worker keeps ([`crate::blocks::Retained`]).
+    pub fn blocks_retained(&self) -> crate::blocks::Retained {
+        self.blocks.worker().lock().unwrap_or_else(std::sync::PoisonError::into_inner).retained()
+    }
+
     /// The board the rows draw, the last one published.
     pub fn drawn(&self) -> Option<&Arc<crate::blocks::Drawn>> {
         self.drawn.as_ref()

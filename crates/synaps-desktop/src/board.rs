@@ -3,8 +3,12 @@
 //!
 //! B2's fold, overlay and bound prefix run to their end, so the frame never
 //! runs them. Each session store ([`crate::live::Live`]) has one
-//! [`Work`]: a [`Worker`] that keeps the history's fold across jobs, and
-//! at most one job at a time.
+//! [`Work`], at most one job at a time on its transcript's history's
+//! [`Worker`] (the history's: it keeps the fold across jobs, and goes
+//! where the transcript goes).
+//! - **A store let go of its transcript** (a switch away, a close, a
+//!   store reused or dropped) lets go of its work: the job stops, a board
+//!   waiting is dropped, and so are re-folds for it ([`AppView::board_out`]).
 //! - **Live events are coalesced.** A frame asks for a board only when
 //!   the transcript's input revision moved
 //!   ([`synaps_client::Transcript::blocks_rev`]), once for everything that
@@ -55,7 +59,6 @@ pub(crate) const STEP: Duration = Duration::from_millis(30);
 /// One session store's board work.
 #[derive(Default)]
 pub(crate) struct Work {
-    worker: Arc<Mutex<Worker>>,
     /// The input revision asked for last.
     asked: Option<u64>,
     /// The running job's: set when a newer input supersedes it.
@@ -67,6 +70,29 @@ pub(crate) struct Work {
     /// A finished board that waits for a pane's pointer lease to end
     /// ([`crate::lease`]).
     pub(crate) waiting: Option<Arc<Drawn>>,
+}
+
+impl Work {
+    /// Its transcript left (module docs): no job, no board waiting, nothing
+    /// asked yet of the next one.
+    fn clear(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.job = None;
+        self.asked = None;
+        self.waiting = None;
+    }
+
+    /// Its transcript's board, revision `rev`, is the one drawn: nothing to
+    /// fold (a closing pane's rows).
+    pub(crate) fn settled(&mut self, rev: u64) {
+        self.asked = Some(rev);
+    }
+
+    /// Whether a job runs (tests).
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> bool {
+        self.job.is_some()
+    }
 }
 
 // The re-fold slot's callers are D7's revision view and D8's outcomes;
@@ -219,14 +245,12 @@ async fn yield_now() {
     .await
 }
 
-impl Work {
-    /// The events a re-fold of `input` reads in full, the journal's then
-    /// the live turn's (tests: the reference).
-    #[cfg(test)]
-    pub(crate) fn events(&self, input: &Input) -> Vec<Event> {
-        let journal = self.worker.lock().unwrap_or_else(PoisonError::into_inner).journal(input).expect("no gap");
-        journal.iter().chain(&input.live.events).cloned().collect()
-    }
+/// The events a re-fold of `input` reads in full, its history's journal
+/// then the live turn's (tests: the reference).
+#[cfg(test)]
+pub(crate) fn events(input: &Input) -> Vec<Event> {
+    let journal = input.worker.lock().unwrap_or_else(PoisonError::into_inner).journal(input).expect("no gap");
+    journal.iter().chain(&input.live.events).cloned().collect()
 }
 
 /// What one step came to.
@@ -301,7 +325,7 @@ impl AppView {
         };
         let stop = Arc::new(AtomicBool::new(false));
         l.board.stop = stop.clone();
-        let (worker, steps, input) = (l.board.worker.clone(), l.board.steps.clone(), Arc::new(input));
+        let (worker, steps, input) = (input.worker.clone(), l.board.steps.clone(), Arc::new(input));
         l.board.job = Some(cx.spawn(async move |this, cx| {
             loop {
                 let (w, s, i, n) = (worker.clone(), stop.clone(), input.clone(), steps.clone());
@@ -368,7 +392,7 @@ impl AppView {
             return;
         };
         let (epoch, generation, read) = (input.epoch, input.generation, Read::of(target, &input, rev));
-        let worker = self.model.lives[live].board.worker.clone();
+        let worker = input.worker.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         self.refolds.started += 1;
@@ -399,7 +423,7 @@ impl AppView {
     fn refold_ended(&mut self, live: LiveId, target: Target, read: Read, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
-        let holds = self.model.lives.get_mut(live).is_some_and(|l| {
+        let holds = self.model.lives.get(live).is_some_and(|l| {
             let t = &l.transcript;
             read.holds(t.blocks_epoch(), t.blocks_len(), t.blocks_rev())
         });
@@ -422,7 +446,29 @@ impl AppView {
         if l.transcript.blocks_epoch() != drawn.epoch {
             return;
         }
+        // A pane's block state is of the history it was made on: another's
+        // (another session, or a cleared or compacted one) starts over, as
+        // row ids are of block names, which histories reuse. The same one
+        // folded again (a resync, a tab shown again) keeps it.
+        let of = crate::blocks::history_of(l.transcript.session_id(), &drawn);
+        for p in self.panes.iter_mut().filter(|p| p.live == live && p.block_of != of) {
+            p.blocks_over(of);
+        }
         self.board_ready(live, drawn, cx);
+    }
+
+    /// Store `live` let go of its transcript (module docs): its job, the
+    /// board waiting and its re-folds go.
+    pub(crate) fn board_out(&mut self, live: LiveId) {
+        if let Some(l) = self.model.lives.get_mut(live) {
+            l.board.clear();
+        }
+        let r = &mut self.refolds;
+        if let Some(j) = r.running.as_ref().filter(|j| j.live == live) {
+            j.stop.store(true, Ordering::Relaxed);
+        }
+        r.next = r.next.filter(|n| n.0 != live);
+        r.done = r.done.take().filter(|d| d.live != live);
     }
 }
 

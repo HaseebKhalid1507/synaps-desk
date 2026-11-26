@@ -667,7 +667,7 @@ fn refolds_run_one_at_a_time_and_drop_when_their_history_changes(cx: &mut TestAp
     let live = view.read_with(cx, |v, _| v.panes.cur.live);
     let (events, generation) = view.read_with(cx, |v, _| {
         let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
-        (v.model.lives[live].board.events(&i), i.generation)
+        (crate::board::events(&i), i.generation)
     });
     let want = |at: Target| {
         let mut rf = Refold::to(generation, &events, at).unwrap();
@@ -731,7 +731,7 @@ fn a_refold_holds_for_the_input_it_read(cx: &mut TestAppContext) {
     let reference = |cx: &mut TestAppContext, at: Target| {
         view.read_with(cx, |v, _| {
             let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
-            let events = v.model.lives[live].board.events(&i);
+            let events = crate::board::events(&i);
             let mut rf = Refold::to(i.generation, &events, at).unwrap();
             while !rf.step(usize::MAX).unwrap() {}
             rf.state().cloned()
@@ -843,6 +843,212 @@ fn an_edit_preview_is_built_as_edits_commit_not_as_rows_draw(cx: &mut TestAppCon
     let after = preview(cx).unwrap();
     let newest = after.groups.last().unwrap().lines.iter().any(|l| l.text.contains("b99"));
     assert!(newest, "the newest group is the new edit's");
+}
+
+/// Session `sid` in a new tab of the pane acted on, shown.
+fn new_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sid: &str) {
+    let client = view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.open_tab(crate::app::Open::Attach { session_id: sid.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    board(cx, w, view);
+}
+
+/// Tab `ix` shown.
+fn show_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix: usize) {
+    let client = view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.focus_tab(ix);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    board(cx, w, view);
+}
+
+/// The pane acted on's current tab closed.
+fn close_current(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        let ix = v.model.tabs.active().expect("a tab");
+        v.close_tab(ix);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    wait(cx, w, view, 1000);
+    board(cx, w, view);
+}
+
+/// A history round putting `ops` (call `tool`), landed.
+fn land_round(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, ops: Value) {
+    land(
+        cx,
+        w,
+        view,
+        vec![
+            json!({"role": "user", "content": "go on"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_block", "input": block_input(ops.clone())}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": block_receipt(&ops)}]}),
+        ],
+    );
+    board(cx, w, view);
+}
+
+/// The pane acted on's block state, and its store's board work: folds,
+/// notes opened, wells' scroll, painted targets, then a re-fold kept for
+/// the store, a board waiting, a job running.
+fn block_state(cx: &mut TestAppContext, view: &Entity<AppView>) -> (usize, usize, usize, usize, bool, bool, bool) {
+    view.read_with(cx, |v, _| {
+        let (p, live) = (&v.panes.cur, v.panes.cur.live);
+        let b = &v.model.lives[live].board;
+        let refold = v.refolds.done.as_ref().is_some_and(|d| d.live == live);
+        let state = (p.block_folds.rows().len(), p.block_more.len(), p.block_scroll.borrow().len(), p.lease.painted.borrow().len());
+        (state.0, state.1, state.2, state.3, refold, b.waiting.is_some(), b.running())
+    })
+}
+
+/// A session's block state and its board's work go where its transcript
+/// goes (Shady #101 P2-4). The user folds A's plan, and a re-fold of A is
+/// kept. A switch to B in another tab of the same pane and store leaves
+/// nothing of A's on the pane or the store (no fold, opened note, scroll,
+/// painted target, re-fold, waiting board or job), and B, with no blocks,
+/// keeps no fold. B's own plan (the same name: the same row) isn't drawn
+/// folded by A's fold. Back on A, its fold comes back with its tab, and
+/// its board reads on where it was: a new op draws. A session with no
+/// blocks, then the last tab closed: nothing kept on the pane or store.
+#[gpui_kit::test]
+fn a_sessions_block_state_and_board_work_go_with_its_transcript(cx: &mut TestAppContext) {
+    use cards_spec::board::{Pos, Target};
+    let (w, view) = blocks(cx, 1500.);
+    let live = view.read_with(cx, |v, _| v.panes.cur.live);
+    let plan = show_block(cx, w, &view, "plan");
+    wait(cx, w, &view, 1000);
+    let at = head_at(cx, w, plan);
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    mouse(cx, w, at, "up");
+    board(cx, w, &view);
+    assert!(folded(cx, &view, plan), "A's plan, folded by the user");
+    view.update(cx, |v, cx| v.refold(live, Target::Outcome(Pos::event(0)), cx));
+    cx.run_until_parked();
+    let a = block_state(cx, &view);
+    assert!(a.0 == 1 && a.3 > 0 && a.4, "A's: {a:?}");
+    let fold = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[live].transcript.blocks_retained().journal);
+    assert!(fold(cx) > 0, "A's fold");
+    // B, in a new tab: nothing of A's.
+    new_tab(cx, w, &view, crate::demo::SID);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.live), live, "the same store");
+    assert_eq!(block_state(cx, &view), (0, 0, 0, 0, false, false, false), "nothing of A's");
+    assert_eq!(fold(cx), 0, "B has no blocks: no fold kept");
+    land_round(
+        cx,
+        w,
+        &view,
+        "toolu_b1",
+        json!([{"op":"put","id":"plan","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"doing"}]}}]),
+    );
+    let (plan_b, _) = row(cx, &view, "plan").expect("B's plan drawn");
+    assert_eq!(plan_b, plan, "the same row id");
+    assert!(!folded(cx, &view, plan_b), "B's plan isn't folded by A's fold");
+    // Back on A: its fold, and its board reads on.
+    show_tab(cx, w, &view, 0);
+    assert!(folded(cx, &view, plan), "A's fold came back with its tab");
+    turn(cx, w, &view);
+    round(cx, w, &view, &[("toolu_a9", json!([{"op":"put","id":"back","kind":"note","body":{"text":"back on A"}}]), true)]);
+    board(cx, w, &view);
+    assert!(row(cx, &view, "back").is_some(), "A's board reads on: the new op draws");
+    heard(cx, w, &view, vec![json!({"ev": "idle"})]);
+    // A session with no blocks, then the last tab closed.
+    new_tab(cx, w, &view, crate::demo::IDLE_CPU);
+    assert_eq!(block_state(cx, &view), (0, 0, 0, 0, false, false, false), "nothing of A's");
+    assert_eq!(fold(cx), 0, "no blocks: no fold kept");
+    while view.read_with(cx, |v, _| !v.model.tabs.is_empty()) {
+        close_current(cx, w, &view);
+    }
+    assert_eq!(block_state(cx, &view), (0, 0, 0, 0, false, false, false), "the last tab closed: nothing kept");
+    assert_eq!(fold(cx), 0);
+}
+
+/// Split panes (Shady #101 P2-4): a pane sharing a store with another, and
+/// closing, leaves the store's board work to the pane that stays (it reads
+/// on: a new op draws there), and its closing rows fold nothing; a pane on
+/// a store of its own, closing, lets go of that store's work and its
+/// re-folds.
+#[gpui_kit::test]
+fn a_closing_split_pane_leaves_a_shared_boards_work_and_lets_go_of_its_own(cx: &mut TestAppContext) {
+    use cards_spec::board::{Pos, Target};
+    let (w, view) = blocks(cx, 1500.);
+    view.update(cx, |v, _| v.app_settings.split = true);
+    let (first, live) = view.read_with(cx, |v, _| (v.panes.cur.id, v.panes.cur.live));
+    let split = |cx: &mut TestAppContext| {
+        use gpui_kit::AppContext as _;
+        cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
+        cx.run_until_parked();
+        settle(cx, w, 8);
+        board(cx, w, &view);
+    };
+    // Shared: the new pane on A's store, closing.
+    split(cx);
+    let (second, shared) = view.read_with(cx, |v, _| (v.panes.cur.id, v.panes.cur.live));
+    assert!(second != first && shared == live, "the second pane shares A's store");
+    view.update(cx, |v, cx| {
+        let ix = v.model.tabs.active().expect("a tab");
+        v.close_tab(ix);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let closing = view.read_with(cx, |v, _| v.panes.iter().find(|p| p.id == second).map(|p| p.live));
+    if let Some(c) = closing.filter(|c| *c != live) {
+        settle(cx, w, 8);
+        assert!(!view.read_with(cx, |v, _| v.model.lives.get(c).is_some_and(|l| l.board.running())), "its closing rows fold nothing");
+    }
+    wait(cx, w, &view, 1000);
+    board(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| (v.panes.len(), v.panes.cur.id)), (1, first), "closed");
+    turn(cx, w, &view);
+    round(cx, w, &view, &[("toolu_s1", json!([{"op":"put","id":"stays","kind":"note","body":{"text":"the pane that stays"}}]), true)]);
+    board(cx, w, &view);
+    assert!(row(cx, &view, "stays").is_some(), "the shared store's board reads on");
+    heard(cx, w, &view, vec![json!({"ev": "idle"})]);
+    // Its own: B in a new pane, a re-fold of it kept, the pane closing.
+    split(cx);
+    new_tab(cx, w, &view, crate::demo::SID);
+    view.update(cx, |v, cx| {
+        let ix = v.model.tabs.iter().position(|t| t.session.as_deref() == Some(crate::demo::BLOCKS)).expect("A's tab");
+        v.close_tab(ix);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    board(cx, w, &view);
+    let own = view.read_with(cx, |v, _| v.panes.cur.live);
+    assert_ne!(own, live, "B on a store of its own");
+    land_round(
+        cx,
+        w,
+        &view,
+        "toolu_b1",
+        json!([{"op":"put","id":"plan","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"doing"}]}}]),
+    );
+    assert!(row(cx, &view, "plan").is_some(), "B's plan drawn");
+    view.update(cx, |v, cx| v.refold(own, Target::Outcome(Pos::event(0)), cx));
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| v.refolds.done.as_ref().is_some_and(|d| d.live == own)), "B's re-fold kept");
+    close_current(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        assert_eq!((v.panes.len(), v.panes.cur.id), (1, first), "closed");
+        assert!(!v.refolds.done.as_ref().is_some_and(|d| d.live == own), "B's re-fold let go");
+        assert!(
+            v.model.lives.get(own).is_none_or(|l| l.transcript.blocks_retained().journal == 0 && !l.board.running()),
+            "B's store let go"
+        );
+    });
+    assert!(row(cx, &view, "stays").is_some(), "A's rows, as they were");
 }
 
 /// Bounded caches (§1.8: renderer caches per pane): a pane's state per

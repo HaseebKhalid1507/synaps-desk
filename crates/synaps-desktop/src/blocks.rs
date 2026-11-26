@@ -279,6 +279,54 @@ impl Folds {
     }
 }
 
+/// A list's block state as it travels with the list (the tab cache, a
+/// worker's view in place): the user's folds and notes opened past their
+/// lines, and the history they are of ([`history_of`]).
+#[derive(Default)]
+pub(crate) struct Kept {
+    folds: Folds,
+    more: std::collections::HashSet<u64>,
+    of: u64,
+}
+
+/// The history a board is of, for the block state kept with it: its
+/// session and its conversation generation (§1.2), never 0.
+pub(crate) fn history_of(session: Option<&str>, drawn: &synaps_client::blocks::Drawn) -> u64 {
+    hash((session, drawn.generation)).max(1)
+}
+
+impl crate::pane::Pane {
+    /// The list's block state goes with it ([`Kept`]); the pointer lease and
+    /// the diff wells' scroll were its painting's, and start over.
+    pub(crate) fn blocks_out(&mut self) -> Kept {
+        self.blocks_reset();
+        Kept {
+            folds: std::mem::take(&mut self.block_folds),
+            more: std::mem::take(&mut self.block_more),
+            of: std::mem::take(&mut self.block_of),
+        }
+    }
+
+    /// A list's block state back with it.
+    pub(crate) fn blocks_in(&mut self, k: Kept) {
+        self.blocks_reset();
+        (self.block_folds, self.block_more, self.block_of) = (k.folds, k.more, k.of);
+    }
+
+    /// History `of`'s board ([`history_of`]) draws here, and the block
+    /// state was of another's: it starts over.
+    pub(crate) fn blocks_over(&mut self, of: u64) {
+        drop(self.blocks_out());
+        self.block_of = of;
+    }
+
+    /// The painting's state: the lease, the diff wells' scroll.
+    pub(crate) fn blocks_reset(&mut self) {
+        self.lease = Default::default();
+        self.block_scroll.borrow_mut().clear();
+    }
+}
+
 impl AppView {
     /// Block row `d` (`at`, its item's `at`th block): its card (module docs).
     #[allow(clippy::too_many_arguments)]

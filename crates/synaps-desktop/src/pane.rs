@@ -103,6 +103,9 @@ pub struct Pane {
     pub(crate) lease: crate::lease::Lease,
     pub(crate) block_more: HashSet<u64>,
     pub(crate) block_scroll: std::cell::RefCell<HashMap<u64, gpui_kit::ScrollHandle>>,
+    /// The history the block state above is of: its session and
+    /// generation ([`crate::blocks::history_of`], [`Pane::blocks_over`]).
+    pub(crate) block_of: u64,
     /// The rows an unfold under Full is revealing: tail-follow is held
     /// paused while they do ([`AppView::hold_unfold`]).
     pub(crate) unfold_hold: Vec<u64>,
@@ -480,6 +483,7 @@ impl Pane {
             lease: Default::default(),
             block_more: HashSet::new(),
             block_scroll: Default::default(),
+            block_of: 0,
             unfold_hold: Vec::new(),
             synced_busy: false,
             files_gen: 0,
@@ -1602,6 +1606,7 @@ impl crate::app::AppView {
     pub(crate) fn fresh_live(&mut self) -> crate::live::LiveId {
         match self.model.lives.ids().into_iter().find(|l| self.panes.showing(*l) == 0) {
             Some(l) => {
+                self.board_out(l);
                 self.model.lives[l] = crate::live::Live::default();
                 l
             }
@@ -1618,6 +1623,7 @@ impl crate::app::AppView {
         if let (Some(c), Some(seq)) = (&self.client, self.model.lives[live].release()) {
             let _ = c.on(seq).detach();
         }
+        self.board_out(live);
         if live == crate::live::LiveId::FIRST {
             self.model.lives[live] = crate::live::Live::default();
         } else {

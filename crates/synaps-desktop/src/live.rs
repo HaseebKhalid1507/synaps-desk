@@ -440,6 +440,11 @@ impl Lives {
     }
 
     /// Store `id`, if it still exists (a job that outlived its pane).
+    /// Store `id`, if it is still there.
+    pub(crate) fn get(&self, id: LiveId) -> Option<&Live> {
+        self.slots.iter().find(|(i, _)| *i == id).map(|(_, l)| l)
+    }
+
     pub(crate) fn get_mut(&mut self, id: LiveId) -> Option<&mut Live> {
         self.slots.iter_mut().find(|(i, _)| *i == id).map(|(_, l)| l)
     }

@@ -36,10 +36,13 @@
 //! then let go: the worker's journal ([`Worker::journal`]) is the one copy
 //! the board reads (B2 reads one contiguous history). A re-fold shares it,
 //! copy-on-write: a job that reads on while a re-fold holds it copies it
-//! once. A worker started over on a history whose staged events were let
-//! go (its store torn down, the transcript kept) has a gap
-//! ([`Worker::gap`]): it draws nothing new until the history is folded
-//! again (another epoch; an attach does).
+//! once. **The worker is the history's** ([`HistoryBlocks::worker`]): what
+//! owns the transcript (a store, the tab cache) owns its fold, and a new
+//! history (another epoch) has a new worker, so a store left, a tab
+//! evicted or a history replaced lets its fold go with it, and a tab shown
+//! again reads on from where it was. A worker that is not its history's
+//! (tests) and missed staged events has a gap ([`Worker::gap`]): it draws
+//! nothing new.
 //!
 //! **The work** ([`Worker::run`]) is the board's: the history's fold, read
 //! on from where it stopped while the history only grows (a new epoch
@@ -72,7 +75,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
 use cards_spec::board::{Board, Event, Place, State};
@@ -118,6 +121,8 @@ fn next_epoch() -> u64 {
 struct Shared {
     taken: AtomicUsize,
     took: AtomicU64,
+    /// What its worker keeps, roughly (bytes), as of its last job.
+    bytes: AtomicUsize,
 }
 
 /// The history's events, read message by message ([`HistoryBlocks::message`]),
@@ -138,6 +143,8 @@ pub struct HistoryBlocks {
     open: Option<(HashMap<String, bool>, usize)>,
     /// A block call read: else there is no board to draw.
     blocks: bool,
+    /// Its worker (module docs: one per history, shared by its clones).
+    worker: Arc<Mutex<Worker>>,
 }
 
 /// A message's events and their rows.
@@ -158,6 +165,7 @@ impl Default for HistoryBlocks {
             shared: Arc::default(),
             open: None,
             blocks: false,
+            worker: Arc::default(),
         }
     }
 }
@@ -180,6 +188,18 @@ impl HistoryBlocks {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Its worker ([`Worker`]): the board's work on this history.
+    pub fn worker(&self) -> &Arc<Mutex<Worker>> {
+        &self.worker
+    }
+
+    /// What it keeps, roughly (bytes): the staged events and their rows,
+    /// and its worker's fold as of its last job ([`Worker::bytes`]).
+    pub fn bytes(&self) -> usize {
+        let staged = self.staged() * (std::mem::size_of::<Event>() + std::mem::size_of::<Option<u64>>());
+        staged + self.staged.len() * 64 + self.shared.bytes.load(Ordering::Relaxed)
     }
 
     /// Events staged: read, and not taken by its worker yet.
@@ -509,6 +529,8 @@ pub struct Input {
     pub history_open: bool,
     shared: Arc<Shared>,
     pub live: Arc<Live>,
+    /// The history's worker ([`HistoryBlocks::worker`]).
+    pub worker: Arc<Mutex<Worker>>,
 }
 
 impl Input {
@@ -536,6 +558,7 @@ impl Input {
             history_open: history.open.as_ref().is_some_and(|(_, n)| *n > 0),
             shared: history.shared.clone(),
             live,
+            worker: history.worker.clone(),
         })
     }
 
@@ -688,6 +711,9 @@ pub struct Drawn {
     /// The input it was folded from: its history, the history's events,
     /// and all its events (the live turn's after them).
     pub epoch: u64,
+    /// Its conversation generation (§1.2): the same history, folded again
+    /// (a resync), has the same; a cleared or compacted one another.
+    pub generation: Option<block::Generation>,
     pub history: usize,
     pub events: usize,
     /// What rows draw of it, by row id (module docs): the live turn's and
@@ -756,6 +782,15 @@ impl Worker {
         self.gap
     }
 
+    /// What it keeps, roughly (bytes): its journal and rows, the committed
+    /// fates not taken yet, and its board.
+    pub fn bytes(&self) -> usize {
+        self.journal.len() * std::mem::size_of::<Event>()
+            + self.rows.len() * std::mem::size_of::<Option<u64>>()
+            + self.committed.len() * std::mem::size_of::<(u64, Fate)>()
+            + self.board.owned_bytes()
+    }
+
     /// What it keeps ([`Retained`]).
     pub fn retained(&self) -> Retained {
         Retained {
@@ -802,6 +837,7 @@ impl Worker {
             }
         }
         input.shared.taken.fetch_max(journal.len(), Ordering::AcqRel);
+        input.shared.bytes.store(self.bytes(), Ordering::Relaxed);
     }
 
     /// `input`'s history, the journal shared (a re-fold's: module docs);
@@ -899,6 +935,7 @@ impl Worker {
         }
         Drawn {
             epoch: input.epoch,
+            generation: Some(input.generation),
             history: input.history_len,
             events: self.journal.len(),
             rows: rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
