@@ -88,7 +88,11 @@
 //! later change expects it, and an answer of its text in the card is
 //! another's, which the entry it was expected in counts as its own: that
 //! entry has no Resend or Retry, which would put this desk's answer over
-//! it.
+//! it. Nor is it the card's answer any more: once a settled history shows
+//! that answer, the entry, at rest (not confirmed, or not sent), is
+//! retired ([`Memos::retire`]), and the card shows the history's answer,
+//! as for any other desk's. A change from it is then a change, sent once;
+//! the answer shown, kept, sends nothing (Shady #94 round 3).
 //!
 //! **Dropped events.** A desk that falls behind the session's broadcast
 //! isn't cut off: the daemon drops what it missed, says so ("event stream
@@ -147,9 +151,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cards_spec::fold::{Answered, Card, Event as Folded, Fold};
+use cards_spec::fold::{Answered, Card, Event as Folded, Fold, NAMES};
 use cards_spec::memo::{CHECK_WAIT, Cause, Entry, Event as Heard, Memo, Resend, State, Trigger, View};
-use cards_spec::{CardDoc, CardId, Reply};
+use cards_spec::{CardDoc, CardId, Envelope, Reply};
 use synaps_client::Transcript;
 use synaps_client::cards::Ask;
 use synaps_client::protocol::{AgentEvent, SessionEvent, StreamEvent};
@@ -356,6 +360,10 @@ pub(crate) struct Memos {
 
 /// Answers kept for [`Memos::take_reached`] at most, the oldest dropped.
 const REACHED_CAP: usize = 64;
+
+/// The tool id of the close [`Memos::retire`] puts in a copy of a fold:
+/// no model's (theirs are `toolu_…` and the like, with no space).
+const RETIRE: &str = "synaps-desktop retires";
 
 /// An answer that reached the chat ([`Memos::take_reached`]): its session,
 /// card, text and values.
@@ -566,6 +574,51 @@ impl Memos {
         let fold = self.fold(session, t);
         let view = Self::view(&fold, t);
         self.with(session, |m| m.observe(&view, now));
+        self.retire(session, &fold, t, now);
+    }
+
+    /// Retire each entry of `session` at rest (not confirmed, or not sent)
+    /// that is [`Memos::doubtful`] on `t`'s history, settled: an answer it
+    /// expected, which a turn's end lost, shows there, another's, and the
+    /// entry counts it as the one it expected (the module's "Changes").
+    /// The card's answer is then the history's: its receipt, its change's
+    /// starting point and what a change is told from.
+    ///
+    /// The memo (`cards_spec::memo`, pinned) has no call to drop one entry,
+    /// and its rule 1 drops an entry whose card is closed, on any view. So
+    /// it reads again the view it has just followed, `fold`, with those
+    /// cards closed in it: they go, and each other entry follows the same
+    /// view a second time, which moves none.
+    fn retire(&mut self, session: &str, fold: &Fold, t: &Transcript, now: Instant) {
+        let Some(m) = self.by.get(session).filter(|_| settled(t)) else { return };
+        let gone: Vec<CardId> = m
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.state, State::Unconfirmed | State::NotSent) && self.doubtful(session, &e.card, t.history_cards()))
+            .map(|e| e.card.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let kept: Vec<Entry> = m.entries().iter().filter(|e| !gone.contains(&e.card)).cloned().collect();
+        let mut closed = fold.clone();
+        for id in &gone {
+            log::info!(target: "synaps_desktop::card", "card {id}: another's answer of the one it expected shows; its entry gives way");
+            let tool_id = RETIRE.to_string();
+            closed.apply(&Folded::Call {
+                tool_id: tool_id.clone(),
+                name: NAMES[0].to_string(),
+                input: serde_json::json!({ "close": id.to_string() }),
+            });
+            closed.apply(&Folded::Result { tool_id, text: Envelope::closed(id.clone()).to_string() });
+        }
+        let view = Self::view(&closed, t);
+        self.with(session, |m| m.observe(&view, now));
+        debug_assert_eq!(
+            self.by.get(session).map_or(&[][..], Memo::entries),
+            kept.as_slice(),
+            "the second reading drops those retired and moves no other entry"
+        );
     }
 
     /// A gap starts with the first view that resyncs, and ends with the
@@ -873,8 +926,19 @@ impl crate::model::Model {
     /// `out` could not be handed to the connection (its thread stopped):
     /// not sent.
     pub(crate) fn card_unsent(&mut self, lid: crate::live::LiveId, reason: &str) {
-        if let Some(s) = self.lives[lid].active.as_ref().map(|a| a.session_id.clone()) {
-            self.memos.on(&s, Heard::Refused { reason }, Instant::now());
+        self.card_refused(lid, reason);
+    }
+
+    /// A card's answer from store `lid` was refused, or never went: not
+    /// sent. Then the view as it is, which the memo follows again: an
+    /// answer it leaves at rest that a lost one's copy shows over is
+    /// retired at once ([`Memos::retire`]), not at the next event.
+    pub(crate) fn card_refused(&mut self, lid: crate::live::LiveId, reason: &str) {
+        let l = &self.lives[lid];
+        if let Some(s) = l.active.as_ref().map(|a| a.session_id.as_str()) {
+            let now = Instant::now();
+            self.memos.on(s, Heard::Refused { reason }, now);
+            self.memos.observe(s, &l.transcript, now);
         }
     }
 

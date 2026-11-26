@@ -14,7 +14,10 @@
 //! many changes back, counted (an answer given twice); an answer never
 //! taken in, or one whose turn lost it, isn't expected, and another
 //! desk's answer of its text wins, as does a copy past the count, or
-//! after the change (Shady #94 P2-1, rounds 1 and 2). With part B's
+//! after the change (Shady #94 P2-1, rounds 1 and 2). One whose turn
+//! lost it, once a settled history shows another's copy, gives way: the
+//! card is the history's answer, a change from it sends once, and keeping
+//! it sends nothing (Shady #94 round 3). With part B's
 //! memory (#93): a reopened card shows the answer it changes, highlighted
 //! and picked, with no `last time` mark; one whose answer has no pick
 //! starts on the memory, unmarked; a change that reaches the chat is
@@ -1058,24 +1061,102 @@ fn both_lost(cx: &mut TestAppContext, tool: &str, card_id: &str) -> (Asked, Stri
     ((w, view, row, events), a, b)
 }
 
-/// Then another desk's answer, byte for byte A's, lands, settled. B's
-/// entry saw A expected: the memo reads this one as that, so B stays not
-/// confirmed, but A was lost, and this one is another's, later than B:
-/// Resend is off, as it is whenever its gate doesn't hold, and a press of
-/// it sends nothing; it would put B over it. A change is offered.
+/// Then another desk's answer, byte for byte A's, lands. B's entry saw A
+/// expected: the memo reads this one as that, but A was lost, and this
+/// one is another's, later than B. Until a view is settled B keeps its
+/// receipt, not confirmed, and Resend is off, as it is whenever its gate
+/// doesn't hold, and a press of it sends nothing: it would put B over
+/// theirs. Settled, B's entry gives way (Shady #94 round 3): the card is
+/// theirs, A, and the way back to B is a change ([`recovers`]).
 #[gpui_kit::test]
 fn an_answer_a_turn_lost_is_another_desks_when_it_shows(cx: &mut TestAppContext) {
     let (tool, id) = ("toolu_e3", "ce3miss");
-    let ((w, view, row, _events), a, _b) = both_lost(cx, tool, id);
-    lands_settled(cx, w, &view, tool, id, &[&a]);
+    let ((w, view, row, _events), a, b) = both_lost(cx, tool, id);
+    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| assert!(!v.model.lives[v.panes.cur.live].transcript.history_settled(), "not settled yet"));
     assert!(has(cx, w, format!("ask-state {row} not confirmed")), "B, as the memo has it");
     assert!(!has(cx, w, format!("ask-resend {row}")) && has(cx, w, format!("ask-resend {row} off")), "no Resend over theirs");
-    assert!(has(cx, w, format!("ask-change {row}")), "a change offered");
     let (lid, painted) = painted(cx, &view, tool);
     let got = view.update(cx, |v, _| v.model.resend_card(lid, &painted, Instant::now()));
     assert!(got.is_err(), "Resend pressed: nothing ({got:?})");
     assert_eq!(sends(cx, &view).len(), 2);
+    settles(cx, w, &view, tool, id);
+    recovers(cx, w, &view, row, tool, id, &a, &b);
     crate::app::pin_arm_clock(None);
+}
+
+/// A digest of the history as the view holds it, the engine's slot
+/// empty: a settled view.
+fn settles(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, tool: &str, card_id: &str) {
+    let all = answers(cx, view, tool);
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let h = history_with(cx, view, tool, card_id, &branch(), &all);
+    heard(cx, w, view, vec![slot_digest(&h, None)]);
+    play(cx, w, view);
+    view.read_with(cx, |v, _| assert!(v.model.lives[v.panes.cur.live].transcript.history_settled(), "settled"));
+}
+
+/// Shady #94 round 3: once B's entry has given way to another desk's A
+/// (an answer it expected, which a turn's end lost), the card's answer is
+/// the history's, A: its receipt (`answered`, no entry of this desk's,
+/// no Resend or Retry, and neither sends), the answer a change starts on
+/// and is told from. Reopened, A is picked; kept on A, nothing is sent.
+/// Reopened again and changed to B: exactly one `Submit` of B, with no
+/// other answer or Check again first, which reaches the chat and reads
+/// `changed`.
+#[allow(clippy::too_many_arguments)]
+fn recovers(
+    cx: &mut TestAppContext,
+    w: gpui_kit::AnyWindowHandle,
+    view: &Entity<AppView>,
+    row: u64,
+    tool: &str,
+    card_id: &str,
+    a: &str,
+    b: &str,
+) {
+    let n = sends(cx, view).len();
+    shows_theirs(cx, w, view, row, card_id, n, "their A");
+    assert!(!has(cx, w, format!("ask-retry {row}")) && !has(cx, w, format!("ask-retry {row} off")), "no Retry");
+    assert!(!has(cx, w, format!("ask-check {row}")), "no Check again");
+    let (lid, painted) = painted(cx, view, tool);
+    let theirs = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc(&branch()), &json!({"choice": "main"})).unwrap());
+    assert_eq!(view.read_with(cx, |v, _| v.changeable(lid, &painted)), Some(theirs), "the answer a change starts on: A");
+    let old =
+        view.update(cx, |v, _| (v.model.resend_card(lid, &painted, Instant::now()), v.model.retry_card(lid, &painted, Instant::now())));
+    assert!(old.0.is_err() && old.1.is_err(), "the old B: neither Resend nor Retry sends ({old:?})");
+    assert_eq!(sends(cx, view).len(), n);
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-change {row}"));
+    assert!(changing(cx, w, row), "reopened");
+    assert_eq!(picked(cx, w, row), vec![1], "on A, picked");
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-option {row} 1"));
+    assert!(!changing(cx, w, row) && has(cx, w, format!("ask-state {row} answered")), "A kept: as it was");
+    assert_eq!(sends(cx, view).len(), n, "A kept: nothing sent");
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-change {row}"));
+    assert!(changing(cx, w, row) && picked(cx, w, row) == vec![1], "reopened again, on A");
+    arm(cx, view, row, true);
+    click(cx, w, view, format!("ask-option {row} 3"));
+    let (seq, _) = attachment(cx, view);
+    assert_eq!(
+        sends(cx, view)[n..],
+        [Outgoing { seq, busy: false, card: id(card_id), text: b.to_string() }],
+        "A to B: one Submit of the change"
+    );
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "on its way");
+    reaches(cx, w, view, b);
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        assert_eq!(v.model.memos.get_state(&sid, card_id), Some(State::InChat), "B in the chat");
+    });
+    assert_eq!(answers(cx, view, tool), vec![a.to_string(), b.to_string()], "theirs, then B");
+    assert!(has(cx, w, format!("ask-state {row} changed")), "B: changed");
+    assert!(!has(cx, w, format!("ask-resend {row}")) && !has(cx, w, format!("ask-retry {row}")), "nothing to resend");
+    assert!(has(cx, w, format!("ask-change {row}")), "a change offered again");
+    assert_eq!(sends(cx, view).len(), n + 1, "B once");
 }
 
 /// Or B is changed (C) first: C expects neither, A lost and B not
@@ -1130,8 +1211,9 @@ fn a_change_whose_expected_answer_came_can_be_resent(cx: &mut TestAppContext) {
 
 /// Retry too: A taken in, changed (B) with no connection, so B is not
 /// sent; the turn then ends without A. Retry shows, nothing over B. Then
-/// another desk's answer of A's text lands, settled: Retry is off, and a
-/// press of it sends nothing.
+/// another desk's answer of A's text lands: until a view is settled,
+/// Retry is off, and a press of it sends nothing; settled, B's entry
+/// gives way, and the way back to B is a change ([`recovers`]).
 #[gpui_kit::test]
 fn an_answer_a_turn_lost_is_another_desks_and_retry_keeps_off(cx: &mut TestAppContext) {
     let (tool, id) = ("toolu_e5", "ce5retr");
@@ -1167,7 +1249,9 @@ fn an_answer_a_turn_lost_is_another_desks_and_retry_keeps_off(cx: &mut TestAppCo
     heard(cx, w, &view, vec![slot_digest(&old, None), json!({"ev": "idle"})]);
     play(cx, w, &view);
     assert!(has(cx, w, format!("ask-retry {row}")), "nothing over B: Retry");
-    lands_settled(cx, w, &view, tool, id, &[&a]);
+    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| assert!(!v.model.lives[v.panes.cur.live].transcript.history_settled(), "not settled yet"));
     assert!(has(cx, w, format!("ask-state {row} not sent")), "B, as the memo has it");
     assert!(!has(cx, w, format!("ask-retry {row}")) && has(cx, w, format!("ask-retry {row} off")), "no Retry over theirs");
     let sent = sends(cx, &view).len();
@@ -1175,6 +1259,39 @@ fn an_answer_a_turn_lost_is_another_desks_and_retry_keeps_off(cx: &mut TestAppCo
     let got = view.update(cx, |v, _| v.model.retry_card(lid, &painted, Instant::now()));
     assert!(got.is_err(), "Retry pressed: nothing ({got:?})");
     assert_eq!(sends(cx, &view).len(), sent, "nothing sent");
+    settles(cx, w, &view, tool, id);
+    let b = changed(id, &input, json!({"choice": "hotfix"}));
+    recovers(cx, w, &view, row, tool, id, &a, &b);
+    crate::app::pin_arm_clock(None);
+}
+
+/// Or B is still on its way when the turn ends without A, and when
+/// another desk's answer of A's text lands, settled: B is this desk's
+/// answer in flight, and stays so (`sending…`, no change offered). Then
+/// the daemon refuses it: not sent, at rest, and its entry gives way at
+/// once, the refusal's view the word on it, not a later event's
+/// ([`crate::model::Model::card_refused`]). The way back to B is a change
+/// ([`recovers`]).
+#[gpui_kit::test]
+fn a_change_refused_after_a_lost_answers_copy_gives_way_at_once(cx: &mut TestAppContext) {
+    let (tool, id) = ("toolu_e7", "ce7refu");
+    let ((w, view, row, _events), a, b) = taken_in_then_changed(cx, tool, id);
+    let old = history_with(cx, &view, tool, id, &branch(), &[]);
+    heard(cx, w, &view, vec![slot_digest(&old, None), json!({"ev": "idle"})]);
+    play(cx, w, &view);
+    lands_settled(cx, w, &view, tool, id, &[&a]);
+    assert!(has(cx, w, format!("ask-state {row} sending…")), "B still on its way");
+    assert!(!has(cx, w, format!("ask-change {row}")), "no change while it is");
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        assert_eq!(v.model.memos.get_state(&sid, id), Some(State::Sending), "B's entry kept, in flight");
+    });
+    let (seq, _) = attachment(cx, &view);
+    let refused = synaps_client::Error::Refused { command: Some("steer".into()), reason: "input is owned by client #1".into() };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::Error { attach_seq: Some(seq), error: refused }], cx));
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    recovers(cx, w, &view, row, tool, id, &a, &b);
     crate::app::pin_arm_clock(None);
 }
 

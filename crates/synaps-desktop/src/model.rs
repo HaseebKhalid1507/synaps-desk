@@ -2014,10 +2014,7 @@ impl Model {
                 }
                 if refused_input(&error) && self.lives[lid].give_back_oldest(&mut effects) {
                     // A card's answer: not sent (§3.5), Retry.
-                    if let Some(a) = self.lives[lid].active.as_ref() {
-                        let reason = error.to_string();
-                        self.memos.on(&a.session_id, cards_spec::memo::Event::Refused { reason: &reason }, std::time::Instant::now());
-                    }
+                    self.card_refused(lid, &error.to_string());
                 }
                 self.lives[lid].last_error = Some(error.to_string());
             }
