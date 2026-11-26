@@ -1,14 +1,15 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
-//! the edit preview's text drawn as D1 draws agent text (P2-9) and the `op
-//! skipped` chip. Each fails on `653c30c`.
+//! the edit preview's text drawn as D1 draws agent text (P2-9), a file's
+//! header (P2-10), and the `op skipped` chip. Each fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
     VisualTestContext, px,
 };
 use serde_json::{Value, json};
+use synaps_client::synthetic::{block_input, block_receipt};
 
-use super::answer_tests::has;
+use super::answer_tests::{has, heard, llm};
 use super::{open_at, settle, wait};
 use crate::app::AppView;
 use crate::turns::Kind;
@@ -63,6 +64,10 @@ fn row(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(u
     })
 }
 
+fn id(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> u64 {
+    row(cx, view, name).unwrap_or_else(|| panic!("block {name} drawn")).0
+}
+
 fn show_block(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, name: &str) -> u64 {
     let (id, ix) = row(cx, view, name).unwrap_or_else(|| panic!("block {name} drawn"));
     view.update(cx, |v, cx| {
@@ -80,6 +85,28 @@ fn bounds(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> Option<gp
 
 fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> gpui_kit::Bounds<gpui_kit::Pixels> {
     bounds(cx, w, sel.clone()).unwrap_or_else(|| panic!("{sel} drawn"))
+}
+
+/// A live round of block calls (`(tool, ops, bound)`); the board lands.
+fn round(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, calls: &[(&str, Value, bool)]) {
+    let mut evs = vec![llm(json!({"kind": "llm", "llm": "response_start"}))];
+    for (tool, ops, _) in calls {
+        evs.push(llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": tool})));
+        evs.push(llm(
+            json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": tool, "input": block_input(ops.clone())}),
+        ));
+    }
+    for (tool, ops, bound) in calls {
+        if *bound {
+            evs.push(llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool, "result": block_receipt(ops)})));
+        }
+    }
+    heard(cx, w, view, evs);
+    board(cx, w, view);
+}
+
+fn turn(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    heard(cx, w, view, vec![json!({"ev": "turn_started", "turn_baseline": 13, "trigger": "user", "user_text": "go on"})]);
 }
 
 fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>, ev: &str) {
@@ -100,6 +127,18 @@ fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_k
     }
     vcx.run_until_parked();
     settle(cx, w, 8);
+}
+
+/// A live turn putting `ops` and twelve notes under them, the first block
+/// at the view's top (the list not following its tail).
+fn put_mid(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ops: Value) {
+    turn(cx, w, view);
+    let mut all = ops.as_array().cloned().unwrap_or_default();
+    let first = all[0]["id"].as_str().unwrap_or_default().to_string();
+    all.extend((0..12).map(|k| json!({"op":"put","id":format!("under{k}"),"kind":"note","body":{"text":"under"}})));
+    round(cx, w, view, &[("toolu_p", json!(all), true)]);
+    show_block(cx, w, view, &first);
+    wait(cx, w, view, 1000);
 }
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a
@@ -133,6 +172,52 @@ fn edit_preview_lines_are_sanitized() {
         }
     }
     assert!(groups.iter().flat_map(|g| &g.lines).any(|l| l.text.contains("lave")), "the text itself is drawn");
+}
+
+/// P2-10: a file's header holds its path, `:line` and note; a title comes
+/// before them and never hides the file's name and line. At 320 px and
+/// wide.
+#[gpui_kit::test]
+fn a_file_header_shows_its_path_line_and_note(cx: &mut TestAppContext) {
+    for width in [320. + 2. * crate::app::STRIP, 1500.] {
+        let (w, view) = blocks(cx, width);
+        let wide = width > 600.;
+        let put = json!([
+            {"op":"put","id":"f1","kind":"file","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}},
+            {"op":"put","id":"f2","kind":"file","title":"The token store, where rotate() takes its lock per session","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}},
+            {"op":"put","id":"f3","kind":"file","body":{"path":"crates/relay/src/session.rs","state":"reading"}},
+            {"op":"put","id":"f4","kind":"file","title":"Session","body":{"path":"crates/relay/src/session.rs","state":"done"}}
+        ]);
+        put_mid(cx, w, &view, put);
+        for (name, shown, has_note, titled) in [
+            ("f1", "token_store.rs:118", true, false),
+            ("f2", "token_store.rs:118", true, true),
+            ("f3", "session.rs", false, false),
+            ("f4", "session.rs", false, true),
+        ] {
+            let f = id(cx, &view, name);
+            let block = drawn(cx, w, format!("block {f}"));
+            let path = drawn(cx, w, format!("block-path {f} {shown}"));
+            assert!(path.left() >= block.left() && path.right() <= block.right() + px(0.5), "{width} {name}: the path inside its block");
+            // The name and line whole: as wide as their characters.
+            let m = view.read_with(cx, |v, _| v.panes.cur.metrics_last.get().expect("drawn"));
+            let min = shown.chars().count() as f32 * m.mono * 0.5;
+            assert!(
+                f32::from(path.size.width) >= min,
+                "{width} {name}: `{shown}` whole ({} px, {min} at least)",
+                f32::from(path.size.width)
+            );
+            assert!((f32::from(block.size.height) - crate::blocks::Geo::of(&m).head).abs() < 0.5, "{width} {name}: one line");
+            if titled {
+                let title = drawn(cx, w, format!("block-title {f}"));
+                assert!(title.right() <= path.left() + px(0.5), "{width} {name}: the title before the path");
+            }
+            if has_note && wide {
+                let n = drawn(cx, w, format!("block-file-note {f} TokenStore::rotate"));
+                assert!(f32::from(n.size.width) > 40. && n.right() <= block.right(), "{width} {name}: the note");
+            }
+        }
+    }
 }
 
 /// The plan's chip says `op skipped` (an op, not the plan), and its

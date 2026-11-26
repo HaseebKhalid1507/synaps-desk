@@ -15,10 +15,12 @@
 //! block has a 2 px spine in the accent on its left edge. The header is
 //! 28 px: the block's life glyph (its state, in the call rows' family),
 //! the title, then the kind and `rN`, a state word and the chevron. A
-//! pending change says `pending` (dim) where `rN` is and never glows; a
-//! skipped op leaves the dim `op skipped` chip, its reason in its tooltip
-//! (an op that didn't apply, never the block's state); a replaced block
-//! reads `rN · replaced`.
+//! file's header is its path, `:line` and note (§6.2), its title before
+//! them: the file's name and line never give way to the title. A pending
+//! change says `pending` (dim) where `rN` is and never glows; a skipped op
+//! leaves the dim `op skipped` chip, its reason in its tooltip (an op that
+//! didn't apply, never the block's state); a replaced block reads
+//! `rN · replaced`.
 //!
 //! **Heights** (§6.2) come from structure: a plan's steps are 28 px, a
 //! status two lines, a diff's well at most 12 lines of 20 px (it scrolls
@@ -426,10 +428,17 @@ impl AppView {
     ) -> Div {
         let b = &s.block;
         let (life, word) = life_of(&b.body, streaming);
-        let title = title_of(s);
+        let file = match &b.body {
+            Body::File(f) => Some(f),
+            _ => None,
+        };
+        // A file's title, if it has one, comes before its path (P2-10).
+        let title = match file {
+            Some(_) => b.title.as_deref().filter(|t| !t.is_empty()).map(|t| crate::ask::shown(t, cards_spec::Lines::Single)),
+            None => Some(title_of(s)),
+        };
         let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, id ^ field.rotate_left(13)), v, c);
         let title_c = glow(1, bound_value(s, |_| s.bound.as_ref().map(|b| b.title.clone())), p.prose_t);
-        let mono_file = matches!(b.body, Body::File(_)) && b.title.is_none();
         let rev = if b.pending {
             "pending".to_string()
         } else if b.replaced.is_some() {
@@ -470,18 +479,22 @@ impl AppView {
                 self.fx.col(self.panes.cur.id).change(motion::Tag::Outcome, id, life.code(), None),
                 None,
             )))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_shrink(1.)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .when(mono_file, |d| d.font_family(fonts::MONO).text_px(m.mono))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(title_c)
-                    .debug_selector(move || format!("block-title {id}"))
-                    .child(title),
-            )
+            .when_some(title, |d, title| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        // A file's title gives way first: its path, line
+                        // and note are its header (§6.2).
+                        .flex_shrink(if file.is_some() { 16. } else { 1. })
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(title_c)
+                        .debug_selector(move || format!("block-title {id}"))
+                        .child(title),
+                )
+            })
+            .when_some(file, |d, f| d.child(self.file_head(f, id, b.title.as_deref().is_none_or(str::is_empty), p, m)))
             .when(b.skipped.is_some(), |d| {
                 // An op that didn't apply, never the block's state (Shady
                 // #101: `skipped` alone read as the plan's).
@@ -553,6 +566,64 @@ impl AppView {
             .map(|d| {
                 let _ = cx;
                 d
+            })
+    }
+
+    /// A file's header (§6.2): its path, `:line` and note. The file's name
+    /// and line keep their room (a title or the note gives way first, then
+    /// the directories); `titled`: no title, the path is it.
+    fn file_head(&self, f: &cards_spec::block::FileBody, id: u64, untitled: bool, p: &Palette, m: &Metrics) -> Div {
+        let path = crate::ask::shown(&crate::turns::tilde(&f.path, false), cards_spec::Lines::Single);
+        let cut = path.rfind('/').map_or(0, |k| k + 1);
+        let (dir, name) = (path[..cut].to_string(), path[cut..].to_string());
+        let name = match f.line {
+            Some(l) => format!("{name}:{l}"),
+            None => name,
+        };
+        let note = f.note.as_deref().filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
+        // At most this much of the header for the name (a long one ellipsizes).
+        let most = (self.panes.cur.layout.column * 0.55).round();
+        let shown = name.clone();
+        h_flex()
+            .min_w_0()
+            .flex_shrink(1.)
+            .gap(px(8.))
+            .items_center()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .font_family(fonts::MONO)
+                    .text_px(m.mono)
+                    .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
+                    .when(!dir.is_empty(), |d| {
+                        d.child(div().min_w_0().flex_shrink(4.).overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(most))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(p.prose_t)
+                            .debug_selector(move || format!("block-path {id} {shown}"))
+                            .child(name),
+                    ),
+            )
+            .when_some(note, |d, n| {
+                let t = format!("block-file-note {id} {n}");
+                d.child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .text_color(p.dim_t)
+                        .debug_selector(move || t.clone())
+                        .child(n),
+                )
             })
     }
 
