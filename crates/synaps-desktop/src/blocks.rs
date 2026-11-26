@@ -20,7 +20,10 @@
 //! change says `pending` (dim) where `rN` is and never glows; a skipped op
 //! leaves the dim `op skipped` chip, its reason in its tooltip (an op that
 //! didn't apply, never the block's state); a replaced block reads
-//! `rN · replaced`.
+//! `rN · replaced`. The pointer lease's note on a block (`this block
+//! changed · look again`) lies over the header's end, where `rN` and the
+//! state are, wrapped to two lines: it reads whole at 320 px and every
+//! text size, the title keeps its room, and nothing moves.
 //!
 //! **Heights** (§6.2) come from structure: a plan's steps are 28 px, a
 //! status two lines, a diff's well at most 12 lines of 20 px (it scrolls
@@ -393,7 +396,7 @@ impl AppView {
         let fit = Fit::of(self.panes.cur.layout.column);
         let folded = self.panes.cur.block_folds.folded(id, s);
         let streaming = self.model.lives[self.panes.cur.live].shown().busy();
-        let head = self.block_head(s, id, folded, streaming, fit, &g, p, m, cx);
+        let head = self.block_head(s, id, p.card_d, folded, streaming, fit, &g, p, m, cx);
         let body = (!folded).then(|| self.block_body(s, id, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
         let tag = s.block.tag;
@@ -418,11 +421,39 @@ impl AppView {
         crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element()
     }
 
+    /// The lease's note on block row `id` (§6.2), until the next input:
+    /// over its header's end, where `rN` and the state are (they are back
+    /// at the next input), on the header's own ground, wrapped to two
+    /// lines at most. Nothing moves when it comes or goes, and the title
+    /// keeps its room (decision #5 of #101).
+    fn block_says(&self, id: u64, g: &Geo, ground: Hsla, p: &Palette, m: &Metrics) -> Option<Div> {
+        let n = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1)?;
+        // Its width: its text's on one line (an estimate) within 60 % of
+        // the header; else two lines, within 85 %.
+        let head = self.panes.cur.layout.column - g.spine - 2. * g.pad;
+        let one = (n.chars().count() as f32 * m.meta * 0.62).ceil();
+        let w = if one <= head * 0.6 { one } else { (one * 0.62).ceil().min((head * 0.85).round()) };
+        Some(
+            div().absolute().top_0().bottom_0().right_0().pl(px(g.gap)).bg(ground).flex().items_center().justify_end().child(
+                div()
+                    .w(px(w))
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .line_height(px((g.head / 2.).floor()))
+                    .text_color(p.acc)
+                    .whitespace_normal()
+                    .debug_selector(move || format!("block-says {id} {n}"))
+                    .child(n),
+            ),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn block_head(
         &self,
         s: &Shown,
         id: u64,
+        ground: Hsla,
         folded: bool,
         streaming: bool,
         fit: Fit,
@@ -464,9 +495,9 @@ impl AppView {
             (_, w) => w.map(str::to_string),
         };
         let word_c = glow(2, bound_value(s, |b| life_of(b, true).1), word_color(life, p));
-        // The lease's note on it (§6.2), until the next input.
-        let note = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1);
+        let says = self.block_says(id, g, ground, p, m);
         h_flex()
+            .relative()
             .h(px(g.head))
             .w_full()
             .gap(px(g.gap))
@@ -537,10 +568,7 @@ impl AppView {
                 )
             })
             .child(div().flex_1().min_w(px(8.)))
-            .when_some(note, |d, n| {
-                d.child(div().flex_none().text_px(m.meta).text_color(p.acc).debug_selector(move || format!("block-says {id} {n}")).child(n))
-            })
-            .when(fit.rev && note.is_none(), |d| {
+            .when(fit.rev, |d| {
                 d.child(
                     div()
                         .flex_none()
@@ -568,6 +596,7 @@ impl AppView {
                     .justify_end()
                     .child(glyph::turn(self.fx.col(self.panes.cur.id).turn(id, !folded), p.dim_t)),
             )
+            .children(says)
             .map(|d| {
                 let _ = cx;
                 d
@@ -873,7 +902,7 @@ impl AppView {
                             .pl(px(g.pad))
                             .bg(p.well_d)
                             .debug_selector(move || format!("block-member {id} {mid}"))
-                            .child(self.block_head(mshown, mid, folded, streaming, fit, g, p, m, cx))
+                            .child(self.block_head(mshown, mid, p.well_d, folded, streaming, fit, g, p, m, cx))
                             .children((!folded).then(|| self.block_body(mshown, mid, streaming, fit, g, p, m, cx))),
                     );
                 }

@@ -1,6 +1,7 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
 //! the edit preview's text drawn as D1 draws agent text (P2-9), a file's
-//! header (P2-10), a metric at 320 px (P2-11), and the `op skipped` chip. Each
+//! header (P2-10), a metric at 320 px (P2-11), the `op skipped` chip, and the
+//! lease's note readable at 320 px and every text size (decision #5). Each
 //! fails on `653c30c`.
 
 use gpui_kit::{
@@ -128,6 +129,14 @@ fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_k
     }
     vcx.run_until_parked();
     settle(cx, w, 8);
+}
+
+fn head_at(cx: &mut TestAppContext, w: AnyWindowHandle, id: u64) -> gpui_kit::Point<gpui_kit::Pixels> {
+    drawn(cx, w, format!("block-head {id}")).center()
+}
+
+fn note(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<(u64, &'static str)> {
+    view.read_with(cx, |v, _| v.panes.cur.lease.note)
 }
 
 /// A live turn putting `ops` and twelve notes under them, the first block
@@ -274,4 +283,54 @@ fn the_skipped_chip_is_an_ops_and_says_why(cx: &mut TestAppContext) {
     wait(cx, w, &view, 800);
     mouse(cx, w, chip, "move");
     assert!(has(cx, w, format!("block-skipped-tip {plan}")), "its reason in a tooltip");
+}
+
+/// Decision #5: the lease's note on a block reads whole inside its header
+/// at 320 px, at the default and the largest text step: the title keeps
+/// its room, and nothing moves as it comes.
+#[gpui_kit::test]
+fn the_lease_note_reads_whole_at_320_px(cx: &mut TestAppContext) {
+    for (width, text) in [(320. + 2. * crate::app::STRIP, 16), (320. + 2. * crate::app::STRIP, 22), (1500., 16)] {
+        let (w, view) = blocks_at(cx, width, text);
+        let put = json!([
+            {"op":"put","id":"a","kind":"plan","body":{"steps":[{"id":"s1","label":"One","state":"todo"}]}},
+            {"op":"put","id":"b","kind":"status","title":"The relay's refresh","body":{"text":"B","state":"working"}}
+        ]);
+        put_mid(cx, w, &view, put);
+        let b = id(cx, &view, "b");
+        let before = drawn(cx, w, format!("block {b}"));
+        // Replaced under the press: the note.
+        let at = head_at(cx, w, b);
+        mouse(cx, w, at, "move");
+        mouse(cx, w, at, "down");
+        round(
+            cx,
+            w,
+            &view,
+            &[(
+                "toolu_r",
+                json!([{"op":"replace","id":"b","kind":"status","title":"The relay's refresh","body":{"text":"B again","state":"working"}}]),
+                true,
+            )],
+        );
+        mouse(cx, w, at, "up");
+        assert_eq!(note(cx, &view), Some((b, crate::lease::CHANGED)));
+        let block = drawn(cx, w, format!("block {b}"));
+        let head = drawn(cx, w, format!("block-head {b}"));
+        let says = drawn(cx, w, format!("block-says {b} {}", crate::lease::CHANGED));
+        assert!(
+            says.left() >= block.left() && says.right() <= block.right() + px(0.5),
+            "{width}/{text}: the note inside its block ({says:?} in {block:?})"
+        );
+        assert!(
+            says.top() >= head.top() - px(0.5) && says.bottom() <= head.bottom() + px(0.5),
+            "{width}/{text}: whole in the header ({says:?} in {head:?})"
+        );
+        let title = drawn(cx, w, format!("block-title {b}"));
+        assert!(
+            f32::from(title.size.width) > 20. && says.left() >= title.left() + px(20.),
+            "{width}/{text}: the title keeps room ({title:?}, {says:?})"
+        );
+        assert_eq!(block.size.height, before.size.height, "{width}/{text}: nothing moved");
+    }
 }
