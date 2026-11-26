@@ -9,8 +9,12 @@
 //!   pointer waits** (the old geometry stays drawn): the hovered block
 //!   removed, moved, merged or replaced (another incarnation is another
 //!   block), its own height changing, or a block row in view above it
-//!   added, removed or changing height. A change that keeps all that draws
-//!   at once, in place. The board is one coherent board: all of it waits,
+//!   added, removed or changing height. Over a group, its members are
+//!   targets too: one replaced, removed, regrouped or moved within it (its
+//!   incarnations and places), and the member under the pointer (its own
+//!   painted target: [`Lease::member`]) gone, in another group or changing
+//!   height. A change that keeps all that draws at once, in place (a tick:
+//!   the same incarnations). The board is one coherent board: all of it waits,
 //!   or none (decision: rather than scroll the content above, §6.2's
 //!   "position" rule waits too, the calmer of the two; listed in the PR).
 //! - **Release**: the lease's end (one timer wake, armed only while a
@@ -128,6 +132,8 @@ pub(crate) struct Lease {
     /// A press taken on a block, held.
     pub pressed: bool,
     pub hover: Option<Target>,
+    /// The group member under the pointer (its group is `hover`).
+    pub member: Option<Target>,
     pub down: Option<Press>,
     /// A block's note until the next input.
     pub note: Option<(u64, &'static str)>,
@@ -158,7 +164,7 @@ impl Lease {
     /// detach, its list gone): no press, hover or note, no target, slide
     /// or pill. Its frame count and the list's anchoring go on.
     pub(crate) fn clear(&mut self) {
-        (self.moved, self.over, self.pressed, self.hover, self.down, self.note) = (None, false, false, None, None, None);
+        (self.moved, self.over, self.pressed, self.hover, self.member, self.down, self.note) = (None, false, false, None, None, None, None);
         self.painted.borrow_mut().clear();
         self.agent_frame.set(None);
         self.above.borrow_mut().clear();
@@ -240,6 +246,13 @@ pub(crate) fn find_any(d: &Drawn, row: u64) -> Option<(&Shown, Option<&Shown>)> 
     })
 }
 
+/// A group's members as targets: each one's row and incarnation, in its
+/// place (a member replaced, removed, added or moved changes it; a tick,
+/// the same incarnation, doesn't).
+fn members(s: &Shown) -> Vec<(u64, Tag)> {
+    s.members.iter().map(|m| (crate::blocks::row_id(&m.block.id), m.block.tag)).collect()
+}
+
 /// A block's content as its pill and glow see it.
 fn content(s: &Shown) -> u64 {
     hash((s.block.tag, s.block.rev, s.block.collapsed, s.block.pending, s.members.iter().map(content).collect::<Vec<_>>()))
@@ -252,13 +265,35 @@ impl AppView {
         let lease = &self.panes.cur.lease;
         let Some(hover) = lease.hover.filter(|_| lease.active(self.fx.now())) else { return false };
         let Some(old) = old else { return false };
+        // A hover the board drawn doesn't hold is stale (its block went
+        // with a board drawn since): nothing of it is under the pointer.
         let Some((oi, oj, os)) = find(old, hover.row) else { return false };
         let Some((ni, nj, ns)) = find(new, hover.row) else { return true };
         let Some(m) = self.panes.cur.metrics_last.get() else { return true };
         let p = &self.panes.cur;
         let g = Geom { cpl: crate::blocks::note_cpl(p.layout.column, &m), more: &p.block_more, folds: &p.block_folds };
-        if (ni, nj) != (oi, oj) || ns.block.tag != hover.tag || shape(ns, &g) != shape(os, &g) {
+        // A target as painted last (the hover's tag is the one the pointer
+        // came in over: a replacement drawn since is what is under it now).
+        let painted = lease.painted.borrow();
+        let shown = |t: Target| painted.get(&t.row).map_or(t.tag, |p| p.tag);
+        if (ni, nj) != (oi, oj) || ns.block.tag != shown(hover) || shape(ns, &g) != shape(os, &g) {
             return true;
+        }
+        // Its members are targets too (Shady #101 R2-3): the same ones, the
+        // same incarnations in the same places.
+        if members(ns) != members(os) {
+            return true;
+        }
+        // The member under the pointer, as painted: in this group, its
+        // incarnation and its height. One the board drawn doesn't hold in
+        // this group can't be proved safe: the board waits.
+        if let Some(mt) = lease.member {
+            let at = |s: &Shown| s.members.iter().position(|x| crate::blocks::row_id(&x.block.id) == mt.row);
+            let (Some(a), Some(b)) = (at(os), at(ns)) else { return true };
+            let (om, nm) = (&os.members[a], &ns.members[b]);
+            if a != b || om.block.tag != shown(mt) || nm.block.tag != shown(mt) || shape(om, &g) != shape(nm, &g) {
+                return true;
+            }
         }
         // The rows in view above it.
         let disp = &self.panes.cur.disp;
@@ -400,7 +435,7 @@ impl AppView {
         self.in_pane(pane, |this| {
             this.panes.cur.lease.over = over;
             if !over {
-                this.panes.cur.lease.hover = None;
+                (this.panes.cur.lease.hover, this.panes.cur.lease.member) = (None, None);
             }
         });
         if !over {
@@ -441,7 +476,20 @@ impl AppView {
             if over {
                 l.hover = Some(Target { row, tag });
             } else if l.hover.is_some_and(|h| h.row == row) {
-                l.hover = None;
+                (l.hover, l.member) = (None, None);
+            }
+        });
+    }
+
+    /// The pointer over group member `row` (painted as `tag`) or off it;
+    /// its group is the hovered block.
+    pub(crate) fn member_hover(&mut self, pane: PaneId, row: u64, tag: Tag, over: bool) {
+        self.in_pane(pane, |this| {
+            let l = &mut this.panes.cur.lease;
+            if over {
+                l.member = Some(Target { row, tag });
+            } else if l.member.is_some_and(|m| m.row == row) {
+                l.member = None;
             }
         });
     }

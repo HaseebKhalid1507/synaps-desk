@@ -504,6 +504,94 @@ fn a_member_is_its_own_target(cx: &mut TestAppContext) {
     assert_eq!(note(cx, &view), Some((rot, crate::lease::CHANGED)), "the member says so");
 }
 
+/// Shady #101 R2-3: a group's member under a moving pointer is a target
+/// of its own, so the lease covers it. In an open group of three notes,
+/// the pointer over the second:
+/// - it is replaced by a note of the same kind and geometry (another
+///   incarnation): the old board stays drawn and the new one waits through
+///   the pointer's further moves, then draws once, at the lease's end;
+/// - a title patched on it (a tick: the same incarnation) draws at once;
+/// - it is removed (the group keeps two): waits too;
+/// - replaced under a held press: waits, and the stale release folds
+///   nothing and says so.
+/// At 320 px and wide.
+#[gpui_kit::test]
+fn a_member_replaced_under_the_pointer_waits(cx: &mut TestAppContext) {
+    for width in [320. + 2. * crate::app::STRIP, 1500.] {
+        let (w, view) = blocks(cx, width);
+        turn(cx, w, &view);
+        let put = |id: &str| json!({"op":"put","id":id,"kind":"note","body":{"text":"the same text"}});
+        let mut ops = vec![put("m1"), put("m2"), put("m3"), json!({"op":"merge","into":"g","title":"Three","ids":["m1","m2","m3"]})];
+        ops.extend((0..12).map(|k| json!({"op":"put","id":format!("under{k}"),"kind":"note","body":{"text":"under"}})));
+        round(cx, w, &view, &[("toolu_g0", json!(ops), true)]);
+        let g = show_block(cx, w, &view, "g");
+        wait(cx, w, &view, 1000);
+        if folded(cx, &view, g) {
+            let at = head_at(cx, w, g);
+            click(cx, w, at);
+        }
+        assert!(!folded(cx, &view, g), "{width}: the group open");
+        wait(cx, w, &view, 1000);
+        let m2 = member(cx, &view, g, 1);
+        let tag = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.block_drawn(m2).map(|(_, s)| s.block.tag));
+        let published = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].board.published);
+        let over = |cx: &mut TestAppContext, k: f32| {
+            let at = head_at(cx, w, m2);
+            mouse(cx, w, point(at.x + px(k), at.y), "move");
+        };
+        over(cx, 0.);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.cur.lease.member.map(|m| m.row)), Some(m2), "{width}: the member's own target");
+        // Replaced by the same geometry: waits, through further moves.
+        let (t0, p0) = (tag(cx), published(cx));
+        assert!(t0.is_some(), "{width}: the member drawn");
+        let same = json!([{"op":"replace","id":"m2","kind":"note","body":{"text":"the same text"}}]);
+        round(cx, w, &view, &[("toolu_r1", same, true)]);
+        for k in 1..=3 {
+            assert!(waiting(cx, &view), "{width}: a same-geometry replacement waits ({k})");
+            assert_eq!(tag(cx), t0, "{width}: the old member stays drawn");
+            wait(cx, w, &view, 500);
+            over(cx, k as f32);
+        }
+        wait(cx, w, &view, 1600);
+        board(cx, w, &view);
+        assert!(!waiting(cx, &view), "{width}: drawn at the lease's end");
+        assert_eq!(published(cx), p0 + 1, "{width}: once");
+        assert_ne!(tag(cx), t0, "{width}: the new incarnation drawn");
+        // A tick on it (a title: the same incarnation, the same height).
+        wait(cx, w, &view, 700);
+        over(cx, 0.);
+        let p1 = published(cx);
+        round(cx, w, &view, &[("toolu_t", json!([{"op":"patch","id":"m2","title":"Two"}]), true)]);
+        let (wt, pb) = (waiting(cx, &view), published(cx));
+        assert!(!wt && pb == p1 + 1, "{width}: an in-place tick draws at once: waiting {wt}, published {pb} from {p1}");
+        // Removed (the group keeps two): waits.
+        over(cx, 1.);
+        round(cx, w, &view, &[("toolu_x", json!([{"op":"remove","id":"m2"}]), true)]);
+        assert!(waiting(cx, &view), "{width}: a removed member waits");
+        assert!(has(cx, w, format!("block-member {g} {m2}")), "{width}: its old geometry stays drawn");
+        mouse(cx, w, point(px(2.), px(500.)), "move");
+        board(cx, w, &view);
+        assert!(!waiting(cx, &view), "{width}: the pointer left: drawn");
+        // Under a held press: the second member now, replaced.
+        let m = member(cx, &view, g, 1);
+        wait(cx, w, &view, 700);
+        let at = head_at(cx, w, m);
+        mouse(cx, w, at, "move");
+        let was = folded(cx, &view, m);
+        mouse(cx, w, at, "down");
+        let again = json!([{"op":"replace","id":"m3","kind":"note","body":{"text":"the same text"}}]);
+        round(cx, w, &view, &[("toolu_r2", again, true)]);
+        assert!(waiting(cx, &view), "{width}: replaced under a held press: waits");
+        mouse(cx, w, at, "up");
+        board(cx, w, &view);
+        wait(cx, w, &view, 1600);
+        board(cx, w, &view);
+        assert!(!waiting(cx, &view), "{width}: drawn once the press and the lease end");
+        assert_eq!(folded(cx, &view, m), was, "{width}: the stale release folds nothing");
+        assert_eq!(note(cx, &view), Some((m, crate::lease::CHANGED)), "{width}: the member says so");
+    }
+}
+
 /// P2-7: a press released anywhere but on its target ends: over blank
 /// transcript space, another pane, outside the window, or lost (a move
 /// with no button down). Nothing folds, and what waited on it draws at the

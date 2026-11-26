@@ -957,6 +957,9 @@ impl AppView {
                             .child(self.block_head(mshown, mid, p.well_d, folded, streaming, fit, g, p, m, cx))
                             .children((!folded).then(|| self.block_body(mshown, mid, Some(group), streaming, fit, g, p, m, cx)))
                             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag, id))
+                            // Its own target under the pointer (§6.2).
+                            .id(("block-member", mid))
+                            .on_hover(cx.listener(move |this, over: &bool, _, _| this.member_hover(pane, mid, mtag, *over)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
