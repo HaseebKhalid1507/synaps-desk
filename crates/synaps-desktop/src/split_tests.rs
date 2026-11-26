@@ -7373,3 +7373,67 @@ fn a_focused_composers_caret_rests_on_after_ten_seconds(cx: &mut TestAppContext)
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
+
+/// `Attached` for `sid` at `cost` (its tokens known: a live cost), with
+/// confirms `prompts` up.
+fn attached_costing(sid: &str, cost: f64, prompts: &[u64]) -> Value {
+    let mut v = attached(sid, None);
+    v["conversation"]["cost"] = json!(cost);
+    v["conversation"]["tokens"] = json!({"input": 10, "output": 20, "cache_read": 0, "cache_creation": 0});
+    v["pending_prompts"] = prompts
+        .iter()
+        .map(|id| json!({"id": id, "kind": "confirm", "title": "Confirm tool call", "prompt": "Tool: edit\n\nAllow this tool call?"}))
+        .collect();
+    v
+}
+
+/// Bella, 11-26: with panes on several sessions, every attached session's
+/// rail row read the FOCUSED pane's store: four rows at $304.12 (the
+/// daemon said $701, $365, $1248, $304). Each row reads the store that
+/// holds its session, whichever pane has the focus: its own cost (the
+/// store's digests, ahead of a stale poll) and its own prompts waiting
+/// (A's two, never B's none on A's row).
+#[gpui_kit::test]
+fn each_rail_row_shows_its_own_sessions_cost_and_waiting_whichever_pane_is_focused(cx: &mut TestAppContext) {
+    let (window, view, _client, mut a, attaches, events) = on_a_as(cx, "rail-own", attached_costing(A, 701.07, &[1, 2]));
+    key(cx, window, "ctrl-\\");
+    view.update(cx, |v, cx| {
+        v.open_tab(crate::app::Open::Attach { session_id: B.into(), fallback: None, open: false }, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    let mut b = crate::test_waits::recv(&attaches).expect("B's attach at the daemon");
+    b.send(attached_costing(B, 304.12, &[]));
+    feed(cx, window, &view, &events, "B attached in the second pane", |v| v.model.lives[v.panes.cur.live].is_active(B));
+    let _ = (names(&mut a), names(&mut b));
+    let (pa, pb) = view.read_with(cx, |v, _| (v.panes.rest[0].id, v.panes.cur.id));
+    assert!(view.read_with(cx, |v, _| v.model.lives[v.panes.rest[0].live].is_active(A)), "A attached in the first pane");
+    // The daemon's list, its numbers behind the stores'.
+    let metas = [(A, 700.0), (B, 300.0)]
+        .iter()
+        .map(|(id, cost)| {
+            serde_json::from_value(json!({"id": id, "model": "m", "lifecycle": "live", "cost_usd": cost})).expect("a session")
+        })
+        .collect();
+    view.update(cx, |v, cx| v.apply_batch(vec![Event::Sessions(metas)], cx));
+    frame(cx, window);
+    let (ka, kb) = view.read_with(cx, |v, _| {
+        let row = |id: &str| {
+            let at = crate::named::RowAction::Attach(id.into());
+            v.rail.rail.rows.iter().find(|r| r.action == at).map(|r| r.key).unwrap_or_else(|| panic!("{id}'s row"))
+        };
+        (row(A), row(B))
+    });
+    let shows = |cx: &mut TestAppContext, sel: String| drawn(cx, window, sel).is_some();
+    for (focus, k) in [(pb, "alt-2"), (pa, "alt-1"), (pb, "alt-2")] {
+        key(cx, window, k);
+        frame(cx, window);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.focused), focus, "{k}: focused");
+        let what = if focus == pa { "A's pane focused" } else { "B's pane focused" };
+        assert!(shows(cx, format!("rail-cost {ka} $701.07")), "{what}: A's row shows A's own cost");
+        assert!(shows(cx, format!("rail-cost {kb} $304.12")), "{what}: B's row shows B's own cost");
+        assert!(!shows(cx, format!("rail-cost {ka} $304.12")), "{what}: A's row never shows B's cost");
+        assert!(!shows(cx, format!("rail-cost {kb} $701.07")), "{what}: B's row never shows A's cost");
+        assert!(shows(cx, format!("rail-waiting {ka} 2")), "{what}: A's row counts A's two prompts");
+        assert!(!shows(cx, format!("rail-waiting {kb} 2")), "{what}: B's row counts none of A's");
+    }
+}

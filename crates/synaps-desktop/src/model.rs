@@ -761,6 +761,19 @@ impl Model {
         }
     }
 
+    /// A held session's cost: the store attached to it, in whichever pane
+    /// (its digests run ahead of the 3 s poll), else the poll's. Never
+    /// another store's: each pane's session has its own.
+    pub fn cost(&self, s: &SessionMeta) -> f64 {
+        self.lives.on(&s.id).map_or(s.cost_usd, |l| l.stats.cost.unwrap_or(s.cost_usd))
+    }
+
+    /// A held session's prompts waiting on the user: its own store's
+    /// pending prompts when attached (in whichever pane), else the poll's.
+    pub fn waiting(&self, s: &SessionMeta) -> usize {
+        self.lives.on(&s.id).map_or(s.awaiting_input, |l| l.transcript.pending_prompts().len())
+    }
+
     /// Store `live`'s session's workers running ([`Model::workers`]; not
     /// listed yet, a create: its transcript's). Nothing attached (a cached
     /// tab on its way back, a detach): none, never a count last seen.
