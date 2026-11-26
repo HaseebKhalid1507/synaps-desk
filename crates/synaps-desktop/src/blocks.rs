@@ -260,6 +260,19 @@ pub(crate) fn note_lines(text: &str, cpl: f32) -> usize {
     text.lines().map(|l| l.chars().count().div_ceil(cpl).max(1)).sum::<usize>().max(1)
 }
 
+/// A note's characters a line in a column `column` px wide at metrics
+/// `m` (the renderer's estimate, and the lease's: [`crate::lease::shape`]).
+pub(crate) fn note_cpl(column: f32, m: &Metrics) -> f32 {
+    let g = Geo::of(m);
+    (column - g.spine - 2. * g.pad) / (m.label * 0.5)
+}
+
+/// Whether a note past [`NOTE_LINES`] (at `cpl`) is cut there (`more`), or
+/// open (`open`: `less`); `None`, it fits.
+pub(crate) fn note_cut(text: &str, cpl: f32, open: bool) -> Option<bool> {
+    (note_lines(text, cpl) > NOTE_LINES).then_some(!open)
+}
+
 /// The tooltip of the `op skipped` chip.
 pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was skipped: it changed nothing here. Not the block's state.";
 
@@ -267,6 +280,7 @@ pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was sk
 fn cols(s: &str) -> usize {
     s.chars().map(|c| if (c as u32) < 0x1100 { 1 } else { 2 }).sum()
 }
+
 /// An edit preview: its groups, and how many earlier ones folded away.
 pub(crate) type Preview = (Vec<EditGroup>, usize);
 
@@ -798,9 +812,8 @@ impl AppView {
             }
             Body::Diff(d) => self.diff_body(s, d, id, g, p, m, cx),
             Body::Note(n) => {
-                let cpl = (self.panes.cur.layout.column - g.spine - 2. * g.pad) / (m.label * 0.5);
-                let lines = note_lines(&n.text, cpl);
                 let open = self.panes.cur.block_more.contains(&id);
+                let cut = note_cut(&n.text, note_cpl(self.panes.cur.layout.column, m), open);
                 let text_c = glow(6, bound_value(s, |b| if let Body::Note(x) = b { Some(x.text.clone()) } else { None }), p.prose_t);
                 let shown = crate::ask::shown(&n.text, cards_spec::Lines::Multi);
                 let body = v_flex()
@@ -810,14 +823,13 @@ impl AppView {
                     .line_height(px(g.line))
                     .text_color(text_c)
                     .children(crate::detail::lines(&shown).into_iter().map(|l| crate::ask::detail_line(l, p, m)));
-                let clipped = lines > NOTE_LINES && !open;
                 let pane = self.panes.cur.id;
                 v_flex()
                     .w_full()
                     .pb(pb)
                     .debug_selector(move || format!("block-note {id}"))
-                    .child(div().w_full().overflow_hidden().when(clipped, |d| d.h(px(g.line * NOTE_LINES as f32))).child(body))
-                    .when(lines > NOTE_LINES, |d| {
+                    .child(div().w_full().overflow_hidden().when(cut == Some(true), |d| d.h(px(g.line * NOTE_LINES as f32))).child(body))
+                    .when_some(cut, |d, cut| {
                         d.child(
                             div()
                                 .id(("block-more", id))
@@ -827,7 +839,7 @@ impl AppView {
                                 .text_color(p.acc)
                                 .cursor_pointer()
                                 .debug_selector(move || format!("block-more {id}"))
-                                .child(if open { "less" } else { "more" })
+                                .child(if cut { "more" } else { "less" })
                                 .on_click(cx.listener(move |this, _, _, cx| this.block_more(pane, id, cx))),
                         )
                     })

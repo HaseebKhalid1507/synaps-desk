@@ -116,30 +116,52 @@ impl Lease {
     }
 }
 
+/// What a block's height follows in one pane, beside the board: the
+/// pane's column and text (a note's wrap), its `more` and its folds.
+pub(crate) struct Geom<'a> {
+    pub cpl: f32,
+    pub more: &'a std::collections::HashSet<u64>,
+    pub folds: &'a crate::blocks::Folds,
+}
+
 fn hash(v: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
     h.finish()
 }
 
-/// What a block's height follows (§6.2: structure and bounded line
-/// counts): a change of it moves what is under it.
-pub(crate) fn shape(s: &Shown) -> u64 {
+/// What a block's height follows in pane geometry `g` (§6.2: structure
+/// and bounded line counts), as the renderer draws it: a change of it
+/// moves what is under it. A note's height is its wrapped text's unless
+/// it is cut at [`crate::blocks::NOTE_LINES`] ([`crate::blocks::note_cut`],
+/// the renderer's own test): its text then, the safe side (the wrap is the
+/// text layout's, not an estimate). A diff's well is its lines' and its
+/// foot's; an edit preview's lines are the session's edits of its file.
+/// The fold is the pane's ([`crate::blocks::Folds`]).
+pub(crate) fn shape(s: &Shown, g: &Geom) -> u64 {
     let b = &s.block;
+    let row = crate::blocks::row_id(&b.id);
     let body = match &b.body {
         Body::Plan(p) => p.steps.len() as u64,
         Body::Status(_) | Body::File(_) => 0,
-        Body::Diff(d) => d.hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>().min(crate::blocks::DIFF_LINES) as u64,
-        Body::Note(n) => crate::blocks::note_lines(&n.text, 60.).min(crate::blocks::NOTE_LINES + 1) as u64,
+        Body::Diff(d) if d.from.is_some() => hash(&d.file),
+        Body::Diff(d) => hash((
+            d.hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>().clamp(1, crate::blocks::DIFF_LINES),
+            d.state == cards_spec::block::DiffState::Proposed,
+        )),
+        Body::Note(n) => match crate::blocks::note_cut(&n.text, g.cpl, g.more.contains(&row)) {
+            Some(true) => 1,
+            cut => hash((cut, &n.text)),
+        },
         Body::Metric(m) => u64::from(m.series.is_empty()),
-        Body::Group(_) => hash(s.members.iter().map(shape).collect::<Vec<_>>()),
+        Body::Group(_) => hash(s.members.iter().map(|m| shape(m, g)).collect::<Vec<_>>()),
     };
-    hash((b.body.kind().as_str(), b.collapsed, body))
+    hash((b.body.kind().as_str(), g.folds.folded(row, s), body))
 }
 
 /// A row's blocks' shapes, and whether its call draws a row.
-fn shapes(r: Option<&Arc<RowBlocks>>) -> u64 {
-    r.map_or(0, |r| hash((matches!(r.call, Some(Fate::Unbound)), r.blocks.iter().map(shape).collect::<Vec<_>>())))
+fn shapes(r: Option<&Arc<RowBlocks>>, g: &Geom) -> u64 {
+    r.map_or(0, |r| hash((matches!(r.call, Some(Fate::Unbound)), r.blocks.iter().map(|s| shape(s, g)).collect::<Vec<_>>())))
 }
 
 /// Where block row `row` is on board `d`: its anchor's item id, its place
@@ -164,7 +186,10 @@ impl AppView {
         let Some(old) = old else { return false };
         let Some((oi, oj, os)) = find(old, hover.row) else { return false };
         let Some((ni, nj, ns)) = find(new, hover.row) else { return true };
-        if (ni, nj) != (oi, oj) || ns.block.tag != hover.tag || shape(ns) != shape(os) {
+        let Some(m) = self.panes.cur.metrics_last.get() else { return true };
+        let p = &self.panes.cur;
+        let g = Geom { cpl: crate::blocks::note_cpl(p.layout.column, &m), more: &p.block_more, folds: &p.block_folds };
+        if (ni, nj) != (oi, oj) || ns.block.tag != hover.tag || shape(ns, &g) != shape(os, &g) {
             return true;
         }
         // The rows in view above it.
@@ -182,14 +207,14 @@ impl AppView {
             if id == oi {
                 // Its own anchor: the blocks before it there.
                 let before = |d: &Drawn| {
-                    d.rows.get(&id).map_or(0, |r| hash(r.blocks[..oj.min(r.blocks.len())].iter().map(shape).collect::<Vec<_>>()))
+                    d.rows.get(&id).map_or(0, |r| hash(r.blocks[..oj.min(r.blocks.len())].iter().map(|s| shape(s, &g)).collect::<Vec<_>>()))
                 };
                 if before(old) != before(new) {
                     return true;
                 }
                 continue;
             }
-            if shapes(old.rows.get(&id)) != shapes(new.rows.get(&id)) {
+            if shapes(old.rows.get(&id), &g) != shapes(new.rows.get(&id), &g) {
                 return true;
             }
         }

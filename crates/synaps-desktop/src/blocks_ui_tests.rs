@@ -1,12 +1,12 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
-//! the edit preview's text drawn as D1 draws agent text (P2-9), a file's
-//! header (P2-10), a metric at 320 px (P2-11), the `op skipped` chip, and the
-//! lease's note readable at 320 px and every text size (decision #5). Each
-//! fails on `653c30c`.
+//! the lease's geometry as the renderer draws it (P2-5), the edit preview's
+//! text drawn as D1 draws agent text (P2-9), a file's header (P2-10), a metric
+//! at 320 px (P2-11), the `op skipped` chip, and the lease's note readable at
+//! 320 px and every text size (decision #5). Each fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
-    VisualTestContext, px,
+    VisualTestContext, point, px,
 };
 use serde_json::{Value, json};
 use synaps_client::synthetic::{block_input, block_receipt};
@@ -131,12 +131,24 @@ fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_k
     settle(cx, w, 8);
 }
 
+/// A click at `at`: the pointer there (the window's hit test is the
+/// pointer's), down and up.
+fn click(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    mouse(cx, w, at, "up");
+}
+
 fn head_at(cx: &mut TestAppContext, w: AnyWindowHandle, id: u64) -> gpui_kit::Point<gpui_kit::Pixels> {
     drawn(cx, w, format!("block-head {id}")).center()
 }
 
 fn note(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<(u64, &'static str)> {
     view.read_with(cx, |v, _| v.panes.cur.lease.note)
+}
+
+fn waiting(cx: &mut TestAppContext, view: &Entity<AppView>) -> bool {
+    view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].board.waiting.is_some())
 }
 
 /// A live turn putting `ops` and twelve notes under them, the first block
@@ -149,6 +161,50 @@ fn put_mid(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
     round(cx, w, view, &[("toolu_p", json!(all), true)]);
     show_block(cx, w, view, &first);
     wait(cx, w, view, 1000);
+}
+
+/// P2-5: under the lease, a note above the hovered block whose text change
+/// only wraps it to another line at 320 px waits, as a note the user
+/// opened past 6 lines whose text grows does: the lease reads a note's
+/// height as the renderer draws it, in this pane.
+#[gpui_kit::test]
+fn a_wrap_only_change_above_the_pointer_waits_at_320(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 320. + 2. * crate::app::STRIP);
+    let long = |n: usize| (0..n).map(|k| format!("word{k}")).collect::<Vec<_>>().join(" ");
+    let put = json!([
+        {"op":"put","id":"a","kind":"note","body":{"text":"A short line"}},
+        {"op":"put","id":"o","kind":"note","body":{"text":long(80)}},
+        {"op":"put","id":"b","kind":"status","body":{"text":"B","state":"working"}}
+    ]);
+    put_mid(cx, w, &view, put);
+    // `o` opened past its 6 lines by the user.
+    let o = id(cx, &view, "o");
+    let more = drawn(cx, w, format!("block-more {o}")).center();
+    click(cx, w, more);
+    assert!(view.read_with(cx, |v, _| v.panes.cur.block_more.contains(&o)), "o opened");
+    let b = id(cx, &view, "b");
+    let y = |cx: &mut TestAppContext| f32::from(drawn(cx, w, format!("block {b}")).top());
+    for (k, ops) in [
+        // 56 characters on one line: one line at 60 a line, two at 320 px.
+        json!([{"op":"patch","id":"a","set":{"text":"A line that is longer now, still under sixty characters"}}]),
+        // The opened note grows.
+        json!([{"op":"patch","id":"o","set":{"text":long(120)}}]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y0 = y(cx);
+        let at_ = head_at(cx, w, b);
+        mouse(cx, w, at_, "move");
+        round(cx, w, &view, &[(if k == 0 { "toolu_w0" } else { "toolu_w1" }, ops, true)]);
+        assert!(waiting(cx, &view), "case {k}: the board waits under the pointer");
+        assert_eq!(y(cx), y0, "case {k}: B stays where it is");
+        // The pointer leaves: it draws.
+        mouse(cx, w, point(px(2.), px(500.)), "move");
+        board(cx, w, &view);
+        wait(cx, w, &view, 1000);
+        assert!(!waiting(cx, &view));
+    }
 }
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a
