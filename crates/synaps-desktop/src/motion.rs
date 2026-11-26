@@ -928,6 +928,11 @@ impl Slide {
         x.abs() < SNAP_EPSILON && v.abs() < SNAP_EPSILON * Self::omega()
     }
 
+    /// Its place.
+    pub(crate) fn target(&self) -> f32 {
+        self.target
+    }
+
     /// A new place: the offset keeps the row where it is (capped at
     /// [`SLIDE_CAP`] on its true side) and its velocity.
     pub(crate) fn retarget(&mut self, target: f32, now: Instant) {

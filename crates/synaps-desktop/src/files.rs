@@ -256,9 +256,16 @@ impl Edits {
                     .lines
                     .iter()
                     .take(EDIT_LINES)
-                    .map(|l| match l.text.chars().count() > EDIT_LINE_CHARS {
-                        true => DiffLine { text: l.text.chars().take(EDIT_LINE_CHARS).collect::<String>().into(), ..l.clone() },
-                        false => l.clone(),
+                    .map(|l| {
+                        // The file's text, the tool's: drawn as D1 draws agent
+                        // text (no bidi, control or invisible character reaches
+                        // the row: `crate::ask::shown`), at most EDIT_LINE_CHARS.
+                        let text = cards_spec::ui_sanitize(&l.text, cards_spec::Lines::Single);
+                        let text = match text.chars().count() > EDIT_LINE_CHARS {
+                            true => text.chars().take(EDIT_LINE_CHARS).collect::<String>(),
+                            false => text,
+                        };
+                        DiffLine { text: text.into(), ..l.clone() }
                     })
                     .collect();
                 EditGroup { lines, written: e.written }

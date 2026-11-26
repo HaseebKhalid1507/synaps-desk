@@ -40,6 +40,11 @@ pub(crate) const ASK_OPEN: &str = "20261124-101700-cd03";
 /// `--offline --session 20261126-093000-bk01`; listed with
 /// `SYNAPS_DEMO_BLOCKS=1` (stills).
 pub(crate) const BLOCKS: &str = "20261126-093000-bk01";
+/// Tests: another session of [`BLOCKS`]' shape, its block ids and files the
+/// same, its edit's text not (what one session's pane state must never
+/// show for another's).
+#[cfg(test)]
+pub(crate) const BLOCKS_TWIN: &str = "20261126-093100-bk02";
 
 /// Message times (`_synaps_at`) on a demo history, as the host records
 /// them: from the local wall time in the session's id on, `step` seconds
@@ -571,6 +576,13 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     }
     if id == BLOCKS {
         return attach_asks(attach_seq, BLOCKS, synaps_client::synthetic::blocks_history(), "Close the refresh race");
+    }
+    #[cfg(test)]
+    if id == BLOCKS_TWIN {
+        let twin = serde_json::to_string(&synaps_client::synthetic::blocks_history())
+            .unwrap_or_default()
+            .replace("Error::Timeout", "Error::Locked");
+        return attach_asks(attach_seq, BLOCKS_TWIN, serde_json::from_str(&twin).unwrap_or_default(), "Close the refresh race again");
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };

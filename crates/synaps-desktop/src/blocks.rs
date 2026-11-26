@@ -15,9 +15,15 @@
 //! block has a 2 px spine in the accent on its left edge. The header is
 //! 28 px: the block's life glyph (its state, in the call rows' family),
 //! the title, then the kind and `rN`, a state word and the chevron. A
-//! pending change says `pending` (dim) where `rN` is and never glows; a
-//! skipped op leaves the dim `skipped` chip; a replaced block reads
-//! `rN · replaced`.
+//! file's header is its path, `:line` and note (§6.2), its title before
+//! them: the file's name and line never give way to the title. A pending
+//! change says `pending` (dim) where `rN` is and never glows; a skipped op
+//! leaves the dim `op skipped` chip, its reason in its tooltip (an op that
+//! didn't apply, never the block's state); a replaced block reads
+//! `rN · replaced`. The pointer lease's note on a block (`this block
+//! changed · look again`) lies over the header's end, where `rN` and the
+//! state are, wrapped to two lines: it reads whole at 320 px and every
+//! text size, the title keeps its room, and nothing moves.
 //!
 //! **Heights** (§6.2) come from structure: a plan's steps are 28 px, a
 //! status two lines, a diff's well at most 12 lines of 20 px (it scrolls
@@ -247,6 +253,27 @@ pub(crate) fn note_lines(text: &str, cpl: f32) -> usize {
     text.lines().map(|l| l.chars().count().div_ceil(cpl).max(1)).sum::<usize>().max(1)
 }
 
+/// A note's characters a line in a column `column` px wide at metrics
+/// `m` (the renderer's estimate, and the lease's: [`crate::lease::shape`]).
+pub(crate) fn note_cpl(column: f32, m: &Metrics) -> f32 {
+    let g = Geo::of(m);
+    (column - g.spine - 2. * g.pad) / (m.label * 0.5)
+}
+
+/// Whether a note past [`NOTE_LINES`] (at `cpl`) is cut there (`more`), or
+/// open (`open`: `less`); `None`, it fits.
+pub(crate) fn note_cut(text: &str, cpl: f32, open: bool) -> Option<bool> {
+    (note_lines(text, cpl) > NOTE_LINES).then_some(!open)
+}
+
+/// The tooltip of the `op skipped` chip.
+pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was skipped: it changed nothing here. Not the block's state.";
+
+/// A metric's value or unit, in mono columns (a wide character takes two).
+fn cols(s: &str) -> usize {
+    s.chars().map(|c| if (c as u32) < 0x1100 { 1 } else { 2 }).sum()
+}
+
 /// The user's own folds (§3.5: presentation, local), by block row: open
 /// or folded, and the agent's `collapse` it overrode. The agent's next one
 /// wins again.
@@ -320,9 +347,11 @@ impl crate::pane::Pane {
         self.block_of = of;
     }
 
-    /// The painting's state: the lease, the diff wells' scroll.
+    /// The painting's state: the lease (its frame count and the list's
+    /// anchoring go on: [`crate::lease::Lease::clear`]), the diff wells'
+    /// scroll.
     pub(crate) fn blocks_reset(&mut self) {
-        self.lease = Default::default();
+        self.lease.clear();
         self.block_scroll.borrow_mut().clear();
     }
 }
@@ -336,10 +365,11 @@ impl AppView {
         let fit = Fit::of(self.panes.cur.layout.column);
         let folded = self.panes.cur.block_folds.folded(id, s);
         let streaming = self.model.lives[self.panes.cur.live].shown().busy();
-        let head = self.block_head(s, id, folded, streaming, fit, &g, p, m, cx);
-        let body = (!folded).then(|| self.block_body(s, id, streaming, fit, &g, p, m, cx));
+        let head = self.block_head(s, id, p.card_d, folded, streaming, fit, &g, p, m, cx);
+        let body = (!folded).then(|| self.block_body(s, id, None, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
         let tag = s.block.tag;
+        let press = crate::lease::Press { at: crate::lease::Target { row: id, tag }, act: crate::lease::Act::Fold, group: None };
         let el = div()
             .id(("block", id))
             .debug_selector(move || format!("block {id}"))
@@ -354,11 +384,38 @@ impl AppView {
             )
             .child(head)
             .children(body)
-            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag))
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, id, tag, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, cx)));
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
         crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element()
+    }
+
+    /// The lease's note on block row `id` (§6.2), until the next input:
+    /// over its header's end, where `rN` and the state are (they are back
+    /// at the next input), on the header's own ground, wrapped to two
+    /// lines at most. Nothing moves when it comes or goes, and the title
+    /// keeps its room (decision #5 of #101).
+    fn block_says(&self, id: u64, g: &Geo, ground: Hsla, p: &Palette, m: &Metrics) -> Option<Div> {
+        let n = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1)?;
+        // Its width: its text's on one line (an estimate) within 60 % of
+        // the header; else two lines, within 85 %.
+        let head = self.panes.cur.layout.column - g.spine - 2. * g.pad;
+        let one = (n.chars().count() as f32 * m.meta * 0.62).ceil();
+        let w = if one <= head * 0.6 { one } else { (one * 0.62).ceil().min((head * 0.85).round()) };
+        Some(
+            div().absolute().top_0().bottom_0().right_0().pl(px(g.gap)).bg(ground).flex().items_center().justify_end().child(
+                div()
+                    .w(px(w))
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .line_height(px((g.head / 2.).floor()))
+                    .text_color(p.acc)
+                    .whitespace_normal()
+                    .debug_selector(move || format!("block-says {id} {n}"))
+                    .child(n),
+            ),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -366,6 +423,7 @@ impl AppView {
         &self,
         s: &Shown,
         id: u64,
+        ground: Hsla,
         folded: bool,
         streaming: bool,
         fit: Fit,
@@ -376,10 +434,17 @@ impl AppView {
     ) -> Div {
         let b = &s.block;
         let (life, word) = life_of(&b.body, streaming);
-        let title = title_of(s);
+        let file = match &b.body {
+            Body::File(f) => Some(f),
+            _ => None,
+        };
+        // A file's title, if it has one, comes before its path (P2-10).
+        let title = match file {
+            Some(_) => b.title.as_deref().filter(|t| !t.is_empty()).map(|t| crate::ask::shown(t, cards_spec::Lines::Single)),
+            None => Some(title_of(s)),
+        };
         let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, id ^ field.rotate_left(13)), v, c);
         let title_c = glow(1, bound_value(s, |_| s.bound.as_ref().map(|b| b.title.clone())), p.prose_t);
-        let mono_file = matches!(b.body, Body::File(_)) && b.title.is_none();
         let rev = if b.pending {
             "pending".to_string()
         } else if b.replaced.is_some() {
@@ -400,9 +465,9 @@ impl AppView {
             (_, w) => w.map(str::to_string),
         };
         let word_c = glow(2, bound_value(s, |b| life_of(b, true).1), word_color(life, p));
-        // The lease's note on it (§6.2), until the next input.
-        let note = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1);
+        let says = self.block_says(id, g, ground, p, m);
         h_flex()
+            .relative()
             .h(px(g.head))
             .w_full()
             .gap(px(g.gap))
@@ -420,36 +485,70 @@ impl AppView {
                 self.fx.col(self.panes.cur.id).change(motion::Tag::Outcome, id, life.code(), None),
                 None,
             )))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_shrink(1.)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .when(mono_file, |d| d.font_family(fonts::MONO).text_px(m.mono))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(title_c)
-                    .debug_selector(move || format!("block-title {id}"))
-                    .child(title),
-            )
-            .when(b.skipped.is_some(), |d| {
+            .when_some(title, |d, title| {
                 d.child(
                     div()
-                        .flex_none()
+                        .min_w_0()
+                        // A file's title gives way first: its path, line
+                        // and note are its header (§6.2).
+                        .flex_shrink(if file.is_some() { 16. } else { 1. })
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(title_c)
+                        .debug_selector(move || format!("block-title {id}"))
+                        .child(title),
+                )
+            })
+            .children(file.map(|f| self.file_head(f, id, b.title.as_deref().is_none_or(str::is_empty), p, m)).into_iter().flatten())
+            .when(b.skipped.is_some(), |d| {
+                // An op that didn't apply, never the block's state (Shady
+                // #101: `skipped` alone read as the plan's).
+                d.child(
+                    // It gives way before the title (to `op…` at least),
+                    // its tooltip whole.
+                    div()
+                        .id(("block-skipped", id))
+                        .min_w(px((m.meta * 1.9).ceil() + 8.))
+                        .flex_shrink(8.)
+                        .overflow_hidden()
                         .px(px(4.))
                         .bg(p.well_d)
                         .font_family(fonts::MONO)
                         .text_px(m.meta)
                         .text_color(p.dim_t)
                         .debug_selector(move || format!("block-skipped {id}"))
-                        .child("skipped"),
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .debug_selector(move || format!("block-skipped-says {id} op skipped"))
+                                .child("op skipped"),
+                        )
+                        .tooltip(move |window, cx| {
+                            crate::overlay::element(
+                                move |_, cx| {
+                                    let p = crate::theme::palette(cx);
+                                    div()
+                                        .max_w(px(320.))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .font_family(fonts::SANS)
+                                        .text_px(fonts::size::TITLE)
+                                        .line_height(px(18.))
+                                        .text_color(p.prose_k)
+                                        .whitespace_normal()
+                                        .debug_selector(move || format!("block-skipped-tip {id}"))
+                                        .child(SKIPPED_TIP)
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
                 )
             })
             .child(div().flex_1().min_w(px(8.)))
-            .when_some(note, |d, n| {
-                d.child(div().flex_none().text_px(m.meta).text_color(p.acc).debug_selector(move || format!("block-says {id} {n}")).child(n))
-            })
-            .when(fit.rev && note.is_none(), |d| {
+            .when(fit.rev, |d| {
                 d.child(
                     div()
                         .flex_none()
@@ -477,10 +576,81 @@ impl AppView {
                     .justify_end()
                     .child(glyph::turn(self.fx.col(self.panes.cur.id).turn(id, !folded), p.dim_t)),
             )
+            .children(says)
             .map(|d| {
                 let _ = cx;
                 d
             })
+    }
+
+    /// A file's header (§6.2): its directories, its name and `:line`, its
+    /// note, as items of the header's own row. The name and line never
+    /// shrink (a long one ellipsizes at 55 % of the column): the title
+    /// gives way first, then the directories and the note. `untitled`: no
+    /// title, the path is it.
+    fn file_head(&self, f: &cards_spec::block::FileBody, id: u64, untitled: bool, p: &Palette, m: &Metrics) -> Vec<AnyElement> {
+        let path = crate::ask::shown(&crate::turns::tilde(&f.path, false), cards_spec::Lines::Single);
+        let cut = path.rfind('/').map_or(0, |k| k + 1);
+        let (dir, name) = (path[..cut].to_string(), path[cut..].to_string());
+        let name = match f.line {
+            Some(l) => format!("{name}:{l}"),
+            None => name,
+        };
+        let note = f.note.as_deref().filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
+        let most = (self.panes.cur.layout.column * 0.55).round();
+        let gap = Geo::of(m).gap;
+        let shown = name.clone();
+        let mut out = Vec::new();
+        if !dir.is_empty() {
+            // Against the name: the row's gap taken back.
+            out.push(
+                div()
+                    .min_w_0()
+                    .flex_shrink(4.)
+                    .mr(px(-gap))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::MONO)
+                    .text_px(m.mono)
+                    .text_color(p.dim_t)
+                    .child(dir)
+                    .into_any_element(),
+            );
+        }
+        out.push(
+            div()
+                .flex_none()
+                .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
+                .child(
+                    div()
+                        .max_w(px(most))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_family(fonts::MONO)
+                        .text_px(m.mono)
+                        .text_color(p.prose_t)
+                        .debug_selector(move || format!("block-path {id} {shown}"))
+                        .child(name),
+                )
+                .into_any_element(),
+        );
+        if let Some(n) = note {
+            let t = format!("block-file-note {id} {n}");
+            out.push(
+                div()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .debug_selector(move || t.clone())
+                    .child(n)
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -488,6 +658,7 @@ impl AppView {
         &self,
         s: &Shown,
         id: u64,
+        group: Option<crate::lease::Target>,
         streaming: bool,
         fit: Fit,
         g: &Geo,
@@ -633,9 +804,8 @@ impl AppView {
             }
             Body::Diff(d) => self.diff_body(s, d, id, g, p, m, cx),
             Body::Note(n) => {
-                let cpl = (self.panes.cur.layout.column - g.spine - 2. * g.pad) / (m.label * 0.5);
-                let lines = note_lines(&n.text, cpl);
                 let open = self.panes.cur.block_more.contains(&id);
+                let cut = note_cut(&n.text, note_cpl(self.panes.cur.layout.column, m), open);
                 let text_c = glow(6, bound_value(s, |b| if let Body::Note(x) = b { Some(x.text.clone()) } else { None }), p.prose_t);
                 let shown = crate::ask::shown(&n.text, cards_spec::Lines::Multi);
                 let body = v_flex()
@@ -645,14 +815,17 @@ impl AppView {
                     .line_height(px(g.line))
                     .text_color(text_c)
                     .children(crate::detail::lines(&shown).into_iter().map(|l| crate::ask::detail_line(l, p, m)));
-                let clipped = lines > NOTE_LINES && !open;
                 let pane = self.panes.cur.id;
+                // `more` is an action like any other (§6.2): its painted
+                // target, taken at down, checked at up.
+                let press =
+                    crate::lease::Press { at: crate::lease::Target { row: id, tag: s.block.tag }, act: crate::lease::Act::More, group };
                 v_flex()
                     .w_full()
                     .pb(pb)
                     .debug_selector(move || format!("block-note {id}"))
-                    .child(div().w_full().overflow_hidden().when(clipped, |d| d.h(px(g.line * NOTE_LINES as f32))).child(body))
-                    .when(lines > NOTE_LINES, |d| {
+                    .child(div().w_full().overflow_hidden().when(cut == Some(true), |d| d.h(px(g.line * NOTE_LINES as f32))).child(body))
+                    .when_some(cut, |d, cut| {
                         d.child(
                             div()
                                 .id(("block-more", id))
@@ -662,8 +835,21 @@ impl AppView {
                                 .text_color(p.acc)
                                 .cursor_pointer()
                                 .debug_selector(move || format!("block-more {id}"))
-                                .child(if open { "less" } else { "more" })
-                                .on_click(cx.listener(move |this, _, _, cx| this.block_more(pane, id, cx))),
+                                .child(if cut { "more" } else { "less" })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.block_down(pane, press, cx);
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.block_up(pane, id, press.act, cx);
+                                    }),
+                                ),
                         )
                     })
                     .into_any_element()
@@ -671,13 +857,37 @@ impl AppView {
             Body::Metric(mt) => {
                 let value_c = glow(7, bound_value(s, |b| if let Body::Metric(x) = b { Some(x.value.clone()) } else { None }), p.ink);
                 let narrow = !fit.notes;
-                let value = div()
-                    .flex_none()
+                // The value and its unit (16 characters each, legal): one
+                // run at 22 px while it fits its room, else at the label's
+                // size; past that each ellipsizes, the unit first, and the
+                // tooltip has it whole (Shady #101 P2-11).
+                let (value, unit) = (
+                    crate::ask::shown(&mt.value, cards_spec::Lines::Single),
+                    mt.unit.as_deref().map(|u| crate::ask::shown(u, cards_spec::Lines::Single)),
+                );
+                let room = (self.panes.cur.layout.column - g.spine - 2. * g.pad) * if narrow { 1. } else { 0.6 };
+                let big = (22. * m.r).round();
+                let wide = (cols(&value) + unit.as_deref().map_or(0, cols)) as f32 * big * 0.6;
+                let size = if wide <= room { big } else { m.label };
+                let whole = match &mt.was {
+                    Some(w) => {
+                        format!("{value}{} · was {}", unit.clone().unwrap_or_default(), crate::ask::shown(w, cards_spec::Lines::Single))
+                    }
+                    None => format!("{value}{}", unit.clone().unwrap_or_default()),
+                };
+                let run = |d: Div| d.min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap();
+                let value = h_flex()
+                    .id(("block-value", id))
+                    .min_w_0()
+                    .max_w(px(room))
+                    .flex_shrink(1.)
                     .font_family(fonts::MONO)
-                    .text_px((22. * m.r).round())
+                    .text_px(size)
                     .text_color(value_c)
                     .debug_selector(move || format!("block-value {id}"))
-                    .child(format!("{}{}", mt.value, mt.unit.as_deref().unwrap_or_default()));
+                    .child(run(div()).flex_shrink(1.).child(value))
+                    .children(unit.map(|u| run(div()).flex_shrink(2.).child(u)))
+                    .tooltip(move |window, cx| crate::overlay::tip(whole.clone(), window, cx));
                 let label = div()
                     .min_w_0()
                     .overflow_hidden()
@@ -704,17 +914,43 @@ impl AppView {
             }
             Body::Group(_) => {
                 let mut col = v_flex().w_full().pb(pb).gap(px(4.)).debug_selector(move || format!("block-members {id}"));
+                let pane = self.panes.cur.id;
+                let group = crate::lease::Target { row: id, tag: s.block.tag };
                 for mshown in &s.members {
                     let mid = row_id(&mshown.block.id);
                     let folded = self.panes.cur.block_folds.folded(mid, mshown);
+                    // A member is its own target (§6.2): its fold, never
+                    // its group's; its group the one it was painted in.
+                    let mtag = mshown.block.tag;
+                    let press = crate::lease::Press {
+                        at: crate::lease::Target { row: mid, tag: mtag },
+                        act: crate::lease::Act::Fold,
+                        group: Some(group),
+                    };
                     col = col.child(
                         v_flex()
+                            .relative()
                             .w_full()
                             .pl(px(g.pad))
                             .bg(p.well_d)
                             .debug_selector(move || format!("block-member {id} {mid}"))
-                            .child(self.block_head(mshown, mid, folded, streaming, fit, g, p, m, cx))
-                            .children((!folded).then(|| self.block_body(mshown, mid, streaming, fit, g, p, m, cx))),
+                            .child(self.block_head(mshown, mid, p.well_d, folded, streaming, fit, g, p, m, cx))
+                            .children((!folded).then(|| self.block_body(mshown, mid, Some(group), streaming, fit, g, p, m, cx)))
+                            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag, id))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.block_down(pane, press, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.block_up(pane, mid, press.act, cx);
+                                }),
+                            ),
                     );
                 }
                 col.into_any_element()
@@ -862,16 +1098,18 @@ impl AppView {
         Some((ix, s))
     }
 
-    /// `more` or `less` on a note.
-    pub(crate) fn block_more(&mut self, pane: crate::pane::PaneId, id: u64, cx: &mut Context<Self>) {
-        self.in_pane(pane, |this| {
-            if !this.panes.cur.block_more.remove(&id) {
-                this.panes.cur.block_more.insert(id);
-            }
-            if let Some(ix) = this.panes.cur.disp.iter().position(|d| d.id == id) {
-                this.panes.cur.list.remeasure_items(ix..ix + 1);
-            }
-        });
-        cx.notify();
+    /// Block row `id` as drawn in this pane now, a top-level block or a
+    /// group's member, and the list index of its row (a member's: its
+    /// group's).
+    pub(crate) fn block_drawn(&self, id: u64) -> Option<(usize, Shown)> {
+        if let Some(found) = self.block_shown(id) {
+            return Some(found);
+        }
+        let items = self.model.lives[self.panes.cur.live].shown().items();
+        self.panes.cur.disp.iter().enumerate().find_map(|(ix, d)| {
+            let Kind::Block { at } = d.kind else { return None };
+            let s = items.get(d.item)?.blocks.as_deref()?.blocks.get(at as usize)?;
+            s.members.iter().find(|m| row_id(&m.block.id) == id).map(|m| (ix, m.clone()))
+        })
     }
 }
