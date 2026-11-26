@@ -70,7 +70,8 @@ impl Moment {
         #[cfg(test)]
         let now = {
             let (mono, wall) = SKEW.with(std::cell::Cell::get);
-            Moment { mono: now.mono + mono, wall: now.wall + wall }
+            let base = FROZEN.with(std::cell::Cell::get).unwrap_or(now);
+            Moment { mono: base.mono + mono, wall: base.wall + wall }
         };
         now
     }
@@ -119,6 +120,16 @@ impl Age {
 thread_local! {
     /// How far a test moved this thread's clocks ([`skew`]): monotonic, wall.
     static SKEW: std::cell::Cell<(Duration, Duration)> = const { std::cell::Cell::new((Duration::ZERO, Duration::ZERO)) };
+    /// Where a test stopped this thread's clocks ([`freeze`]).
+    static FROZEN: std::cell::Cell<Option<Moment>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: [`Moment::now`] on this thread stands still from here, moved by
+/// [`skew`] alone: a test that lets many minutes go by a second at a time
+/// is not early by the real time it takes (a slow runner's seconds).
+#[cfg(test)]
+pub(crate) fn freeze() {
+    FROZEN.with(|f| f.set(Some(Moment { mono: Instant::now(), wall: SystemTime::now() })));
 }
 
 /// Tests: [`Moment::now`] on this thread `mono` and `wall` later than it

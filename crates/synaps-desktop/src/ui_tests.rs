@@ -9717,6 +9717,7 @@ fn an_answer_does_not_outlive_the_daemon_s_cache_query(cx: &mut TestAppContext) 
 fn a_ping_in_flight_is_seen_to_end_however_it_ends(cx: &mut TestAppContext) {
     use serde_json::json;
     let (window, view, _events, seq) = cache_panel(cx);
+    crate::warm::freeze();
     let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"));
     let status = |period: serde_json::Value| synaps_client::Event::SessionStatus {
         attach_seq: seq,
@@ -9732,12 +9733,11 @@ fn a_ping_in_flight_is_seen_to_end_however_it_ends(cx: &mut TestAppContext) {
     };
     let next_ping =
         |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.warm.as_ref().and_then(|w| w.next_ping));
-    // Nothing asked until about second `secs` (the panel's clock is the
-    // test's plus the real time the test takes): what it asked by then.
+    // Nothing asked until second `secs`: what it asked then.
     let look = |cx: &mut TestAppContext, secs: u64| {
-        pass(cx, window, &view, secs - 2);
+        pass(cx, window, &view, secs - 1);
         assert_eq!(panel_asks(cx, &view), [], "nothing before {secs} s");
-        pass(cx, window, &view, 3);
+        pass(cx, window, &view, 1);
         panel_asks(cx, &view)
     };
     deliver(
