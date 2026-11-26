@@ -1248,7 +1248,14 @@ fn reaches(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<
 }
 
 /// The agent asks `input` again as card `card_id` (call `tool`): its row.
-fn asks_again(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, tool: &str, card_id: &str, input: &Value) -> u64 {
+fn asks_again(
+    cx: &mut TestAppContext,
+    w: gpui_kit::AnyWindowHandle,
+    view: &Entity<AppView>,
+    tool: &str,
+    card_id: &str,
+    input: &Value,
+) -> u64 {
     super::answer_tests::ask_live(cx, w, view, tool, card_id, input.clone());
     at_rest(cx, w, view);
     view.read_with(cx, |v, _| v.ask_row(tool).unwrap_or_else(|| panic!("the card of {tool}")))
