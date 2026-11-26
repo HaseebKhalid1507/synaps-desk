@@ -3216,6 +3216,11 @@ impl AppView {
                     let _ = c.on(seq).status();
                 }
             }
+            Effect::CacheExpiry(seq) => {
+                if let Some(c) = &self.client {
+                    let _ = c.on(seq).cache_expiry();
+                }
+            }
         }
     }
 
@@ -4986,19 +4991,27 @@ impl AppView {
         self.watch_poll = Some((due, task));
     }
 
-    /// The right panel's countdown redraws when what it says changes (each
-    /// second under ten minutes, each minute above), and the status is asked
-    /// again a little after a keep-warm ping is due: only while the panel
-    /// shows (`shown`) in a visible window. Cold, or nothing counting:
-    /// nothing armed (an idle window draws no frame for it).
+    /// The right panel's countdowns redraw when what they say changes (each
+    /// second under ten minutes, each minute above); both answers are asked
+    /// again a little after a keep-warm ping is due, and the cache once more
+    /// when its countdown reaches zero: only while the panel shows (`shown`)
+    /// in a visible window. Nothing counting: nothing armed (an idle window
+    /// draws no frame for it).
     fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
         let now = crate::warm::Moment::now();
-        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
+        let stats = &self.model.lives[self.panes.cur.live].stats;
+        let warm = stats.warm.as_ref().filter(|_| shown && self.visible);
+        let expiry = stats.expiry.as_ref().filter(|_| shown && self.visible);
         let seq = self.model.lives[self.panes.cur.live].attachment();
-        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
+        let asks = seq.is_some() && self.client.is_some();
+        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| asks);
+        let zero = expiry.and_then(|e| e.zero_at(now)).filter(|_| asks && self.model.expiry_query);
         // Woken from a sleep: read again at once (the callback rebases).
         let slept = warm.is_some_and(|w| w.slept(now)).then_some(now.mono);
-        let due = [warm.and_then(|w| w.next_change(now)), refresh, slept].into_iter().flatten().min();
+        let due = [warm.and_then(|w| w.next_change(now)), expiry.and_then(|e| e.next_change(now)), refresh, zero, slept]
+            .into_iter()
+            .flatten()
+            .min();
         let Some(due) = due else {
             self.warm_tick = None;
             return;
@@ -5024,13 +5037,29 @@ impl AppView {
                     slept
                 });
                 // A due ping moved the cache's anchor: ask once.
+                let asks = v.model.expiry_query;
                 if (slept || refresh.is_some_and(|r| now.mono >= r))
                     && let (Some(c), Some(seq)) = (&v.client, seq)
                 {
                     let _ = c.on(seq).status();
-                    if let Some(w) = v.model.lives[v.panes.cur.live].stats.warm.as_mut() {
+                    let stats = &mut v.model.lives[v.panes.cur.live].stats;
+                    if asks {
+                        let _ = c.on(seq).cache_expiry();
+                        // Its answer counts down afresh.
+                        if let Some(e) = stats.expiry.as_mut() {
+                            e.asked_at_zero = true;
+                        }
+                    }
+                    if let Some(w) = stats.warm.as_mut() {
                         w.next_ping = None;
                     }
+                } else if zero.is_some_and(|z| now.mono >= z)
+                    && let (Some(c), Some(seq)) = (&v.client, seq)
+                    && let Some(e) = v.model.lives[v.panes.cur.live].stats.expiry.as_mut().filter(|e| !e.asked_at_zero)
+                {
+                    // The countdown reached zero: the band, and once more.
+                    e.asked_at_zero = true;
+                    let _ = c.on(seq).cache_expiry();
                 }
                 cx.notify();
             });

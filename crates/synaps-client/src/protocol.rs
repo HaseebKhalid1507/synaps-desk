@@ -38,9 +38,9 @@ pub const SAVED_SESSIONS_MAX: u32 = 1000;
 /// watch-sessions replacement of `saved_sessions`). An older daemon
 /// answers the frame with `Error{unknown variant}`.
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
-/// `Welcome.features` entry: the daemon answers `Status{cache: true}` with
-/// when the session's prompt cache expires (`cache`), to the asking client
-/// only. An older daemon is never asked.
+/// `Welcome.features` entry: the daemon answers `SessionQuery::CacheExpiry`
+/// (SynapsCLI #462). An older daemon fails the frame as malformed, so it is
+/// never asked.
 pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
@@ -349,14 +349,9 @@ impl std::fmt::Debug for SessionCommand {
 pub enum SessionQuery {
     /// Reply value: the session's `api_messages` array.
     Messages,
-    /// Reply value: the session's status object. `cache`: with when the
-    /// prompt cache expires (`cache`), answered to this client only; ask it
-    /// only of a daemon whose `Welcome.features` lists
-    /// [`FEATURE_CACHE_EXPIRY`] (an off flag is not sent: the old bytes).
-    Status {
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        cache: bool,
-    },
+    /// Reply value: the session's status object (`model`, `cost`,
+    /// `keepwarm`, `pinned`, `cache_ttl`).
+    Status,
     /// Reply value: a [`WatchPage`] of worker `handle_id`'s journal from
     /// `since` (the previous page's `next_seq`; 0 = all), or `{"error":
     /// "no subagent <id> in this session"}`. `tool_queue`: include the
@@ -369,6 +364,12 @@ pub enum SessionQuery {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// Reply value: a [`crate::cache_expiry::CacheExpiry`], or a
+    /// [`crate::cache_expiry::QueryError`] (`{"error": {"code", ..}}`).
+    /// Only of a daemon whose `Welcome.features` lists
+    /// [`FEATURE_CACHE_EXPIRY`]: an older one answers
+    /// `Error{"malformed frame: unknown variant `cache_expiry`..."}`.
+    CacheExpiry,
 }
 
 /// One page of a worker's watch journal (`runtime::subagent_watch::WatchPage`,

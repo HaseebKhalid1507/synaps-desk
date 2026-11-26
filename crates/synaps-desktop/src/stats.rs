@@ -139,9 +139,15 @@ pub struct Stats {
     pub subagents: Subagents,
     /// The attachment ended: these are the last numbers seen, not live.
     pub detached: bool,
-    /// Its prompt cache and keep-warm, as its last `Status` said
-    /// ([`crate::warm`]); kept across a re-attach of the same session.
+    /// Its keep-warm, as its last `Status` said ([`crate::warm`]); kept
+    /// across a re-attach of the same session.
     pub warm: Option<crate::warm::Warm>,
+    /// Its prompt cache, as its last `cache_expiry` answer said; kept
+    /// across a re-attach of the same session, dropped when the cache is
+    /// not what it was (until the daemon answers again).
+    pub expiry: Option<crate::warm::Expiry>,
+    /// A `stale` answer was asked once more (and not answered since).
+    pub expiry_retried: bool,
 }
 
 impl Stats {
@@ -160,7 +166,7 @@ impl Stats {
         }
         subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
-        let warm = if same { self.warm.take() } else { None };
+        let (warm, expiry) = if same { (self.warm.take(), self.expiry.take()) } else { (None, None) };
         *self = Stats {
             session: Some(a.meta.id.clone()),
             view: RuntimeInfo::from_value(&a.view),
@@ -172,6 +178,8 @@ impl Stats {
             subagents,
             detached: false,
             warm,
+            expiry,
+            expiry_retried: false,
         };
         self.subagents.replaying(true);
         for env in &a.replay {
@@ -204,8 +212,8 @@ impl Stats {
 
     /// A live event; `raw` is the wire event (fields the mirror drops).
     /// `true`: the session's prompt cache is not what it was (the history
-    /// was replaced, or the model changed): the countdown stops, and the
-    /// daemon is asked again.
+    /// was replaced, or the model changed): the countdown is dropped, and
+    /// the daemon is asked again.
     pub fn on_session(&mut self, ev: &SessionEvent, raw: &Value) -> bool {
         self.subagents.on_session(ev);
         let mut new_cache = false;
@@ -255,8 +263,8 @@ impl Stats {
             }
             _ => {}
         }
-        if new_cache && let Some(w) = self.warm.as_mut() {
-            w.invalidate();
+        if new_cache {
+            self.expiry = None;
         }
         new_cache
     }

@@ -96,6 +96,7 @@
 //! - [`transcript`]: history + live events folded into display rows
 //! - [`synthetic`]: deterministic load for benches
 
+pub mod cache_expiry;
 pub mod cards;
 pub mod client;
 pub mod conn;
@@ -107,9 +108,10 @@ pub mod protocol;
 pub mod synthetic;
 pub mod transcript;
 
+pub use cache_expiry::{CacheExpiry, CacheReason, CacheState, QueryError, QueryErrorCode, decode_query_reply, render_cache_expiry};
 pub use client::{
-    ATTACH_MAX, Backoff, Client, ClientClosed, ClientOptions, Command, CommandReply, CreateOptions, Cwd, Error, Event, Expect,
-    RELOAD_RETRY, RELOAD_WINDOW, RELOADING, RequestError, STEER_UNSUPPORTED, SessionRef, Status, WatchReply,
+    ATTACH_MAX, Backoff, CacheExpiryReply, Client, ClientClosed, ClientOptions, Command, CommandReply, CreateOptions, Cwd, Error, Event,
+    Expect, RELOAD_RETRY, RELOAD_WINDOW, RELOADING, RequestError, STEER_UNSUPPORTED, SessionRef, Status, WatchReply,
 };
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;

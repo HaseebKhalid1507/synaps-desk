@@ -9519,3 +9519,55 @@ fn a_fold_turned_round_mid_way_takes_over_where_it_is(cx: &mut TestAppContext) {
         assert!((ys[0] - ys.last().copied().unwrap_or(0.)).abs() < 0.5, "back where it was: {ys:?}");
     }
 }
+
+/// The right panel's PROMPT CACHE in each state of SynapsCLI #462's
+/// `cache_expiry` answer, as drawn: the EXPIRES cell says what the answer
+/// says (a countdown "about", the band, cold, no matching request, `—` for
+/// what can't be told), inside its half column; a daemon that can't answer
+/// draws `—`, never `cold`; no answer at all, no section.
+#[gpui_kit::test]
+fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
+    use serde_json::{Value, json};
+    let (window, view, _events) = open(cx);
+    let show = |cx: &mut TestAppContext, keep_warm: bool, answer: Option<Value>, asked: bool| {
+        view.update(cx, |v, cx| {
+            let now = crate::warm::Moment::now();
+            v.model.expiry_query = asked;
+            let stats = &mut v.model.lives[v.panes.cur.live].stats;
+            stats.warm = keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now));
+            stats.expiry = answer.map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now));
+            cx.notify();
+        });
+        settle(cx, window, 8);
+    };
+    for (answer, asked, says) in [
+        (Some(json!({"state": "warm", "warm_for_secs": 3030, "proof_ttl_secs": 3600})), true, "about 50m"),
+        (Some(json!({"state": "unknown", "reason": "may_have_expired", "lapse_by_secs": 2400})), true, "expired?"),
+        (Some(json!({"state": "cold", "reason": "expired"})), true, "cold"),
+        (Some(json!({"state": "cold", "reason": "uncached"})), true, "uncached"),
+        (Some(json!({"state": "unknown", "reason": "no_matching_request"})), true, "no match"),
+        (Some(json!({"state": "unknown", "reason": "parked"})), true, "—"),
+        (Some(json!({"state": "lukewarm", "reason": "meteor"})), true, "—"),
+        (Some(json!({"error": {"code": "busy"}})), true, "—"),
+        (None, true, "—"),
+        (None, false, "—"),
+    ] {
+        show(cx, true, answer.clone(), asked);
+        let mut vcx = VisualTestContext::from_window(window, cx);
+        let section = vcx.debug_bounds("right-cache").unwrap_or_else(|| panic!("{answer:?}: the section"));
+        let cell = vcx.debug_bounds(format!("right-cache-expires {says}").leak()).unwrap_or_else(|| panic!("{answer:?}: says {says}"));
+        // The cell is half the section's content (24 px padding a side);
+        // its words, drawn at 17 px display, fit in it.
+        let half = (f32::from(section.size.width) - 48.) / 2.;
+        assert!((f32::from(cell.size.width) - half).abs() < 1., "{says}: half the section ({cell:?} of {section:?})");
+        let w = cx.update_window(window, |_, window, cx| view.read(cx).display_w(says, 17., window)).expect("the window");
+        assert!(w <= half, "{says}: {w} px in {half}");
+    }
+    // Only the cache's answer (the status not in yet): the section, its
+    // keep-warm cells `—`.
+    show(cx, false, Some(json!({"state": "cold", "reason": "expired"})), true);
+    assert!(VisualTestContext::from_window(window, cx).debug_bounds("right-cache-expires cold").is_some());
+    // Neither: no section.
+    show(cx, false, None, true);
+    assert!(VisualTestContext::from_window(window, cx).debug_bounds("right-cache").is_none());
+}

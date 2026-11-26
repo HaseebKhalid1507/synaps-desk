@@ -179,8 +179,11 @@ pub enum Effect {
         reply: Result<Option<String>, String>,
     },
     /// Ask attachment `attach_seq`'s session for its `Status` (the right
-    /// panel's cache and keep-warm numbers, [`crate::warm`]).
+    /// panel's keep-warm numbers, [`crate::warm`]).
     Status(u64),
+    /// Ask attachment `attach_seq`'s session what its requests show about
+    /// its prompt cache (`cache_expiry`, the panel's countdown).
+    CacheExpiry(u64),
 }
 
 /// A resume in flight (`Client::resume`).
@@ -432,10 +435,15 @@ pub struct Model {
     /// for its dash again).
     pub daemon: Option<Daemon>,
     pub daemon_gen: u64,
-    /// The daemon's `Status` says when the prompt cache expires
-    /// (`Welcome.features: cache_expiry`): only then is it asked for the
-    /// right panel's cache and keep-warm ([`crate::warm`]).
+    /// The daemon answers `cache_expiry` (`Welcome.features:
+    /// cache_expiry`): only then is it asked for the right panel's cache
+    /// and keep-warm ([`crate::warm`]).
     pub cache_expiry: bool,
+    /// ... and it has not failed the query as malformed (a daemon that
+    /// lists the feature for an earlier contract): until the next
+    /// connection, its cache is not asked again (the panel says it can't
+    /// tell); its keep-warm still is.
+    pub expiry_query: bool,
 }
 
 /// Tests only (split/architecture.md §6.6): `v.model.transcript`,
@@ -502,6 +510,23 @@ impl Model {
             daemon: None,
             daemon_gen: 0,
             cache_expiry: false,
+            expiry_query: false,
+        }
+    }
+
+    /// Ask store `lid`'s attachment `seq` for the right panel's numbers:
+    /// its status, and its cache from a daemon that answers it.
+    fn ask_panel(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+        effects.push(Effect::Status(seq));
+        self.ask_expiry(lid, seq, effects);
+    }
+
+    /// Ask store `lid`'s attachment `seq` for its cache's evidence (a
+    /// `stale` answer is asked once more after it).
+    fn ask_expiry(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+        if self.expiry_query {
+            self.lives[lid].stats.expiry_retried = false;
+            effects.push(Effect::CacheExpiry(seq));
         }
     }
 
@@ -1502,7 +1527,7 @@ impl Model {
         // (attach, a turn's end, a keep-warm notice): the store's own
         // attachment only, from a daemon that says when the cache expires.
         if let Some(seq) = crate::warm::asks(&ev).filter(|s| self.cache_expiry && self.lives[lid].current(*s)) {
-            effects.push(Effect::Status(seq));
+            self.ask_panel(lid, seq, &mut effects);
         }
         let ev = match ev {
             Event::Sessions(mut s) => {
@@ -1607,6 +1632,36 @@ impl Model {
                 }
                 return effects;
             }
+            Event::CacheExpiry { reply: synaps_client::CacheExpiryReply::Unsupported, .. } => {
+                // It can't decode the query: not asked again on this
+                // connection; the panel says it can't tell.
+                self.expiry_query = false;
+                self.view_dirty = true;
+                return effects;
+            }
+            Event::CacheExpiry { attach_seq, reply } => {
+                use synaps_client::{CacheExpiryReply, QueryErrorCode};
+                if !self.lives[lid].current(attach_seq) {
+                    return effects;
+                }
+                let stats = &mut self.lives[lid].stats;
+                let answer = match reply {
+                    CacheExpiryReply::Answer(c) => Ok(c),
+                    // A newer ask's answer follows.
+                    CacheExpiryReply::Error(e) if e.code == QueryErrorCode::Superseded => return effects,
+                    // What it was computed from changed: once more.
+                    CacheExpiryReply::Error(e) if e.code == QueryErrorCode::Stale && !stats.expiry_retried => {
+                        stats.expiry_retried = true;
+                        effects.push(Effect::CacheExpiry(attach_seq));
+                        return effects;
+                    }
+                    CacheExpiryReply::Error(e) => Err(e),
+                    _ => return effects,
+                };
+                stats.expiry = Some(crate::warm::Expiry::new(answer, crate::warm::Moment::now()));
+                self.view_dirty = true;
+                return effects;
+            }
             ev => ev,
         };
         self.view_dirty = true;
@@ -1638,6 +1693,7 @@ impl Model {
                     // on local builds only) until it does not.
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
                     self.cache_expiry = features.iter().any(|f| f == synaps_client::FEATURE_CACHE_EXPIRY);
+                    self.expiry_query = self.cache_expiry;
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     self.named.polled = None;
                     self.named.retries = 0;
@@ -1895,8 +1951,13 @@ impl Model {
                 if raw["ev"] == "external" && raw["event"]["content"]["content_type"] == "subagent_steer" {
                     self.lives[lid].watch.steer_accepted(raw["event"]["content"]["data"]["handle_id"].as_str().unwrap_or(""));
                 }
+                // The cache is not what it was: both asked again. Any applied
+                // setting may make the next request another (thinking is in
+                // the cache's identity): its cache is asked again.
                 if self.lives[lid].stats.on_session(&event, &raw) && self.cache_expiry {
-                    effects.push(Effect::Status(attach_seq));
+                    self.ask_panel(lid, attach_seq, &mut effects);
+                } else if raw["ev"] == "setting_changed" && raw["applied"]["ok"] != false {
+                    self.ask_expiry(lid, attach_seq, &mut effects);
                 }
                 // After a swap (a compaction, `/clear`, `/resume`): only a
                 // compaction's successor names its parent. The journal it
@@ -3091,11 +3152,16 @@ mod tests {
     }
 
     /// The right panel's cache and keep-warm (`crate::warm`): asked from a
-    /// daemon that says when the cache expires, on the attachment's attach,
-    /// turn end and keep-warm notices, nothing else; the answer is the store's.
+    /// daemon that answers `cache_expiry`, on the attachment's attach, turn
+    /// end and keep-warm notices, nothing else; the answers are the store's.
     #[test]
     fn cache_status_is_asked_on_attach_turn_end_and_keep_warm_notices() {
-        let asked = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Status(1))).count();
+        let asked = |fx: &[Effect]| {
+            let status = fx.iter().filter(|e| matches!(e, Effect::Status(1))).count();
+            let cache = fx.iter().filter(|e| matches!(e, Effect::CacheExpiry(1))).count();
+            assert_eq!(status, cache, "both together: {fx:?}");
+            status
+        };
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&[]));
         m.want(LiveId::FIRST, 1);
@@ -3109,21 +3175,106 @@ mod tests {
         assert_eq!(asked(&m.apply(notice("cache keep-warm ended: bound reached"))), 1, "keep-warm notice");
         assert_eq!(asked(&m.apply(notice("model → x"))), 0, "any other notice");
         assert_eq!(asked(&m.apply(session(7, SessionEvent::Idle))), 0, "not this store's attachment");
-        let st = json!({"pinned": true, "keepwarm": {"mode": "auto", "session_pings": 2}, "cache": {"ttl": "5m", "expires_in_secs": 200}});
+        let st = json!({"pinned": true, "keepwarm": {"mode": "auto", "session_pings": 2}});
         m.apply(Event::SessionStatus { attach_seq: 1, value: st });
         let w = m.lives[LiveId::FIRST].stats.warm.clone().expect("kept");
-        assert_eq!((w.mode.as_str(), w.pinned, w.pings, w.expires.map(|d| d.as_secs())), ("auto", true, 2, Some(200)));
+        assert_eq!((w.mode.as_str(), w.pinned, w.pings), ("auto", true, 2));
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 200})));
+        assert_eq!(left(&m), Some(200));
+        // Another attachment's answer is not this store's.
+        m.apply(expiry(7, json!({"state": "cold", "reason": "expired"})));
+        assert_eq!(left(&m), Some(200));
+    }
+
+    /// `Event::CacheExpiry` for attachment `seq`, the daemon's `value`.
+    fn expiry(seq: u64, value: Value) -> Event {
+        let reply = match synaps_client::decode_query_reply(&value) {
+            Ok(c) => synaps_client::CacheExpiryReply::Answer(c),
+            Err(e) => synaps_client::CacheExpiryReply::Error(e),
+        };
+        Event::CacheExpiry { attach_seq: seq, reply }
+    }
+
+    /// The first store's `warm` countdown's seconds, as answered.
+    fn left(m: &Model) -> Option<u64> {
+        m.lives[LiveId::FIRST].stats.expiry.as_ref().and_then(|e| e.answer.as_ref().ok()).and_then(|c| c.warm_for_secs)
+    }
+
+    /// A daemon without SynapsCLI #462 (avante's and dev's today): one that
+    /// doesn't list `cache_expiry` is never asked; one that lists it for an
+    /// earlier contract and fails the query as malformed is not asked it
+    /// again on that connection (its keep-warm still is), and the panel
+    /// says it can't tell, never `cold`. A new connection asks again.
+    #[test]
+    fn a_daemon_that_cannot_answer_is_not_asked_again() {
+        let count = |fx: &[Effect]| {
+            (
+                fx.iter().filter(|e| matches!(e, Effect::Status(1))).count(),
+                fx.iter().filter(|e| matches!(e, Effect::CacheExpiry(1))).count(),
+            )
+        };
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        let fx = m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        assert_eq!(count(&fx), (1, 1));
+        m.apply(Event::CacheExpiry { attach_seq: 1, reply: synaps_client::CacheExpiryReply::Unsupported });
+        assert!(!m.expiry_query);
+        for _ in 0..3 {
+            assert_eq!(count(&m.apply(session(1, SessionEvent::Idle))), (1, 0), "keep-warm only, every turn");
+        }
+        let cell = crate::warm::expires(m.lives[LiveId::FIRST].stats.expiry.as_ref(), m.expiry_query, crate::warm::Moment::now());
+        assert_eq!((cell.text.as_str(), cell.tip.as_deref()), ("—", Some(crate::warm::CANT_TELL)));
+        // A reconnect (perhaps to a newer daemon) asks again, once.
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        assert_eq!(count(&m.apply(session(1, SessionEvent::Idle))), (1, 1));
+        // A daemon without the feature: nothing at all.
+        m.apply(connected(&[]));
+        assert_eq!(count(&m.apply(session(1, SessionEvent::Idle))), (0, 0));
+    }
+
+    /// `stale` is asked once more (the answer stands until then), then
+    /// said; `superseded` waits for the newer ask's answer; any other error
+    /// is said (`—`, couldn't check). A fresh ask may retry a stale again.
+    #[test]
+    fn stale_is_asked_once_more_and_superseded_waits() {
+        let retried = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::CacheExpiry(1))).count();
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 200})));
+        let stale = || expiry(1, json!({"error": {"code": "stale"}}));
+        assert_eq!(retried(&m.apply(stale())), 1, "once more");
+        assert_eq!(left(&m), Some(200), "the last answer stands meanwhile");
+        assert_eq!(retried(&m.apply(stale())), 0, "not twice");
+        let e = m.lives[LiveId::FIRST].stats.expiry.clone().unwrap();
+        assert_eq!(e.answer.unwrap_err().code, synaps_client::QueryErrorCode::Stale);
+        m.apply(session(1, SessionEvent::Idle));
+        assert_eq!(retried(&m.apply(stale())), 1, "a fresh ask retries again");
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 100})));
+        assert_eq!(retried(&m.apply(expiry(1, json!({"error": {"code": "superseded"}})))), 0);
+        assert_eq!(left(&m), Some(100), "superseded: the answer stands");
+        m.apply(expiry(1, json!({"error": {"code": "busy"}})));
+        let cell = crate::warm::expires(m.lives[LiveId::FIRST].stats.expiry.as_ref(), true, crate::warm::Moment::now());
+        assert_eq!((cell.text.as_str(), cell.tip.as_deref()), ("—", Some("couldn't check (busy)")));
     }
 
     /// The countdown is not the session's any more after an effective model
     /// change (a `Set`, another client's `/model`: both `setting_changed`)
     /// or a replaced history (`/clear`, `/resume`, an applied compaction):
-    /// it stops at once and the daemon is asked again. A refused or
+    /// it is dropped at once and both are asked again. A refused or
     /// same-model change, a thinking change, a failed compaction, or
-    /// another attachment's event keeps it, unasked.
+    /// another attachment's event keeps it; an applied setting (a thinking
+    /// change is another request) asks for the cache again.
     #[test]
     fn a_new_model_or_history_stops_the_countdown_and_asks_again() {
-        let asked = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Status(1))).count();
+        let asked = |fx: &[Effect]| {
+            (
+                fx.iter().filter(|e| matches!(e, Effect::Status(1))).count(),
+                fx.iter().filter(|e| matches!(e, Effect::CacheExpiry(1))).count(),
+            )
+        };
         let raw = |seq: u64, v: Value| {
             let e = synaps_client::protocol::decode_event(&v).unwrap();
             Event::session(seq, "s", 0, e, Arc::new(v))
@@ -3135,7 +3286,6 @@ mod tests {
                 "view": {"model": model, "thinking_level": level, "reasoning_level": level, "context_window": 200000}}}),
             )
         };
-        let warm = json!({"keepwarm": {"mode": "off"}, "cache": {"ttl": "1h", "expires_in_secs": 3000}});
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
         m.want(LiveId::FIRST, 1);
@@ -3143,21 +3293,20 @@ mod tests {
             "input_owner": 2, "view": {"model": "claude-a", "thinking_level": "low", "context_window": 200000}});
         let Ok(synaps_client::protocol::DaemonFrame::Attached(a)) = synaps_client::protocol::decode_frame(&v.to_string()) else { panic!() };
         m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: false });
-        let counting = |m: &Model| m.lives[LiveId::FIRST].stats.warm.as_ref().and_then(|w| w.expires).is_some();
         let fresh = |m: &mut Model| {
-            m.apply(Event::SessionStatus { attach_seq: 1, value: warm.clone() });
-            assert!(counting(m));
+            m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 3000})));
+            assert!(left(m).is_some());
         };
         fresh(&mut m);
-        for (why, ev) in [
-            ("refused", set(1, false, "claude-a", "low")),
-            ("the same model", set(1, true, "claude-a", "low")),
-            ("a thinking change", set(1, true, "claude-a", "high")),
-            ("a failed compaction", raw(1, json!({"ev": "compaction_failed", "message": "no"}))),
-            ("another attachment's", set(7, true, "claude-b", "low")),
+        for (why, ev, again) in [
+            ("refused", set(1, false, "claude-a", "low"), 0),
+            ("the same model", set(1, true, "claude-a", "low"), 1),
+            ("a thinking change", set(1, true, "claude-a", "high"), 1),
+            ("a failed compaction", raw(1, json!({"ev": "compaction_failed", "message": "no"})), 0),
+            ("another attachment's", set(7, true, "claude-b", "low"), 0),
         ] {
-            assert_eq!(asked(&m.apply(ev)), 0, "{why}");
-            assert!(counting(&m), "{why}: still counting");
+            assert_eq!(asked(&m.apply(ev)), (0, again), "{why}");
+            assert!(left(&m).is_some(), "{why}: still counting");
         }
         for (why, ev) in [
             ("another model", set(1, true, "claude-b", "low")),
@@ -3169,15 +3318,14 @@ mod tests {
             ),
         ] {
             fresh(&mut m);
-            assert_eq!(asked(&m.apply(ev)), 1, "{why}: asked again");
-            let w = m.lives[LiveId::FIRST].stats.warm.as_ref().unwrap();
-            assert!(w.expires.is_none() && w.next_change(crate::warm::Moment::now()).is_none(), "{why}: stopped");
+            assert_eq!(asked(&m.apply(ev)), (1, 1), "{why}: asked again");
+            assert!(m.lives[LiveId::FIRST].stats.expiry.is_none(), "{why}: dropped, can't tell until answered");
         }
     }
 
     /// Providers don't share a prompt cache: a switch to another
     /// provider's model of the same name is a new model, so the countdown
-    /// stops and the daemon is asked again (Shady #68 round 3). Only
+    /// is dropped and the daemon is asked again (Shady #68 round 3). Only
     /// `anthropic/`, the default provider's documented alias, is the same
     /// model written two ways.
     #[test]
@@ -3189,7 +3337,6 @@ mod tests {
             let e = synaps_client::protocol::decode_event(&v).unwrap();
             Event::session(1, "s", 0, e, Arc::new(v))
         };
-        let warm = json!({"keepwarm": {"mode": "off"}, "cache": {"ttl": "1h", "expires_in_secs": 3000}});
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
         m.want(LiveId::FIRST, 1);
@@ -3197,7 +3344,6 @@ mod tests {
             "input_owner": 2, "view": {"model": "anthropic/claude-sonnet-4-6", "thinking_level": "low", "context_window": 200000}});
         let Ok(synaps_client::protocol::DaemonFrame::Attached(a)) = synaps_client::protocol::decode_frame(&v.to_string()) else { panic!() };
         m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: false });
-        let counting = |m: &Model| m.lives[LiveId::FIRST].stats.warm.as_ref().and_then(|w| w.expires).is_some();
         for (model, new) in [
             ("bedrock/claude-sonnet-4-6", true),
             ("claude-sonnet-4-6", true),
@@ -3206,10 +3352,10 @@ mod tests {
             ("ext-b/claude-sonnet-4-6", true),
             ("ext-b/claude-sonnet-4-6", false),
         ] {
-            m.apply(Event::SessionStatus { attach_seq: 1, value: warm.clone() });
-            assert!(counting(&m));
+            m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 3000})));
+            assert!(left(&m).is_some());
             assert_eq!(asked(&m.apply(set(model))), usize::from(new), "to {model}: asked again");
-            assert_eq!(!counting(&m), new, "to {model}: stopped");
+            assert_eq!(left(&m).is_none(), new, "to {model}: dropped");
         }
     }
 
