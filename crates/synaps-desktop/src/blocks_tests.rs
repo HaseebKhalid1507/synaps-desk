@@ -593,6 +593,65 @@ fn a_held_press_acts_on_what_it_pressed(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].board.waiting.is_none()), "drawn at release");
 }
 
+/// The daemon detaches a session its tab still shows (it ended, or was
+/// taken over): the transcript stays, read-only, and so does its board
+/// work (Shady #101 P2-4: release what no pane owns; this pane owns it).
+/// The board drawn stays drawn, the history's fold stays with it, and a
+/// board that waited under the pointer lease (which the detach cleared)
+/// still draws, the newest; nothing runs after. Its fold goes with the
+/// transcript (a switch away, a close: `a_sessions_block_state_and_board_
+/// work_go_with_its_transcript`).
+#[gpui_kit::test]
+fn a_detached_sessions_board_stays_with_the_transcript_it_shows(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let live = view.read_with(cx, |v, _| v.panes.cur.live);
+    turn(cx, w, &view);
+    let put = json!([
+        {"op":"put","id":"a","kind":"plan","body":{"steps":[{"id":"s1","label":"One","state":"todo"}]}},
+        {"op":"put","id":"b","kind":"note","body":{"text":"B"}}
+    ]);
+    round(cx, w, &view, &[("toolu_p", put, true)]);
+    view.update(cx, |v, cx| {
+        v.panes.cur.list.scroll_to_end();
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let b = id(cx, &view, "b");
+    let at = head_at(cx, w, b);
+    mouse(cx, w, at, "move");
+    let grow = json!([{"op":"patch","id":"a","append":{"steps":[{"id":"s2","label":"Two","state":"todo"}]}}]);
+    round(cx, w, &view, &[("toolu_g", grow, true)]);
+    assert!(view.read_with(cx, |v, _| v.model.lives[live].board.waiting.is_some()), "a board waits under the lease");
+    let (seq, sid) = super::answer_tests::attachment(cx, &view);
+    view.update(cx, |v, cx| {
+        let ev = synaps_client::Event::Detached { attach_seq: seq, session_id: Some(sid), reason: "session ended".into() };
+        v.apply_batch(vec![ev], cx);
+    });
+    let state = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let l = &v.model.lives[live];
+            (l.active.is_none(), l.transcript.drawn().is_some(), l.transcript.blocks_retained().journal > 0)
+        })
+    };
+    assert_eq!(state(cx), (true, true, true), "detached: its board drawn and its fold kept");
+    wait(cx, w, &view, 2000);
+    board(cx, w, &view);
+    let steps = view.read_with(cx, |v, _| {
+        let (_, s) = v.block_shown(row_of(v, "a")).expect("a drawn");
+        match &s.block.body {
+            synaps_client::blocks::Body::Plan(p) => p.steps.len(),
+            _ => 0,
+        }
+    });
+    assert_eq!(steps, 2, "the board that waited draws: the newest");
+    view.read_with(cx, |v, _| {
+        let l = &v.model.lives[live];
+        assert!(l.board.waiting.is_none() && !l.board.running(), "nothing waits or runs after");
+    });
+    assert_eq!(state(cx), (true, true, true), "still drawn, its fold still kept");
+    assert!(row(cx, &view, "b").is_some(), "the read-only transcript's blocks");
+}
+
 /// A key releases the lease: what waited draws.
 #[gpui_kit::test]
 fn a_key_releases_the_lease(cx: &mut TestAppContext) {
