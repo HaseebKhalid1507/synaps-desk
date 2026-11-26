@@ -12,6 +12,15 @@
 //! - **Skip** on any open card (F7).
 //! - **Retry** on an answer not sent, **Resend** on one the desk couldn't
 //!   confirm (F16, F17, F20, F22): a human's click, never automatic.
+//! - **Change** (§3.6, F15; the D4 row of §9.3): an answered or skipped
+//!   card's receipt says `· change` while the card is in the history, not
+//!   closed, and no answer of this desk's to it is on its way. A click
+//!   reopens the card, the answer its receipt shows in it; what is sent
+//!   from it is `[card <id> changed]` (a skip is a skip), through the
+//!   same press as a first answer ([`AppView::ask_send`]), so every
+//!   delivery outcome and the memo are as for one. Picking the answer it
+//!   already shows sends nothing, and Keep (Esc, from the keys) closes it
+//!   as it was. The later answer wins in the fold (§3.6).
 //!
 //! Every control acts only once armed ([`crate::app::ARM`] after it was
 //! first painted in view in its pane, actionable: [`crate::ask::probe`]):
@@ -33,10 +42,10 @@
 //! answers ends a keyboard batch, and the keys go back to the composer
 //! ([`AppView::clicked_an_answer`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
-use cards_spec::{CardDoc, FieldKind, FieldValue, Mode, Reply};
+use cards_spec::{Answer, CardDoc, Choice, FieldKind, FieldValue, Mode, Reply};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::*;
 use serde_json::{Map, Value, json};
@@ -59,6 +68,9 @@ pub(crate) struct Draft {
     pub(crate) longs: HashMap<String, Entity<TextareaState>>,
     /// Each check's value, once clicked (until then, its prefill).
     pub(crate) checks: HashMap<String, bool>,
+    /// A reopened card's text fields as its answer gave them, until
+    /// clicked into (D4: change an answer).
+    pub(crate) given: HashMap<String, String>,
     /// What the last click met, when it sent nothing.
     pub(crate) said: Option<String>,
     _subs: Vec<Subscription>,
@@ -75,23 +87,26 @@ impl Draft {
             lines: HashMap::new(),
             longs: HashMap::new(),
             checks: HashMap::new(),
+            given: HashMap::new(),
             said: None,
             _subs: Vec::new(),
         }
     }
 
-    /// Field `id`'s value as it stands: typed, or the prefill.
+    /// Field `id`'s value as it stands: typed, or as the answer being
+    /// changed gave it, or the prefill.
     pub(crate) fn value(&self, doc: &CardDoc, id: &str, cx: &App) -> Option<FieldValue> {
         let f = doc.field(id)?;
+        let given = || self.given.get(id).map_or_else(|| f.value.clone(), |t| FieldValue::Text(t.clone()));
         Some(match f.kind {
             FieldKind::Check => FieldValue::Check(self.checks.get(id).copied().unwrap_or(f.value == FieldValue::Check(true))),
             FieldKind::Text => match self.lines.get(id) {
                 Some(e) => FieldValue::Text(e.read(cx).value().to_string()),
-                None => f.value.clone(),
+                None => given(),
             },
             FieldKind::Long => match self.longs.get(id) {
                 Some(e) => FieldValue::Text(e.read(cx).value().to_string()),
-                None => f.value.clone(),
+                None => given(),
             },
         })
     }
@@ -131,6 +146,28 @@ impl Draft {
     /// check one (`cards_spec::parse_answer`), or what it still needs.
     pub(crate) fn reply(&self, doc: &CardDoc, cx: &App) -> Result<Reply, String> {
         cards_spec::parse_answer(doc, &self.values(doc, cx)).map(Reply::Answer).map_err(|e| needs(doc, &e))
+    }
+}
+
+/// Whether `new` says what `shown` says: the same values, or both a skip.
+/// Read as the card shows them (Shady #94 P2-2): a multi-select's picks
+/// as a set (a draft lists them in the doc's order, an answer read from
+/// the chat in its own, and nothing on the card sets an order), and the
+/// fields by id.
+fn same(shown: &Reply, new: &Reply) -> bool {
+    match (shown, new) {
+        (Reply::Skip, Reply::Skip) => true,
+        (Reply::Answer(a) | Reply::Change(a), Reply::Answer(b) | Reply::Change(b)) => {
+            let picks = match (&a.choice, &b.choice) {
+                (Some(Choice::Many(x)), Some(Choice::Many(y))) => x.iter().collect::<BTreeSet<_>>() == y.iter().collect::<BTreeSet<_>>(),
+                (x, y) => x == y,
+            };
+            fn fields(a: &Answer) -> Option<BTreeMap<&str, &FieldValue>> {
+                a.fields.as_ref().map(|f| f.iter().map(|(id, v)| (id.as_str(), v)).collect())
+            }
+            picks && a.note == b.note && fields(a) == fields(b)
+        }
+        _ => false,
     }
 }
 
@@ -371,13 +408,29 @@ impl AppView {
     /// Press `reply` on the card `painted`: checked on what the store holds
     /// now ([`crate::model::Model::press_card`]), sent, its draft gone
     /// (true); or the card says why nothing went. D2b's keys send here
-    /// too: the one delivery path.
+    /// too: the one delivery path. On a card reopened to change its answer
+    /// (D4), an answer is a change (`[card <id> changed]`, §3.3; a skip is
+    /// a skip), and one that says what the card shows already sends
+    /// nothing: the card closes as it was (true).
     pub(crate) fn ask_send(&mut self, session: &str, row: u64, painted: &Painted, reply: Reply, cx: &mut Context<Self>) -> bool {
         let live = self.panes.cur.live;
+        let key = (session.to_string(), painted.tool_id.clone());
+        let changing = self.card_changing.contains(&key);
+        let reply = match reply {
+            Reply::Answer(a) if changing => Reply::Change(a),
+            r => r,
+        };
+        if changing && self.changeable(live, painted).is_some_and(|shown| same(&shown, &reply)) {
+            log::info!(target: "synaps_desktop::card", "card {}: the answer it shows, nothing sent", painted.id);
+            self.card_keep(session, painted);
+            self.after_card(row, cx);
+            return true;
+        }
         let sent = match self.model.press_card(live, painted, reply, Instant::now()) {
             Ok(out) => {
                 self.send_card(live, out, cx);
-                self.card_drafts.remove(&(session.to_string(), painted.tool_id.clone()));
+                self.card_drafts.remove(&key);
+                self.card_changing.remove(&key);
                 true
             }
             Err(why) => {
@@ -388,6 +441,121 @@ impl AppView {
         };
         self.after_card(row, cx);
         sent
+    }
+
+    /// The answer of the card `painted` in store `live` that this desk may
+    /// change now (§3.6), as its receipt shows it: the card still the one
+    /// painted, in the history (not the live turn's alone), and not closed,
+    /// replaced or gone; answered or skipped, or ours not confirmed or not
+    /// sent; and no answer of this desk's to it on its way (one per card,
+    /// §3.5). Ours, while the memo holds it; else the fold's latest.
+    pub(crate) fn changeable(&self, live: crate::live::LiveId, painted: &Painted) -> Option<Reply> {
+        let l = &self.model.lives[live];
+        if l.watch.focused().is_some() {
+            return None;
+        }
+        let session = l.active.as_ref()?.session_id.as_str();
+        let t = &l.transcript;
+        let c = painted.find(t.cards()).filter(|c| c.answerable() && painted.confirmed(t))?;
+        let ours = self.model.memos.entry(session, c);
+        if ours.is_some_and(|e| e.in_flight()) {
+            return None;
+        }
+        ours.map(|e| e.reply.clone()).or_else(|| c.receipt().map(|r| r.reply.clone()))
+    }
+
+    /// The card of call `tool` of `session` is reopened, its answer being
+    /// changed.
+    pub(crate) fn changing(&self, session: &str, tool: &str) -> bool {
+        self.card_changing.contains(&(session.to_string(), tool.to_string()))
+    }
+
+    /// A click on `· change`, on the receipt of the card `painted` (row
+    /// `row`): it reopens.
+    pub(crate) fn ask_change(&mut self, row: u64, painted: &Painted, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "change")) else { return };
+        self.card_change(&session, row, painted, window, cx);
+    }
+
+    /// The card `painted` of `session` reopened to change its answer, by a
+    /// click or a key (true), while it may be ([`AppView::changeable`]):
+    /// the answer its receipt shows in its draft, picked, typed and ticked.
+    /// Its controls arm afresh: none was in view a moment ago, so a second
+    /// click of the first lands on nothing (§7). It stays open until an
+    /// answer from it goes, or Keep.
+    pub(crate) fn card_change(&mut self, session: &str, row: u64, painted: &Painted, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(shown) = self.changeable(self.panes.cur.live, painted) else {
+            log::info!(target: "synaps_desktop::card", "card {}: not reopened: it can't be changed now", painted.id);
+            return false;
+        };
+        let draft = self.reopened(row, &painted.doc, &shown, window, cx);
+        let key = (session.to_string(), painted.tool_id.clone());
+        self.card_drafts.insert(key.clone(), draft);
+        self.card_open.remove(&key);
+        self.card_changing.insert(key);
+        for pane in self.panes.iter_mut() {
+            pane.ask_shown.borrow_mut().retain(|(r, _), _| *r != row);
+        }
+        log::info!(target: "synaps_desktop::card", "card {}: reopened, its answer to change", painted.id);
+        self.remeasure_row(row);
+        cx.notify();
+        true
+    }
+
+    /// A draft of `doc` holding `shown`, the answer being changed: its
+    /// picks, its note (open, as typed), its fields. A skip's: as asked.
+    fn reopened(&mut self, row: u64, doc: &CardDoc, shown: &Reply, window: &mut Window, cx: &mut Context<Self>) -> Draft {
+        let mut d = Draft::new(doc);
+        let (Reply::Answer(a) | Reply::Change(a)) = shown else { return d };
+        d.picked = match &a.choice {
+            Some(Choice::One(l)) => vec![l.clone()],
+            Some(Choice::Many(ls)) => ls.clone(),
+            None => Vec::new(),
+        };
+        if let (Some(note), Some(Choice::One(l))) = (&a.note, &a.choice)
+            && let Some(prompt) = doc.option(l).and_then(|o| o.note.clone())
+        {
+            let e = cx.new(|cx| {
+                let mut s = InputState::new(window, cx).placeholder(crate::ask::shown(&prompt, cards_spec::Lines::Single));
+                s.set_value(note.clone(), window, cx);
+                s
+            });
+            d._subs.push(Self::watch_input(row, &e, window, cx));
+            d.note = Some(e);
+        }
+        for (id, v) in a.fields.iter().flatten() {
+            match v {
+                FieldValue::Check(b) => {
+                    d.checks.insert(id.clone(), *b);
+                }
+                FieldValue::Text(t) => {
+                    d.given.insert(id.clone(), t.clone());
+                }
+            }
+        }
+        d
+    }
+
+    /// Keep, on a reopened card: it closes as it was, nothing sent, and
+    /// the keys go back to the composer.
+    pub(crate) fn ask_keep(&mut self, row: u64, painted: &Painted, cx: &mut Context<Self>) {
+        let Some(session) = self.card_session().filter(|_| self.ask_armed(row, painted, "keep")) else { return };
+        self.card_keep(&session, painted);
+        self.clicked_an_answer(cx);
+        self.after_card(row, cx);
+    }
+
+    /// The card `painted` of `session` no longer reopened: its answer
+    /// stays, and the draft of its change goes (true if it was reopened).
+    /// An open card's draft is never touched: Esc on one keeps what was
+    /// typed.
+    pub(crate) fn card_keep(&mut self, session: &str, painted: &Painted) -> bool {
+        let key = (session.to_string(), painted.tool_id.clone());
+        let was = self.card_changing.remove(&key);
+        if was {
+            self.card_drafts.remove(&key);
+        }
+        was
     }
 
     /// Retry on the card `painted`'s answer, not sent.

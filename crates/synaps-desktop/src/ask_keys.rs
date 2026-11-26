@@ -50,6 +50,16 @@
 //!   resolved or rebound, scrolls out of view, the window goes inactive,
 //!   the session or the tab changes, or the keys go elsewhere (another
 //!   pane, an overlay, a click).
+//! - **Changing an answer** (D4, §3.6, F15: Ctrl+J, Enter, a key). Last
+//!   in Ctrl+J's order, once nothing waits on screen or off, come the
+//!   answers this desk may change ([`AppView::changeable`]): the focused
+//!   pane's latest first, then the others' in reading order; Ctrl+J on
+//!   one entered goes to the next, round. A receipt is entered as a card
+//!   is (its ring, its keys from its first paint): Enter reopens the
+//!   card, the answer in it, and enters it, its highlight on the answer
+//!   given ([`AppView::start_hi`]); Esc goes back; nothing else acts. On
+//!   a reopened card the keys are an open card's, and what they send is
+//!   a change; Esc keeps the answer as it was.
 //!
 //! Every answer goes through D2a's send ([`AppView::ask_send`]): one
 //! `Submit` or `Steer` of `cards_spec::message`'s text on the card's
@@ -114,8 +124,9 @@ pub(crate) struct Entry {
     /// [`crate::waiting`]'s order, this one at `at`.
     pub(crate) batch: Vec<Painted>,
     pub(crate) at: usize,
-    /// The highlighted option (Enter's), from the choice remembered for
-    /// this question here ([`crate::recall`]), else the default.
+    /// The highlighted option (Enter's), from [`AppView::start_hi`]: the
+    /// answer being changed (D4), else the choice remembered for this
+    /// question here ([`crate::recall`]), else the default.
     pub(crate) hi: Option<usize>,
     pub(crate) spot: Spot,
     /// A field to put the keys in once the card is painted: a form's
@@ -126,6 +137,9 @@ pub(crate) struct Entry {
     /// Its ring was painted in view since the frame began (read and reset
     /// each frame: none, and it scrolled out of view).
     pub(crate) seen: Rc<Cell<bool>>,
+    /// Its receipt is entered (D4): Enter reopens the card to change its
+    /// answer.
+    pub(crate) receipt: bool,
 }
 
 /// Every key's presses, window-wide ([`Press`]): whether the last key-down
@@ -310,7 +324,8 @@ fn typed(ks: &Keystroke) -> Option<String> {
     ks.key_char.clone().filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
 }
 
-/// The highlight a card starts on: its default, when it names one option.
+/// The highlight an open card starts on: its default, when it names one
+/// option ([`AppView::start_hi`]).
 fn start_on(doc: &cards_spec::CardDoc) -> Option<usize> {
     match &doc.default {
         Some(DefaultChoice::One(l)) => doc.options.iter().position(|o| &o.label == l),
@@ -382,6 +397,82 @@ impl AppView {
             }
         }
         out
+    }
+
+    /// The option an entered card's highlight starts on (Enter's): the one
+    /// place it is set. Reopened to change its answer (D4), the answer
+    /// given (its draft's first pick); else, and for a skip or an answer
+    /// with no pick, the choice remembered for this question here
+    /// ([`AppView::recall_start`], D4 part B: no `last time` mark on a
+    /// reopened card, [`AppView::recalled`]); else the agent's default
+    /// ([`start_on`]).
+    pub(crate) fn start_hi(&self, session: &str, painted: &Painted) -> Option<usize> {
+        let doc = &painted.doc;
+        if self.changing(session, &painted.tool_id) {
+            let given = self.card_drafts.get(&(session.to_string(), painted.tool_id.clone())).and_then(|d| d.picked.first());
+            if let Some(i) = given.and_then(|l| doc.options.iter().position(|o| &o.label == l)) {
+                return Some(i);
+            }
+        }
+        self.recall_start(painted).or_else(|| start_on(doc))
+    }
+
+    /// The answers this desk may change on this window's visible panes
+    /// (D4, [`AppView::changeable`]), Ctrl+J's last: the focused pane's
+    /// first, then the others' in reading order; in each, the latest
+    /// first. A pane showing a view (Settings, Usage) shows none.
+    fn changeable_here(&self) -> Vec<(PaneId, Painted)> {
+        let focused = self.panes.focused;
+        let mut places = vec![focused];
+        places.extend(self.reading_order().into_iter().filter(|id| *id != focused));
+        let mut out = Vec::new();
+        for id in places {
+            let Some(p) = self.panes.get(id) else { continue };
+            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
+            if tabs.view().is_some() {
+                continue;
+            }
+            for c in self.model.lives[p.live].transcript.cards().cards().iter().rev() {
+                let (Some(card), Some(doc)) = (c.id.clone(), c.doc.clone()) else { continue };
+                let painted = Painted { tool_id: c.tool_id.clone(), id: card, doc: Arc::new(doc), wait: c.wait };
+                if self.changeable(p.live, &painted).is_some() {
+                    out.push((id, painted));
+                }
+            }
+        }
+        out
+    }
+
+    /// Ctrl+J with nothing waiting on screen or off (D4): an answer this
+    /// desk may change, entered: the latest ([`AppView::changeable_here`]);
+    /// with one entered, the next, round. Its receipt, whose Enter reopens
+    /// it; a card already reopened, as a card. Whether one was.
+    pub(crate) fn ask_jump_receipt(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let all = self.changeable_here();
+        if all.is_empty() {
+            return false;
+        }
+        let now = self.panes.cur.ask.entry.as_ref().map(|e| e.painted.clone());
+        let focused = self.panes.focused;
+        let at = now.and_then(|n| all.iter().position(|(pane, p)| *pane == focused && *p == n)).map_or(0, |i| (i + 1) % all.len());
+        let (pane, painted) = all[at].clone();
+        if pane != focused {
+            self.focus_pane(pane, crate::pane::KeysTo::Follow, cx);
+        }
+        self.in_pane(pane, |v| {
+            if v.card_session().is_some_and(|s| v.changing(&s, &painted.tool_id)) {
+                v.enter_ask(vec![painted], 0, window, cx);
+            } else {
+                v.enter_receipt(painted, window, cx);
+            }
+        });
+        true
+    }
+
+    /// An answer this desk may change is on a visible pane: Ctrl+J, with
+    /// nothing waiting, has one to go to (D4, [`AppView::ask_jump_receipt`]).
+    pub(crate) fn ask_changes(&self) -> bool {
+        !self.changeable_here().is_empty()
     }
 
     /// Some card waits on a visible pane: Ctrl+J has somewhere to go.
@@ -473,25 +564,44 @@ impl AppView {
                 f.kind != FieldKind::Check && !f.optional && v == FieldValue::Text(String::new())
             })
             .map(|f| f.id.clone());
+        log::info!(target: "synaps_desktop::card", "card {}: entered ({} of {})", painted.id, at + 1, batch.len());
+        let hi = self.start_hi(&session, &painted);
+        let e =
+            Entry { session, painted, batch, at, hi, spot: Spot::Body, field, shown: Rc::default(), seen: Rc::default(), receipt: false };
+        self.put_entry(e, window, cx);
+    }
+
+    /// The receipt of the card `painted` entered in this pane (D4): Enter
+    /// reopens it; its keys live from its first paint, as a card's.
+    fn enter_receipt(&mut self, painted: Painted, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.card_session() else { return };
+        log::info!(target: "synaps_desktop::card", "card {}: its receipt entered", painted.id);
+        let e = Entry {
+            session,
+            painted: painted.clone(),
+            batch: vec![painted],
+            at: 0,
+            hi: None,
+            spot: Spot::Body,
+            field: None,
+            shown: Rc::default(),
+            seen: Rc::default(),
+            receipt: true,
+        };
+        self.put_entry(e, window, cx);
+    }
+
+    /// `e` entered in this pane, instead of what was: the keys on the
+    /// pane's card focus, its row drawn again.
+    fn put_entry(&mut self, e: Entry, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(e) = self.panes.cur.ask.entry.take()
             && let Some(row) = self.ask_row(&e.painted.tool_id)
         {
             self.remeasure_row(row);
         }
-        log::info!(target: "synaps_desktop::card", "card {}: entered ({} of {})", painted.id, at + 1, batch.len());
         let focus = self.panes.cur.ask.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        let tool = painted.tool_id.clone();
-        self.panes.cur.ask.entry = Some(Entry {
-            session,
-            hi: self.recall_start(&painted).or_else(|| start_on(&doc)),
-            painted,
-            batch,
-            at,
-            spot: Spot::Body,
-            field,
-            shown: Rc::default(),
-            seen: Rc::default(),
-        });
+        let tool = e.painted.tool_id.clone();
+        self.panes.cur.ask.entry = Some(e);
         window.focus(&focus, cx);
         if let Some(row) = self.ask_row(&tool) {
             self.remeasure_row(row);
@@ -543,9 +653,16 @@ impl AppView {
         })
     }
 
-    /// The card `painted` is still open here, as this desk may answer it.
-    fn ask_still_open(&self, painted: &Painted) -> bool {
-        self.open_cards(self.panes.cur.live).iter().any(|(p, _)| p == painted)
+    /// The card `painted` is still as entered here: open, as this desk may
+    /// answer it, or reopened to change its answer (D4); `receipt`: its
+    /// receipt, not reopened, whose answer this desk may change.
+    fn ask_still_open(&self, painted: &Painted, receipt: bool) -> bool {
+        let live = self.panes.cur.live;
+        let changing = self.card_session().is_some_and(|s| self.changing(&s, &painted.tool_id));
+        if receipt || changing {
+            return receipt != changing && self.changeable(live, painted).is_some();
+        }
+        self.open_cards(live).iter().any(|(p, _)| p == painted)
     }
 
     /// The entered card, when its keys may answer it now: its session, row
@@ -587,12 +704,13 @@ impl AppView {
     /// into view; one painted puts the keys in its first field to fill.
     pub(crate) fn sync_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.ask.entry.as_ref() else { return };
-        let (shown, seen) = (e.shown.get(), e.seen.replace(false));
+        let (shown, seen, receipt) = (e.shown.get(), e.seen.replace(false), e.receipt);
         let painted = e.painted.clone();
         let holds = self.ask_holds_keys(window, cx);
         let active = window.is_window_active();
-        let here =
-            self.model.tabs.view().is_none() && self.card_session().as_deref() == Some(e.session.as_str()) && self.ask_still_open(&painted);
+        let here = self.model.tabs.view().is_none()
+            && self.card_session().as_deref() == Some(e.session.as_str())
+            && self.ask_still_open(&painted, receipt);
         if holds && active && here && (!shown || seen) {
             if !shown {
                 if let Some(ix) = self.ask_ix(&painted.tool_id) {
@@ -679,8 +797,18 @@ impl AppView {
             log::debug!(target: "synaps_desktop::card", "card key {key}: not a new, bare press");
             return;
         }
+        // An entered receipt (D4): Enter reopens its card; Esc goes back.
+        // Nothing else acts on it.
+        if self.panes.cur.ask.entry.as_ref().is_some_and(|e| e.receipt) {
+            match key {
+                "escape" => self.leave_ask(true, window, cx),
+                "enter" => self.ask_reopen(window, cx),
+                _ => {}
+            }
+            return;
+        }
         match (key, digit) {
-            ("escape", _) => self.leave_ask(true, window, cx),
+            ("escape", _) => self.ask_escape(window, cx),
             ("up" | "down", _) => self.ask_move(key == "down", cx),
             ("space", _) => self.ask_space(window, cx),
             ("enter", _) => self.ask_enter(window, cx),
@@ -694,6 +822,27 @@ impl AppView {
             (_, Some(n)) => self.ask_digit(n as usize - 1, window, cx),
             _ => {}
         }
+    }
+
+    /// Enter on an entered receipt (D4): its card reopened, the answer in
+    /// it, and entered: its keys live from its first paint, its highlight
+    /// on the answer given ([`AppView::start_hi`]).
+    fn ask_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((s, row, painted)) = self.ask_target() else { return };
+        if self.card_change(&s, row, &painted, window, cx) {
+            self.enter_ask(vec![painted], 0, window, cx);
+        }
+    }
+
+    /// Esc on an entered card, or in one of its fields: back to the
+    /// composer; reopened to change its answer (D4), the answer stays.
+    fn ask_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((s, painted)) = self.panes.cur.ask.entry.as_ref().filter(|e| !e.receipt).map(|e| (e.session.clone(), e.painted.clone()))
+            && self.card_keep(&s, &painted)
+        {
+            log::info!(target: "synaps_desktop::card", "card {}: kept, nothing sent", painted.id);
+        }
+        self.leave_ask(true, window, cx);
     }
 
     /// `1`–`9`: option `i` (a quick card's answer; a form's pick).
@@ -770,7 +919,7 @@ impl AppView {
     /// The batch's next card still open, entered; none, the composer.
     fn ask_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.ask.entry.take() else { return };
-        match (e.at + 1..e.batch.len()).find(|k| self.ask_still_open(&e.batch[*k])) {
+        match (e.at + 1..e.batch.len()).find(|k| self.ask_still_open(&e.batch[*k], false)) {
             Some(k) => self.enter_ask(e.batch, k, window, cx),
             None => {
                 self.panes.cur.ask.entry = Some(e);
@@ -783,7 +932,8 @@ impl AppView {
     /// of its stops, round: the card itself, the note its pick asks for
     /// (once open), then each field. What a note or a field holds stays.
     pub(crate) fn ask_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(e) = self.panes.cur.ask.entry.as_ref() else { return };
+        // A receipt (D4) has no stops: its fields aren't drawn.
+        let Some(e) = self.panes.cur.ask.entry.as_ref().filter(|e| !e.receipt) else { return };
         let note = self.ask_note(e);
         let mut stops = vec![Spot::Body];
         stops.extend(note.is_some().then_some(Spot::Note));
@@ -887,7 +1037,7 @@ impl AppView {
             log::debug!(target: "synaps_desktop::card", "field Esc {esc:?}: not a new, bare press, or a composition's");
             return;
         }
-        self.leave_ask(true, window, cx);
+        self.ask_escape(window, cx);
     }
 
     /// An input's Enter or Esc (`key`), as its action comes: pending, till

@@ -11,6 +11,13 @@
 //!   prefills, as they do without it. Enter on it is a user's press, one
 //!   `Submit` or `Steer` like any other; nothing here sends, answers or
 //!   counts as an answer (§10 decision 4: no auto-answer, no "Always").
+//! - **A change (D4) starts on the answer it changes.** A card reopened
+//!   to change its answer shows that answer, ticked and highlighted, and
+//!   no "last time" mark: a mark of another choice beside it would read as
+//!   what was answered. The highlight falls back to the memory only when
+//!   that answer has no pick (a skip, a multi pick with none), unmarked,
+//!   then to the default ([`AppView::start_hi`]). A change that reaches the
+//!   chat is remembered as a first answer is ("When", below).
 //! - **Fixed at first sight.** What a card recalls is read once, the
 //!   first time it is drawn or entered, and kept while it is open (bound,
 //!   not answered, closed or replaced; behind a tab counts): a choice
@@ -758,8 +765,22 @@ impl Recall {
 impl AppView {
     /// The options of the open card `painted`, in this pane, that the user
     /// chose last time this question came in this folder, in the doc's
-    /// order: marked "last time", never picked.
+    /// order: marked "last time", never picked. None on a card reopened to
+    /// change its answer (D4): what it shows, ticked and highlighted, is
+    /// the answer being changed, and a mark of another choice would read as
+    /// what was answered ([`AppView::start_hi`]).
     pub(crate) fn recalled(&self, painted: &Painted) -> Vec<usize> {
+        let l = &self.model.lives[self.panes.cur.live];
+        let Some(a) = l.active.as_ref() else { return Vec::new() };
+        if self.changing(&a.session_id, &painted.tool_id) {
+            return Vec::new();
+        }
+        self.remembered(painted)
+    }
+
+    /// [`AppView::recalled`], a reopened card's too: where the highlight
+    /// falls back to ([`AppView::recall_start`]).
+    fn remembered(&self, painted: &Painted) -> Vec<usize> {
         let l = &self.model.lives[self.panes.cur.live];
         let Some(a) = l.active.as_ref() else { return Vec::new() };
         let card = (a.session_id.clone(), painted.tool_id.clone(), painted.id.clone());
@@ -791,9 +812,10 @@ impl AppView {
 
     /// Where an entered card's highlight starts, if memory says: the first
     /// option recalled. Before the agent's default (§6.1); the caller falls
-    /// back to it.
+    /// back to it. After the answer being changed, on a reopened card
+    /// ([`AppView::start_hi`]), which has no mark.
     pub(crate) fn recall_start(&self, painted: &Painted) -> Option<usize> {
-        self.recalled(painted).first().copied()
+        self.remembered(painted).first().copied()
     }
 
     /// Answers that reached the chat since the last look

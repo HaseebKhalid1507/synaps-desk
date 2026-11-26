@@ -667,8 +667,9 @@ impl AppView {
     /// and its card shown.
     /// Agent cards (D2b): prompts first ([`crate::waiting`]'s order), then
     /// the visible panes' cards, entered ([`AppView::ask_jump`]); a session
-    /// waiting off screen last. While a prompt has the keys, Ctrl+J goes
-    /// on to the cards.
+    /// waiting off screen; then, nothing waiting, an answer this desk may
+    /// change (D4, [`AppView::ask_jump_receipt`]). While a prompt has the
+    /// keys, Ctrl+J goes on to the cards.
     pub(crate) fn jump_to_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An agent card first in the order (no prompt on screen, or one
         // has the keys already): entered (D2b, `crate::waiting`).
@@ -690,6 +691,10 @@ impl AppView {
                 let fallback = self.model.journal_of(&s);
                 self.open_tab(crate::app::Open::Attach { session_id: s, fallback, open: false }, crate::tabs::Place::Current);
                 cx.notify();
+            } else {
+                // Nothing waits, on screen or off: an answer this desk may
+                // change (D4), last in the order.
+                self.ask_jump_receipt(window, cx);
             }
             return;
         }
