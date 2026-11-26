@@ -785,6 +785,25 @@ fn the_skipped_chip_is_an_ops_and_says_why(cx: &mut TestAppContext) {
     assert!(has(cx, w, format!("block-skipped-tip {plan}")), "its reason in a tooltip");
 }
 
+/// The `op skipped` chip gives way before the plan's title: at 320 px and
+/// every text step the title keeps the larger part of their room, and the
+/// chip stays inside the header.
+#[gpui_kit::test]
+fn the_skipped_chip_gives_way_before_the_title(cx: &mut TestAppContext) {
+    for text in crate::theme::TEXT_STEPS {
+        let (w, view) = blocks_at(cx, 320. + 2. * crate::app::STRIP, text);
+        let plan = show_block(cx, w, &view, "plan");
+        let head = drawn(cx, w, format!("block-head {plan}"));
+        let title = drawn(cx, w, format!("block-title {plan}"));
+        let chip = drawn(cx, w, format!("block-skipped {plan}"));
+        assert!(chip.left() >= title.right() - px(0.5) && chip.right() <= head.right() + px(0.5), "{text}: the chip in the header");
+        assert!(
+            title.size.width > chip.size.width && title.size.width > px(90.),
+            "{text}: the title keeps the larger part ({title:?}, chip {chip:?})"
+        );
+    }
+}
+
 /// Decision #5: the lease's note on a block reads whole inside its header
 /// at 320 px, at the default and the largest text step: the title keeps
 /// its room, and nothing moves as it comes.

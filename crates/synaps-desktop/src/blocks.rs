@@ -557,16 +557,26 @@ impl AppView {
                 // An op that didn't apply, never the block's state (Shady
                 // #101: `skipped` alone read as the plan's).
                 d.child(
+                    // It gives way before the title (to `op…` at least),
+                    // its tooltip whole.
                     div()
                         .id(("block-skipped", id))
-                        .flex_none()
+                        .min_w(px((m.meta * 1.9).ceil() + 8.))
+                        .flex_shrink(8.)
+                        .overflow_hidden()
                         .px(px(4.))
                         .bg(p.well_d)
                         .font_family(fonts::MONO)
                         .text_px(m.meta)
                         .text_color(p.dim_t)
                         .debug_selector(move || format!("block-skipped {id}"))
-                        .child(div().debug_selector(move || format!("block-skipped-says {id} op skipped")).child("op skipped"))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .debug_selector(move || format!("block-skipped-says {id} op skipped"))
+                                .child("op skipped"),
+                        )
                         .tooltip(move |window, cx| {
                             crate::overlay::element(
                                 move |_, cx| {
