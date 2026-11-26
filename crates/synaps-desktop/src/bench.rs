@@ -1362,8 +1362,10 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 if let Some(n) = std::env::var("SYNAPS_BENCH_PANES").ok().and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 1) {
                     // The keys stay on the window's root, as the 1-pane scene
                     // has them: a split gives them to the new pane's composer
-                    // (at its next frame), whose caret blinks (2 Hz, as main's
-                    // does when focused). `SYNAPS_BENCH_PANES_CARET=1`: it does.
+                    // (at its next frame), whose caret blinks (2 Hz) for 10 s,
+                    // then rests on (`theme::CURSOR_BLINK`): the idle window
+                    // opens ~1.9 s after the last split, so it holds ~8 s of
+                    // blinks. `SYNAPS_BENCH_PANES_CARET=1`: it does.
                     let caret = std::env::var("SYNAPS_BENCH_PANES_CARET").as_deref() == Ok("1");
                     for step in crate::pane::shape(n) {
                         let _ = view.update_in(cx, |v, w, cx| {
@@ -1381,10 +1383,22 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     sleep(1.5).await;
                     out["panes"] = json!(view.update(cx, |v, _| v.panes.len()).unwrap_or(0));
                     out["mem_panes"] = mem::sample();
+                } else if std::env::var("SYNAPS_BENCH_PANES_CARET").as_deref() == Ok("1") {
+                    // One pane, `SYNAPS_BENCH_PANES_CARET=1`: its composer
+                    // takes the keys (at its next frame), as a split's new
+                    // pane's does, as long before the idle window.
+                    let _ = view.update(cx, |v, cx| v.focus_composer(cx));
+                    sleep(1.9).await;
                 }
                 let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
                 sleep(idle.unwrap_or(10) as f64).await;
                 out[format!("idle_{}s", idle.unwrap_or(10))] = stats(cx, t0, Instant::now(), c0, f0);
+                // `SYNAPS_BENCH_IDLE_ONLY=1`: the scene ends there.
+                if std::env::var("SYNAPS_BENCH_IDLE_ONLY").as_deref() == Ok("1") {
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // A tool runs: its glyph scans on the beat (8 Hz), the foot's too.
                 let _ = upd(cx, &|v, _| {
                     v.bench_session("bench-motion");

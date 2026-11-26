@@ -7275,3 +7275,101 @@ fn panes_split_in_a_window_not_active_leave_no_caret_blinking(cx: &mut TestAppCo
     let n = frames(cx);
     assert!((7..=9).contains(&n), "active: the focused composer's caret alone, a frame every 500 ms: {n} in 4 s");
 }
+
+/// The focused pane's caret as drawn: a thin quad of the caret's colour
+/// in its composer, if one (its blink's off phase, none).
+fn caret_drawn(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) -> Option<Bounds<Pixels>> {
+    let ix = view.read_with(cx, |v, _| v.panes.focused.index());
+    let frame = VisualTestContext::from_window(window, cx).debug_bounds(format!("composer-frame {ix}").leak())?;
+    cx.update_window(window, |_, w, cx| {
+        let (ink, s) = (Theme::global(cx).colors.caret, w.scale_factor());
+        let at = |b: Bounds<gpui_kit::ScaledPixels>| {
+            Bounds::new(gpui_kit::point(px(b.origin.x.0 / s), px(b.origin.y.0 / s)), size(px(b.size.width.0 / s), px(b.size.height.0 / s)))
+        };
+        let carets: Vec<_> = w
+            .painted_quads()
+            .iter()
+            .filter(|q| q.background.as_solid() == Some(ink))
+            .map(|q| at(q.bounds))
+            .filter(|b| b.size.width <= px(3.) && b.size.height >= px(8.) && frame.contains(&b.center()))
+            .collect();
+        assert!(carets.len() <= 1, "one caret at most: {carets:?}");
+        carets.first().copied()
+    })
+    .expect("the window")
+}
+
+/// `steps` of 50 ms at rest: the frames drawn, and at each step whether
+/// the focused composer's caret was drawn.
+fn caret_for(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, steps: usize) -> (u64, Vec<bool>) {
+    let f0 = view.read_with(cx, |v, _| v.fx.frames());
+    let seen = (0..steps)
+        .map(|_| {
+            idle_step(cx, window, view, Duration::from_millis(50));
+            caret_drawn(cx, window, view).is_some()
+        })
+        .collect();
+    (view.read_with(cx, |v, _| v.fx.frames()) - f0, seen)
+}
+
+/// A focused composer's caret blinks for 10 s after the last thing it
+/// heard, then rests on, drawn (GTK's `gtk-cursor-blink-timeout`): a
+/// focused composer at rest draws no frame, where it drew one every
+/// 500 ms for the window's life (each a frame of every pane). A key, a
+/// caret moved by the mouse, a pane focus move and the window active
+/// again each blink it again, from on.
+#[gpui_kit::test]
+fn a_focused_composers_caret_rests_on_after_ten_seconds(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "caret-rest", attached(A, None), (2560., 1440.));
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Off), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    // Ctrl+\: a second pane on A, focused, its composer the keys'.
+    key(cx, window, "ctrl-\\");
+    // From each start: on at once, blinking 500 ms on, 500 ms off, 10 s
+    // of it (a frame a blink, 20), then nothing for 5 s, the caret on.
+    let blinks = |cx: &mut TestAppContext, what: &str| {
+        let (n, seen) = caret_for(cx, window, &view, 220);
+        assert!(seen[..5].iter().all(|on| *on), "{what}: the caret starts on: {seen:?}");
+        let off = seen.iter().filter(|on| !**on).count();
+        assert_eq!(off, 100, "{what}: then 500 ms off in each second, for 10 s: {off} steps of 50 ms off");
+        assert!((20..=21).contains(&n), "{what}: a frame a blink for 10 s: {n}");
+        let (n, seen) = caret_for(cx, window, &view, 100);
+        assert_eq!(n, 0, "{what}: 10 s on, at rest: no frame for 5 s");
+        assert!(seen.iter().all(|on| *on), "{what}: the caret rests on, drawn: {seen:?}");
+    };
+    let right = view.read_with(cx, |v, _| v.panes.focused);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2);
+    blinks(cx, "a split's new pane");
+    assert!(keys_in(cx, window, &view, right, false), "the new pane's composer has the keys");
+
+    VisualTestContext::from_window(window, cx).simulate_keystrokes("a");
+    blinks(cx, "a key");
+    assert_eq!(view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().to_string()), "a", "the key typed");
+
+    // A click at the text's start: the caret there, before the "a".
+    let at = caret_drawn(cx, window, &view).expect("the caret on");
+    let start = view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).input_bounds().left()) + px(1.);
+    VisualTestContext::from_window(window, cx).simulate_click(gpui_kit::point(start, at.center().y), Default::default());
+    blinks(cx, "the caret moved by the mouse");
+    assert!(caret_drawn(cx, window, &view).expect("the caret on").left() < at.left(), "the click moved it");
+
+    let _ = cx.update_window(window, |_, _, cx| view.update(cx, |v, cx| v.focus_nth(0, cx)));
+    let left = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(left, right);
+    blinks(cx, "the focus to the left pane");
+    assert!(keys_in(cx, window, &view, left, false), "the left pane's composer has the keys");
+    let _ = cx.update_window(window, |_, _, cx| view.update(cx, |v, cx| v.focus_nth(1, cx)));
+    blinks(cx, "the focus back to the right pane");
+    assert!(keys_in(cx, window, &view, right, false), "the right pane's composer has the keys");
+
+    VisualTestContext::from_window(window, cx).deactivate_window();
+    let (_, seen) = caret_for(cx, window, &view, 40);
+    assert!(seen.iter().all(|on| !on), "not active: no caret: {seen:?}");
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    blinks(cx, "the window active again");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}

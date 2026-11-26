@@ -980,7 +980,8 @@ impl crate::app::AppView {
     /// ([`AppView::apply_keys`], as a pane key asks), never now: a
     /// composer focused and left before a frame is drawn never hears its
     /// blur (GPUI sends focus events from what each frame drew), so its
-    /// caret would blink, a frame every 500 ms, for the window's life.
+    /// caret would blink on unseen, a frame every 500 ms, for 10 s
+    /// ([`crate::theme::CURSOR_BLINK`]).
     pub(crate) fn focus_composer(&mut self, cx: &mut Context<Self>) {
         self.ask_keys(KeysTo::Pane);
         cx.notify();
@@ -1065,9 +1066,10 @@ impl crate::app::AppView {
         match self.in_pane(focused, |v| v.model.tabs.view().is_none().then(|| v.panes.cur.composer.clone())).flatten() {
             // A window that is not active gets no focus events, so a
             // composer focused and left there never hears its blur: its
-            // caret would blink on, a frame of every pane each 500 ms, for
-            // the window's life. There the focus alone: the kit starts the
-            // caret of the input focused when the window is active again.
+            // caret would blink on unseen, a frame of every pane each 500 ms,
+            // for 10 s (`theme::CURSOR_BLINK`). There the focus alone: the
+            // kit starts the caret of the input focused when the window is
+            // active again.
             Some(c) if !window.is_window_active() => {
                 let h = c.read(cx).focus_handle(cx);
                 window.focus(&h, cx);

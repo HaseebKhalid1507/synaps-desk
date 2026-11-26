@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::base::{TextViewDefaults, TextViewStyle};
 use gpui_kit::component::Theme;
+use gpui_kit::component::input::CursorBlink;
 use gpui_kit::{App, FontWeight, Global, HighlightStyle, Hsla, Rems, Rgba, StyleRefinement, Styled as _, px, rgb};
 
 use crate::fonts::TextPx as _;
@@ -1547,8 +1548,16 @@ fn highlight_theme(r: &Roles) -> Option<std::sync::Arc<gpui_kit::component::high
     serde_json::from_value(v).ok().map(std::sync::Arc::new)
 }
 
+/// A focused input's caret: on and off every 500 ms (the kit's), at rest
+/// on, drawn, 10 s after the last key, caret move, focus or the window
+/// active again (GTK's `gtk-cursor-blink-timeout`): a caret blinking on
+/// at idle draws a frame of the window, every pane's, at each blink.
+pub(crate) const CURSOR_BLINK: CursorBlink =
+    CursorBlink::blinking(std::time::Duration::from_millis(500)).with_idle_timeout(std::time::Duration::from_secs(10));
+
 /// The kit theme follows the roles: inputs, popovers, tooltips, scrollbars,
-/// the focus ring and selection.
+/// the focus ring and selection; every input's caret blinks as
+/// [`CURSOR_BLINK`] says.
 fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
     let p = *p;
     let highlight = highlight_theme(r);
@@ -1564,6 +1573,7 @@ fn sync_kit(p: &Palette, r: &Roles, cx: &mut App) {
         t.radius = px(0.);
         t.radius_lg = px(0.);
         t.shadow = false;
+        t.cursor_blink = CURSOR_BLINK;
         let c = &mut t.colors;
         c.background = p.chrome;
         c.foreground = p.ink;
