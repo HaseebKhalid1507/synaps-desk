@@ -25,7 +25,9 @@
 //!   in the same group), else it does nothing and the block says `this
 //!   block changed · look again` until the next input. It never redirects
 //!   to whatever holds the name now. A release anywhere else (another
-//!   to whatever holds the name now.
+//!   block, blank space, another pane, outside the window), a move with no
+//!   button down (the release was lost) or the window losing focus ends
+//!   the press with no action ([`AppView::lease_unpress`]).
 //! - **Just moved**: a pointer-down on a target an agent op moved (its
 //!   painted rect) or replaced (its tag) in the last [`JUST_MOVED`] does
 //!   nothing, once, and says `this moved just now`. "An agent op" is a
@@ -346,12 +348,17 @@ impl AppView {
     }
 
     /// The pointer moved over pane `pane`'s list: the lease (no frame).
-    pub(crate) fn lease_move(&mut self, pane: PaneId) {
+    /// With no button down while a press is held, its release was lost
+    /// (outside the window, a grab taken): the press ends.
+    pub(crate) fn lease_move(&mut self, pane: PaneId, buttons: bool, cx: &mut Context<Self>) {
         let now = self.fx.now();
         self.in_pane(pane, |this| {
             this.panes.cur.lease.moved = Some(now);
             this.panes.cur.lease.over = true;
         });
+        if !buttons && self.panes.iter().any(|p| p.lease.pressed) {
+            self.lease_unpress(cx);
+        }
     }
 
     /// The pointer over pane `pane`'s list or not.
@@ -374,6 +381,23 @@ impl AppView {
             p.lease.moved = None;
         }
         self.lease_release(cx);
+    }
+
+    /// A press ends with no action (§6.2 "Down and up": a release that is
+    /// not on its target, a lost one, the window's focus gone): no pane
+    /// holds one, and a board that waited on it has its wake, or draws.
+    pub(crate) fn lease_unpress(&mut self, cx: &mut Context<Self>) {
+        let mut ended = false;
+        for p in self.panes.iter_mut() {
+            ended |= std::mem::take(&mut p.lease.pressed) | p.lease.down.take().is_some();
+        }
+        if !ended {
+            return;
+        }
+        if self.model.lives.ids().into_iter().any(|l| self.model.lives[l].board.waiting.is_some()) {
+            self.arm_lease_wake(cx);
+        }
+        cx.notify();
     }
 
     /// The pointer over block row `row` (painted as `tag`) or off it.
@@ -401,7 +425,7 @@ impl AppView {
                 if let Some(p) = l.painted.borrow_mut().get_mut(&row) {
                     p.moved = None;
                 }
-                l.down = None;
+                (l.down, l.pressed) = (None, false);
                 l.note = Some((row, MOVED));
                 return;
             }

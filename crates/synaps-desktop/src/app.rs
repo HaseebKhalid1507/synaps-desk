@@ -9186,7 +9186,9 @@ impl AppView {
                         .min_h_0()
                         .relative()
                         // The pointer lease (blocks.md §6.2): a move asks for no frame.
-                        .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, _| this.lease_move(id)))
+                        .on_mouse_move(
+                            cx.listener(move |this, ev: &MouseMoveEvent, _, cx| this.lease_move(id, ev.pressed_button.is_some(), cx)),
+                        )
                         .on_hover(cx.listener(move |this, over: &bool, _, cx| this.lease_over(id, *over, cx)))
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
                         // Held (a dropped row's flight), nothing drawn
@@ -10313,6 +10315,22 @@ impl Render for AppView {
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
+            // A release that isn't on its press's target, in the window or
+            // outside it, ends the press after the target's own up has
+            // acted (§6.2 "Down and up"; Shady #101 P2-7).
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                if this.panes.iter().any(|p| p.lease.pressed) {
+                    cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    if this.panes.iter().any(|p| p.lease.pressed) {
+                        cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                    }
+                }),
+            )
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
                 Some(until) if ev.click_count > 1 && Instant::now() < until => cx.stop_propagation(),
                 Some(_) => this.swallow_clicks = None,

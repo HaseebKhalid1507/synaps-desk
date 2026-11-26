@@ -1,9 +1,10 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
 //! the lease's geometry as the renderer draws it (P2-5), one painted-target
-//! rule for every action (P2-6), the edit preview's text drawn as D1 draws
-//! agent text (P2-9), a file's header (P2-10), a metric at 320 px (P2-11), the
-//! `op skipped` chip, and the lease's note readable at 320 px and every text
-//! size (decision #5). Each fails on `653c30c`.
+//! rule for every action (P2-6), a press released anywhere (P2-7), the edit
+//! preview's text drawn as D1 draws agent text (P2-9), a file's header
+//! (P2-10), a metric at 320 px (P2-11), the `op skipped` chip, and the lease's
+//! note readable at 320 px and every text size (decision #5). Each fails on
+//! `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
@@ -197,6 +198,19 @@ fn put_mid(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
     wait(cx, w, view, 1000);
 }
 
+/// Split panes on, and the pane acted on split: a second pane on its
+/// session (its store).
+fn split(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    super::answer_tests::key(cx, w, "ctrl-\\");
+    board(cx, w, view);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "two panes");
+}
+
 /// P2-5: under the lease, a note above the hovered block whose text change
 /// only wraps it to another line at 320 px waits, as a note the user
 /// opened past 6 lines whose text grows does: the lease reads a note's
@@ -313,6 +327,60 @@ fn a_member_is_its_own_target(cx: &mut TestAppContext) {
     assert!(!folded(cx, &view, why), "the group untouched");
     assert_eq!(folded(cx, &view, rot), was, "the replaced member untouched");
     assert_eq!(note(cx, &view), Some((rot, crate::lease::CHANGED)), "the member says so");
+}
+
+/// P2-7: a press released anywhere but on its target ends: over blank
+/// transcript space, another pane, outside the window, or lost (a move
+/// with no button down). Nothing folds, and what waited on it draws at the
+/// lease's end.
+#[gpui_kit::test]
+fn a_press_released_elsewhere_ends(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1800.);
+    split(cx, w, &view);
+    let panes = view.read_with(cx, |v, _| v.panes.ids());
+    view.update(cx, |v, cx| v.focus_pane(panes[0], crate::pane::KeysTo::Pane, cx));
+    let put = json!([
+        {"op":"put","id":"a","kind":"plan","body":{"steps":[{"id":"s1","label":"One","state":"todo"}]}},
+        {"op":"put","id":"b","kind":"note","body":{"text":"B"}}
+    ]);
+    put_mid(cx, w, &view, put);
+    let b = id(cx, &view, "b");
+    let other = view.read_with(cx, |v, _| v.panes.get(panes[1]).map(|p| p.list.viewport_bounds()).expect("pane 2"));
+    let list = view.read_with(cx, |v, _| v.panes.cur.list.viewport_bounds());
+    let blank = point(list.left() + px(4.), list.bottom() - px(4.));
+    let pressed = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.iter().any(|p| p.lease.pressed || p.lease.down.is_some()));
+    for (k, (to, how)) in
+        [(blank, "up"), (other.center(), "up"), (point(px(-40.), px(-40.)), "up"), (point(px(4000.), px(300.)), "up"), (blank, "move")]
+            .into_iter()
+            .enumerate()
+    {
+        let was = folded(cx, &view, b);
+        let at = head_at(cx, w, b);
+        mouse(cx, w, at, "move");
+        mouse(cx, w, at, "down");
+        assert!(pressed(cx), "case {k}: pressed");
+        if how == "up" {
+            mouse(cx, w, to, "drag");
+        }
+        mouse(cx, w, to, how);
+        assert!(!pressed(cx), "case {k}: released at {to:?} ({how}): the press is over");
+        assert_eq!(folded(cx, &view, b), was, "case {k}: nothing folded");
+        wait(cx, w, &view, 1600);
+    }
+    // No immortal lease: a change that would move B waits under a moving
+    // pointer, then draws at the lease's end.
+    let at_ = head_at(cx, w, b);
+    mouse(cx, w, at_, "move");
+    let at_ = head_at(cx, w, b);
+    mouse(cx, w, at_, "down");
+    let grow = json!([{"op":"patch","id":"a","append":{"steps":[{"id":"s2","label":"Two","state":"todo"}]}}]);
+    round(cx, w, &view, &[("toolu_g", grow, true)]);
+    assert!(waiting(cx, &view), "held by the press");
+    mouse(cx, w, blank, "drag");
+    mouse(cx, w, blank, "up");
+    wait(cx, w, &view, 1600);
+    board(cx, w, &view);
+    assert!(!waiting(cx, &view), "drawn at the lease's end");
 }
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a
