@@ -4,7 +4,7 @@ Commit hashes are this repository's (`synaps-desk`). PR numbers other than synap
 
 ## Since 108223a
 
-Agent cards, read-only (synaps-cards `docs/design.md` v1.2, the D1 row of §9.3). Additive; one new dependency, `cards-spec` (synaps-cards, a git dependency pinned to `62ea8f3`).
+Agent cards, read-only (synaps-cards `docs/design.md` v1.2, the D1 row of §9.3). Additive; one new dependency, `cards-spec` (synaps-cards, a git dependency pinned to `c971966`, cards-spec 0.1.1: 0.1.0 at `62ea8f3` and `Memo::forget`, which this crate doesn't use).
 
 - New `cards` module: `CardRow` (`Ask`, `Answer`, `Close`), `Ask` (the normalized doc, `wait`, the bound id, the fold's `State`, the latest reply and how many answers), `Answered`, `Closed`, `is_card_tool`, and `cards_spec`'s doc and answer types re-exported.
 - New `Item::card: Option<Arc<CardRow>>`: what a row draws of the cards, by `cards_spec::fold` over the history (each message as it is folded, read as `fold::events` reads a whole history, so any split of it into updates gives the same) and then the live turn (a call once `ToolUse` makes its input whole, its result, a turn's `user_text`), in the order those events came, not the rows' (results need not come in call order). A close that closed a card is drawn on its own call's row from its result on, whatever later calls its tool id. Part of `rev`: a row whose card changes (answered, closed) is touched, and a refold that changes nothing keeps its `rev`.
