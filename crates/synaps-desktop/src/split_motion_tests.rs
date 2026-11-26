@@ -737,12 +737,13 @@ fn a_split_down_mid_ride_rides_on(cx: &mut TestAppContext) {
 /// each pane once. At 1280 px, 125 %, rail 247 and right 240, two equal
 /// panes: the right panel yields to them. The rail folds and the right
 /// panel comes back on its tie: the centre only widens (1000.8 at 279.2
-/// to 1008 at 32), so each column keeps its wrap from the frame before
-/// until the panels land, and rewraps there, once. The frozen centre was
-/// laid out at the landing's origin, where the same width is a fraction
-/// wider a pane (the panes are rounded on the window's pixels): pane 0
-/// went 467 → 468 at the start and → 472 as they landed. Then the rail
-/// unfolds (the centre narrows): one rewrap, in the flight's first frame.
+/// to 1008 at 32). Each column rewraps once, for its landed box, in the
+/// flight's first frame (widening, revealed: `crate::turns::Reveal`). The
+/// frozen centre was laid out at the landing's origin, where the same
+/// width is a fraction wider a pane (the panes are rounded on the window's
+/// pixels): pane 0 went 467 → 468 at the start and → 472 as they landed.
+/// Then the rail unfolds (the centre narrows): one rewrap, in the flight's
+/// first frame.
 /// Every draw (#61's hook), from the frame before each flight, at rest;
 /// each lands ([`landing`]) on the columns the same fold or unfold draws
 /// at Off (Shady #62 r6 R6-2).
@@ -800,9 +801,9 @@ fn a_panels_flight_from_a_fractional_origin_rewraps_each_pane_once(cx: &mut Test
             if landed != before && (landed > before) != widens {
                 fails.push(format!("{motion}: pane {i}'s column went {before} -> {landed}"));
             }
-            // Widening, the column from the frame before while they fly;
-            // narrowing, the landed one from the flight's first frame.
-            let held = if widens { before } else { landed };
+            // Either way, the landed one from the flight's first frame
+            // (widening, revealed: `crate::turns::Reveal`).
+            let held = landed;
             if let Some(&(_, c)) = path.iter().find(|&&(moving, c)| moving && c != held) {
                 fails.push(format!("{motion}: pane {i}'s column {c} in the flight (the frame before {before}, landed {landed})"));
             }
@@ -1270,6 +1271,185 @@ fn every_flight_rewraps_each_pane_at_most_once(cx: &mut TestAppContext) {
     }
     assert!(fails.is_empty(), "{fails:#?}");
 }
+
+// ── fix/rail-close-rewrap ───────────────────────────────────────────────
+
+/// A draw of [`a_pane_growing_as_its_neighbour_closes_reveals_its_landed_column`]:
+/// whether a flight was under way, the pane's box (its left edge in the
+/// window, its width), its column, and its last row (left edge, width).
+type RevealDraw = (bool, Option<(f32, f32)>, f32, Option<(f32, f32)>);
+
+/// A pane growing as its neighbour closes widens as a rail's close does
+/// (Haseeb, 2026-11-26: its column kept the old, narrow wrap until the
+/// flight landed, then jumped; `crate::turns::Reveal`). 1100 px, both
+/// panels folded (nothing yields), two panes; the right one closes: the
+/// left pane's column is the landed one from the flight's first draw,
+/// rewrapped once; its left edge (the far one from the edge that moves)
+/// where it was, then a glide right, no faster than the centred column's,
+/// to where it lands; its list's item width the column in every draw; the
+/// flight lands ([`landing`]) and draws nothing after.
+#[gpui_kit::test]
+fn a_pane_growing_as_its_neighbour_closes_reveals_its_landed_column(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "reveal-close", (1100., 900.));
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_collapsed, p.right_collapsed) = (true, true);
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert_eq!(order.len(), 2, "two panes");
+    let left = order[0];
+    level(cx, crate::motion::Level::Full);
+    // Each draw: whether a flight is under way, the left pane's box (its
+    // left edge in the window, its width), its column, and its last row as
+    // drawn (its left edge, the list's item width).
+    let seen = draws(cx, &view, move |v: &AppView| {
+        let (o, rects) = v.rects_drawn.borrow().clone();
+        let r = rects.iter().find(|(i, _)| *i == left).map(|(_, r)| (o.0 + r.x, r.w));
+        let p = v.panes.get(left).expect("the left pane");
+        let row = p.list.bounds_for_item(p.disp.len().saturating_sub(1)).map(|b| (f32::from(b.left()), f32::from(b.size.width)));
+        (flying(v), r, p.layout.column, row)
+    });
+    frame_144(cx, window, &view);
+    let at = seen.borrow().len() - 1;
+    // The right pane's last tab: the pane closes.
+    press(cx, window, "ctrl-w");
+    let steps = settle(cx, window, &view, &seen, |d| d.0);
+    let got = seen.borrow()[at..].to_vec();
+    eprintln!("REVEAL close: {got:?}");
+    let mut fails: Vec<String> =
+        landing("the close", &got, &steps.iter().map(|s| s - at).collect::<Vec<_>>(), |d| d.0).into_iter().collect();
+    let (before, last) = (got[0], got[got.len() - 1]);
+    let first = got.iter().position(|d| d.0).expect("it flew");
+    let x = |d: &RevealDraw| d.3.expect("the row drawn").0;
+    if before.0 || last.2 <= before.2 {
+        fails.push(format!("the frame before at rest, the column widened: {before:?} -> {last:?}"));
+    }
+    if got[first].2 != last.2 {
+        fails.push(format!("the landed column from the first draw: {:?}, landed {last:?}", got[first]));
+    }
+    let wraps: Vec<usize> = (1..got.len()).filter(|&i| got[i].2 != got[i - 1].2).collect();
+    if wraps != vec![first] {
+        fails.push(format!("one rewrap, at the first draw ({first}): {wraps:?}"));
+    }
+    if (x(&got[first]) - x(&before)).abs() > 1. {
+        fails.push(format!("its left edge where it was: {before:?} -> {:?}", got[first]));
+    }
+    for (i, d) in got.iter().enumerate() {
+        if d.3.map(|r| r.1) != Some(d.2) {
+            fails.push(format!("draw {i}: the list's item width is the column: {d:?}"));
+        }
+    }
+    for (i, p) in got[first..].windows(2).enumerate() {
+        let step = (p[1].1.map_or(0., |r| r.1) - p[0].1.map_or(0., |r| r.1)).abs();
+        if x(&p[1]) < x(&p[0]) || x(&p[1]) - x(&p[0]) > step / 2. + 1. {
+            fails.push(format!("draw {}: a glide to the right: {p:?}", first + i + 1));
+        }
+    }
+    if got.iter().rev().take_while(|d| !d.0).any(|d| (d.2, d.3) != (last.2, last.3)) {
+        fails.push(format!("nothing moves after it lands: {last:?}"));
+    }
+    view.update(cx, |v, _| v.on_draw = None);
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// The rail closing over two panes side by side (the divider rides the
+/// rail: both edges of the left pane go left, its left one twice as far):
+/// in each pane the landed column from the flight's first draw, rewrapped
+/// once; its right edge (the far one: the side that leads takes all it
+/// gains) where it was, never stepping back; then a glide left, never
+/// faster than the pane's left edge, its right edge never past the pane's;
+/// its list's item width the column in every draw; the flight lands and
+/// draws nothing after. 1600 px, the right panel folded.
+#[gpui_kit::test]
+fn the_rail_closing_over_two_panes_holds_each_columns_far_edge(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_at(cx, "reveal-rail-two", (1600., 900.));
+    view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        (p.rail_collapsed, p.right_collapsed) = (false, true);
+        v.panels = p;
+        cx.notify();
+    });
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    for _ in 0..10 {
+        frame(cx, window);
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let order: [crate::pane::PaneId; 2] = order.try_into().expect("two panes");
+    assert!(view.read_with(cx, |v, _| v.panel_fx.sides[0].shown > 100.), "the rail open beside them");
+    level(cx, crate::motion::Level::Full);
+    let seen = draws(cx, &view, move |v: &AppView| {
+        let (o, rects) = v.rects_drawn.borrow().clone();
+        let each = order.map(|id| {
+            let r = rects.iter().find(|(i, _)| *i == id).map(|(_, r)| (o.0 + r.x, r.w));
+            let p = v.panes.get(id).expect("the pane");
+            let row = p.list.bounds_for_item(p.disp.len().saturating_sub(1)).map(|b| (f32::from(b.left()), f32::from(b.size.width)));
+            (r, p.layout.column, row)
+        });
+        (flying(v), each)
+    });
+    frame_144(cx, window, &view);
+    let at = seen.borrow().len() - 1;
+    view.update(cx, |v, cx| v.toggle_panel(true, cx));
+    let steps = settle(cx, window, &view, &seen, |d| d.0);
+    let got = seen.borrow()[at..].to_vec();
+    let mut fails: Vec<String> =
+        landing("the fold", &got, &steps.iter().map(|s| s - at).collect::<Vec<_>>(), |d| d.0).into_iter().collect();
+    let first = got.iter().position(|d| d.0).expect("it flew");
+    for pane in 0..2 {
+        let d: Vec<_> = got.iter().map(|g| (g.0, g.1[pane])).collect();
+        eprintln!("REVEAL two, pane {pane}: {d:?}");
+        let (before, last) = (d[0].1, d[d.len() - 1].1);
+        let (x, rect) = (|e: &EachDraw| e.2.expect("the row drawn").0, |e: &EachDraw| e.0.expect("the pane drawn"));
+        if d[0].0 || last.1 <= before.1 {
+            fails.push(format!("pane {pane}: the frame before at rest, the column widened: {before:?} -> {last:?}"));
+        }
+        let wraps: Vec<usize> = (1..d.len()).filter(|&i| d[i].1.1 != d[i - 1].1.1).collect();
+        if d[first].1.1 != last.1 || wraps != vec![first] {
+            fails.push(format!("pane {pane}: the landed column from the first draw, once: {wraps:?}, {:?}, landed {last:?}", d[first]));
+        }
+        let right = |e: &EachDraw| x(e) + e.1;
+        if (right(&d[first].1) - right(&before)).abs() > 1. {
+            fails.push(format!("pane {pane}: its right edge where it was: {before:?} -> {:?}", d[first].1));
+        }
+        for (i, (_, e)) in d.iter().enumerate() {
+            if e.2.map(|r| r.1) != Some(e.1) {
+                fails.push(format!("pane {pane}, draw {i}: the list's item width is the column: {e:?}"));
+            }
+            if right(e) > rect(e).0 + rect(e).1 + 0.5 {
+                fails.push(format!("pane {pane}, draw {i}: its right edge inside the pane: {e:?}"));
+            }
+        }
+        for (i, p) in d[first..].windows(2).enumerate() {
+            let step = (rect(&p[1].1).0 - rect(&p[0].1).0).abs();
+            if x(&p[1].1) > x(&p[0].1) || x(&p[0].1) - x(&p[1].1) > step + 1. {
+                fails.push(format!("pane {pane}, draw {}: a glide left with the pane: {p:?}", first + i + 1));
+            }
+        }
+        if d.iter().rev().take_while(|g| !g.0).any(|g| (g.1.1, g.1.2) != (last.1, last.2)) {
+            fails.push(format!("pane {pane}: nothing moves after it lands: {last:?}"));
+        }
+    }
+    view.update(cx, |v, _| v.on_draw = None);
+    assert!(fails.is_empty(), "{fails:#?}");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// A pane in a draw of
+/// [`the_rail_closing_over_two_panes_holds_each_columns_far_edge`]: its
+/// box (its left edge in the window, its width), its column, and its last
+/// row (left edge, width).
+type EachDraw = (Option<(f32, f32)>, f32, Option<(f32, f32)>);
 
 // ── fix/restored-panes-hang ─────────────────────────────────────────────
 
