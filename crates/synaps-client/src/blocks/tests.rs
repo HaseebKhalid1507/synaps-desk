@@ -158,8 +158,8 @@ fn fates_read_in_passes_are_a_call_at_a_times() {
     }
 }
 
-fn input(history: &[Value], live: Live) -> Input {
-    Input::of(&read(history), Arc::new(live)).expect("blocks")
+fn input(history: &[Value]) -> Input {
+    Input::of(&read(history), &LiveLog::default()).expect("blocks")
 }
 
 /// The worker's board is the history's fold, read on from where it stopped
@@ -168,7 +168,7 @@ fn input(history: &[Value], live: Live) -> Input {
 #[test]
 fn the_worker_reads_on_stops_between_slices_and_starts_over_on_another_epoch() {
     let h = blocks_history();
-    let whole = input(&h, Live::default());
+    let whole = input(&h);
     let mut w = Worker::default();
     let one = w.run(&whole, &mut || true).expect("done");
     let board = Board::fold(whole.generation, &whole.events());
@@ -179,15 +179,15 @@ fn the_worker_reads_on_stops_between_slices_and_starts_over_on_another_epoch() {
     let mut w2 = Worker::default();
     for m in &h {
         hb.message(m, &[]);
-        let i = Input::of(&hb, Arc::new(Live::default()));
+        let i = Input::of(&hb, &LiveLog::default());
         if let Some(i) = i {
             w2.run(&i, &mut || true).expect("done");
         }
     }
-    assert_eq!(w2.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).unwrap().live, one.live);
+    assert_eq!(w2.run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).unwrap().live, one.live);
     // Long: stopped after its first slice, then finished.
     let long: Vec<Value> = h.iter().cloned().chain(crate::synthetic::history(20_000, 3)).collect();
-    let big = input(&long, Live::default());
+    let big = input(&long);
     assert!(big.history_len > 2 * SLICE, "{}", big.history_len);
     let mut w3 = Worker::default();
     let mut asked = 0;
@@ -203,7 +203,7 @@ fn the_worker_reads_on_stops_between_slices_and_starts_over_on_another_epoch() {
     assert_eq!(done.live, one.live);
     assert_eq!(w3.position(), big.history_len);
     // Another history (a new epoch): folded from its start.
-    let other = input(&h[..6], Live::default());
+    let other = input(&h[..6]);
     let again = w3.run(&other, &mut || true).expect("done");
     assert_eq!(w3.position(), other.history_len);
     assert!(again.live < one.live);
@@ -249,7 +249,7 @@ fn big_batch(n: usize) -> Vec<Value> {
 type Normal = (Block, Option<Block>, Vec<(Block, Option<Block>)>);
 fn reference(i: &Input, events: &[Event]) -> (std::collections::BTreeMap<u64, Vec<Normal>>, std::collections::BTreeMap<u64, Arc<str>>) {
     assert_eq!(i.from, 0, "a fresh read: every event staged");
-    let rows: Vec<Option<u64>> = i.chunks.iter().flat_map(|c| c.rows.iter().copied()).chain(i.live.rows.iter().copied()).collect();
+    let rows: Vec<Option<u64>> = i.chunks.iter().flat_map(|c| c.rows.iter().copied()).chain(i.live_rows()).collect();
     assert_eq!(rows.len(), events.len());
     let board = Board::fold(i.generation, events);
     let (view, bound) = (board.view(events), board.bound(events));
@@ -348,12 +348,12 @@ fn traces_at_and_past_a_replays_pass() {
 #[test]
 fn a_history_replaced_during_a_job_starts_over() {
     let long: Vec<Value> = blocks_history().into_iter().chain(crate::synthetic::history(20_000, 5)).collect();
-    let old = input(&long, Live::default());
+    let old = input(&long);
     let mut w = Worker::default();
     assert!(w.run(&old, &mut || false).is_none(), "stopped after its first slice");
     assert_eq!(w.position(), SLICE);
     let new_h = blocks_history()[..6].to_vec();
-    let new = input(&new_h, Live::default());
+    let new = input(&new_h);
     assert_ne!(new.epoch, old.epoch);
     let d = w.run(&new, &mut || true).expect("done");
     assert_eq!(d.epoch, new.epoch);
@@ -394,7 +394,7 @@ fn the_worker_keeps_one_journal_and_nothing_per_call() {
             .unwrap_or_default();
         hb.message(m, &rows);
         if (k % 50 == 0 || k + 1 == h.len())
-            && let Some(i) = Input::of(&hb, Arc::new(Live::default()))
+            && let Some(i) = Input::of(&hb, &LiveLog::default())
         {
             let d = w.run(&i, &mut || true).expect("done");
             hb.took(d.committed_to);
@@ -411,7 +411,7 @@ fn the_worker_keeps_one_journal_and_nothing_per_call() {
     assert_eq!(hb.staged(), 0, "the history keeps no second copy");
     assert!(d.committed.len() <= 400, "{}: the last publication carries what committed since the one before", d.committed.len());
     // Taken: the next publication carries nothing of the history's calls.
-    let i = Input::of(&hb, Arc::new(Live::default())).unwrap();
+    let i = Input::of(&hb, &LiveLog::default()).unwrap();
     let again = w.run(&i, &mut || true).unwrap();
     assert!(again.committed.is_empty(), "{}", again.committed.len());
     assert_eq!(w.retained().committed, 0);
@@ -441,16 +441,16 @@ fn a_gap_draws_nothing_until_another_epoch() {
         hb.message(m, &[]);
     }
     let mut w = Worker::default();
-    w.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).expect("done");
+    w.run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).expect("done");
     for m in &h[4..] {
         hb.message(m, &[]);
     }
     assert!(hb.staged() < hb.len(), "what the worker took is let go");
     let mut fresh = Worker::default();
-    assert!(fresh.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).is_none());
+    assert!(fresh.run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).is_none());
     assert!(fresh.gap());
-    assert!(w.run(&Input::of(&hb, Arc::new(Live::default())).unwrap(), &mut || true).is_some(), "its own worker reads on");
+    assert!(w.run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).is_some(), "its own worker reads on");
     let again = read(&h);
-    assert!(fresh.run(&Input::of(&again, Arc::new(Live::default())).unwrap(), &mut || true).is_some());
+    assert!(fresh.run(&Input::of(&again, &LiveLog::default()).unwrap(), &mut || true).is_some());
     assert!(!fresh.gap());
 }

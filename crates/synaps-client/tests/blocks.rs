@@ -17,7 +17,7 @@ use cards_spec::block::{BlockId, Ref};
 use cards_spec::board::Event;
 use cards_spec::fold::events;
 use serde_json::{Value, json};
-use synaps_client::blocks::{Drawn, Fate, RowBlocks, Worker};
+use synaps_client::blocks::{Drawn, Fate, RowBlocks, SLICE, Worker};
 use synaps_client::history::HistoryUpdate;
 use synaps_client::protocol::*;
 use synaps_client::synthetic::{BLOCKS_CARD, block_input, block_receipt, blocks_history};
@@ -546,6 +546,153 @@ fn refused_calls_grow_no_publication_and_no_second_copy() {
     }
     assert_eq!(sizes[0].1, sizes[1].1, "a tick's publication doesn't grow with refused calls: {sizes:?}");
     assert!(sizes[1].1 <= 16, "{sizes:?}");
+}
+
+/// A live block call of a note `pad` long: it starts, then its input is
+/// whole.
+fn live_call(d: &mut Desk, k: usize, pad: &str) -> [SessionEvent; 2] {
+    let _ = d;
+    let id = format!("toolu_l{k}");
+    let ops = json!([{"op":"put","id":format!("n{k}"),"kind":"note","body":{"text":pad}}]);
+    [
+        llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})),
+        tool_use(&id, "cards_block", block_input(ops)),
+    ]
+}
+
+/// Shady #101 R2-1: a live event costs the frame the events it adds to
+/// the board's input, never the turn so far. One response of `n` block
+/// calls, at and past a replay's 256-call pass and far past it, each input
+/// near the 8 KiB limit, the batch open (no result yet); then its results
+/// (a results-only tail, every call refused); then 300 more rounds, the
+/// history never landing. Each event writes at most two events; a round's
+/// sealing moves its own once, so the turn costs at most twice its events.
+/// Besides its events, the live log keeps two rounds' calls. The inputs are
+/// the rows' (shared): what a job read of them is counted, heap included.
+#[test]
+fn the_live_turn_costs_the_frame_only_what_it_adds() {
+    let pad = "p".repeat(6_000);
+    for n in [255, 256, 257, 600, 3_000] {
+        let mut d = Desk::of(attach(&blocks_history()));
+        let mut worst = 0;
+        let mut each = |d: &mut Desk, e: &SessionEvent| {
+            let w0 = d.t.blocks_work();
+            d.apply(e);
+            worst = worst.max(d.t.blocks_work() - w0);
+        };
+        each(&mut d, &ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "go"})));
+        each(&mut d, &llm(json!({"kind": "llm", "llm": "response_start"})));
+        for k in 0..n {
+            for e in live_call(&mut d, k, &pad) {
+                each(&mut d, &e);
+            }
+        }
+        let open = d.t.blocks_input().unwrap();
+        let calls = open.events().iter().filter(|e| matches!(e, Event::Call { tool_id, .. } if tool_id.starts_with("toolu_l"))).count();
+        assert_eq!(calls, n, "{n}: the open batch's calls, whole");
+        // Its results: a results-only tail.
+        for k in 0..n {
+            each(&mut d, &tool_result(&format!("toolu_l{k}"), "cards_block: refused (a test)"));
+        }
+        // 300 more rounds before the history lands.
+        for r in 0..300 {
+            each(&mut d, &llm(json!({"kind": "llm", "llm": "response_start"})));
+            for e in live_call(&mut d, n + r, "short") {
+                each(&mut d, &e);
+            }
+            each(&mut d, &tool_result(&format!("toolu_l{}", n + r), "cards_block: refused (a test)"));
+        }
+        assert!(worst <= 2, "{n}: an event wrote {worst} events");
+        let len = d.t.blocks_live().len();
+        assert!(d.t.blocks_work() <= 2 * len, "{n}: {} written and moved for {len} events", d.t.blocks_work());
+        assert!(d.t.blocks_live().calls() <= 2, "{n}: the log keeps {} calls besides its events", d.t.blocks_live().calls());
+        // The payloads are the rows': the log keeps none of them, a few
+        // hundred bytes an event however long its input.
+        let payload = n * pad.len();
+        let kept = d.t.blocks_live().bytes();
+        assert!(kept < 400 * len && kept < payload / 2, "{n}: the log keeps {kept} bytes for {len} events");
+        // A job read them: counted, heap included.
+        let drawn = d.fold();
+        assert_eq!(drawn.rows.values().filter(|r| r.call == Some(Fate::Unbound)).count(), n + 300, "{n}: every call refused");
+        assert!(d.t.blocks_bytes() >= payload, "{n}: {} bytes counted for {payload} of inputs", d.t.blocks_bytes());
+    }
+}
+
+/// Shady #101 R2-1: a job reads the live turn from its log a slice at a
+/// time, asked whether to go on between slices, and keeps its place: each
+/// stopped run's next reads on from there; a longer turn (the backlog
+/// grown) is read on, not again; a reset is read again from its cut. Each
+/// board it ends on is a single run's.
+#[test]
+fn a_job_reads_the_live_turn_a_slice_at_a_time_and_keeps_its_place() {
+    // `d`, and its twin `r` (the same events) whose staging no worker took:
+    // a fresh worker's single run on it is the reference.
+    let (mut d, mut r) = (Desk::of(attach(&blocks_history())), Desk::of(attach(&blocks_history())));
+    let both = |d: &mut Desk, r: &mut Desk, e: &SessionEvent| {
+        d.apply(e);
+        r.apply(e);
+    };
+    let reference = |r: &mut Desk| {
+        let d = (*r.fold()).clone();
+        (d.rows, d.live, d.history, d.events)
+    };
+    let of = |d: Drawn| (d.rows, d.live, d.history, d.events);
+    both(&mut d, &mut r, &ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "go"})));
+    both(&mut d, &mut r, &llm(json!({"kind": "llm", "llm": "response_start"})));
+    for k in 0..2_000 {
+        for e in live_call(&mut d, k, "short") {
+            both(&mut d, &mut r, &e);
+        }
+    }
+    let input = d.t.blocks_input().unwrap();
+    let live = input.events().len() - input.history_len;
+    assert!(live > 2_000 && input.history_len < SLICE, "{live}");
+    let mut w = Worker::default();
+    let mut asked = 0;
+    let first = w.run(&input, &mut || {
+        asked += 1;
+        false
+    });
+    assert!(first.is_none(), "stopped between slices");
+    let mut copied = w.retained().journal - input.history_len;
+    assert!(asked == 1 && copied > 0 && copied <= SLICE, "asked {asked}, {copied} copied");
+    let mut runs = 1;
+    let done = loop {
+        if let Some(d) = w.run(&input, &mut || false) {
+            break d;
+        }
+        runs += 1;
+        let now = w.retained().journal - input.history_len;
+        assert!(now > copied, "run {runs} read on: {now} after {copied}");
+        copied = now;
+    };
+    assert!(runs > 2, "{runs} runs");
+    assert_eq!(of(done), reference(&mut r), "a single run's board");
+    // The backlog grows: read on from there.
+    for k in 2_000..2_500 {
+        for e in live_call(&mut d, k, "short") {
+            both(&mut d, &mut r, &e);
+        }
+    }
+    let more = d.t.blocks_input().unwrap();
+    let before = w.retained().journal;
+    assert_eq!(before, input.history_len + live, "the turn so far kept");
+    assert!(w.run(&more, &mut || false).is_none());
+    let after = w.retained().journal;
+    assert!(after > before && after - before <= SLICE, "read on: {before} → {after}");
+    let done = loop {
+        if let Some(d) = w.run(&more, &mut || false) {
+            break d;
+        }
+    };
+    assert_eq!(of(done), reference(&mut r));
+    // A reset: the response's calls go; read again from its cut.
+    both(&mut d, &mut r, &llm(json!({"kind": "llm", "llm": "response_reset"})));
+    let reset = d.t.blocks_input().unwrap();
+    assert!(reset.events().len() < input.history_len + 10, "{}", reset.events().len());
+    assert!(w.run(&more, &mut || true).is_none(), "an input its log changed: a newer one stands");
+    let done = w.run(&reset, &mut || true).expect("done");
+    assert_eq!(of(done), reference(&mut r));
 }
 
 /// A session with no block call has no board: nothing to fold, and its

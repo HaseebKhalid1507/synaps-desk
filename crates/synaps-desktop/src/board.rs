@@ -253,7 +253,7 @@ async fn yield_now() {
 #[cfg(test)]
 pub(crate) fn events(input: &Input) -> Vec<Event> {
     let journal = input.worker.lock().unwrap_or_else(PoisonError::into_inner).journal(input).expect("no gap");
-    journal.iter().chain(&input.live.events).cloned().collect()
+    journal.iter().cloned().chain(input.live_events().expect("the input holds")).collect()
 }
 
 /// What one step came to.
@@ -411,8 +411,10 @@ impl AppView {
                     // copy, the re-fold's alone, while it runs.
                     let journal = worker.lock().unwrap_or_else(PoisonError::into_inner).journal(&input)?;
                     let events = match read {
-                        Read::Whole { .. } if !input.live.events.is_empty() => {
-                            Arc::new(journal.iter().chain(&input.live.events).cloned().collect())
+                        // Its live turn read from its log (`None`: changed
+                        // since, a newer input stands: nothing to read).
+                        Read::Whole { .. } if input.live_len() > 0 => {
+                            Arc::new(journal.iter().cloned().chain(input.live_events()?).collect())
                         }
                         _ => journal,
                     };
@@ -484,9 +486,9 @@ mod tests {
     use super::{Chunk, Duration, Input, REFOLD_STEP, Step, Worker, chunk, step};
     use cards_spec::board::{Board, Pos, REFOLD_MAX, Refold, Target, TooFar};
     use serde_json::Value;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
-    use synaps_client::blocks::{HistoryBlocks, Live};
+    use synaps_client::blocks::{HistoryBlocks, LiveLog};
     use synaps_client::synthetic::{blocks_history, history};
 
     fn input(h: &[Value]) -> Input {
@@ -494,7 +496,7 @@ mod tests {
         for m in h {
             b.message(m, &[]);
         }
-        Input::of(&b, Arc::new(Live::default())).unwrap()
+        Input::of(&b, &LiveLog::default()).unwrap()
     }
 
     /// A job runs in steps of its budget, the worker reading on from where

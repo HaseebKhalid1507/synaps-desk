@@ -970,7 +970,7 @@ fn a_job_paused_mid_fold_publishes_only_the_snapshot_it_ends_on(cx: &mut TestApp
     let d = drawn(cx);
     let (epoch, history, events) = view.read_with(cx, |v, _| {
         let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
-        (i.epoch, i.history_len, i.history_len + i.live.events.len())
+        (i.epoch, i.history_len, i.history_len + i.live_len())
     });
     assert_eq!((d.epoch, d.history, d.events), (epoch, history, events), "the input as it is now, whole");
     assert!(row(cx, &view, "snap").is_some(), "the live round's block drawn");
@@ -1202,6 +1202,43 @@ fn an_edits_block_draws_its_files_lines_only(cx: &mut TestAppContext) {
         assert!(!has(cx, w, format!("block-text {edits} alpha-{k}")), "A's line {k} in B's block");
     }
     assert!(!has(cx, w, format!("block-text {edits} crates/relay/src/other.rs")), "A's name in B's block");
+}
+
+/// Shady #101 R2-1: a tab's cached bytes hold its block calls' inputs as
+/// its rows and its board's journal keep them, heap included, so the tab
+/// cache's budget holds. 160 block calls with inputs near the 8 KiB limit:
+/// under a 1 MiB budget the tab goes from the cache when it is left; under
+/// one that holds it, it stays, counted at least twice its inputs (the
+/// rows' copy and the journal's).
+#[gpui_kit::test]
+fn a_tabs_block_inputs_count_against_the_cache_budget(cx: &mut TestAppContext) {
+    let pad = "q".repeat(6_000);
+    let n = 160;
+    let mut msgs = vec![json!({"role": "user", "content": "notes"})];
+    for k in 0..n {
+        let id = format!("toolu_big{k}");
+        let ops = json!([{"op":"put","id":format!("big{k}"),"kind":"note","body":{"text":pad}}]);
+        msgs.push(
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops)}]}),
+        );
+        msgs.push(
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "cards_block: refused (a test)"}]}),
+        );
+    }
+    let payload = n * pad.len();
+    let sid = crate::demo::BLOCKS.to_string();
+    for (budget, kept) in [(1usize << 20, false), (64 << 20, true)] {
+        let (w, view) = blocks(cx, 1500.);
+        land(cx, w, &view, msgs.clone());
+        board(cx, w, &view);
+        view.update(cx, |v, _| v.tab_cache = crate::tabs::Lru::new(crate::app::TAB_CACHE, budget));
+        new_tab(cx, w, &view, crate::demo::SID);
+        let (has, bytes) = view.read_with(cx, |v, _| (v.tab_cache.contains(&sid), v.tab_cache.bytes()));
+        assert_eq!(has, kept, "a {budget}-byte budget: {bytes} bytes cached");
+        if kept {
+            assert!(bytes >= 2 * payload, "{bytes} bytes counted for {payload} of inputs");
+        }
+    }
 }
 
 /// Session `sid` in a new tab of the pane acted on, shown.

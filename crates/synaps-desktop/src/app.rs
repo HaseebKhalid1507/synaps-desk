@@ -190,17 +190,20 @@ pub(crate) struct Column {
 
 impl TabCache {
     /// What it keeps, roughly (bytes): the transcript's items (texts, tool
-    /// inputs and results), the rows' strings, the display rows, the files
-    /// ledger, and per item what the strings do not show (the list's
-    /// heights, maps, allocator slack: [`ITEM_OVERHEAD`]). Measured once,
-    /// when the tab is left.
-    fn bytes(&self) -> usize {
+    /// inputs and results, a card's or block's input kept whole, heap
+    /// included), the rows' strings, the display rows, the files ledger,
+    /// the board's input (its history's journal and the live turn's log,
+    /// heap included: `Transcript::blocks_bytes`), and per item what the
+    /// strings do not show (the list's heights, maps, allocator slack:
+    /// [`ITEM_OVERHEAD`]). Measured once, when the tab is left.
+    pub(crate) fn bytes(&self) -> usize {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
                 + i.text.capacity()
                 + i.tool
                     .as_ref()
                     .map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity() + t.tail.capacity())
+                + i.kept_bytes()
         };
         let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len() + r.card.bytes();
         self.transcript.items().iter().map(item).sum::<usize>()

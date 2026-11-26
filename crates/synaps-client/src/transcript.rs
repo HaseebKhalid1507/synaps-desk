@@ -357,6 +357,12 @@ pub struct Item {
 }
 
 impl Item {
+    /// What its kept input holds (bytes, heap included: [`Item`]'s
+    /// `kept_input`, a card or block call's input whole).
+    pub fn kept_bytes(&self) -> usize {
+        self.kept_input.as_deref().map_or(0, |v| std::mem::size_of::<Value>() + crate::blocks::value_bytes(v))
+    }
+
     /// A notice or error this client added (not part of the history).
     pub fn is_note(&self) -> bool {
         self.anchor.is_some()
@@ -505,8 +511,6 @@ pub struct Transcript {
     /// ([`crate::blocks::LiveLog`]): the board's live input is read from
     /// them, never from rows.
     live_log: crate::blocks::LiveLog,
-    /// The live turn's, as the board reads it, at the last sync.
-    blocks_live: Arc<crate::blocks::Live>,
     /// The blocks' input's revision ([`Transcript::blocks_rev`]).
     blocks_rev: u64,
     /// The board the rows draw, once one is published ([`Transcript::set_drawn`]).
@@ -516,8 +520,9 @@ pub struct Transcript {
     /// Rows were taken to be folded again since the last sync: they draw
     /// the last board again ([`Transcript::sync_blocks`]).
     rows_moved: bool,
-    /// The history's epoch and length at the last sync.
-    blocks_seen: (u64, usize),
+    /// The history's epoch and length, and the live log's version, at the
+    /// last sync.
+    blocks_seen: (u64, usize, (u64, u64)),
     /// A card call among the live rows: set as one starts, so a session
     /// without cards reads no row per event ([`Transcript::sync_cards`]).
     /// It may stay set once that row is gone: then the fold just runs.
@@ -609,12 +614,12 @@ impl Transcript {
     /// The board's input now ([`crate::blocks::Input`]): `None` with no
     /// block call in the history or the live turn.
     pub fn blocks_input(&self) -> Option<crate::blocks::Input> {
-        crate::blocks::Input::of(&self.blocks, self.blocks_live.clone())
+        crate::blocks::Input::of(&self.blocks, &self.live_log)
     }
 
     /// A block call in the history or the live turn: the board draws them.
     pub fn has_blocks(&self) -> bool {
-        self.blocks.has_blocks() || self.blocks_live.blocks
+        self.blocks.has_blocks() || self.live_log.has_blocks()
     }
 
     /// The history's epoch ([`crate::blocks::HistoryBlocks::epoch`]): a
@@ -628,10 +633,25 @@ impl Transcript {
         self.blocks.len()
     }
 
-    /// What the history's blocks keep, its worker's fold included, roughly
-    /// (bytes: [`crate::blocks::HistoryBlocks::bytes`]).
+    /// What the board's input keeps, heap included (bytes): the history's
+    /// blocks with its worker's fold ([`crate::blocks::HistoryBlocks::bytes`])
+    /// and the live turn's log ([`crate::blocks::LiveLog::bytes`]).
     pub fn blocks_bytes(&self) -> usize {
-        self.blocks.bytes()
+        self.blocks.bytes() + self.live_log.bytes()
+    }
+
+    /// The frame's work for the board's live input so far: the events its
+    /// live log wrote and moved (tests: the events each live event adds,
+    /// never the turn so far).
+    #[doc(hidden)]
+    pub fn blocks_work(&self) -> usize {
+        self.live_log.work()
+    }
+
+    /// The live turn's log (tests: what it keeps).
+    #[doc(hidden)]
+    pub fn blocks_live(&self) -> &crate::blocks::LiveLog {
+        &self.live_log
     }
 
     /// What the history's worker keeps ([`crate::blocks::Retained`]).
@@ -708,21 +728,17 @@ impl Transcript {
         }
     }
 
-    /// The board's input again, the live turn's read from its log as the
-    /// board will (cheap: the turn's facts); [`Transcript::blocks_rev`]
-    /// moves if it changed. Rows folded again (the history replaced them)
-    /// draw the last board's blocks until the next one lands, so nothing
-    /// blinks; no other row is read.
+    /// The board's input again: [`Transcript::blocks_rev`] moves if the
+    /// history's events or the live log's did (its version: nothing of the
+    /// turn is read here, the log wrote each event as it came). Rows folded
+    /// again (the history replaced them) draw the last board's blocks
+    /// until the next one lands, so nothing blinks; no other row is read.
     fn sync_blocks(&mut self) {
         self.blocks.prune();
-        let seen = (self.blocks.epoch(), self.blocks.len());
-        let live = if self.blocks.has_blocks() || self.live_log.has_blocks() {
-            crate::blocks::live(&self.blocks, &self.live_log)
-        } else {
-            crate::blocks::Live::default()
-        };
-        if *self.blocks_live != live || self.blocks_seen != seen {
-            self.blocks_live = Arc::new(live);
+        // With no block call there is no board: its live turn is no input.
+        let live = if self.has_blocks() { self.live_log.version() } else { (0, 0) };
+        let seen = (self.blocks.epoch(), self.blocks.len(), live);
+        if self.blocks_seen != seen {
             self.blocks_seen = seen;
             self.blocks_rev = next_card_rev();
         }
@@ -1808,11 +1824,11 @@ impl Transcript {
             WatchEvent::Steered { text } if !ExternalEvent::is_payload(text.trim_start()) => {
                 self.end_streaming_text();
                 let ix = self.push_new(ItemKind::User, text.clone(), None, false);
-                self.live_log.user(text, Some(self.items[ix].id));
+                self.live_log.user(&self.blocks, text, Some(self.items[ix].id));
             }
             // A drained event's payload: its parent's business (its history
             // holds it as a user message all the same).
-            WatchEvent::Steered { text } => self.live_log.user(text, None),
+            WatchEvent::Steered { text } => self.live_log.user(&self.blocks, text, None),
             WatchEvent::Failed { category } => self.notice(ItemKind::Error, format!("subagent failed [{category}]")),
             other => {
                 if let Some(s) = other.to_stream() {
@@ -1904,7 +1920,7 @@ impl Transcript {
                 self.deliver_all();
                 if let Some(t) = user_text {
                     let ix = self.push_new(ItemKind::User, t.clone(), None, false);
-                    self.live_log.user(t, Some(self.items[ix].id));
+                    self.live_log.user(&self.blocks, t, Some(self.items[ix].id));
                 }
             }
             SessionEvent::Stream { event } => self.apply_stream(event),
@@ -2039,11 +2055,11 @@ impl Transcript {
                     }
                 }
                 LlmEvent::Thinking { text } => {
-                    self.live_log.content();
+                    self.live_log.content(&self.blocks);
                     self.append_live(ItemKind::Thinking, text)
                 }
                 LlmEvent::Text { text } => {
-                    self.live_log.content();
+                    self.live_log.content(&self.blocks);
                     self.append_live(ItemKind::Assistant, text)
                 }
                 LlmEvent::ToolUseStart { tool_name, tool_id } => {
@@ -2056,7 +2072,7 @@ impl Transcript {
                         ..Default::default()
                     };
                     let ix = self.push_new(ItemKind::Tool, String::new(), Some(tool), true);
-                    self.live_log.started(self.items[ix].id, tool_id, tool_name);
+                    self.live_log.started(&self.blocks, self.items[ix].id, tool_id, tool_name);
                 }
                 LlmEvent::ToolUseDelta { tool_id, delta } => {
                     if let Some(ix) = self.tool_mut(tool_id) {
@@ -2088,7 +2104,7 @@ impl Transcript {
                     // A live call; the history's own (an attach's replay of
                     // a call its history holds) is the history's.
                     if ix >= self.history_end {
-                        self.live_log.call(self.items[ix].id, tool_id, tool_name, self.items[ix].kept_input.clone());
+                        self.live_log.call(&self.blocks, self.items[ix].id, tool_id, tool_name, self.items[ix].kept_input.clone());
                     }
                     self.live_cards |= card;
                     self.came(ix, false);
@@ -2153,7 +2169,7 @@ impl Transcript {
                     // round's results: a user message of its text there
                     // (an event's payload too; the board reads which text
                     // is the user's own, blocks.md §7).
-                    self.live_log.user(message, None);
+                    self.live_log.user(&self.blocks, message, None);
                     if let Some(ev) = steered_event(message) {
                         self.delivered(ev);
                     }
