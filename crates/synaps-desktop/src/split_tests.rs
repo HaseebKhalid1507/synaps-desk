@@ -7001,6 +7001,48 @@ fn nine_panes(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<Ap
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), crate::pane::PANES_MAX, "nine panes: {tree:?}");
 }
 
+/// A split that evens out its row (a halved pane would be under 320)
+/// flies there: its panes' last frame in the air is where they land, not
+/// where halving the pane would have put them (a jump of ~90 px at the
+/// landing). Four across at 1920 × 1080, both panels at their strips;
+/// Ctrl+\ evens the row to five.
+#[gpui_kit::test]
+fn an_evened_split_flies_to_where_it_lands(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    let (rail, right) = crate::app::panel_keys(cfg!(target_os = "macos"));
+    press(cx, window, rail);
+    press(cx, window, right);
+    land(cx, window, &view);
+    for _ in 0..3 {
+        key(cx, window, "ctrl-\\");
+        land(cx, window, &view);
+    }
+    let at = view.read_with(cx, |v, _| v.panes.focused);
+    let halved = view.read_with(cx, |v, _| v.panes.tree.split_as(at, crate::split::Side::Right, crate::pane::PaneId::nth(4)));
+    key(cx, window, "ctrl-\\");
+    let (tree, order) = view.read_with(cx, |v, _| (v.panes.tree.clone(), v.reading_order()));
+    assert_eq!(order.len(), 5);
+    assert_ne!(Some(&tree), halved.as_ref(), "the row evened, not the pane halved");
+    let mut frames: Vec<Vec<[f32; 4]>> = Vec::new();
+    for _ in 0..400 {
+        frame_144(cx, window, &view);
+        frames.push(order.iter().map(|id| pane_box(cx, window, *id)).collect());
+        if view.read_with(cx, |v, _| v.panes.flight.is_none()) {
+            break;
+        }
+    }
+    assert!(frames.len() > 2, "a flight: {} frames", frames.len());
+    let (last, rest) = (&frames[frames.len() - 2], &frames[frames.len() - 1]);
+    for (a, b) in last.iter().zip(rest) {
+        assert!((a[0] - b[0]).abs() <= 2. && (a[2] - b[2]).abs() <= 2., "the last frame in the air {last:?} is where it lands {rest:?}");
+    }
+    assert!(rest.iter().all(|b| b[2] >= crate::split::PANE_MIN_W), "five across, each at least 320: {rest:?}");
+}
+
 /// The pane key `n` (1-based) as this platform binds it: Alt+N, Ctrl+N on
 /// macOS.
 fn nth_key(n: usize) -> String {
