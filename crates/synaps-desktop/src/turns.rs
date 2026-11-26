@@ -2013,7 +2013,9 @@ fn target_el(card: &Card, arg: &SharedString, quiet: bool, id: u64, p: &Palette,
     let lit = if quiet { p.dim_t } else { p.prose_t };
     match &card.path {
         Some((dir, base)) => {
-            let name_w = (crate::blocks::cols(base) as f32 * m.mono * 0.6).ceil();
+            // The name's width, a little over (the facts wrap away early
+            // rather than squeeze it).
+            let name_w = (crate::blocks::cols(base) as f32 * m.mono * 0.62).ceil() + 2.;
             let t = format!("tool-file {id} {base}");
             h_flex()
                 .flex_grow(1.)
@@ -2023,11 +2025,22 @@ fn target_el(card: &Card, arg: &SharedString, quiet: bool, id: u64, p: &Palette,
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .debug_selector(move || format!("tool-target {id}"))
-                .child(div().min_w_0().flex_shrink(1000.).overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir.clone()))
                 .child(
                     div()
                         .min_w_0()
                         .flex_shrink(1.)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(p.dim_t)
+                        .debug_selector(move || format!("tool-dir {id}"))
+                        .child(dir.clone()),
+                )
+                // As wide as the name, the target at most: the folder
+                // shrinks alone while it can.
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w_full()
                         .overflow_hidden()
                         .text_ellipsis_middle()
                         .text_color(lit)

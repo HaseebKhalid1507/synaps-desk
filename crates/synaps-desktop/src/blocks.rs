@@ -561,9 +561,7 @@ impl AppView {
                 )
             })
             .children(
-                path.map(|(path, line, note)| self.path_head(path, line, note, id, b.title.as_deref().is_none_or(str::is_empty), p, m))
-                    .into_iter()
-                    .flatten(),
+                path.map(|(path, line, note)| self.path_head(path, line, note, id, b.title.as_deref().is_none_or(str::is_empty), p, m)),
             )
             .when(b.skipped.is_some(), |d| {
                 // An op that didn't apply, never the block's state (Shady
@@ -648,11 +646,11 @@ impl AppView {
     }
 
     /// A file's or a diff's path in its header (§6.2): its directories,
-    /// its name and `:line`, a file's note, as items of the header's own
-    /// row. The title gives way first, then the directories and the note;
-    /// the name last, in its middle (its start and its extension and line
-    /// stay), at most 55 % of the column. `untitled`: no title, the path is
-    /// it.
+    /// its name and `:line`, a file's note, in one box of the header's row.
+    /// The title gives way first; in the box, the directories and the note
+    /// (the name never shrinks while they can); the name last, when the box
+    /// is narrower than it, in its middle (its start, its extension and
+    /// `:line` stay). `untitled`: no title, the path is it.
     #[allow(clippy::too_many_arguments)]
     fn path_head(
         &self,
@@ -663,7 +661,7 @@ impl AppView {
         untitled: bool,
         p: &Palette,
         m: &Metrics,
-    ) -> Vec<AnyElement> {
+    ) -> AnyElement {
         let path = crate::ask::shown(&crate::turns::tilde(path, false), cards_spec::Lines::Single);
         let cut = path.rfind('/').map_or(0, |k| k + 1);
         let (dir, name) = (path[..cut].to_string(), path[cut..].to_string());
@@ -672,36 +670,33 @@ impl AppView {
             None => name,
         };
         let note = note.filter(|n| !n.is_empty()).map(|n| crate::ask::shown(n, cards_spec::Lines::Single));
-        let most = (self.panes.cur.layout.column * 0.55).round();
         let gap = Geo::of(m).gap;
         let shown = name.clone();
-        let mut out = Vec::new();
-        if !dir.is_empty() {
-            // Against the name: the row's gap taken back.
-            out.push(
-                div()
-                    .min_w_0()
-                    .flex_shrink(100.)
-                    .mr(px(-gap))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .font_family(fonts::MONO)
-                    .text_px(m.mono)
-                    .text_color(p.dim_t)
-                    .child(dir)
-                    .into_any_element(),
-            );
-        }
-        out.push(
-            h_flex()
-                .min_w_0()
-                .flex_shrink(1.)
-                .when(untitled, |d| d.debug_selector(move || format!("block-title {id}")))
-                .child(
+        h_flex()
+            .min_w_0()
+            .flex_shrink(1.)
+            .overflow_hidden()
+            .items_center()
+            .debug_selector(move || format!("block-pathbox {id}"))
+            .when(!dir.is_empty(), |d| {
+                d.child(
                     div()
                         .min_w_0()
                         .flex_shrink(1.)
-                        .max_w(px(most))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_family(fonts::MONO)
+                        .text_px(m.mono)
+                        .text_color(p.dim_t)
+                        .debug_selector(move || format!("block-dir {id}"))
+                        .child(dir),
+                )
+            })
+            .child(
+                // As wide as the name, the box at most.
+                div().flex_none().max_w_full().when(untitled, |d| d.debug_selector(move || format!("block-title {id}"))).child(
+                    div()
+                        .max_w_full()
                         .overflow_hidden()
                         .text_ellipsis_middle()
                         .font_family(fonts::MONO)
@@ -709,26 +704,25 @@ impl AppView {
                         .text_color(p.prose_t)
                         .debug_selector(move || format!("block-path {id} {shown}"))
                         .child(name),
+                ),
+            )
+            .when_some(note, |d, n| {
+                let t = format!("block-file-note {id} {n}");
+                d.child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .ml(px(gap))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .text_color(p.dim_t)
+                        .debug_selector(move || t.clone())
+                        .child(n),
                 )
-                .into_any_element(),
-        );
-        if let Some(n) = note {
-            let t = format!("block-file-note {id} {n}");
-            out.push(
-                div()
-                    .min_w_0()
-                    .flex_shrink(100.)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .font_family(fonts::SANS)
-                    .text_px(m.meta)
-                    .text_color(p.dim_t)
-                    .debug_selector(move || t.clone())
-                    .child(n)
-                    .into_any_element(),
-            );
-        }
-        out
+            })
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
