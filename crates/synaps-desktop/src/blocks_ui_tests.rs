@@ -1,8 +1,106 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
-//! the edit preview's text drawn as D1 draws agent text (P2-9). Each fails on
-//! `653c30c`.
+//! the edit preview's text drawn as D1 draws agent text (P2-9) and the `op
+//! skipped` chip. Each fails on `653c30c`.
 
+use gpui_kit::{
+    AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
+    VisualTestContext, px,
+};
 use serde_json::{Value, json};
+
+use super::answer_tests::has;
+use super::{open_at, settle, wait};
+use crate::app::AppView;
+use crate::turns::Kind;
+
+type W = (AnyWindowHandle, Entity<AppView>);
+
+/// Session `id` opened in `place`, attached by the demo's transport.
+fn open_session(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: &str, place: crate::tabs::Place) {
+    let client = view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.open_tab(crate::app::Open::Attach { session_id: id.into(), fallback: None, open: false }, place);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    board(cx, w, view);
+    wait(cx, w, view, 600);
+}
+
+/// The blocks demo session in a window `w` px wide at text step `text`,
+/// its board drawn.
+fn blocks_at(cx: &mut TestAppContext, w: f32, text: u8) -> W {
+    let (win, view, _events) = open_at(cx, (w, 1000.), text);
+    open_session(cx, win, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    (win, view)
+}
+
+fn blocks(cx: &mut TestAppContext, w: f32) -> W {
+    blocks_at(cx, w, crate::theme::Panels::default().text_size)
+}
+
+/// The board's job runs and lands, and what it drew settles.
+fn board(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    for _ in 0..4 {
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        settle(cx, w, 8);
+    }
+}
+
+/// Block `name`'s row in the pane acted on: its id and display index.
+fn row(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(u64, usize)> {
+    view.read_with(cx, |v, _| {
+        let items = v.model.lives[v.panes.cur.live].shown().items();
+        v.panes.cur.disp.iter().enumerate().find_map(|(ix, d)| {
+            let Kind::Block { at } = d.kind else { return None };
+            let s = items.get(d.item)?.blocks.as_ref()?.blocks.get(at as usize)?;
+            (s.block.id.to_string() == name).then_some((d.id, ix))
+        })
+    })
+}
+
+fn show_block(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, name: &str) -> u64 {
+    let (id, ix) = row(cx, view, name).unwrap_or_else(|| panic!("block {name} drawn"));
+    view.update(cx, |v, cx| {
+        v.panes.cur.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    id
+}
+
+fn bounds(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel))
+}
+
+fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    bounds(cx, w, sel.clone()).unwrap_or_else(|| panic!("{sel} drawn"))
+}
+
+fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>, ev: &str) {
+    let mut vcx = VisualTestContext::from_window(w, cx);
+    match ev {
+        "move" => vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }),
+        "drag" => {
+            vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() })
+        }
+        "down" => vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+        _ => vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }),
+    }
+    vcx.run_until_parked();
+    settle(cx, w, 8);
+}
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a
 /// successful edit, write or multi-edit whose text holds bidi controls,
@@ -35,4 +133,18 @@ fn edit_preview_lines_are_sanitized() {
         }
     }
     assert!(groups.iter().flat_map(|g| &g.lines).any(|l| l.text.contains("lave")), "the text itself is drawn");
+}
+
+/// The plan's chip says `op skipped` (an op, not the plan), and its
+/// tooltip says why it is there.
+#[gpui_kit::test]
+fn the_skipped_chip_is_an_ops_and_says_why(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let plan = show_block(cx, w, &view, "plan");
+    assert!(has(cx, w, format!("block-skipped-says {plan} op skipped")), "`op skipped`");
+    let chip = drawn(cx, w, format!("block-skipped {plan}")).center();
+    mouse(cx, w, chip, "move");
+    wait(cx, w, &view, 800);
+    mouse(cx, w, chip, "move");
+    assert!(has(cx, w, format!("block-skipped-tip {plan}")), "its reason in a tooltip");
 }

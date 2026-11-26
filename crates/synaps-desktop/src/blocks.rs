@@ -16,8 +16,9 @@
 //! 28 px: the block's life glyph (its state, in the call rows' family),
 //! the title, then the kind and `rN`, a state word and the chevron. A
 //! pending change says `pending` (dim) where `rN` is and never glows; a
-//! skipped op leaves the dim `skipped` chip; a replaced block reads
-//! `rN · replaced`.
+//! skipped op leaves the dim `op skipped` chip, its reason in its tooltip
+//! (an op that didn't apply, never the block's state); a replaced block
+//! reads `rN · replaced`.
 //!
 //! **Heights** (§6.2) come from structure: a plan's steps are 28 px, a
 //! status two lines, a diff's well at most 12 lines of 20 px (it scrolls
@@ -254,6 +255,8 @@ pub(crate) fn note_lines(text: &str, cpl: f32) -> usize {
     text.lines().map(|l| l.chars().count().div_ceil(cpl).max(1)).sum::<usize>().max(1)
 }
 
+/// The tooltip of the `op skipped` chip.
+pub(crate) const SKIPPED_TIP: &str = "An op the agent sent for this block was skipped: it changed nothing here. Not the block's state.";
 /// An edit preview: its groups, and how many earlier ones folded away.
 pub(crate) type Preview = (Vec<EditGroup>, usize);
 
@@ -480,8 +483,11 @@ impl AppView {
                     .child(title),
             )
             .when(b.skipped.is_some(), |d| {
+                // An op that didn't apply, never the block's state (Shady
+                // #101: `skipped` alone read as the plan's).
                 d.child(
                     div()
+                        .id(("block-skipped", id))
                         .flex_none()
                         .px(px(4.))
                         .bg(p.well_d)
@@ -489,7 +495,27 @@ impl AppView {
                         .text_px(m.meta)
                         .text_color(p.dim_t)
                         .debug_selector(move || format!("block-skipped {id}"))
-                        .child("skipped"),
+                        .child(div().debug_selector(move || format!("block-skipped-says {id} op skipped")).child("op skipped"))
+                        .tooltip(move |window, cx| {
+                            crate::overlay::element(
+                                move |_, cx| {
+                                    let p = crate::theme::palette(cx);
+                                    div()
+                                        .max_w(px(320.))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .font_family(fonts::SANS)
+                                        .text_px(fonts::size::TITLE)
+                                        .line_height(px(18.))
+                                        .text_color(p.prose_k)
+                                        .whitespace_normal()
+                                        .debug_selector(move || format!("block-skipped-tip {id}"))
+                                        .child(SKIPPED_TIP)
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
                 )
             })
             .child(div().flex_1().min_w(px(8.)))
