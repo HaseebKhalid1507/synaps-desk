@@ -241,15 +241,71 @@ fn big_batch(n: usize) -> Vec<Value> {
     ]
 }
 
+/// What a board's rows must draw, from the reference fold alone (Shady
+/// #101 P3-1: the whole of it, not a count): each placed list's blocks in
+/// order (their members inside), the view's, each with the bound prefix's
+/// of the same incarnation, on the row of the event the list is placed
+/// at (the input's own row map); each run's title on its call's row.
+type Normal = (Block, Option<Block>, Vec<(Block, Option<Block>)>);
+fn reference(i: &Input, events: &[Event]) -> (std::collections::BTreeMap<u64, Vec<Normal>>, std::collections::BTreeMap<u64, Arc<str>>) {
+    assert_eq!(i.from, 0, "a fresh read: every event staged");
+    let rows: Vec<Option<u64>> = i.chunks.iter().flat_map(|c| c.rows.iter().copied()).chain(i.live.rows.iter().copied()).collect();
+    assert_eq!(rows.len(), events.len());
+    let board = Board::fold(i.generation, events);
+    let (view, bound) = (board.view(events), board.bound(events));
+    let of = |r: &Ref| {
+        let b = view.block(r).expect("listed: live");
+        (b.clone(), bound.block(r).filter(|x| x.tag == b.tag).cloned())
+    };
+    let mut want = std::collections::BTreeMap::new();
+    for (place, refs) in view.lists() {
+        let Place::Transcript(pos) = place else { continue };
+        let row = rows[pos].expect("a list is placed at an event with a row");
+        let list: &mut Vec<Normal> = want.entry(row).or_default();
+        for r in refs {
+            let (b, bd) = of(r);
+            let members = b.members().iter().map(|m| of(&Ref::Block(m.clone()))).collect();
+            list.push((b, bd, members));
+        }
+    }
+    let runs = view.runs().filter_map(|run| Some((rows[run.at.event]?, Arc::from(&*run.summary)))).collect();
+    (want, runs)
+}
+
+/// A board's rows, as [`reference`] normalizes them.
+fn normal(d: &Drawn) -> (std::collections::BTreeMap<u64, Vec<Normal>>, std::collections::BTreeMap<u64, Arc<str>>) {
+    let n = |s: &Shown| ((*s.block).clone(), s.bound.as_deref().cloned());
+    let blocks = d
+        .rows
+        .iter()
+        .filter(|(_, r)| !r.blocks.is_empty())
+        .map(|(k, r)| (*k, r.blocks.iter().map(|s| (n(s).0, n(s).1, s.members.iter().map(n).collect())).collect()))
+        .collect();
+    let runs = d.rows.iter().filter_map(|(k, r)| Some((*k, r.run.clone()?))).collect();
+    (blocks, runs)
+}
+
 /// D5's traces: at and past a replay's 256-call pass (`cards_spec::board`),
-/// with refused block calls, a results-only tail and other tools' calls,
-/// the worker's board is the reference fold's, read whole or a slice at a
-/// time, and each call's fate is its batch's.
+/// with refused block calls, a results-only tail, other tools' calls and a
+/// last call still pending, the worker's board is the reference fold's,
+/// whole (Shady #101 P3-1): every block's body, revision, order and row,
+/// its bound value, the runs' titles; read whole or a slice at a time the
+/// same; the plan's step is the last bound patch's in the bound prefix and
+/// the pending one's in the view; each call's fate is its batch's.
 #[test]
 fn traces_at_and_past_a_replays_pass() {
     for n in [255, 256, 257, 600] {
-        let h = big_batch(n);
-        let i = input(&h, Live::default());
+        let mut h = big_batch(n);
+        // The last bound patch's state, and the pending one flips it.
+        let bound_k = (0..n).rev().find(|k| k % 3 != 0).expect("a bound patch");
+        let last = if bound_k % 2 == 0 { "done" } else { "doing" };
+        let pending = json!([{"op":"patch","id":"plan","state":{"a": last}}]);
+        h.push(json!({"role": "user", "content": "one more"}));
+        h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "q", "name": "cards_block", "input": block_input(pending)}]}));
+        // Read by a transcript: its rows, each event's.
+        let mut tr = crate::transcript::Transcript::default();
+        tr.apply_history(&h);
+        let i = tr.blocks_input().expect("blocks");
         let events = i.events();
         let want = Board::fold(i.generation, &events);
         let mut w = Worker::default();
@@ -263,14 +319,25 @@ fn traces_at_and_past_a_replays_pass() {
         }
         let d = d.unwrap();
         assert_eq!(d.live, want.view(&events).live(), "{n}");
+        assert_eq!(normal(&d), reference(&i, &events), "{n}: the reference fold's, whole");
         assert_eq!(d, Worker::default().run(&i, &mut || true).unwrap(), "{n}: sliced or whole, the same");
+        // By hand: the plan's step, as the last bound patch set it, and in
+        // the view the pending one's.
+        let step = |b: &Block| match &b.body {
+            cards_spec::block::Body::Plan(p) => p.steps[0].state.as_str().to_string(),
+            _ => panic!("a plan"),
+        };
+        let plan = d.rows.values().flat_map(|r| &r.blocks).find(|s| s.block.id.to_string() == "plan").expect("the plan drawn");
+        assert_eq!(step(plan.bound.as_deref().expect("bound")), if bound_k % 2 == 0 { "doing" } else { "done" }, "{n}");
+        assert_eq!(step(&plan.block), last, "{n}: the pending patch, in the view");
+        assert!(plan.block.rev > plan.bound.as_ref().unwrap().rev, "{n}: the view ahead of the bound prefix");
         // Fates: every third refused (unbound), the rest bound; the late
         // result after the batch's end binds nothing.
         let fates: Vec<Fate> = all_fates(&events).into_iter().map(|x| x.1).collect();
         let count = |x: Fate| fates.iter().filter(|f| **f == x).count();
         assert_eq!(count(Fate::Unbound), n.div_ceil(3), "{n}");
         assert_eq!(count(Fate::Bound), 1 + n - n.div_ceil(3), "{n}");
-        assert_eq!(count(Fate::Pending), 0, "{n}");
+        assert_eq!(count(Fate::Pending), 1, "{n}: the last call's");
     }
 }
 
