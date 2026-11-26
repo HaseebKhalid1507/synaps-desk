@@ -9,8 +9,8 @@
 //!   "about", in a neutral colour; at zero it reads as the amber band (may
 //!   have expired) and the daemon is asked once more: once per countdown
 //!   (a `warm` of zero seconds starts none). Also asked on any setting
-//!   change, and once more on `stale`. A daemon that can't answer
-//!   it shows `—`, never `cold`.
+//!   change, and once more on `stale`. A daemon that can't answer it shows
+//!   `—`, never `cold`, and no answer it gave before.
 //! - **Keep-warm** ([`Warm`]): the session's `Status` (`keepwarm`,
 //!   `pinned`): mode, pin, pings, spend and next ping.
 //!
@@ -271,11 +271,12 @@ pub(crate) struct Cell {
 pub(crate) const CANT_TELL: &str = "Can't tell: this daemon doesn't report the prompt cache's expiry";
 
 /// The EXPIRES cell for `e`, now. `asked`: this daemon is asked (it lists
-/// `cache_expiry` and has not refused it); without an answer the cell
-/// says it cannot tell, never `cold`.
+/// `cache_expiry` and has not refused it). Without an answer the cell says
+/// it cannot tell, never `cold`; from a daemon that is not asked, nothing
+/// it said before either (Shady #100 F2).
 pub(crate) fn expires(e: Option<&Expiry>, asked: bool, now: Moment) -> Cell {
     let cell = |text: &str, tone, tip: Option<String>| Cell { text: text.to_string(), tone, tip };
-    let Some(e) = e else {
+    let Some(e) = e.filter(|_| asked) else {
         return cell("—", Tone::Dim, (!asked).then(|| CANT_TELL.to_string()));
     };
     let c = match e.aged(now) {

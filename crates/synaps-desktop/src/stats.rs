@@ -148,6 +148,10 @@ pub struct Stats {
     pub expiry: Option<crate::warm::Expiry>,
     /// A `stale` answer was asked once more (and not answered since).
     pub expiry_retried: bool,
+    /// The model's [`crate::model::Model::cache_epoch`] when `warm` and
+    /// `expiry` were answered: a tab's numbers restored under a later one
+    /// (the daemon refused the query, or lost it, since) keep neither.
+    pub cache_epoch: u64,
 }
 
 impl Stats {
@@ -167,6 +171,7 @@ impl Stats {
         subagents.reset(&a.conversation.api_messages, same);
         let tokens = Tokens::conversation(&a.conversation.tokens, &a.conversation.keepwarm_tokens);
         let (warm, expiry) = if same { (self.warm.take(), self.expiry.take()) } else { (None, None) };
+        let cache_epoch = self.cache_epoch;
         *self = Stats {
             session: Some(a.meta.id.clone()),
             view: RuntimeInfo::from_value(&a.view),
@@ -180,6 +185,7 @@ impl Stats {
             warm,
             expiry,
             expiry_retried: false,
+            cache_epoch,
         };
         self.subagents.replaying(true);
         for env in &a.replay {

@@ -1268,6 +1268,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let warm = |secs: Option<u64>| {
                         move |v: &mut AppView, _: &mut Context<AppView>| {
                             let now = crate::warm::Moment::now();
+                            (v.model.cache_expiry, v.model.expiry_query) = (true, true);
                             let stats = &mut v.model.lives[v.panes.cur.live].stats;
                             stats.warm = secs.map(|_| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now));
                             stats.expiry = secs.map(|s| {
@@ -1348,7 +1349,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     for (name, st, answer, asked) in states {
                         let set = move |v: &mut AppView, _: &mut Context<AppView>| {
                             let now = crate::warm::Moment::now();
-                            v.model.expiry_query = asked;
+                            (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
                             let stats = &mut v.model.lives[v.panes.cur.live].stats;
                             stats.warm = st.as_ref().map(|s| crate::warm::Warm::from_status(s, now));
                             stats.expiry = answer.as_ref().map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(c), now));

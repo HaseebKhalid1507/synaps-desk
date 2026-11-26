@@ -2460,12 +2460,15 @@ impl AppView {
                     .child(div().flex_1().child(kv(label::COST, cost.clone(), true, glow(8, &cost, p.cost_ch), p))),
             );
         // The prompt cache's countdown and keep-warm (`crate::warm`): once
-        // either answer has come.
-        let cache = (s.warm.is_some() || s.expiry.is_some()).then(|| {
+        // either answer has come, from a daemon that answers the cache
+        // query (one without it: no section, whatever a store kept; one
+        // that refused it: its keep-warm, and `—`).
+        let asked = self.model.expiry_query;
+        let cache = (self.model.cache_expiry && (s.warm.is_some() || s.expiry.is_some())).then(|| {
             let now = crate::warm::Moment::now();
             let w = s.warm.as_ref();
-            let e = s.expiry.as_ref();
-            let exp = crate::warm::expires(e, self.model.expiry_query, now);
+            let e = s.expiry.as_ref().filter(|_| asked);
+            let exp = crate::warm::expires(e, asked, now);
             let exp_c = match exp.tone {
                 crate::warm::Tone::Ink => p.ink,
                 crate::warm::Tone::Warn => p.warn_ch,

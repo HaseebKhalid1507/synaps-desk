@@ -7438,6 +7438,24 @@ fn each_rail_row_shows_its_own_sessions_cost_and_waiting_whichever_pane_is_focus
     }
 }
 
+/// The right panel's cache tests on a split (Shady #100): two panes
+/// across a window wide enough for the panel, `p0` on A and `p1`
+/// (focused) on A and B, showing B; as [`two_panes`].
+fn two_panes_wide(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (AnyWindowHandle, Entity<AppView>, Client, Kept, crate::pane::PaneId, crate::pane::PaneId) {
+    let (window, view, client, a, attaches, events) = on_a_in(cx, name, attached(A, None), (1920., 1080.));
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    let b = open_b(cx, window, &view, &attaches, &events);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    (window, view, client, (a, b, attaches, events), p0, p1)
+}
+
 /// The daemon answers `cache_expiry` (its `Welcome.features`), nothing
 /// asked yet.
 fn cache_on(cx: &mut TestAppContext, view: &Entity<AppView>) {
@@ -7483,6 +7501,15 @@ fn panel_asks(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<(u64, &'st
     view.update(cx, |v, _| std::mem::take(&mut v.panel_asks))
 }
 
+fn connected(features: &[&str]) -> Event {
+    Event::Status(synaps_client::Status::Connected {
+        daemon_version: "0.0.0".into(),
+        profile: None,
+        pid: 1,
+        features: features.iter().map(|f| f.to_string()).collect(),
+    })
+}
+
 /// Shady #100 F1 on a split: two panes on one session share its store,
 /// its countdown and its one zero ask, whichever is focused; `warm`
 /// answers of zero ask nothing more.
@@ -7505,6 +7532,44 @@ fn two_panes_on_one_session_ask_once_at_the_zero(cx: &mut TestAppContext) {
         pass(cx, window, 1);
         assert_eq!(panel_asks(cx, &view), [], "warm-zero answer {k}: nothing more");
     }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #100 F2 on a split: a refusal of the query, and a daemon without
+/// it, reach every store, not only the focused pane's: the other pane,
+/// focused, shows no old `cold`.
+#[gpui_kit::test]
+fn a_lost_cache_query_reaches_every_pane(cx: &mut TestAppContext) {
+    let (window, view, client, _kept, p0, p1) = two_panes_wide(cx, "cache-lost");
+    let (a, b) = (attachment_of(cx, &view, p0), attachment_of(cx, &view, p1));
+    cache_on(cx, &view);
+    let answers = || {
+        [a, b]
+            .into_iter()
+            .flat_map(|s| {
+                [
+                    Event::SessionStatus { attach_seq: s, value: json!({"keepwarm": {"mode": "auto"}}) },
+                    cache_reply(s, json!({"state": "cold", "reason": "expired"})),
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    give(cx, window, &view, answers());
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_some(), "B's");
+    // B's connection refuses it.
+    give(cx, window, &view, vec![Event::CacheExpiry { attach_seq: b, reply: synaps_client::CacheExpiryReply::Unsupported }]);
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_none(), "A's: not its last answer");
+    assert!(drawn(cx, window, "right-cache-expires —".into()).is_some(), "A's: can't tell");
+    // A daemon that answers, then one without the query.
+    give(cx, window, &view, [vec![connected(&[synaps_client::FEATURE_CACHE_EXPIRY])], answers()].concat());
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_some(), "A's again");
+    give(cx, window, &view, vec![connected(&[])]);
+    view.update(cx, |v, cx| v.focus_pane(p1, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert!(drawn(cx, window, "right-cache".into()).is_none(), "B's: no section");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }

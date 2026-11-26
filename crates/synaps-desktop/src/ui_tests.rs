@@ -9532,7 +9532,7 @@ fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
     let show = |cx: &mut TestAppContext, keep_warm: bool, answer: Option<Value>, asked: bool| {
         view.update(cx, |v, cx| {
             let now = crate::warm::Moment::now();
-            v.model.expiry_query = asked;
+            (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
             let stats = &mut v.model.lives[v.panes.cur.live].stats;
             stats.warm = keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now));
             stats.expiry = answer.map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now));
@@ -9639,4 +9639,66 @@ fn a_warm_zero_answer_does_not_ask_again(cx: &mut TestAppContext) {
     deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
     pass(cx, window, &view, 3);
     assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")]);
+}
+
+/// Shady #100 F2: an answer is the daemon's that gave it. One that
+/// refuses the query (it lists `cache_expiry` for an earlier contract)
+/// leaves the keep-warm and `—`, never the last `cold`; one without the
+/// feature, after a reconnect of the same session, no section at all
+/// (as an older daemon's); and a tab's numbers restored from before
+/// either show no old answer, a daemon that answers again included.
+#[gpui_kit::test]
+fn an_answer_does_not_outlive_the_daemon_s_cache_query(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    let drawn =
+        |cx: &mut TestAppContext, what: &str| VisualTestContext::from_window(window, cx).debug_bounds(what.to_string().leak()).is_some();
+    let connected = |features: &[&str]| {
+        synaps_client::Event::Status(synaps_client::Status::Connected {
+            daemon_version: "0.0.0".into(),
+            profile: None,
+            pid: 1,
+            features: features.iter().map(|f| f.to_string()).collect(),
+        })
+    };
+    let (sid, live) =
+        view.read_with(cx, |v, _| (v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"), v.panes.cur.live));
+    let reattach = || {
+        let ev =
+            crate::demo::attach(&sid, seq).into_iter().find(|e| matches!(e, synaps_client::Event::Attached { .. })).expect("an attach");
+        let synaps_client::Event::Attached { attached, mode, .. } = ev else { unreachable!() };
+        synaps_client::Event::Attached { attach_seq: seq, attached, mode, reconnect: true }
+    };
+    let restore = |cx: &mut TestAppContext, stats: &crate::stats::Stats| {
+        view.update(cx, |v, cx| {
+            let t = std::mem::take(&mut v.model.lives[live].transcript);
+            v.model.switch_in(live, t, stats.clone());
+            cx.notify();
+        });
+        settle(cx, window, 8);
+    };
+    let status = synaps_client::Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto"}}) };
+    deliver(cx, window, &view, vec![status, cache_reply(seq, json!({"state": "cold", "reason": "expired"}))]);
+    assert!(drawn(cx, "right-cache-expires cold"));
+    let kept = view.read_with(cx, |v, _| v.model.lives[live].stats.clone());
+    // Refused: the keep-warm stays, the cache can't be told.
+    deliver(
+        cx,
+        window,
+        &view,
+        vec![synaps_client::Event::CacheExpiry { attach_seq: seq, reply: synaps_client::CacheExpiryReply::Unsupported }],
+    );
+    assert!(!drawn(cx, "right-cache-expires cold"), "refused: not the last answer");
+    assert!(drawn(cx, "right-cache") && drawn(cx, "right-cache-expires —"), "refused: keep-warm and `—`");
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache-expires cold"), "a tab restored from before the refusal");
+    // A daemon without the query; the same session attached again.
+    deliver(cx, window, &view, vec![connected(&[]), reattach()]);
+    assert!(!drawn(cx, "right-cache"), "no feature: no section");
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache"), "no feature: a restored tab neither");
+    // One that answers it again: nothing from before, until it answers.
+    deliver(cx, window, &view, vec![connected(&[synaps_client::FEATURE_CACHE_EXPIRY])]);
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache-expires cold"), "a restored tab's answer is the old daemon's");
 }

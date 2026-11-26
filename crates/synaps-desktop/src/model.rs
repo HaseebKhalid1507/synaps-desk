@@ -444,6 +444,11 @@ pub struct Model {
     /// connection, its cache is not asked again (the panel says it can't
     /// tell); its keep-warm still is.
     pub expiry_query: bool,
+    /// Counts the times the daemon stopped answering the cache query (it
+    /// refused it, or a connection without it): the answers from before are
+    /// gone from every store, and a tab's numbers restored from before
+    /// ([`Stats::cache_epoch`]) keep none (Shady #100 F2).
+    pub cache_epoch: u64,
 }
 
 /// Tests only (split/architecture.md §6.6): `v.model.transcript`,
@@ -511,6 +516,7 @@ impl Model {
             daemon_gen: 0,
             cache_expiry: false,
             expiry_query: false,
+            cache_epoch: 0,
         }
     }
 
@@ -527,6 +533,22 @@ impl Model {
         if self.expiry_query {
             self.lives[lid].stats.expiry_retried = false;
             effects.push(Effect::CacheExpiry(seq));
+        }
+    }
+
+    /// The daemon stopped answering the cache query (it refused it, or the
+    /// connection is to one without it): no store keeps an answer it gave
+    /// (without the feature, nor its keep-warm: no section), and a tab's
+    /// numbers restored from before keep none ([`Model::switch_in`]).
+    fn cache_lost(&mut self) {
+        self.cache_epoch += 1;
+        for l in self.lives.ids() {
+            let s = &mut self.lives[l].stats;
+            s.expiry = None;
+            if !self.cache_expiry {
+                s.warm = None;
+            }
+            s.cache_epoch = self.cache_epoch;
         }
     }
 
@@ -1331,7 +1353,16 @@ impl Model {
 
     /// The visible tab's session, as last seen (a cached tab) or nothing
     /// yet; its attach follows.
-    pub fn switch_in(&mut self, live: LiveId, transcript: Transcript, stats: Stats) {
+    pub fn switch_in(&mut self, live: LiveId, transcript: Transcript, mut stats: Stats) {
+        // Its cache's numbers from before the daemon stopped answering the
+        // query, or from a daemon that does not answer it: not shown.
+        if stats.cache_epoch != self.cache_epoch || !self.expiry_query {
+            stats.expiry = None;
+        }
+        if stats.cache_epoch != self.cache_epoch || !self.cache_expiry {
+            stats.warm = None;
+        }
+        stats.cache_epoch = self.cache_epoch;
         let l = &mut self.lives[live];
         l.transcript = transcript;
         l.stats = stats;
@@ -1626,22 +1657,28 @@ impl Model {
                 return effects;
             }
             Event::SessionStatus { attach_seq, value } => {
-                if self.lives[lid].current(attach_seq) {
-                    self.lives[lid].stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now()));
+                if self.lives[lid].current(attach_seq) && self.cache_expiry {
+                    let stats = &mut self.lives[lid].stats;
+                    stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now()));
+                    stats.cache_epoch = self.cache_epoch;
                     self.view_dirty = true;
                 }
                 return effects;
             }
             Event::CacheExpiry { reply: synaps_client::CacheExpiryReply::Unsupported, .. } => {
                 // It can't decode the query: not asked again on this
-                // connection; the panel says it can't tell.
+                // connection; the panel says it can't tell, in every store.
                 self.expiry_query = false;
+                self.cache_lost();
                 self.view_dirty = true;
                 return effects;
             }
             Event::CacheExpiry { attach_seq, reply } => {
                 use synaps_client::{CacheExpiryReply, QueryErrorCode};
                 if !self.lives[lid].current(attach_seq) {
+                    return effects;
+                }
+                if !self.expiry_query {
                     return effects;
                 }
                 let stats = &mut self.lives[lid].stats;
@@ -1659,6 +1696,7 @@ impl Model {
                     _ => return effects,
                 };
                 stats.expiry = Some(crate::warm::Expiry::new(answer, crate::warm::Moment::now()));
+                stats.cache_epoch = self.cache_epoch;
                 self.view_dirty = true;
                 return effects;
             }
@@ -1694,6 +1732,9 @@ impl Model {
                     self.named.pages = features.iter().any(|f| f == FEATURE_SESSION_PAGE);
                     self.cache_expiry = features.iter().any(|f| f == synaps_client::FEATURE_CACHE_EXPIRY);
                     self.expiry_query = self.cache_expiry;
+                    if !self.cache_expiry {
+                        self.cache_lost();
+                    }
                     self.named.saved_supported = self.named.pages || features.iter().any(|f| f == FEATURE_SAVED_SESSIONS);
                     self.named.polled = None;
                     self.named.retries = 0;
