@@ -14,7 +14,11 @@
 //! many changes back, counted (an answer given twice); an answer never
 //! taken in, or one whose turn lost it, isn't expected, and another
 //! desk's answer of its text wins, as does a copy past the count, or
-//! after the change (Shady #94 P2-1, rounds 1 and 2).
+//! after the change (Shady #94 P2-1, rounds 1 and 2). With part B's
+//! memory (#93): a reopened card shows the answer it changes, highlighted
+//! and picked, with no `last time` mark; one whose answer has no pick
+//! starts on the memory, unmarked; a change that reaches the chat is
+//! remembered as a first answer is.
 //!
 //! What would have gone to the daemon is the view's record
 //! (`AppView::card_sends`). Keys go in as new presses (`keys_tests::press`,
@@ -1217,5 +1221,153 @@ fn an_untouched_multi_select_answer_sends_nothing(cx: &mut TestAppContext) {
         vec![changed("c9multi", &input, json!({"choice": ["Unit", "Integration", "Load"]}))],
         "a pick added: a change"
     );
+    crate::app::pin_arm_clock(None);
+}
+
+/// D4 part B's memory ([`crate::recall`]) meets a change: the answer
+/// `text`, sent to the quiet session on screen, reaches the chat (its
+/// echo starts the turn, which ends, and the history lands with it).
+fn reaches(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, text: &str) {
+    heard(
+        cx,
+        w,
+        view,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 44, "trigger": "user", "user_text": text}),
+            json!({"ev": "stream", "event": {"kind": "session", "session": "done"}}),
+            json!({"ev": "idle"}),
+        ],
+    );
+    land(
+        cx,
+        w,
+        view,
+        vec![json!({"role": "user", "content": text}), json!({"role": "assistant", "content": [{"type": "text", "text": "On it."}]})],
+    );
+    play(cx, w, view);
+}
+
+/// The agent asks `input` again as card `card_id` (call `tool`): its row.
+fn asks_again(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, view: &Entity<AppView>, tool: &str, card_id: &str, input: &Value) -> u64 {
+    super::answer_tests::ask_live(cx, w, view, tool, card_id, input.clone());
+    at_rest(cx, w, view);
+    view.read_with(cx, |v, _| v.ask_row(tool).unwrap_or_else(|| panic!("the card of {tool}")))
+}
+
+/// The options of card row `row` (from 1) marked `last time`.
+fn marked(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, row: u64) -> Vec<usize> {
+    (1..=9).filter(|n| has(cx, w, format!("ask-last {row} {n}"))).collect()
+}
+
+/// The options of card row `row` (from 1) picked.
+fn picked(cx: &mut TestAppContext, w: gpui_kit::AnyWindowHandle, row: u64) -> Vec<usize> {
+    (1..=9).filter(|n| has(cx, w, format!("ask-picked {row} {n}"))).collect()
+}
+
+/// The entered card's highlight (from 1).
+fn hi(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<usize> {
+    view.read_with(cx, |v, _| v.panes.cur.ask.entry.as_ref().and_then(|e| e.hi).map(|i| i + 1))
+}
+
+/// This desk answers card `card_id` (call `tool`, `input`) by keys,
+/// `keys` then the answer `values`, and it reaches the chat: its choice
+/// is remembered.
+fn remembered(cx: &mut TestAppContext, tool: &str, card_id: &str, input: &Value, keys: &[&str], values: Value) -> Asked {
+    let (w, view, row, events) = asked(cx, tool, card_id, input);
+    nothing_waits_elsewhere(cx, &view);
+    press(cx, w, "ctrl-j");
+    for k in keys {
+        press(cx, w, k);
+    }
+    let text = message(card_id, input, values);
+    assert_eq!(texts(cx, &view), vec![text.clone()], "sent");
+    reaches(cx, w, &view, &text);
+    assert_eq!(view.read_with(cx, |v, _| v.recall.len()), 1, "remembered");
+    (w, view, row, events)
+}
+
+/// The rule #93 and #94 agreed (PR #94, "For part B"): a card reopened to
+/// change its answer shows that answer, not the memory. This desk answers
+/// `release` (remembered); the same question again starts there, marked
+/// `last time`, as ever. Another desk answers it `hotfix` (not this
+/// desk's: the memory is still `release`). Reopened, the card shows no
+/// `last time` mark, and its highlight and pick are `hotfix`, neither the
+/// memory nor the default (`main`). A change from it that reaches the
+/// chat is remembered as a first answer is: the next card is marked on
+/// it.
+#[gpui_kit::test]
+fn a_change_starts_on_the_answer_it_changes_and_is_remembered(cx: &mut TestAppContext) {
+    let input = branch();
+    let (w, view, _first, _events) = remembered(cx, "toolu_r1", "cr1mem1", &input, &["2"], json!({"choice": "release"}));
+    let row = asks_again(cx, w, &view, "toolu_r2", "cr2mem2", &input);
+    assert_eq!(marked(cx, w, row), [2], "a fresh card: last time, release");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, row));
+    assert_eq!(hi(cx, &view), Some(2), "a fresh card starts on the memory");
+    press(cx, w, "escape");
+    land(cx, w, &view, vec![json!({"role": "user", "content": message("cr2mem2", &input, json!({"choice": "hotfix"}))})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} answered")), "another desk's answer, hotfix");
+    assert_eq!(view.read_with(cx, |v, _| v.recall.len()), 1);
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, row), "Ctrl+J: the answer to change");
+    press(cx, w, "enter");
+    assert!(changing(cx, w, row), "reopened");
+    assert_eq!(marked(cx, w, row), Vec::<usize>::new(), "reopened: no last time mark");
+    assert_eq!(hi(cx, &view), Some(3), "the highlight on the answer changed, hotfix");
+    assert!(has(cx, w, format!("ask-hi {row} 3")) && !has(cx, w, format!("ask-hi {row} 2")));
+    assert_eq!(picked(cx, w, row), [3], "hotfix picked");
+    let sent = sends(cx, &view).len();
+    press(cx, w, "1");
+    let c = changed("cr2mem2", &input, json!({"choice": "main"}));
+    assert_eq!(texts(cx, &view).last(), Some(&c), "the change: main");
+    assert_eq!(sends(cx, &view).len(), sent + 1);
+    reaches(cx, w, &view, &c);
+    assert!(has(cx, w, format!("ask-state {row} changed")));
+    let next = asks_again(cx, w, &view, "toolu_r3", "cr3mem3", &input);
+    assert_eq!(marked(cx, w, next), [1], "the change, remembered: last time, main");
+    crate::app::pin_arm_clock(None);
+}
+
+/// A reopened card whose answer has no pick, a skip, falls back to the
+/// memory (`release`), unmarked, before the default (`main`); nothing
+/// picked.
+#[gpui_kit::test]
+fn a_reopened_skip_starts_on_the_memory_unmarked(cx: &mut TestAppContext) {
+    let input = branch();
+    let (w, view, _first, _events) = remembered(cx, "toolu_r4", "cr4mem4", &input, &["2"], json!({"choice": "release"}));
+    let row = asks_again(cx, w, &view, "toolu_r5", "cr5mem5", &input);
+    land(cx, w, &view, vec![json!({"role": "user", "content": skipped("cr5mem5", BRANCH)})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} skipped")), "another desk's skip");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, row));
+    press(cx, w, "enter");
+    assert!(changing(cx, w, row), "reopened");
+    assert_eq!(marked(cx, w, row), Vec::<usize>::new(), "no last time mark");
+    assert_eq!(hi(cx, &view), Some(2), "the memory, unmarked: release");
+    assert_eq!(picked(cx, w, row), Vec::<usize>::new(), "nothing picked");
+    crate::app::pin_arm_clock(None);
+}
+
+/// So does a multi pick answered with none: the memory's first (`Load`),
+/// unmarked, nothing ticked.
+#[gpui_kit::test]
+fn a_reopened_empty_multi_pick_starts_on_the_memory_unmarked(cx: &mut TestAppContext) {
+    let input = json!({"question": SUITES, "multi": true, "options": ["Unit", "Integration", "Load"]});
+    let (w, view, _first, _events) = remembered(cx, "toolu_r6", "cr6mem6", &input, &["3", "enter"], json!({"choice": ["Load"]}));
+    let row = asks_again(cx, w, &view, "toolu_r7", "cr7mem7", &input);
+    assert_eq!(marked(cx, w, row), [3], "a fresh card: last time, Load");
+    assert_eq!(picked(cx, w, row), Vec::<usize>::new(), "never ticked");
+    land(cx, w, &view, vec![json!({"role": "user", "content": message("cr7mem7", &input, json!({"choice": []}))})]);
+    play(cx, w, &view);
+    assert!(has(cx, w, format!("ask-state {row} answered")), "another desk's answer, no pick");
+    press(cx, w, "ctrl-j");
+    assert!(entered(cx, w, row));
+    press(cx, w, "enter");
+    assert!(changing(cx, w, row), "reopened");
+    assert_eq!(marked(cx, w, row), Vec::<usize>::new(), "no last time mark");
+    assert_eq!(hi(cx, &view), Some(3), "the memory, unmarked: Load");
+    assert_eq!(picked(cx, w, row), Vec::<usize>::new(), "nothing ticked");
     crate::app::pin_arm_clock(None);
 }

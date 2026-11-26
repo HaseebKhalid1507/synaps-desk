@@ -401,9 +401,11 @@ impl AppView {
 
     /// The option an entered card's highlight starts on (Enter's): the one
     /// place it is set. Reopened to change its answer (D4), the answer
-    /// given (its draft's first pick); else the choice remembered for this
-    /// question here ([`AppView::recall_start`], D4 part B); else the
-    /// agent's default ([`start_on`]).
+    /// given (its draft's first pick); else, and for a skip or an answer
+    /// with no pick, the choice remembered for this question here
+    /// ([`AppView::recall_start`], D4 part B: no `last time` mark on a
+    /// reopened card, [`AppView::recalled`]); else the agent's default
+    /// ([`start_on`]).
     pub(crate) fn start_hi(&self, session: &str, painted: &Painted) -> Option<usize> {
         let doc = &painted.doc;
         if self.changing(session, &painted.tool_id) {
