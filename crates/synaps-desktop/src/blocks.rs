@@ -595,13 +595,26 @@ impl AppView {
                         ))))
                         .child(div().font_family(fonts::MONO).text_px(m.meta).text_color(p.dim_t).child(format!("{}/{}", pr.n, pr.of)))
                 });
+                // Tests read the glow off the drawn text: lit, or its colour.
+                let lit = if text_c != p.prose_t { "lit" } else { "rest" };
                 v_flex()
                     .w_full()
                     .pb(pb)
                     .debug_selector(move || format!("block-status {id}"))
-                    .child(line(h_flex()).font_family(fonts::SANS).text_px(m.label).text_color(text_c).child(
-                        div().min_w_0().overflow_hidden().text_ellipsis().child(crate::ask::shown(&st.text, cards_spec::Lines::Single)),
-                    ))
+                    .child(
+                        line(h_flex())
+                            .font_family(fonts::SANS)
+                            .text_px(m.label)
+                            .text_color(text_c)
+                            .debug_selector(move || format!("block-text {id} {lit}"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(crate::ask::shown(&st.text, cards_spec::Lines::Single)),
+                            ),
+                    )
                     .child(
                         line(h_flex())
                             .gap(px(g.gap))

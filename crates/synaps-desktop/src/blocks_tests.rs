@@ -656,6 +656,108 @@ fn a_glow_asks_for_frames_only_while_it_runs(cx: &mut TestAppContext) {
     }
 }
 
+/// Motion keeps to its level from the first frame (§6.3, decision #3;
+/// Shady #101 P3-1: a three-second quiet window can't tell a Reduced glow
+/// stretched to Full's from Reduced's). A bound change of a status's text
+/// and a plan step's state, sampled on the frames after it publishes: the
+/// text's afterglow is lit at Full through 400 ms and out by 600 (GLOW,
+/// 480 ms), at Reduced lit for its flash only (QUICK, 120 ms: out by 200),
+/// at Off never; the step's glyph turns (`life-turn`, inside its row) at
+/// Full in its first 132 ms (two TURNs) and is over by 200, and at Reduced
+/// and Off never turns at all.
+#[gpui_kit::test]
+fn a_glow_and_a_glyph_turn_keep_to_their_level_from_the_first_frame(cx: &mut TestAppContext) {
+    use crate::motion::Level;
+    for level in [Level::Full, Level::Reduced, Level::Off] {
+        let (w, view) = blocks(cx, 1500.);
+        motion_level(cx, &view, level);
+        let put = json!([
+            {"op":"put","id":"g","kind":"status","body":{"text":"one","state":"working"}},
+            {"op":"put","id":"q","kind":"plan","body":{"steps":[{"id":"s","label":"Step","state":"doing"}]}}
+        ]);
+        land_round(cx, w, &view, "toolu_gp", put);
+        view.update(cx, |v, cx| {
+            v.panes.cur.list.scroll_to_end();
+            cx.notify();
+        });
+        wait(cx, w, &view, 2000);
+        let (g, q) = (id(cx, &view, "g"), id(cx, &view, "q"));
+        assert!(has(cx, w, format!("block-text {g} rest")), "{level:?}: at rest");
+        let tick = json!([{"op":"patch","id":"g","set":{"text":"two"}},{"op":"patch","id":"q","state":{"s":"done"}}]);
+        land_round(cx, w, &view, "toolu_gt", tick);
+        let sample = |cx: &mut TestAppContext| {
+            let lit = has(cx, w, format!("block-text {g} lit"));
+            let step = bounds(cx, w, format!("block-step {q} s")).expect("the step drawn");
+            let turning = (0..3).filter_map(|n| bounds(cx, w, format!("life-turn {n}"))).any(|b| step.contains(&b.center()));
+            (lit, turning)
+        };
+        let mut seen = vec![sample(cx)];
+        for ms in [60, 140, 200, 200] {
+            wait(cx, w, &view, ms);
+            seen.push(sample(cx));
+        }
+        let (lit, turn): (Vec<bool>, Vec<bool>) = seen.into_iter().unzip();
+        // At 0, 60, 200, 400 and 600 ms.
+        let (want_lit, want_turn) = match level {
+            Level::Full => ([true, true, true, true, false], [true, true, false, false, false]),
+            Level::Reduced => ([true, true, false, false, false], [false; 5]),
+            Level::Off => ([false; 5], [false; 5]),
+        };
+        assert_eq!(lit, want_lit, "{level:?}: the text's afterglow at 0, 60, 200, 400, 600 ms");
+        assert_eq!(turn, want_turn, "{level:?}: the step's glyph turning at 0, 60, 200, 400, 600 ms");
+    }
+}
+
+/// A user's local fold is theirs until the agent folds or opens that
+/// block by name (decision #4, §3.5; B2's `folded_at` is the last
+/// `collapse` naming it). A step's state, a title, a replace, a collapse
+/// of another block and a run's title leave it; a `collapse` naming it
+/// (`open`, or among `ids`) overrides it, and the user's next fold is
+/// theirs again.
+#[gpui_kit::test]
+fn a_local_fold_yields_only_to_a_collapse_naming_that_block(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let toggle = |cx: &mut TestAppContext, row: u64| {
+        let (ix, _) = view.read_with(cx, |v, _| v.block_shown(row)).expect("drawn");
+        show(cx, w, &view, ix);
+        wait(cx, w, &view, 1000);
+        let at = head_at(cx, w, row);
+        mouse(cx, w, at, "move");
+        mouse(cx, w, at, "down");
+        mouse(cx, w, at, "up");
+        board(cx, w, &view);
+        mouse(cx, w, gpui_kit::point(px(2.), px(2.)), "move");
+    };
+    let plan = id(cx, &view, "plan");
+    assert!(!folded(cx, &view, plan), "the agent never folded it");
+    toggle(cx, plan);
+    assert!(folded(cx, &view, plan), "the user's fold");
+    let ticks = [
+        json!([{"op":"patch","id":"plan","state":{"deploy":"doing"}}]),
+        json!([{"op":"patch","id":"plan","set":{"title":"Close the race"}}]),
+        json!([{"op":"replace","id":"plan","kind":"plan","title":"Close it","body":{"steps":[{"id":"z","label":"Z","state":"todo"}]}}]),
+        json!([{"op":"collapse","id":"now"}]),
+        json!([{"op":"collapse","run":true,"summary":"Another run"}]),
+    ];
+    for (k, ops) in ticks.into_iter().enumerate() {
+        land_round(cx, w, &view, &format!("toolu_f{k}"), ops.clone());
+        wait(cx, w, &view, 1000);
+        assert!(folded(cx, &view, plan), "{ops}: the user's fold stays");
+    }
+    land_round(cx, w, &view, "toolu_fo", json!([{"op":"collapse","id":"plan","open":true}]));
+    wait(cx, w, &view, 1000);
+    assert!(!folded(cx, &view, plan), "a collapse naming it, open: the agent's");
+    toggle(cx, plan);
+    assert!(folded(cx, &view, plan), "the user's again");
+    land_round(cx, w, &view, "toolu_fp", json!([{"op":"patch","id":"plan","state":{"z":"done"}}]));
+    wait(cx, w, &view, 1000);
+    assert!(folded(cx, &view, plan), "a tick leaves it");
+    toggle(cx, plan);
+    land_round(cx, w, &view, "toolu_fi", json!([{"op":"collapse","ids":["plan","now"]}]));
+    wait(cx, w, &view, 1000);
+    assert!(folded(cx, &view, plan), "named among ids: the agent's fold over the user's opening");
+}
+
 /// Re-folds (`cards_spec::board` guarantee 6): one at a time, off the
 /// frame; the board at a position is the reference's; a request while one
 /// runs stops it and waits for its end; another history drops it; asked
