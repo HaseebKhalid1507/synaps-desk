@@ -1901,19 +1901,15 @@ impl AppView {
         let menu_open = self.menu.is_some() || self.smenu.is_some() || self.wmenu.is_some() || self.choice.menu.is_some();
         let meta = row.live.and_then(|i| self.model.sessions.get(i));
         let st = meta.map(|s| self.model.state(s)).unwrap_or(row.state);
-        let on = meta.is_some_and(|s| self.model.is_active(&s.id));
         // The marker follows the visible tab (also while its attach is on
         // its way); a session open in a background tab has a faint one.
         let shown = meta.is_some_and(|s| self.model.is_shown(&s.id));
         let in_tab = !shown && meta.is_some_and(|s| self.model.tabs.holds(&s.id));
-        // The attached session's cost as the panel shows it (its digests
-        // run ahead of the 3 s poll), else the poll's.
-        let cost = meta
-            .map(|s| if on { self.model.lives[self.panes.cur.live].stats.cost.unwrap_or(s.cost_usd) } else { s.cost_usd })
-            .filter(|c| *c > 0.0);
-        let waiting = meta
-            .map(|s| if on { self.model.lives[self.panes.cur.live].transcript.pending_prompts().len() } else { s.awaiting_input })
-            .unwrap_or(0);
+        // Its cost and prompts waiting from the store that holds it, in
+        // whichever pane (its digests run ahead of the 3 s poll), else the
+        // poll's: never the focused pane's for another pane's session.
+        let cost = meta.map(|s| self.model.cost(s)).filter(|c| *c > 0.0);
+        let waiting = meta.map_or(0, |s| self.model.waiting(s));
         let workers = if st == State::Workers { meta.map_or(0, |s| self.model.workers(s)) } else { 0 };
         let gone = row.gone && meta.is_none();
         let title_color = match st {
@@ -1969,7 +1965,9 @@ impl AppView {
                 .items_baseline()
                 .gap(px(5.))
                 .child(display(w, size::D_S, word_color))
-                .when(st == State::NeedsYou && waiting > 1, |d| d.child(mono(count(waiting), size::META, p.warn_ch)))
+                .when(st == State::NeedsYou && waiting > 1, |d| {
+                    d.child(mono(count(waiting), size::META, p.warn_ch).debug_selector(move || format!("rail-waiting {key} {waiting}")))
+                })
                 .when(st == State::Workers, |d| d.child(mono(count(workers), size::META, p.run_ch)))
         });
         let lead = if gone {
@@ -2068,7 +2066,13 @@ impl AppView {
                                         .text_color(sub_color)
                                         .when(sub, |d| d.child(SharedString::from(&row.sub))),
                                 )
-                                .when_some(cost, |d, c| d.child(mono(format!("${c:.2}"), size::META, p.cost_ch).flex_none()))
+                                .when_some(cost, |d, c| {
+                                    d.child(
+                                        mono(format!("${c:.2}"), size::META, p.cost_ch)
+                                            .flex_none()
+                                            .debug_selector(move || format!("rail-cost {key} ${c:.2}")),
+                                    )
+                                })
                                 .children(remove),
                         ),
                 ),

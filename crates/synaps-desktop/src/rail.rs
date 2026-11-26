@@ -869,7 +869,7 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
     let (value, aside) = match st {
         State::Opening => ("opening".to_string(), "attach sent, waiting for the daemon".to_string()),
         State::NeedsYou => {
-            let n = m.lives.on(&s.id).map_or(s.awaiting_input, |l| l.transcript.pending_prompts().len());
+            let n = m.waiting(s);
             let cards = m.presence.of(&s.id).wait;
             let turn = if age.is_empty() { String::new() } else { format!(" · turn began {age} ago") };
             let what = match (n, cards) {
@@ -912,7 +912,7 @@ pub fn readout_live(m: &Model, s: &SessionMeta, now: i64) -> Readout {
     if let Some(c) = s.cwd.as_deref().filter(|c| !c.is_empty()) {
         lines.push((label::R_CWD, home_short(c), String::new()));
     }
-    let cost = m.lives.on(&s.id).map_or(s.cost_usd, |l| l.stats.cost.unwrap_or(s.cost_usd));
+    let cost = m.cost(s);
     lines.push((label::R_SIZE, format!("{} · ${cost:.2}", plural(s.messages, "msg", "msg")), String::new()));
     let names: Vec<String> = s.roster.iter().map(|c| if c.name.is_empty() { c.kind.clone() } else { c.name.clone() }).collect();
     let clients = s.clients.max(s.roster.len());
