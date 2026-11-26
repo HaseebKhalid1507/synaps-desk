@@ -695,6 +695,134 @@ fn a_job_reads_the_live_turn_a_slice_at_a_time_and_keeps_its_place() {
     assert_eq!(of(done), reference(&mut r));
 }
 
+/// `h`'s board three ways, at each of its message boundaries from `from`
+/// (a turn's start) on: streamed live a message at a time, each board the
+/// landed prefix's there (every block's body, revision, pending and bound
+/// value, every call's fate); landed whole at the end, before and after
+/// the next board; and reattached at each boundary with the rest appended.
+fn three_ways(h: &[Value], from: usize) {
+    let want = landed(h);
+    let mut d = Desk::of(attach(&h[..from]));
+    for k in from..h.len() {
+        stream_with(&mut d.t, &h[k..=k], k > from, false, false);
+        assert_eq!(d.drawn(), landed(&h[..=k]), "live through message {k}");
+    }
+    d.t.apply_update(&HistoryUpdate::Replace { messages: h.to_vec() }).unwrap();
+    assert_eq!(d.drawn(), want, "landed");
+    for k in from..h.len() {
+        let mut t = attach(&h[..k]);
+        t.apply_update(&HistoryUpdate::Append { base_len: k, messages: h[k..].to_vec() }).unwrap();
+        assert_eq!(Desk::of(t).drawn(), want, "reattached at {k}");
+    }
+}
+
+/// The note `id`'s text, revision and pending flag where `d` draws it, and
+/// its bound value's text (`None`: the bound board has none of it).
+fn note_state(d: &BTreeMap<String, RowBlocks>, id: &str) -> Option<(String, u32, bool, Option<String>)> {
+    let s = d.values().flat_map(|r| &r.blocks).find(|s| s.block.id.to_string() == id)?;
+    let text = |b: &cards_spec::board::Block| match &b.body {
+        cards_spec::block::Body::Note(n) => n.text.clone(),
+        _ => panic!("a note"),
+    };
+    Some((text(&s.block), s.block.rev, s.block.pending, s.bound.as_deref().map(text)))
+}
+
+/// Shady #101 round 2, the first untested case: a block call the
+/// extension refused, re-run with its input fixed, is another call with
+/// facts of its own. The refused call stays unbound for good (a plain row,
+/// none of its ops applied, nothing drawn at it); the fixed one binds and
+/// its note is the board's. Live, landed and reattached alike, at every
+/// boundary. And live, a response the provider streamed again (a reset)
+/// before its result is not a result of the call it held: the call is gone
+/// with its rows, and the re-streamed call alone binds.
+#[test]
+fn a_refused_call_rerun_with_its_input_fixed_binds_on_its_own() {
+    let mut h = blocks_history();
+    let from = h.len();
+    let bad = json!([{"op":"put","id":"fix","kind":"note","body":{"text":"first try"}},{"op":"patch","id":"nope","set":{"text":"x"}}]);
+    let good = json!([{"op":"put","id":"fix","kind":"note","body":{"text":"second try"}}]);
+    let call = |id: &str, ops: &Value| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}]});
+    let result = |id: &str, text: &str| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]});
+    h.push(json!({"role": "user", "content": "keep a note"}));
+    h.push(call("toolu_bad", &bad));
+    h.push(result("toolu_bad", "cards_block: refused: patch `nope`: no such block"));
+    h.push(call("toolu_fix", &good));
+    h.push(result("toolu_fix", &block_receipt(&good)));
+    three_ways(&h, from);
+    let d = landed(&h);
+    assert_eq!(d["toolu_bad"].call, Some(Fate::Unbound), "refused: a plain row, for good");
+    assert!(d["toolu_bad"].blocks.is_empty(), "nothing drawn at the refused call");
+    assert_eq!(d["toolu_fix"].call, Some(Fate::Bound));
+    assert_eq!(note_state(&d, "fix"), Some(("second try".into(), 1, false, Some("second try".into()))));
+    // Between the two: the refused call's note was never the board's.
+    assert_eq!(note_state(&landed(&h[..from + 3]), "fix"), None, "after the refusal: no note");
+    // Live, a reset before the result: the re-streamed call alone.
+    let mut d = Desk::of(attach(&h[..from]));
+    stream(&mut d.t, &h[from..from + 1], false);
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": "toolu_bad"})));
+    d.apply(&tool_use("toolu_bad", "cards_block", block_input(bad.clone())));
+    assert_eq!(note_state(&d.drawn(), "fix").map(|n| n.2), Some(true), "pending before the reset");
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_reset"})));
+    d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": "toolu_fix"})));
+    d.apply(&tool_use("toolu_fix", "cards_block", block_input(good.clone())));
+    d.apply(&tool_result("toolu_bad", "cards_block: refused: patch `nope`: no such block"));
+    d.apply(&tool_result("toolu_fix", &block_receipt(&good)));
+    let r = d.drawn();
+    assert!(!r.contains_key("toolu_bad"), "the reset call's row is gone");
+    assert_eq!(r["toolu_fix"].call, Some(Fate::Bound));
+    let mut once = h[..from + 1].to_vec();
+    once.push(call("toolu_fix", &good));
+    once.push(result("toolu_fix", &block_receipt(&good)));
+    assert_eq!(r, landed(&once), "the history that holds the re-streamed call alone");
+}
+
+/// Shady #101 round 2, the second untested case: a pending call whose
+/// prerequisite's fate changes what it does. One response puts note `dep`
+/// and patches it: both pending, the view draws the patch on the put, the
+/// bound board has neither. The put binds first (live, results come one at
+/// a time): the bound note is the put's, the view still the patch's on it.
+/// Then, three ways: the patch binds too (the patch's text, bound); the
+/// patch is refused (the put's text, bound); the put is refused (and so is
+/// the patch, which the extension couldn't apply: no note at all). Each
+/// checked live, landed and reattached at every boundary.
+#[test]
+fn a_pending_calls_prerequisite_decides_what_it_does() {
+    let put = json!([{"op":"put","id":"dep","kind":"note","body":{"text":"v1"}}]);
+    let patch = json!([{"op":"patch","id":"dep","set":{"text":"v2"}}]);
+    let refused = "cards_block: refused (a test)";
+    let round = json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_p", "name": "cards_block", "input": block_input(put.clone())},
+        {"type": "tool_use", "id": "toolu_q", "name": "cards_block", "input": block_input(patch.clone())}]});
+    let mut h = blocks_history();
+    let from = h.len();
+    h.push(json!({"role": "user", "content": "a note, then its fix"}));
+    h.push(round);
+    // Both pending.
+    let mut d = Desk::of(attach(&h[..from]));
+    stream(&mut d.t, &h[from..], false);
+    let r = d.drawn();
+    assert_eq!((r["toolu_p"].call, r["toolu_q"].call), (Some(Fate::Pending), Some(Fate::Pending)));
+    assert_eq!(note_state(&r, "dep"), Some(("v2".into(), 2, true, None)), "the patch on the put, pending; none bound");
+    // The put binds first.
+    d.apply(&tool_result("toolu_p", &block_receipt(&put)));
+    let r = d.drawn();
+    assert_eq!((r["toolu_p"].call, r["toolu_q"].call), (Some(Fate::Bound), Some(Fate::Pending)));
+    assert_eq!(note_state(&r, "dep"), Some(("v2".into(), 2, true, Some("v1".into()))), "the put's bound, the patch's pending");
+    for (p, q, want) in [
+        (block_receipt(&put), block_receipt(&patch), Some(("v2".to_string(), 2, false, Some("v2".to_string())))),
+        (block_receipt(&put), refused.to_string(), Some(("v1".to_string(), 1, false, Some("v1".to_string())))),
+        (refused.to_string(), refused.to_string(), None),
+    ] {
+        let mut h = h.clone();
+        h.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_p", "content": p},
+            {"type": "tool_result", "tool_use_id": "toolu_q", "content": q}]}));
+        three_ways(&h, from);
+        assert_eq!(note_state(&landed(&h), "dep"), want);
+    }
+}
+
 /// A session with no block call has no board: nothing to fold, and its
 /// input's revision stays put through a turn.
 #[test]
