@@ -348,6 +348,23 @@ pub(crate) struct Memos {
     /// Bumped whenever an entry changes, or what a session's cards say of
     /// a gap: cards drawn from it are measured again.
     changes: u64,
+    /// Entries that reached the chat (moved to "in the chat": answered, or
+    /// taken in) since the desk last took them, for its memory of card
+    /// choices ([`crate::recall`]); at most [`REACHED_CAP`].
+    reached: Vec<Reached>,
+}
+
+/// Answers kept for [`Memos::take_reached`] at most, the oldest dropped.
+const REACHED_CAP: usize = 64;
+
+/// An answer that reached the chat ([`Memos::take_reached`]): its session,
+/// card, text and values.
+#[derive(Clone, Debug)]
+pub(crate) struct Reached {
+    pub(crate) session: String,
+    pub(crate) card: CardId,
+    pub(crate) text: String,
+    pub(crate) reply: Reply,
 }
 
 impl Memos {
@@ -428,6 +445,13 @@ impl Memos {
         f(m);
         if m.entries() != before.as_slice() {
             self.changes += 1;
+        }
+        let was_in = |e: &Entry| before.iter().any(|b| b.card == e.card && b.text == e.text && b.state == State::InChat);
+        for e in m.entries().iter().filter(|e| e.state == State::InChat && !was_in(e)) {
+            if self.reached.len() >= REACHED_CAP {
+                self.reached.remove(0);
+            }
+            self.reached.push(Reached { session: session.to_string(), card: e.card.clone(), text: e.text.clone(), reply: e.reply.clone() });
         }
         if m.entries().is_empty() {
             self.by.remove(session);
@@ -747,6 +771,14 @@ impl Memos {
         let mut out = Resend::No;
         self.with(session, |m| out = m.resend(card, &view, now));
         out
+    }
+
+    /// The answers that reached the chat since the last call, oldest
+    /// first: an entry moved to "in the chat" (§3.5's table), by the fold
+    /// or `SteeringDelivered`. Never a press, a sending, queued, held or
+    /// unconfirmed entry.
+    pub(crate) fn take_reached(&mut self) -> Vec<Reached> {
+        std::mem::take(&mut self.reached)
     }
 
     /// `session`'s entry for card `card`'s id, whatever its binding (tests).

@@ -124,7 +124,9 @@ pub(crate) struct Entry {
     /// [`crate::waiting`]'s order, this one at `at`.
     pub(crate) batch: Vec<Painted>,
     pub(crate) at: usize,
-    /// The highlighted option (Enter's), from the default.
+    /// The highlighted option (Enter's), from [`AppView::start_hi`]: the
+    /// answer being changed (D4), else the choice remembered for this
+    /// question here ([`crate::recall`]), else the default.
     pub(crate) hi: Option<usize>,
     pub(crate) spot: Spot,
     /// A field to put the keys in once the card is painted: a form's
@@ -399,8 +401,9 @@ impl AppView {
 
     /// The option an entered card's highlight starts on (Enter's): the one
     /// place it is set. Reopened to change its answer (D4), the answer
-    /// given (its draft's first pick); else the agent's default
-    /// ([`start_on`]).
+    /// given (its draft's first pick); else the choice remembered for this
+    /// question here ([`AppView::recall_start`], D4 part B); else the
+    /// agent's default ([`start_on`]).
     pub(crate) fn start_hi(&self, session: &str, painted: &Painted) -> Option<usize> {
         let doc = &painted.doc;
         if self.changing(session, &painted.tool_id) {
@@ -409,7 +412,7 @@ impl AppView {
                 return Some(i);
             }
         }
-        start_on(doc)
+        self.recall_start(painted).or_else(|| start_on(doc))
     }
 
     /// The answers this desk may change on this window's visible panes

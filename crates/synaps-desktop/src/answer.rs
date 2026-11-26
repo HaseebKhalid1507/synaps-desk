@@ -684,6 +684,7 @@ impl AppView {
     /// of every pane is measured again (a card becomes its receipt, a line
     /// comes or goes), and drawn.
     pub(crate) fn cards_moved(&mut self, cx: &mut Context<Self>) {
+        self.recall_answers(cx);
         let n = self.model.memos.changes();
         if n == self.memo_seen {
             return;

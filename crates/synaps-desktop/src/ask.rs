@@ -8,8 +8,9 @@
 //! - **Open**, the whole card: its head (a mark and `QUESTION`, or
 //!   `NEEDS YOU` in the accent when the agent waits on it), the question,
 //!   the detail, the options with their numbers (the result numbers them
-//!   so for the agent: "2" typed is the second) and the agent's default
-//!   marked `suggested`, the fields with their prefills, and a footer that
+//!   so for the agent: "2" typed is the second), the agent's default
+//!   marked `suggested` and the user's choice the last time this question
+//!   came in this folder `last time` ([`crate::recall`]), the fields with their prefills, and a footer that
 //!   says how to answer. Asked but not bound yet (its result still to
 //!   come, milliseconds), the same, `asking…`.
 //! - **Answered, skipped, closed, replaced**: its receipt, one line, the
@@ -313,6 +314,9 @@ impl AppView {
             (None, _) => Vec::new(),
         };
         let can = act.is_some_and(|x| x.can);
+        // The options chosen last time this question came in this folder
+        // (D4, [`crate::recall`]): marked, never picked.
+        let last = act.map(|x| self.recalled(&x.painted)).unwrap_or_default();
         // Entered from the keys (D2b): where they are on it.
         let keys = self.panes.cur.ask.entry.as_ref().filter(|e| e.painted.tool_id == a.tool_id && Some(&e.painted.id) == a.id.as_ref());
         let (hi, spot) = keys.map_or((None, None), |e| (e.hi, Some(&e.spot)));
@@ -422,6 +426,16 @@ impl AppView {
                             .child(div().absolute().top_0().left_0().size(px(1.)).debug_selector(move || format!("ask-hi {id} {n}")))
                     })
                     .child(div().flex_1())
+                    .when(last.contains(&i), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_px(m.meta)
+                                .text_color(p.dim_t)
+                                .debug_selector(move || format!("ask-last {id} {n}"))
+                                .child("last time"),
+                        )
+                    })
                     .when(suggested(doc, &o.label), |d| {
                         d.child(
                             div()
