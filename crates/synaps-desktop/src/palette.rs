@@ -1122,8 +1122,28 @@ impl AppView {
             (AppAct::SplitDown, "Split down", k("Ctrl+Shift+\\", "⌘⇧\\"), "".into(), self.split_refusal(Some(crate::split::Side::Down))),
         ];
         for i in 0..crate::pane::PANES_MAX {
-            const TITLES: [&str; 4] = ["Focus pane 1", "Focus pane 2", "Focus pane 3", "Focus pane 4"];
-            const KEYS: [(&str, &str); 4] = [("Alt+1", "⌃1"), ("Alt+2", "⌃2"), ("Alt+3", "⌃3"), ("Alt+4", "⌃4")];
+            const TITLES: [&str; crate::pane::PANES_MAX] = [
+                "Focus pane 1",
+                "Focus pane 2",
+                "Focus pane 3",
+                "Focus pane 4",
+                "Focus pane 5",
+                "Focus pane 6",
+                "Focus pane 7",
+                "Focus pane 8",
+                "Focus pane 9",
+            ];
+            const KEYS: [(&str, &str); crate::pane::PANES_MAX] = [
+                ("Alt+1", "⌃1"),
+                ("Alt+2", "⌃2"),
+                ("Alt+3", "⌃3"),
+                ("Alt+4", "⌃4"),
+                ("Alt+5", "⌃5"),
+                ("Alt+6", "⌃6"),
+                ("Alt+7", "⌃7"),
+                ("Alt+8", "⌃8"),
+                ("Alt+9", "⌃9"),
+            ];
             let off = one.or((i >= n).then_some("no such pane")).or((order.get(i) == Some(&self.panes.focused)).then_some("focused"));
             v.push((AppAct::FocusPane(i), TITLES[i], k(KEYS[i].0, KEYS[i].1), "".into(), off));
         }

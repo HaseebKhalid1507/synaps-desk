@@ -568,16 +568,36 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     v.panes.cur.list.scroll_to_end();
                 });
                 sleep(1.5).await;
+                // `SYNAPS_BENCH_PANES_ACROSS=N` (the 2026-11-25 note under
+                // split.md §0): N − 1 panes side by side first, then a split
+                // to N before the panels' actions and a close back after.
+                let across = std::env::var("SYNAPS_BENCH_PANES_ACROSS").ok().and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 1);
+                for _ in 2..across.unwrap_or(0) {
+                    let _ = view.update_in(cx, |v, w, cx| {
+                        v.split_pane(Some(crate::split::Side::Right), w, cx);
+                        v.keys_to = None;
+                        cx.notify();
+                    });
+                    sleep(0.6).await;
+                }
+                if across.is_some() {
+                    sleep(1.0).await;
+                }
                 let long = "A draft that runs past the end of its first line and onto a second one, so the composer grows by \
                             a line: the field's height and the transcript above it make room, then it shrinks back once cleared.";
-                for (name, act) in [
+                let panels = [
                     ("rail_fold", 0u8),
                     ("rail_unfold", 0),
                     ("right_fold", 1),
                     ("right_unfold", 1),
                     ("composer_grow", 2),
                     ("composer_shrink", 3),
-                ] {
+                ];
+                let acts: Vec<(&str, u8)> = match across {
+                    Some(_) => [("split", 4u8)].into_iter().chain(panels).chain([("close", 5)]).collect(),
+                    None => panels.to_vec(),
+                };
+                for (name, act) in acts {
                     let (t0, c0, f0) = (Instant::now(), cpu_ns(), frames(cx));
                     let _ = cx.update(|window, cx| {
                         let _ = view.update(cx, |v, cx| {
@@ -585,7 +605,12 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                                 0 => v.toggle_panel(true, cx),
                                 1 => v.toggle_panel(false, cx),
                                 2 => v.panes.cur.composer.update(cx, |s, cx| s.set_value(long, window, cx)),
-                                _ => v.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+                                3 => v.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+                                4 => {
+                                    v.split_pane(Some(crate::split::Side::Right), window, cx);
+                                    v.keys_to = None;
+                                }
+                                _ => v.close_pane(),
                             }
                             cx.notify();
                         });
@@ -609,6 +634,7 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     out[name] = s;
                 }
                 out["rows"] = json!(view.update(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.len()).unwrap_or(0));
+                out["panes_across"] = json!(across.unwrap_or(1));
                 out["window_w"] = json!(view.update(cx, |v, _| v.width).unwrap_or(0.));
                 out["mem_end"] = mem::sample();
                 println!("{out}");
