@@ -16,6 +16,8 @@ mod answer_tests;
 mod ask_tests;
 #[path = "blocks_tests.rs"]
 mod blocks_tests;
+#[path = "blocks_ui_tests.rs"]
+mod blocks_ui_tests;
 #[path = "cards_d_tests.rs"]
 mod cards_d_tests;
 #[path = "change_tests.rs"]

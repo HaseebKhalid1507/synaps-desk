@@ -287,7 +287,10 @@ pub(crate) fn edit_preview(items: &[Item], ledger: &crate::files::Ledger, file: 
             .lines
             .iter()
             .map(|l| {
+                // The file's text, the tool's: drawn as D1 draws agent text
+                // (no bidi, control or invisible character reaches the row).
                 let mut l = l.clone();
+                l.text = crate::ask::shown(&l.text, cards_spec::Lines::Single).into();
                 if l.text.chars().count() > EDIT_LINE_CHARS {
                     l.text = l.text.chars().take(EDIT_LINE_CHARS).collect::<String>().into();
                 }
