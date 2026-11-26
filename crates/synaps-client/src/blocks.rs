@@ -504,6 +504,9 @@ pub struct Input {
     chunks: Vec<Chunk>,
     pub from: usize,
     pub history_len: usize,
+    /// The history ends with an assistant message's calls: their batch is
+    /// open, and the live turn's results can still commit it.
+    pub history_open: bool,
     shared: Arc<Shared>,
     pub live: Arc<Live>,
 }
@@ -530,6 +533,7 @@ impl Input {
             chunks: history.staged.iter().cloned().collect(),
             from: history.from,
             history_len: history.len,
+            history_open: history.open.as_ref().is_some_and(|(_, n)| *n > 0),
             shared: history.shared.clone(),
             live,
         })

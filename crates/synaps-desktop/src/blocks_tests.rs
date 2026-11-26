@@ -667,7 +667,7 @@ fn refolds_run_one_at_a_time_and_drop_when_their_history_changes(cx: &mut TestAp
     let live = view.read_with(cx, |v, _| v.panes.cur.live);
     let (events, generation) = view.read_with(cx, |v, _| {
         let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
-        (i.events(), i.generation)
+        (v.model.lives[live].board.events(&i), i.generation)
     });
     let want = |at: Target| {
         let mut rf = Refold::to(generation, &events, at).unwrap();
@@ -713,6 +713,82 @@ fn refolds_run_one_at_a_time_and_drop_when_their_history_changes(cx: &mut TestAp
     settle(cx, w, 8);
     assert!(done(cx).is_none(), "a re-fold of another history is dropped");
     assert_eq!(started(cx), 4, "A, B, A again, then B on the old history");
+}
+
+/// A re-fold holds for the input it read, not just its history's epoch
+/// (Shady #101 P2-2). An outcome, which reads the whole input, done: the
+/// same request after a live result changed the input runs again, and
+/// finds the new input's board. Running when an append changes it (the
+/// same epoch): stopped before its first turn, and run again on the new
+/// input, never finished on the old. A revision whose batch committed in
+/// the history reads that history only: a live tick changes nothing of it,
+/// and it is kept.
+#[gpui_kit::test]
+fn a_refold_holds_for_the_input_it_read(cx: &mut TestAppContext) {
+    use cards_spec::board::{Pos, Refold, Target};
+    let (w, view) = blocks(cx, 1500.);
+    let live = view.read_with(cx, |v, _| v.panes.cur.live);
+    let reference = |cx: &mut TestAppContext, at: Target| {
+        view.read_with(cx, |v, _| {
+            let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
+            let events = v.model.lives[live].board.events(&i);
+            let mut rf = Refold::to(i.generation, &events, at).unwrap();
+            while !rf.step(usize::MAX).unwrap() {}
+            rf.state().cloned()
+        })
+    };
+    let done = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.refolds.done.clone());
+    let started = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.refolds.started);
+    let state = |cx: &mut TestAppContext| done(cx).and_then(|d| d.state.ok().flatten()).map(|s| (*s).clone());
+    let outcome = Target::Outcome(Pos::event(0));
+    view.update(cx, |v, cx| v.refold(live, outcome, cx));
+    cx.run_until_parked();
+    let before = state(cx).expect("an outcome");
+    assert_eq!(Some(before.clone()), reference(cx, outcome));
+    // A live round patches a block: the same epoch, another input.
+    let epoch = view.read_with(cx, |v, _| v.model.lives[live].transcript.blocks_epoch());
+    turn(cx, w, &view);
+    round(cx, w, &view, &[("toolu_p2", json!([{"op":"patch","id":"now","set":{"detail":"after the outcome"}}]), true)]);
+    assert_eq!(view.read_with(cx, |v, _| v.model.lives[live].transcript.blocks_epoch()), epoch, "the same history");
+    assert!(done(cx).is_none(), "an outcome over another input is dropped");
+    view.update(cx, |v, cx| v.refold(live, outcome, cx));
+    cx.run_until_parked();
+    assert_eq!(started(cx), 2, "the same request runs again");
+    let after = state(cx).expect("an outcome");
+    assert_ne!(after, before);
+    assert_eq!(Some(after), reference(cx, outcome), "the new input's");
+    // Running when the input moves on: never finished on the old one.
+    view.update(cx, |v, cx| {
+        v.refold(live, outcome, cx);
+        v.refold_cancel();
+        v.refold(live, outcome, cx);
+    });
+    let n = started(cx);
+    view.update(cx, |v, cx| {
+        let t = &mut v.model.lives[live].transcript;
+        t.apply(
+            &synaps_client::protocol::decode_event(
+                &json!({"ev": "turn_started", "turn_baseline": 14, "trigger": "user", "user_text": "more"}),
+            )
+            .unwrap(),
+        );
+        v.sync_board(live, cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert_eq!(started(cx), n + 1, "run again on the new input");
+    assert_eq!(state(cx), reference(cx, outcome), "the new input's, not the old one's");
+    // A revision in the history: a live tick doesn't touch it.
+    let at = Target::Revision(Pos::event(8));
+    view.update(cx, |v, cx| v.refold(live, at, cx));
+    cx.run_until_parked();
+    let n = started(cx);
+    let kept = state(cx);
+    assert_eq!(kept, reference(cx, at));
+    round(cx, w, &view, &[("toolu_p3", json!([{"op":"patch","id":"now","set":{"detail":"a tick"}}]), true)]);
+    view.update(cx, |v, cx| v.refold(live, at, cx));
+    cx.run_until_parked();
+    assert_eq!((started(cx), state(cx)), (n, kept), "kept: nothing ran");
 }
 
 /// Bounded caches (§1.8: renderer caches per pane): a pane's state per

@@ -623,6 +623,11 @@ impl Transcript {
         self.blocks.epoch()
     }
 
+    /// The history's events read so far: within an epoch it only grows.
+    pub fn blocks_len(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// The board the rows draw, the last one published.
     pub fn drawn(&self) -> Option<&Arc<crate::blocks::Drawn>> {
         self.drawn.as_ref()

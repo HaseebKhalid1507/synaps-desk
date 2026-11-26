@@ -26,15 +26,23 @@
 //! a time, app-wide (§1.8's one scratch): a request while one runs stops
 //! it and waits until it has ended. It runs off the frame in steps of
 //! [`REFOLD_STEP`] visits, the 30 ms clock checked between them, yielding
-//! when it is up. A re-fold whose request changed (another target, the
-//! view closed) or whose history did (another epoch) is dropped, never
-//! finished; `too far back to show` is its result like any other.
+//! when it is up; `too far back to show` is its result like any other.
+//! - **What it read** ([`Read`]) stamps it: a revision whose batch
+//!   committed within the history reads that history only (the worker's
+//!   journal, shared), and holds for every longer history of the epoch (it
+//!   only grows); any other target reads the whole input, the live turn
+//!   included, and holds for that input's revision only.
+//! - **An input it no longer holds for** stops it, and runs the request
+//!   again on the new one (it stands), or, done, drops what it found:
+//!   nothing is reused over another input. Another history (an epoch)
+//!   drops it, never finished, and its request with it; so does a request
+//!   that changed (another target, the view closed).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use cards_spec::board::{Event, Refold, State, Target, TooFar};
+use cards_spec::board::{Event, Pos, Refold, State, Target, TooFar};
 use gpui_kit::*;
 use synaps_client::blocks::{Drawn, Input, Worker};
 
@@ -70,6 +78,39 @@ pub(crate) struct Work {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const REFOLD_STEP: usize = 2_048;
 
+/// What a re-fold read (module docs): the input it holds for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Read {
+    /// History `epoch`'s first `len` events, the target's batch committed
+    /// in them: every longer history of the epoch reads the same there.
+    Prefix { epoch: u64, len: usize },
+    /// The whole input at revision `rev` (the transcript's `blocks_rev`).
+    Whole { rev: u64 },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Read {
+    /// What a re-fold of `target` reads of `input` (revision `rev`).
+    fn of(target: Target, input: &Input, rev: u64) -> Self {
+        match target {
+            Target::Revision(Pos { event, .. }) if event < input.history_len && !input.history_open => {
+                Read::Prefix { epoch: input.epoch, len: input.history_len }
+            }
+            _ => Read::Whole { rev },
+        }
+    }
+
+    /// It holds for the input of history `epoch`, `len` events long, at
+    /// revision `rev`.
+    fn holds(self, epoch: u64, len: usize, rev: u64) -> bool {
+        match self {
+            Read::Prefix { epoch: e, len: l } => e == epoch && len >= l,
+            Read::Whole { rev: r } => r == rev,
+        }
+    }
+}
+
 /// The re-fold slot (module docs): one running, the next request waiting.
 #[derive(Default)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -88,19 +129,20 @@ struct Running {
     live: LiveId,
     target: Target,
     epoch: u64,
+    read: Read,
     stop: Arc<AtomicBool>,
     _task: Task<()>,
 }
 
-/// A finished re-fold: store `live`'s board at `target`, of the history
-/// `epoch`. `Ok(None)`: the target never took effect (its call didn't
-/// bind, or it is pending).
+/// A finished re-fold: store `live`'s board at `target`, of the input it
+/// read (`read`). `Ok(None)`: the target never took effect (its call
+/// didn't bind, or it is pending).
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Refolded {
     pub(crate) live: LiveId,
     pub(crate) target: Target,
-    pub(crate) epoch: u64,
+    pub(crate) read: Read,
     pub(crate) state: Result<Option<Arc<State>>, TooFar>,
     /// Its work, in visits ([`Refold::visited`]).
     pub(crate) visited: usize,
@@ -177,6 +219,16 @@ async fn yield_now() {
     .await
 }
 
+impl Work {
+    /// The events a re-fold of `input` reads in full, the journal's then
+    /// the live turn's (tests: the reference).
+    #[cfg(test)]
+    pub(crate) fn events(&self, input: &Input) -> Vec<Event> {
+        let journal = self.worker.lock().unwrap_or_else(PoisonError::into_inner).journal(input).expect("no gap");
+        journal.iter().chain(&input.live.events).cloned().collect()
+    }
+}
+
 /// What one step came to.
 #[derive(Debug)]
 pub(crate) enum Step {
@@ -224,14 +276,19 @@ impl AppView {
         l.board.asked = Some(rev);
         l.board.stop.store(true, Ordering::Relaxed);
         l.board.job = None;
-        // A re-fold of another history is dropped (module docs).
-        let epoch = l.transcript.blocks_epoch();
+        // A re-fold of an input that moved on: stopped and run again, or,
+        // of another history, dropped (module docs).
+        let (epoch, len) = (l.transcript.blocks_epoch(), l.transcript.blocks_len());
         let r = &mut self.refolds;
-        if r.running.as_ref().is_some_and(|j| j.live == live && j.epoch != epoch) {
-            r.running.as_ref().inspect(|j| j.stop.store(true, Ordering::Relaxed));
-            r.next = r.next.filter(|n| n.0 != live);
+        if let Some(j) = r.running.as_ref().filter(|j| j.live == live && !j.read.holds(epoch, len, rev)) {
+            j.stop.store(true, Ordering::Relaxed);
+            if j.epoch != epoch {
+                r.next = r.next.filter(|n| n.0 != live);
+            } else if r.next.is_none() {
+                r.next = Some((live, j.target));
+            }
         }
-        if r.done.as_ref().is_some_and(|d| d.live == live && d.epoch != epoch) {
+        if r.done.as_ref().is_some_and(|d| d.live == live && !d.read.holds(epoch, len, rev)) {
             r.done = None;
         }
         let l = &mut self.model.lives[live];
@@ -271,14 +328,16 @@ impl AppView {
     /// Asked again while it runs or once done, nothing new.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refold(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
-        let epoch = self.model.lives[live].transcript.blocks_epoch();
+        let t = &self.model.lives[live].transcript;
+        let now = (t.blocks_epoch(), t.blocks_len(), t.blocks_rev());
+        let holds = |read: Read| read.holds(now.0, now.1, now.2);
         let r = &mut self.refolds;
-        if r.done.as_ref().is_some_and(|d| (d.live, d.target, d.epoch) == (live, target, epoch)) {
+        if r.done.as_ref().is_some_and(|d| (d.live, d.target) == (live, target) && holds(d.read)) {
             return;
         }
         r.done = None;
         match &r.running {
-            Some(j) if (j.live, j.target, j.epoch) == (live, target, epoch) && !j.stop.load(Ordering::Relaxed) => {
+            Some(j) if (j.live, j.target) == (live, target) && holds(j.read) && !j.stop.load(Ordering::Relaxed) => {
                 r.next = None;
             }
             Some(j) => {
@@ -302,13 +361,13 @@ impl AppView {
     #[cfg_attr(not(test), allow(dead_code))]
     fn refold_start(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
         let t = &self.model.lives[live].transcript;
+        let rev = t.blocks_rev();
         let Some(input) = t.blocks_input() else {
-            let epoch = t.blocks_epoch();
-            self.refolds.done = Some(Refolded { live, target, epoch, state: Ok(None), visited: 0 });
+            self.refolds.done = Some(Refolded { live, target, read: Read::Whole { rev }, state: Ok(None), visited: 0 });
             cx.notify();
             return;
         };
-        let (epoch, generation) = (input.epoch, input.generation);
+        let (epoch, generation, read) = (input.epoch, input.generation, Read::of(target, &input, rev));
         let worker = self.model.lives[live].board.worker.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
@@ -320,27 +379,32 @@ impl AppView {
                     // (a gap: nothing to read). The live turn after it: a
                     // copy, the re-fold's alone, while it runs.
                     let journal = worker.lock().unwrap_or_else(PoisonError::into_inner).journal(&input)?;
-                    let events = match input.live.events.is_empty() {
-                        true => journal,
-                        false => Arc::new(journal.iter().chain(&input.live.events).cloned().collect()),
+                    let events = match read {
+                        Read::Whole { .. } if !input.live.events.is_empty() => {
+                            Arc::new(journal.iter().chain(&input.live.events).cloned().collect())
+                        }
+                        _ => journal,
                     };
                     refold(events, generation, target, s).await
                 })
                 .await;
-            let _ = this.update(cx, |v, cx| v.refold_ended(live, target, epoch, out, cx));
+            let _ = this.update(cx, |v, cx| v.refold_ended(live, target, read, out, cx));
         });
-        self.refolds.running = Some(Running { live, target, epoch, stop, _task: task });
+        self.refolds.running = Some(Running { live, target, epoch, read, stop, _task: task });
     }
 
-    /// A re-fold ended: kept if it finished and its request and history
-    /// still stand; then the request that waited runs.
+    /// A re-fold ended: kept if it finished, and its request stands and its
+    /// input still holds (module docs); then the request that waited runs.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn refold_ended(&mut self, live: LiveId, target: Target, epoch: u64, out: Option<Folded>, cx: &mut Context<Self>) {
+    fn refold_ended(&mut self, live: LiveId, target: Target, read: Read, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
-        let now = self.model.lives.get_mut(live).map(|l| l.transcript.blocks_epoch());
-        if let (Some((state, visited)), false, Some(true)) = (out, stopped, now.map(|e| e == epoch)) {
-            r.done = Some(Refolded { live, target, epoch, state: state.map(|s| s.map(|s| Arc::new(*s))), visited });
+        let holds = self.model.lives.get_mut(live).is_some_and(|l| {
+            let t = &l.transcript;
+            read.holds(t.blocks_epoch(), t.blocks_len(), t.blocks_rev())
+        });
+        if let (Some((state, visited)), false, true) = (out, stopped, holds) {
+            r.done = Some(Refolded { live, target, read, state: state.map(|s| s.map(|s| Arc::new(*s))), visited });
             cx.notify();
         }
         if let Some((live, target)) = r.next.take() {
