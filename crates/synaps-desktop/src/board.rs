@@ -151,9 +151,25 @@ async fn refold(events: Vec<Event>, generation: cards_spec::block::Generation, t
         match chunk(&mut rf, &stop, STEP) {
             Chunk::Done(out) => return Some((out, rf.visited())),
             Chunk::Stopped => return None,
-            Chunk::Paused => futures_lite::future::yield_now().await,
+            Chunk::Paused => yield_now().await,
         }
     }
+}
+
+/// One turn given back to the executor (every platform: `futures-lite`
+/// is the desk's on Linux only).
+#[cfg_attr(not(test), allow(dead_code))]
+async fn yield_now() {
+    let mut once = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut once, true) {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 /// What one step came to.
