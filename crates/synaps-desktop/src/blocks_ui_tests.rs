@@ -1,10 +1,11 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
-//! the lease's geometry as the renderer draws it (P2-5), one painted-target
-//! rule for every action (P2-6), a press released anywhere (P2-7), just moved
-//! by an agent op's frame, not by the clock (P2-8), the edit preview's text
-//! drawn as D1 draws agent text (P2-9), a file's header (P2-10), a metric at
-//! 320 px (P2-11), the `op skipped` chip, and the lease's note readable at 320
-//! px and every text size (decision #5). Each fails on `653c30c`.
+//! the pane's block state per session (P2-4), the lease's geometry as the
+//! renderer draws it (P2-5), one painted-target rule for every action
+//! (P2-6), a press released anywhere (P2-7), just moved by an agent op's
+//! frame, not by the clock (P2-8), the edit preview's text drawn as D1
+//! draws agent text (P2-9), a file's header (P2-10), a metric at 320 px
+//! (P2-11), the `op skipped` chip, and the lease's note readable at 320 px
+//! and every text size (decision #5). Each fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
@@ -209,6 +210,178 @@ fn split(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     super::answer_tests::key(cx, w, "ctrl-\\");
     board(cx, w, view);
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "two panes");
+}
+
+/// The pane's state for blocks, by row: folds, `more`, wells, painted
+/// targets, slides, and the edit previews' files.
+fn kept(cx: &mut TestAppContext, view: &Entity<AppView>) -> (Vec<u64>, usize, usize, usize, usize) {
+    view.read_with(cx, |v, _| {
+        let p = &v.panes.cur;
+        (
+            p.block_folds.rows(),
+            p.block_more.len(),
+            p.lease.painted.borrow().len(),
+            p.lease.slides.borrow().len(),
+            p.block_edits.borrow().len(),
+        )
+    })
+}
+
+/// P2-4: the slide map keeps only the rows the board draws. A block put
+/// and removed again and again (each another id) leaves no slide behind.
+#[gpui_kit::test]
+fn the_slide_map_keeps_only_what_the_board_draws(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    turn(cx, w, &view);
+    for k in 0..12 {
+        let id = format!("s{k}");
+        round(cx, w, &view, &[("toolu_put", json!([{"op":"put","id":id,"kind":"note","body":{"text":"here a moment"}}]), true)]);
+        view.update(cx, |v, cx| {
+            v.panes.cur.list.scroll_to_end();
+            cx.notify();
+        });
+        settle(cx, w, 8);
+        assert!(row(cx, &view, &id).is_some(), "{id} drawn");
+        round(cx, w, &view, &[("toolu_rm", json!([{"op":"remove","id":id}]), true)]);
+    }
+    let rows: std::collections::HashSet<u64> = view.read_with(cx, |v, _| {
+        let d = v.model.lives[v.panes.cur.live].transcript.drawn().cloned().expect("a board");
+        d.rows
+            .values()
+            .flat_map(|r| r.blocks.iter().flat_map(|s| std::iter::once(s).chain(&s.members)))
+            .map(|s| crate::blocks::row_id(&s.block.id))
+            .collect()
+    });
+    let slides: Vec<u64> = view.read_with(cx, |v, _| v.panes.cur.lease.slides.borrow().keys().copied().collect());
+    let left: Vec<&u64> = slides.iter().filter(|r| !rows.contains(r)).collect();
+    assert!(left.is_empty(), "{} slides for blocks not drawn ({} slides, {} rows drawn)", left.len(), slides.len(), rows.len());
+}
+
+/// P2-4: what a pane held for one session's blocks never shows for
+/// another's (the same block ids and file paths): a local unfold, an edit
+/// preview. A session with no blocks, and a pane's last tab closed, leave
+/// it nothing; the session shown again has its folds back (the tab cache).
+#[gpui_kit::test]
+fn a_panes_block_state_never_crosses_sessions(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    // A: the group and the edit preview unfolded by the user.
+    for name in ["why", "edits"] {
+        let id = show_block(cx, w, &view, name);
+        assert!(folded(cx, &view, id), "{name}: made folded");
+        let at_ = head_at(cx, w, id);
+        click(cx, w, at_);
+        assert!(!folded(cx, &view, id), "{name}: unfolded");
+    }
+    let file = "crates/relay/src/token_store.rs";
+    let preview = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            v.panes.cur.block_edits.borrow().get(file).map(|(_, (groups, _))| {
+                groups.iter().flat_map(|g| g.lines.iter().map(|l| l.text.to_string())).collect::<Vec<_>>().join("\n")
+            })
+        })
+    };
+    assert!(preview(cx).expect("A's preview").contains("Error::Timeout"), "A's edit");
+    // B, in a tab of its own: the same ids, made folded, its own edit.
+    open_session(cx, w, &view, crate::demo::BLOCKS_TWIN, crate::tabs::Place::New);
+    let why = id(cx, &view, "why");
+    assert!(folded(cx, &view, why), "B's group as its agent made it, not A's unfold");
+    let edits = show_block(cx, w, &view, "edits");
+    if folded(cx, &view, edits) {
+        let at_ = head_at(cx, w, edits);
+        click(cx, w, at_);
+    }
+    let b = preview(cx).expect("B's preview");
+    assert!(b.contains("Error::Locked") && !b.contains("Error::Timeout"), "B's edit, never A's: {b}");
+    // Back to A: its unfolds are back.
+    view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.focus_tab(0);
+        v.client = c;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    board(cx, w, &view);
+    let why = id(cx, &view, "why");
+    assert!(!folded(cx, &view, why), "A's unfold, back with its tab");
+    // A session with no blocks: nothing kept for blocks.
+    let plain = crate::demo::SID;
+    open_session(cx, w, &view, plain, crate::tabs::Place::Current);
+    assert!(row(cx, &view, "why").is_none(), "no blocks here");
+    let (folds, more, _, slides, edits) = kept(cx, &view);
+    assert!(
+        folds.is_empty() && more == 0 && slides == 0 && edits == 0,
+        "a session with no blocks keeps none: {folds:?} {more} {slides} {edits}"
+    );
+    // The pane's last tab closed: nothing.
+    open_session(cx, w, &view, crate::demo::BLOCKS_TWIN, crate::tabs::Place::Current);
+    let why = show_block(cx, w, &view, "why");
+    let at_ = head_at(cx, w, why);
+    click(cx, w, at_);
+    view.update(cx, |v, cx| {
+        while !v.model.tabs.is_empty() {
+            v.close_tab(0);
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let (folds, more, painted, slides, edits) = kept(cx, &view);
+    assert!(
+        folds.is_empty() && more == 0 && painted == 0 && slides == 0 && edits == 0,
+        "the last tab closed: {folds:?} {more} {painted} {slides} {edits}"
+    );
+}
+
+/// P2-4: a detach releases the pane's block state (and a press it held);
+/// a store another pane shows keeps that pane's when this one switches.
+#[gpui_kit::test]
+fn a_detach_releases_the_block_state_and_a_shared_pane_keeps_its_own(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let why = show_block(cx, w, &view, "why");
+    let at_ = head_at(cx, w, why);
+    click(cx, w, at_);
+    assert!(!folded(cx, &view, why));
+    show_block(cx, w, &view, "why");
+    let at_ = head_at(cx, w, why);
+    mouse(cx, w, at_, "move");
+    mouse(cx, w, at_, "down");
+    let l = view.read_with(cx, |v, _| (v.panes.cur.lease.pressed, v.panes.cur.lease.note, v.panes.cur.lease.down));
+    assert!(l.0, "a press held: {l:?}");
+    let (seq, sid) = super::answer_tests::attachment(cx, &view);
+    view.update(cx, |v, cx| {
+        v.apply_batch(vec![synaps_client::Event::Detached { attach_seq: seq, session_id: Some(sid), reason: "gone".into() }], cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let (folds, more, _, _, _) = kept(cx, &view);
+    assert!(folds.is_empty() && more == 0, "detached: the user's folds released: {folds:?}");
+    assert!(view.read_with(cx, |v, _| !v.panes.cur.lease.pressed && v.panes.cur.lease.down.is_none()), "and the press");
+
+    // Two panes on one session: the second keeps its unfold when the first
+    // switches away.
+    let (w, view) = blocks(cx, 1800.);
+    split(cx, w, &view);
+    let panes = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(panes.len(), 2);
+    let shared = view.read_with(cx, |v, _| v.panes.iter().map(|p| p.live).collect::<Vec<_>>());
+    assert_eq!(shared[0], shared[1], "one store, two panes");
+    // Pane 2 unfolds it (both panes draw the row: its state, set as its
+    // click would).
+    let why = id(cx, &view, "why");
+    view.update(cx, |v, cx| {
+        v.in_pane(panes[1], |v| {
+            let (_, s) = v.block_shown(why).expect("drawn in pane 2");
+            v.panes.cur.block_folds.toggle(why, &s);
+        });
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    view.update(cx, |v, cx| v.focus_pane(panes[0], crate::pane::KeysTo::Pane, cx));
+    open_session(cx, w, &view, crate::demo::BLOCKS_TWIN, crate::tabs::Place::Current);
+    let theirs = view.read_with(cx, |v, _| v.panes.get(panes[1]).map(|p| p.block_folds.rows()).unwrap_or_default());
+    assert!(theirs.contains(&why), "the pane still on A keeps its unfold: {theirs:?}");
+    let twin_why = id(cx, &view, "why");
+    assert!(folded(cx, &view, twin_why), "the switched pane's B: its agent's fold");
 }
 
 /// P2-5: under the lease, a note above the hovered block whose text change

@@ -455,6 +455,20 @@ pub(crate) struct Parked {
 }
 
 impl Pane {
+    /// Its blocks' state goes (Shady #101 P2-4): the user's folds and
+    /// `more`, the wells' scroll, the edit previews, and the lease's
+    /// press, targets, slides and pill. What it held was another
+    /// session's, or a store's this pane no longer shows (a switch, a
+    /// detach, its last tab closed); a store another pane shows keeps that
+    /// pane's.
+    pub(crate) fn blocks_clear(&mut self) {
+        self.block_folds = Default::default();
+        self.block_more.clear();
+        self.block_scroll.borrow_mut().clear();
+        self.block_edits.borrow_mut().clear();
+        self.lease.clear();
+    }
+
     /// A pane with nothing on it yet: an empty list following its tail.
     pub(crate) fn fresh(
         id: PaneId,

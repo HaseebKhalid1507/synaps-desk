@@ -118,6 +118,10 @@ pub(crate) struct TabCache {
     metrics_gen: u64,
     /// Its worker views (the one focused comes back focused).
     pub(crate) watch: Watch,
+    /// The user's block folds and notes opened past 6 lines: this
+    /// session's, back when it is shown again (Shady #101 P2-4).
+    block_folds: crate::blocks::Folds,
+    block_more: HashSet<u64>,
 }
 
 /// What the user unfolded or folded: the rows they flipped from their
@@ -3130,8 +3134,19 @@ impl AppView {
                 self.panes.cur.watch_note = None;
                 self.model.view_dirty = true;
             }
+            // The store's attachment detached: what its panes held for its
+            // blocks goes (Shady #101 P2-4).
+            let detached = match &ev {
+                Event::Detached { attach_seq, .. } if self.model.lives[self.panes.cur.live].current(*attach_seq) => {
+                    Some(self.panes.cur.live)
+                }
+                _ => None,
+            };
             for fx in self.model.apply(ev) {
                 self.effect(fx);
+            }
+            if let Some(live) = detached.filter(|l| self.model.lives[*l].active.is_none()) {
+                self.panes.iter_mut().filter(|p| p.live == live).for_each(crate::pane::Pane::blocks_clear);
             }
         }
     }
@@ -3813,6 +3828,7 @@ impl AppView {
         pane.main_column = None;
         pane.column_of = None;
         pane.worker_columns.clear();
+        pane.blocks_clear();
     }
 
     /// The current tab's worker view. A worker tab: its worker, checked
@@ -3979,7 +3995,10 @@ impl AppView {
             waiting_on: self.panes.cur.waiting_on.take(),
             metrics_gen: self.panes.cur.metrics_gen,
             watch,
+            block_folds: std::mem::take(&mut self.panes.cur.block_folds),
+            block_more: std::mem::take(&mut self.panes.cur.block_more),
         };
+        self.panes.cur.blocks_clear();
         self.panes.cur.rows_session = None;
         if let Some(k) = key {
             let tabs = &self.model.tabs;
@@ -3995,6 +4014,7 @@ impl AppView {
         // The last transcript's changes were synced as it left (`stash`).
         self.panes.cur.pending = None;
         self.disarm_halt();
+        self.panes.cur.blocks_clear();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(self.panes.cur.live, c.transcript, c.stats);
@@ -4008,6 +4028,7 @@ impl AppView {
                 self.panes.cur.synced_busy = c.synced_busy;
                 self.panes.cur.files_gen = c.files_gen;
                 self.panes.cur.waiting_on = c.waiting_on;
+                (self.panes.cur.block_folds, self.panes.cur.block_more) = (c.block_folds, c.block_more);
                 if c.metrics_gen != self.panes.cur.metrics_gen {
                     // The text size changed while it was in the background.
                     self.panes.cur.list.remeasure();
@@ -6765,6 +6786,7 @@ impl AppView {
                         self.panes.cur.summaries.clear();
                         self.panes.cur.toggled.clear();
                         self.panes.cur.open_runs.clear();
+                        self.panes.cur.blocks_clear();
                         self.took.borrow_mut().clear();
                         self.ran.borrow_mut().clear();
                     }

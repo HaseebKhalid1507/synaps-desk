@@ -386,7 +386,14 @@ impl AppView {
     fn edit_groups(&self, file: &str) -> (Vec<EditGroup>, usize) {
         let l = &self.model.lives[self.panes.cur.live];
         let t = l.shown();
-        let key = hash((t.items().len(), t.items().last().map(|i| (i.id, i.rev)), l.shown_files().generation(), file));
+        let key = hash((
+            t.session_id(),
+            t.blocks_epoch(),
+            t.items().len(),
+            t.items().last().map(|i| (i.id, i.rev)),
+            l.shown_files().generation(),
+            file,
+        ));
         if let Some((k, v)) = self.panes.cur.block_edits.borrow().get(file)
             && *k == key
         {

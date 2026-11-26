@@ -154,6 +154,17 @@ impl Lease {
         self.pressed || (self.over && self.moved.is_some_and(|t| now < t + LEASE))
     }
 
+    /// Everything it holds for the blocks it drew (another session, a
+    /// detach, its list gone): no press, hover or note, no target, slide
+    /// or pill. Its frame count and the list's anchoring go on.
+    pub(crate) fn clear(&mut self) {
+        (self.moved, self.over, self.pressed, self.hover, self.down, self.note) = (None, false, false, None, None, None);
+        self.painted.borrow_mut().clear();
+        self.agent_frame.set(None);
+        self.above.borrow_mut().clear();
+        self.slides.borrow_mut().clear();
+    }
+
     /// Whether the pane's frame `frame` draws an agent op for row `slid`
     /// (the top-level block row it slides with): the frame that draws a
     /// board published, or one of a slide an agent op started.
@@ -328,6 +339,7 @@ impl AppView {
         for p in self.panes.iter_mut().filter(|p| p.live == live) {
             p.lease.painted.borrow_mut().retain(|r, _| rows.contains(r));
             p.lease.above.borrow_mut().retain(|r| rows.contains(r));
+            p.lease.slides.borrow_mut().retain(|r, _| rows.contains(r));
             p.block_scroll.borrow_mut().retain(|r, _| rows.contains(r));
             p.block_more.retain(|r| rows.contains(r));
             p.block_folds.retain(|r| rows.contains(r));
