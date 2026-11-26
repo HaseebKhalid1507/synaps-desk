@@ -429,7 +429,7 @@ impl AppView {
             )
             .child(head)
             .children(body)
-            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag))
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
@@ -946,7 +946,7 @@ impl AppView {
                             .debug_selector(move || format!("block-member {id} {mid}"))
                             .child(self.block_head(mshown, mid, p.well_d, folded, streaming, fit, g, p, m, cx))
                             .children((!folded).then(|| self.block_body(mshown, mid, Some(group), streaming, fit, g, p, m, cx)))
-                            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag))
+                            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag, id))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {

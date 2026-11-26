@@ -1,10 +1,10 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
 //! the lease's geometry as the renderer draws it (P2-5), one painted-target
-//! rule for every action (P2-6), a press released anywhere (P2-7), the edit
-//! preview's text drawn as D1 draws agent text (P2-9), a file's header
-//! (P2-10), a metric at 320 px (P2-11), the `op skipped` chip, and the lease's
-//! note readable at 320 px and every text size (decision #5). Each fails on
-//! `653c30c`.
+//! rule for every action (P2-6), a press released anywhere (P2-7), just moved
+//! by an agent op's frame, not by the clock (P2-8), the edit preview's text
+//! drawn as D1 draws agent text (P2-9), a file's header (P2-10), a metric at
+//! 320 px (P2-11), the `op skipped` chip, and the lease's note readable at 320
+//! px and every text size (decision #5). Each fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
@@ -381,6 +381,94 @@ fn a_press_released_elsewhere_ends(cx: &mut TestAppContext) {
     wait(cx, w, &view, 1600);
     board(cx, w, &view);
     assert!(!waiting(cx, &view), "drawn at the lease's end");
+}
+
+/// P2-8: the user's own change right after an agent op never starts the
+/// just-moved window: an agent tick, then 200 ms later the user's fold, or
+/// `more`, or a scroll, moves the target: a click at once acts. A frame
+/// that draws both an agent op and a user's change stays the agent's.
+#[gpui_kit::test]
+fn just_moved_is_the_agents_frame_not_the_clock(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let long = (0..200).map(|k| format!("w{k}")).collect::<Vec<_>>().join(" ");
+    let put = json!([
+        {"op":"put","id":"a","kind":"plan","body":{"steps":[{"id":"s1","label":"One","state":"todo"},{"id":"s2","label":"Two","state":"todo"}]}},
+        {"op":"put","id":"n","kind":"note","body":{"text":long}},
+        {"op":"put","id":"b","kind":"note","body":{"text":"B"}},
+        {"op":"put","id":"c","kind":"status","body":{"text":"C","state":"working"}}
+    ]);
+    put_mid(cx, w, &view, put);
+    let (a, n, b) = (id(cx, &view, "a"), id(cx, &view, "n"), id(cx, &view, "b"));
+    let tick = |cx: &mut TestAppContext, k: usize| {
+        round(cx, w, &view, &[(&format!("toolu_t{k}"), json!([{"op":"patch","id":"c","set":{"text":format!("C {k}")}}]), true)]);
+        wait(cx, w, &view, 200);
+    };
+    let acts = |cx: &mut TestAppContext, why: &str| {
+        let y0 = f32::from(drawn(cx, w, format!("block {b}")).top());
+        let was = folded(cx, &view, b);
+        let at_ = head_at(cx, w, b);
+        click(cx, w, at_);
+        assert_ne!(folded(cx, &view, b), was, "{why}: the click acts at once (B at {y0})");
+        assert_eq!(note(cx, &view), None, "{why}: no note");
+        let at_ = head_at(cx, w, b);
+        click(cx, w, at_);
+        wait(cx, w, &view, 700);
+    };
+    // The user's fold.
+    tick(cx, 1);
+    let y0 = f32::from(drawn(cx, w, format!("block {b}")).top());
+    let at_ = head_at(cx, w, a);
+    click(cx, w, at_);
+    assert!(f32::from(drawn(cx, w, format!("block {b}")).top()) < y0, "the fold moved B up");
+    acts(cx, "a fold");
+    let at_ = head_at(cx, w, a);
+    click(cx, w, at_);
+    wait(cx, w, &view, 700);
+    // The user's `more`.
+    tick(cx, 2);
+    let at_ = drawn(cx, w, format!("block-more {n}")).center();
+    click(cx, w, at_);
+    acts(cx, "more");
+    let at_ = drawn(cx, w, format!("block-more {n}")).center();
+    click(cx, w, at_);
+    wait(cx, w, &view, 700);
+    // The user's scroll.
+    tick(cx, 3);
+    view.update(cx, |v, cx| {
+        v.panes.cur.list.scroll_by(px(-40.));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    acts(cx, "a scroll");
+    // One frame drawing an agent op (a release) and the user's fold: the
+    // agent's (the safe side).
+    motion_level(cx, &view, crate::motion::Level::Off);
+    let at_ = head_at(cx, w, b);
+    mouse(cx, w, at_, "move");
+    round(
+        cx,
+        w,
+        &view,
+        &[("toolu_g", json!([{"op":"patch","id":"a","append":{"steps":[{"id":"s3","label":"Three","state":"todo"}]}}]), true)],
+    );
+    assert!(waiting(cx, &view));
+    let pane = view.read_with(cx, |v, _| v.panes.cur.id);
+    view.update(cx, |v, cx| {
+        v.lease_over(pane, false, cx);
+        let (ix, s) = v.block_shown(n).expect("n drawn");
+        v.panes.cur.block_folds.toggle(n, &s);
+        v.panes.cur.list.remeasure_items(ix..ix + 1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    wait(cx, w, &view, 200);
+    let was = folded(cx, &view, b);
+    let at_ = head_at(cx, w, b);
+    click(cx, w, at_);
+    assert_eq!(folded(cx, &view, b), was, "both in one frame: the agent's, the click does nothing");
+    assert_eq!(note(cx, &view), Some((b, crate::lease::MOVED)));
 }
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a

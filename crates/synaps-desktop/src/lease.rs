@@ -30,11 +30,15 @@
 //!   the press with no action ([`AppView::lease_unpress`]).
 //! - **Just moved**: a pointer-down on a target an agent op moved (its
 //!   painted rect) or replaced (its tag) in the last [`JUST_MOVED`] does
-//!   nothing, once, and says `this moved just now`. "An agent op" is a
-//!   frame within [`JUST_MOVED`] of a board drawn; a slide's frames each
-//!   restart the window, so it runs from the motion's end. A timestamp per
-//!   hit region, compared when input arrives: no timer, no frame. Keys
-//!   never meet it.
+//!   nothing, once, and says `this moved just now`. "An agent op" is the
+//!   pane's frame that draws a board published (its number, set as the
+//!   board lands: [`Lease::agent_frame`]) and the frames of the slides it
+//!   started ([`SlideY`]): each restarts the window, so it runs from the
+//!   motion's end. A user's own change in another frame (a fold, `more`,
+//!   a scroll, a resize) never starts it, however soon after a board; a
+//!   frame that draws both counts as the agent's (the safe side). A
+//!   timestamp per hit region, compared when input arrives: no timer, no
+//!   frame. Keys never meet it.
 //! - **The pill**: blocks that changed above the view, `2 blocks changed
 //!   above ↑` at the list's top; a click walks to the first, and a block
 //!   painted in view leaves it.
@@ -95,6 +99,17 @@ pub(crate) struct Press {
     pub group: Option<Target>,
 }
 
+/// A block row's slide ([`SlideY`]), the pane frame it was laid out in
+/// last, whether an agent op started it, and the last frame it moved in
+/// for one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sliding {
+    pub slide: motion::Slide,
+    pub at: u64,
+    pub agent: bool,
+    pub moved: u64,
+}
+
 /// A block row's last paint: its rect and tag, and when an agent op last
 /// moved or replaced it.
 #[derive(Clone, Copy, Debug)]
@@ -117,14 +132,13 @@ pub(crate) struct Lease {
     /// A block's note until the next input.
     pub note: Option<(u64, &'static str)>,
     pub painted: Rc<RefCell<HashMap<u64, Painted>>>,
-    /// When a board was last drawn: frames within [`JUST_MOVED`] of it
-    /// draw an agent op.
-    pub agent_op: Rc<Cell<Option<Instant>>>,
+    /// The pane frame that draws the last board published: it draws an
+    /// agent op (module docs).
+    pub agent_frame: Rc<Cell<Option<u64>>>,
     /// Block rows changed above the view, oldest first (the pill).
     pub above: Rc<RefCell<Vec<u64>>>,
-    /// Block rows' slides ([`SlideY`]), by row, and the frame each was
-    /// laid out in last.
-    pub slides: Rc<RefCell<HashMap<u64, (motion::Slide, u64)>>>,
+    /// Block rows' slides ([`SlideY`]), by row.
+    pub slides: Rc<RefCell<HashMap<u64, Sliding>>>,
     /// The pane's frames drawn.
     pub frame: Rc<Cell<u64>>,
     /// The list neither follows its tail nor scrolled since the last frame
@@ -138,6 +152,13 @@ pub(crate) struct Lease {
 impl Lease {
     pub(crate) fn active(&self, now: Instant) -> bool {
         self.pressed || (self.over && self.moved.is_some_and(|t| now < t + LEASE))
+    }
+
+    /// Whether the pane's frame `frame` draws an agent op for row `slid`
+    /// (the top-level block row it slides with): the frame that draws a
+    /// board published, or one of a slide an agent op started.
+    fn agent_in(agent: &Cell<Option<u64>>, slides: &RefCell<HashMap<u64, Sliding>>, frame: u64, slid: u64) -> bool {
+        agent.get() == Some(frame) || slides.borrow().get(&slid).is_some_and(|s| s.moved == frame)
     }
 }
 
@@ -269,7 +290,6 @@ impl AppView {
             return;
         }
         self.model.lives[live].board.waiting = None;
-        let now = self.fx.now();
         for p in panes {
             self.in_pane(p, |this| {
                 // Changed above the view: the pill.
@@ -290,7 +310,9 @@ impl AppView {
                     }
                 }
                 drop(above);
-                this.panes.cur.lease.agent_op.set(Some(now));
+                // Its next frame draws it: an agent op's.
+                let l = &this.panes.cur.lease;
+                l.agent_frame.set(Some(l.frame.get() + 1));
             });
         }
         self.model.lives[live].transcript.set_drawn(Some(drawn.clone()));
@@ -499,8 +521,8 @@ impl AppView {
 pub(crate) struct SlideY {
     child: AnyElement,
     row: u64,
-    agent: Rc<Cell<Option<Instant>>>,
-    slides: Rc<RefCell<HashMap<u64, (motion::Slide, u64)>>>,
+    agent: Rc<Cell<Option<u64>>>,
+    slides: Rc<RefCell<HashMap<u64, Sliding>>>,
     anchored: Rc<Cell<bool>>,
     frame: Rc<Cell<u64>>,
     fx: Rc<motion::Motion>,
@@ -512,7 +534,7 @@ impl SlideY {
         SlideY {
             child,
             row,
-            agent: l.agent_op.clone(),
+            agent: l.agent_frame.clone(),
             slides: l.slides.clone(),
             anchored: l.anchored.clone(),
             frame: l.frame.clone(),
@@ -521,28 +543,40 @@ impl SlideY {
         }
     }
 
-    /// Its offset this frame, its layout top at `top`.
+    /// Its offset this frame, its layout top at `top`. A slide starts only
+    /// in the frame that draws an agent op, and goes on while its row's
+    /// place holds: a user's change (a fold, a scroll, a resize) moves the
+    /// row at once, even mid-slide.
     fn offset(&mut self, top: f32) -> f32 {
         let now = self.fx.now();
-        let agent = self.agent.get().is_some_and(|t| now.saturating_duration_since(t) < JUST_MOVED);
-        let slide = agent && self.anchored.get() && self.fx.level() == motion::Level::Full;
         let frame = self.frame.get();
+        let agent = self.agent.get() == Some(frame) && self.anchored.get() && self.fx.level() == motion::Level::Full;
         let mut slides = self.slides.borrow_mut();
-        let (s, at) = slides.entry(self.row).or_insert_with(|| (motion::Slide::rest(top, now), frame));
+        let e =
+            slides.entry(self.row).or_insert_with(|| Sliding { slide: motion::Slide::rest(top, now), at: frame, agent: false, moved: 0 });
         // Laid out in the pane's last frame: from there; else it comes
         // from out of view (`appear`, not a slide).
-        let last = *at + 1 == frame || *at == frame;
-        *at = frame;
-        match last && slide {
-            true => s.retarget(top, now),
-            false => *s = motion::Slide::rest(top, now),
+        let last = e.at + 1 == frame || e.at == frame;
+        e.at = frame;
+        if last && agent {
+            e.slide.retarget(top, now);
+            e.agent = true;
+        } else if !(last && e.agent && e.slide.target() == top) {
+            (e.slide, e.agent) = (motion::Slide::rest(top, now), false);
         }
-        if s.settled(now) {
-            *s = motion::Slide::rest(top, now);
+        if e.slide.settled(now) {
+            // Its last move lands now: the window runs from here.
+            if std::mem::take(&mut e.agent) {
+                e.moved = frame;
+            }
+            e.slide = motion::Slide::rest(top, now);
             return 0.;
         }
+        if e.agent {
+            e.moved = frame;
+        }
         self.fx.want_frame();
-        s.state(now).0
+        e.slide.state(now).0
     }
 }
 
@@ -607,16 +641,18 @@ impl Element for SlideY {
     }
 }
 
-/// A block's probe (a child of the block, which is positioned): each paint
-/// notes its rect and tag; a change in a frame that draws an agent op
-/// marks it just moved; painted in view, it leaves the pill.
-pub(crate) fn probe(l: &Lease, fx: &Rc<crate::motion::Motion>, row: u64, tag: Tag) -> impl IntoElement + use<> {
-    let (painted, agent, above, fx) = (l.painted.clone(), l.agent_op.clone(), l.above.clone(), fx.clone());
+/// A block's probe (a child of the block, or of a group's member, which is
+/// positioned): each paint notes its rect and tag; a change in a frame
+/// that draws an agent op (for row `slid`, the top-level block row it
+/// slides with) marks it just moved; painted in view, it leaves the pill.
+pub(crate) fn probe(l: &Lease, fx: &Rc<crate::motion::Motion>, row: u64, tag: Tag, slid: u64) -> impl IntoElement + use<> {
+    let (painted, agent, slides, frame, above, fx) =
+        (l.painted.clone(), l.agent_frame.clone(), l.slides.clone(), l.frame.clone(), l.above.clone(), fx.clone());
     canvas(
         |_, _, _| {},
         move |bounds, (), window, _| {
             let now = fx.now();
-            let agent = agent.get().is_some_and(|t| now.saturating_duration_since(t) < JUST_MOVED);
+            let agent = Lease::agent_in(&agent, &slides, frame.get(), slid);
             let mut map = painted.borrow_mut();
             match map.get_mut(&row) {
                 Some(p) if p.bounds != bounds || p.tag != tag => {
