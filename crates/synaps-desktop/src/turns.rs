@@ -1364,6 +1364,11 @@ pub(crate) struct Layout {
     pub left: f32,
     /// And its right.
     pub right: f32,
+    /// How far the column's box is drawn from the pane's left edge: 0 but
+    /// in a widening flight's reveal ([`Reveal`]), where the box is the
+    /// pane as it lands (`left` and `right` are that pane's), moved so the
+    /// column stays where the reveal puts it in the window.
+    pub shift: f32,
 }
 
 impl Layout {
@@ -1377,8 +1382,9 @@ impl Layout {
 
     /// [`Layout::of`] with the column laid out for a `wrap` px pane (its
     /// width, the labels' hang, the tight gutter) and centred in `pane`:
-    /// while a side panel flies, `wrap` is the flight's narrowest pane, so
-    /// the rows keep their wrap and only the padding moves (fluid.md §3.8).
+    /// in a flight, `wrap` is the pane as the flight lands, so the rows
+    /// wrap once, as it starts, and only the padding moves (fluid.md §3.8;
+    /// widening, the column is placed by its [`Reveal`]).
     pub(crate) fn of_in(pane: f32, wrap: f32, height: f32, m: &Metrics, ex: crate::fit::Extras) -> Self {
         let tight = wrap < 560.;
         let gutter = if tight { 16. } else { 24. };
@@ -1394,6 +1400,7 @@ impl Layout {
             cramped: height < crate::fit::cramped_below(m, ex),
             left,
             right: (pane - column - left).max(0.),
+            shift: 0.,
         }
     }
 
@@ -1471,6 +1478,80 @@ impl HangFx {
             (self.measured, self.between) = (self.k == 1., false);
         }
         (Layout { hang, hang_k: self.k, ..lay }, landed)
+    }
+}
+
+/// A widening flight's column (Haseeb, 2026-11-26: a rail closing kept
+/// the old, narrow column for the whole flight, then jumped). From the
+/// flight's first frame the column is the one it lands with, laid out in
+/// the pane as it lands, and the moving edge reveals it: its far edge
+/// (from the edge that moves) stays where it was, and the column goes on
+/// to its landed place with the pane's width. A column that takes all the
+/// width it gains (under the cap, the same gutters) is where it lands from
+/// the first frame and does not move at all; one at the cap glides as the
+/// centred column did. One whose far edge held would put its near edge in
+/// view (a gain under its gutter) holds its near edge instead, and glides.
+/// Each an affine map of the pane's width: on the panel's spring, with no
+/// curve of its own. Everything in the window, on the window's x.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Reveal {
+    /// The pane in the frame before the flight: its left edge and width.
+    pub from: (f32, f32),
+    /// Its column then: its left edge and width.
+    pub col: (f32, f32),
+    /// The pane as it lands (its left edge and width), and the column's
+    /// left edge in it there (the landed layout's `left`).
+    pub to: (f32, f32),
+    pub left: f32,
+    /// The landed column's width.
+    pub column: f32,
+    /// The column's left edge as last drawn ([`Reveal::step`]).
+    pub drawn: Option<f32>,
+}
+
+impl Reveal {
+    /// [`Reveal::column_x`] for the frame drawn now, never back from the
+    /// one before towards where it started: a pane's width, from edges on
+    /// half pixels, can step back half a pixel in a flight's tail, and the
+    /// column would twitch a pixel back and forth.
+    pub(crate) fn step(&mut self, w: f32) -> f32 {
+        let (x, landed) = (self.column_x(w), self.to.0 + self.left);
+        let x = match self.drawn {
+            Some(d) if d > landed => x.clamp(landed, d),
+            Some(d) if d < landed => x.clamp(d, landed),
+            Some(_) => landed,
+            None => x,
+        };
+        self.drawn = Some(x);
+        x
+    }
+
+    /// The column's left edge in the window, the pane `w` wide this frame.
+    pub(crate) fn column_x(&self, w: f32) -> f32 {
+        let ((x0, w0), (x1, w1)) = (self.from, self.to);
+        let landed = x1 + self.left;
+        let grow = w1 - w0;
+        if grow < 0.5 {
+            return landed;
+        }
+        // What the column gains, taken on each side as the pane's edges
+        // move: all on the left when only the left edge moves (the rail),
+        // none when only the right one does (the right panel). Both edges
+        // moving the same way (a pane in a split, its divider riding the
+        // rail), all on the side that leads: the far edge holds still in
+        // the first frame, never stepping back to make room.
+        let held = self.col.0 - (self.column - self.col.1) * ((x0 - x1) / grow).clamp(0., 1.);
+        // Held, the far edge puts the near one where the pane shows it (a
+        // gain under its gutter, near the cap): it would hop. The near edge
+        // holds instead, and the column glides on with the pane.
+        let start = if held > x0 { self.col.0 } else { held };
+        // Within a pixel of it (the floors of the centring): where it
+        // lands, never a pixel's step in the flight.
+        if (start - landed).abs() <= 1. {
+            return landed;
+        }
+        let k = ((w - w0) / grow).clamp(0., 1.);
+        start + (landed - start) * k
     }
 }
 
@@ -2801,8 +2882,8 @@ mod tests {
     use synaps_client::transcript::ItemKind;
 
     use super::{
-        Counts, DAY_ID, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, RowCache, RunSummary, Summaries, Tally,
-        TextRows, Who, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
+        Counts, DAY_ID, Disp, Gap, Hue, KEEP, KEEP_BYTES, Keep, Kind, Layout, MAX_WAIT, Metrics, Reveal, RowCache, RunSummary, Summaries,
+        Tally, TextRows, Who, diff, digits, plus, tally_fit, text_lines, text_w, turn_start,
     };
     use crate::files::{CallDelta, Ledger};
     use crate::subagents::Subagents;
@@ -3569,6 +3650,68 @@ mod tests {
             assert_eq!(pane - a - b, 672., "{pane}");
             assert!((a - b).abs() <= 1.);
         }
+    }
+
+    /// A widening flight's column ([`Reveal`]): from its first frame where
+    /// its far edge was, at the landed width; to where it lands, with the
+    /// pane. Under the cap with the same gutters it does not move at all.
+    #[test]
+    fn a_reveal_keeps_the_far_edge_and_lands_centred() {
+        let m = Metrics::at(16);
+        let lay = |pane: f32| Layout::of(pane, 900., &m, Default::default());
+        let reveal = |from: (f32, f32), to: (f32, f32)| {
+            let (l0, l1) = (lay(from.1), lay(to.1));
+            Reveal { from, col: (from.0 + l0.left, l0.column), to, left: l1.left, column: l1.column, drawn: None }
+        };
+        // The rail closing (448 to a 48 px strip): the pane 652 to 1052,
+        // the column 604 to its cap, 672. Its right edge holds, then it
+        // glides to its centre, slower than a centred column would (half
+        // the pane's step); the rail's edge goes 400 px.
+        let r = reveal((448., 652.), (48., 1052.));
+        let right = |w: f32| r.column_x(w) + r.column;
+        assert_eq!(right(652.), 448. + 24. + 604., "the far edge where it was");
+        assert_eq!(r.column_x(1052.), 48. + 190., "lands centred");
+        let xs: Vec<f32> = (0..=10).map(|i| r.column_x(652. + 40. * i as f32)).collect();
+        assert!(xs.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 20.), "a glide, never a step: {xs:?}");
+        // The right panel closing (its left edge holds): the near edge holds.
+        let r = reveal((48., 652.), (48., 1052.));
+        assert_eq!(r.column_x(652.), 48. + 24., "its left edge where it was");
+        assert_eq!(r.column_x(1052.), 48. + 190.);
+        // A split's left pane as the rail closes (its divider rides the
+        // rail: both edges go left, the left one twice as far): the far
+        // edge holds in the first frame, never stepping back, then glides
+        // with the pane to its centre.
+        let r = reveal((312., 648.), (32., 788.));
+        let right = |w: f32| r.column_x(w) + r.column;
+        assert_eq!(right(648.), 312. + 24. + 600., "the far edge where it was");
+        assert_eq!(r.column_x(788.), 32. + 58., "lands centred");
+        let xs: Vec<f32> = (0..=14).map(|i| r.column_x(648. + 10. * i as f32)).collect();
+        assert!(xs.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 20.), "a glide, never a step: {xs:?}");
+        // Near the cap (660 to 672: 12 px gained, under the 24 px gutter):
+        // the far edge held would hop the near one 12 px in view; the near
+        // edge holds, and the column glides with the pane to its centre.
+        let r = reveal((448., 708.), (48., 1108.));
+        assert_eq!(r.column_x(708.), 448. + 24., "the near edge where it was");
+        assert_eq!(r.column_x(1108.), 48. + 218., "lands centred");
+        let xs: Vec<f32> = (0..=10).map(|i| r.column_x(708. + 40. * i as f32)).collect();
+        assert!(xs.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 21.), "a glide, never a step: {xs:?}");
+        // Under the cap both ends, the same gutters (580 to 700): where it
+        // lands, in every frame.
+        let (l0, l1) = (lay(580.), lay(700.));
+        assert!(l1.column < m.column && (l0.left, l1.left) == (24., 24.), "under the cap: {l0:?} {l1:?}");
+        let r = reveal((168., 580.), (48., 700.));
+        for w in [580., 600., 650., 699., 700.] {
+            assert_eq!(r.column_x(w), 48. + 24., "still at {w}");
+        }
+        // Nothing to gain (a flight back to where it was): where it lands.
+        let r = Reveal { from: (48., 652.), col: (72., 604.), to: (48., 652.), left: 24., column: 604., drawn: None };
+        assert_eq!(r.column_x(652.), 72.);
+        // A width that steps back half a pixel in the tail: the column
+        // holds, never back towards where it started.
+        let mut r = reveal((312., 648.), (32., 788.));
+        let xs: Vec<f32> = [648., 700., 780., 786., 785.5, 787., 786.5, 788.].iter().map(|&w| r.step(w)).collect();
+        assert!(xs.windows(2).all(|w| w[1] <= w[0]), "never back: {xs:?}");
+        assert_eq!(xs[xs.len() - 1], 32. + 58., "lands");
     }
 
     /// A row's layout is its height once its view's own parse has landed,

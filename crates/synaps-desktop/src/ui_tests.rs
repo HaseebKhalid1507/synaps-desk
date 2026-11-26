@@ -8093,10 +8093,11 @@ fn panels_fold_on_sheet_clipped_not_squeezed(cx: &mut TestAppContext) {
 }
 
 /// fluid.md §3.8: while a panel flies the column keeps its wrap: it is
-/// laid out for the flight's narrowest pane, so it rewraps at most once
-/// per flight (at the start when the pane narrows, at the end when it
-/// widens), and is centred in the pane as drawn every frame. Not following,
-/// the top row's top never moves; following, the end stays the bottom.
+/// laid out for the pane as the flight lands, so it rewraps at most once
+/// per flight, at the start; narrowing, it is centred in the pane as drawn
+/// every frame, and widening, revealed (`crate::turns::Reveal`: its far
+/// edge holds, then it glides to where it lands). Not following, the top
+/// row's top never moves; following, the end stays the bottom.
 #[gpui_kit::test]
 fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
     let (w, view, _events) = open_at(cx, (1100., 800.), crate::theme::Panels::default().text_size);
@@ -8106,7 +8107,7 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| {
             let l = v.layout;
             let pane = v.width - crate::chrome::MARK - v.panel_fx.sides[0].shown - v.panel_fx.sides[1].shown;
-            (l.column, l.hang, l.left, pane)
+            (l.column, l.hang, l.left, pane, crate::chrome::MARK + v.panel_fx.sides[0].shown + l.left + l.shift)
         })
     };
     for (follow, fold) in [(false, true), (false, false), (true, true), (true, false)] {
@@ -8126,9 +8127,24 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
         cx.run_until_parked();
         let mut seen = vec![col(cx)];
         let mut moving = vec![panel(cx, &view, true).2];
-        let check = |cx: &mut TestAppContext, seen: &mut Vec<(f32, bool, f32, f32)>| {
+        let check = |cx: &mut TestAppContext, seen: &mut Vec<(f32, bool, f32, f32, f32)>| {
             let c = col(cx);
-            assert!((c.2 - ((c.3 - c.0) / 2.).floor()).abs() <= 1., "{fold}: centred in the pane as drawn {c:?}");
+            // Folding (the pane widens), the landed column revealed
+            // (`crate::turns::Reveal`), in the window: its far edge (the
+            // right) where it was as it rewraps, then a glide to where it
+            // lands, never a step past the centred column's (half the
+            // pane's). Unfolding, centred in the pane as drawn.
+            match seen.last() {
+                Some(p) if fold => {
+                    let step = (c.3 - p.3).abs() / 2. + 1.;
+                    if c.0 == p.0 {
+                        assert!(c.4 <= p.4 && p.4 - c.4 <= step, "{fold}: a glide to where it lands {p:?} {c:?}");
+                    } else {
+                        assert!(((c.4 + c.0) - (p.4 + p.0)).abs() <= step, "{fold}: its far edge where it was {p:?} {c:?}");
+                    }
+                }
+                _ => assert!((c.2 - ((c.3 - c.0) / 2.).floor()).abs() <= 1., "{fold}: centred in the pane as drawn {c:?}"),
+            }
             // GPUI's item width (the list's width less its padding) is the
             // column, bit for bit, in every frame (Shady H1: a fraction of a
             // pixel more or less and the list forgets every row's height).
@@ -8161,11 +8177,17 @@ fn column_rewraps_at_most_once_per_panel_motion(cx: &mut TestAppContext) {
         let changes: Vec<usize> = (1..wraps.len()).filter(|&i| wraps[i] != wraps[i - 1]).collect();
         assert!(changes.len() <= 1, "{fold}: rewrapped {} times: {wraps:?}", changes.len());
         assert!(!changes.is_empty(), "{fold}: 1100 px crosses a wrap width either way");
+        // Either way the flight lands (Shady #96 A-1: the old widening
+        // check's `expect` was this guarantee): the panel at rest and its
+        // motion done before `fly`'s bound, the one rewrap before that.
+        let landed = moving.iter().position(|m| !m).expect("it landed");
+        let rest = !moving.last().copied().unwrap_or(true) && !motion_pending(cx, &view).0;
+        assert!(rest && frames < 400, "{fold}: it landed ({frames} frames, {moving:?})");
+        assert!(changes[0] <= landed + 1, "{fold}: rewrapped before it landed ({} {landed})", changes[0]);
         if fold {
-            // The pane widens: the new wrap in the flight's last frame
-            // (`wraps` has the frame before the flight first).
-            let landed = moving.iter().position(|m| !m).expect("it landed");
-            assert!((landed + 1..=landed + 2).contains(&changes[0]), "{fold}: widening rewraps at the end ({} {landed})", changes[0]);
+            // The pane widens: the landed wrap in the flight's first frame
+            // (`wraps` has the frame before the flight first), revealed.
+            assert_eq!(changes[0], 1, "{fold}: widening rewraps at the start");
         } else {
             assert_eq!(changes[0], 1, "{fold}: narrowing rewraps at the start");
         }
@@ -8831,8 +8853,8 @@ fn a_section_folds_and_unfolds_mid_rail_in_a_scrolled_rail(cx: &mut TestAppConte
 /// with both panels open), each as wide as the others, `CHIP_GAP` apart,
 /// filling the column. A new step, its clock, the hover's ×, an armed
 /// cancel or a state's change moves no chip and leaves the dock its
-/// height. A panel in flight leaves them be (the frozen column); landed,
-/// they take the new column's share.
+/// height. A panel in flight: the column's share from its first frame
+/// (the landed column, `crate::turns::Reveal`); landed, the same.
 #[gpui_kit::test]
 fn a_chip_is_the_columns_share_whatever_it_says(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, MouseMoveEvent};
@@ -8910,13 +8932,16 @@ fn a_chip_is_the_columns_share_whatever_it_says(cx: &mut TestAppContext) {
     settle(cx, w, 8);
     assert!(drawn(cx, w, "tray-confirm".into()).is_some(), "armed: CONFIRM");
     same(cx, "armed");
-    // A panel in flight: the frozen column's share; landed, the new one's.
+    // A panel in flight: the share of the column as drawn (the frame
+    // before's, then the landed one's from the first frame); landed, the
+    // new one's.
     catch_up(cx, &view);
     view.update(cx, |v, cx| v.toggle_panel(true, cx));
     cx.run_until_parked();
     let mut frames = 0;
     while view.read_with(cx, |v, _| v.panel_fx.moving()) && frames < 400 {
-        assert_eq!(geo(cx).0.iter().map(|c| c[2]).collect::<Vec<_>>(), [cw; 3], "in flight");
+        let share = view.read_with(cx, |v, _| crate::tray::grid(v.layout.column, &crate::theme::Metrics::at(16)).1);
+        assert_eq!(geo(cx).0.iter().map(|c| c[2]).collect::<Vec<_>>(), [share; 3], "in flight");
         fluid_frame(cx, w, &view);
         frames += 1;
     }

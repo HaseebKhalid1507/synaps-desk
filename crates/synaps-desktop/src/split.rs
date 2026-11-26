@@ -75,17 +75,6 @@ pub(crate) struct Flight {
     pub ghosts: Vec<PaneId>,
     /// Its spring's length; 0 until its first frame measures it.
     pub travel: f32,
-    /// Each pane's narrowest box in the flight: its column keeps that wrap
-    /// until the flight lands (the panels' `PanelFx.freeze` rule: it
-    /// rewraps once, at the start as it narrows, at the end as it widens).
-    pub wrap: Vec<(PaneId, f32)>,
-    /// The centres `wrap` was set at, the flight's start's and its
-    /// landing's, each with its origin in the window (Shady #42 L2: set
-    /// once, not the narrowest drawn so far, which crept frame by frame
-    /// under a panel's flight; #62 r4 R4-1: the same width at another
-    /// origin is another layout); `None`: not yet (the wraps a flight
-    /// carries on from are kept where narrower).
-    pub wrap_at: Option<(Rect, Rect)>,
     /// A panel yielding on this flight (#51): the layout rides its spring.
     pub ride: Option<Ride>,
 }
@@ -134,7 +123,7 @@ impl Flight {
     }
 
     pub(crate) fn new(from: Node, to: Node, grow: Vec<PaneId>, ghosts: Vec<PaneId>) -> Self {
-        Flight { from, to, grow, ghosts, travel: 0., wrap: Vec::new(), wrap_at: None, ride: None }
+        Flight { from, to, grow, ghosts, travel: 0., ride: None }
     }
 
     /// A frame of its ride `r` (#51), the centre `area`: the panes by how
@@ -149,45 +138,6 @@ impl Flight {
         let t = if (r.to - r.from).abs() < 0.5 { 1. } else { ((area.w - r.from) / (r.to - r.from)).min(1.) };
         let at = |w: f32| Rect { w, ..area };
         self.to.lerp_px_from(&self.from, t, at(r.from), at(r.to), area)
-    }
-
-    /// Each pane's wrap (its narrowest width on the way), set from the
-    /// flight's ends laid out in `area` (the centre at the panels'
-    /// narrowest): a pane's width is a product of ratios lerped linearly,
-    /// least at an end (Shady #42 L2). Again only when `area`'s width
-    /// changes (a panel's flight starts or lands, a resize). A growing or
-    /// closing pane keeps its landed or last box, as before.
-    pub(crate) fn set_wraps(&mut self, area: Rect) {
-        self.set_wraps_at(area, area);
-    }
-
-    /// [`Flight::set_wraps`] from its ends each in its own centre: `from`
-    /// where the flight starts, `to` where it lands, each at its own
-    /// origin in the window (`x`, `y`: the panes are rounded on the
-    /// window's pixels, [`Node::rects_in`]). A panel yielding on this
-    /// flight (#51) moves on its spring from its start, so the centre and
-    /// the ratios move together: a pane's width, the product of a share
-    /// and the centre moving the other way, is still least at an end.
-    pub(crate) fn set_wraps_at(&mut self, from: Rect, to: Rect) {
-        if self.wrap_at == Some((from, to)) {
-            return;
-        }
-        let carried = self.wrap_at.is_none();
-        let ends = [self.from.rects(from), self.to.rects(to)];
-        for id in self.to.leaves() {
-            if self.grow.contains(&id) || self.ghosts.contains(&id) {
-                continue;
-            }
-            let w = ends.iter().filter_map(|rs| rs.iter().find(|(i, _)| *i == id).map(|(_, r)| r.w)).fold(f32::INFINITY, f32::min);
-            if !w.is_finite() {
-                continue;
-            }
-            match self.wrap.iter_mut().find(|(i, _)| *i == id) {
-                Some((_, old)) => *old = if carried { old.min(w) } else { w },
-                None => self.wrap.push((id, w)),
-            }
-        }
-        self.wrap_at = Some((from, to));
     }
 }
 

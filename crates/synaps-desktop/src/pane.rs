@@ -161,6 +161,13 @@ pub struct Pane {
     pub(crate) layout_naming: bool,
     /// The labels' move between inline and the gutter ([`crate::turns::HangFx`]).
     pub(crate) hang_fx: crate::turns::HangFx,
+    /// Its flight's landed box and column (its left edge in the window, its
+    /// width, the column's), and that flight's reveal if it widens
+    /// ([`crate::turns::Reveal`]); none at rest.
+    pub(crate) reveal: Option<((f32, f32, f32), Option<crate::turns::Reveal>)>,
+    /// The frame it was last drawn in ([`crate::motion::Motion::frame`])
+    /// and its box then: its left edge in the window and its width.
+    pub(crate) drawn_box: Option<(u64, (f32, f32))>,
     /// The metrics the last frame drew with (a fold's header height:
     /// [`AppView::start_gap`]).
     pub(crate) metrics_last: Cell<Option<Metrics>>,
@@ -483,6 +490,8 @@ impl Pane {
             layout: Layout::of(800., 800., &Metrics::at(crate::theme::DEFAULT_TEXT), Default::default()),
             layout_naming: false,
             hang_fx: Default::default(),
+            reveal: None,
+            drawn_box: None,
             metrics_last: Cell::new(None),
             body_line: 0.,
             column_key: (None, 0, None),
@@ -568,9 +577,8 @@ impl Pane {
 }
 
 /// Where a new flight starts ([`Panes::flight_ends`]): the layout as
-/// drawn, where the flight in the air goes, its growing and closing panes
-/// and its wraps.
-type FlightEnds = (crate::split::Node, crate::split::Node, Vec<PaneId>, Vec<PaneId>, Vec<(PaneId, f32)>);
+/// drawn, where the flight in the air goes, its growing and closing panes.
+type FlightEnds = (crate::split::Node, crate::split::Node, Vec<PaneId>, Vec<PaneId>);
 
 /// The window's panes (split panes step 3: up to [`PANES_MAX`], on
 /// [`Panes::tree`]).
@@ -655,8 +663,7 @@ impl Panes {
 
     /// Where a new flight starts (split.md §10, Shady #42 M1): the layout
     /// as drawn, and where the flight in the air goes (its closing panes in
-    /// it at 0), with its growing and closing panes and its wraps; at rest,
-    /// the tree.
+    /// it at 0), with its growing and closing panes; at rest, the tree.
     /// A new flight takes over: the one in the air (measured: it has had a
     /// frame) is what it turns from.
     fn hand_over(&mut self) {
@@ -671,10 +678,10 @@ impl Panes {
     fn flight_ends(&self) -> FlightEnds {
         use crate::split::Node;
         match &self.flight {
-            Some(f) if self.drawn.same_shape(&f.to) => (self.drawn.clone(), f.to.clone(), f.grow.clone(), f.ghosts.clone(), f.wrap.clone()),
+            Some(f) if self.drawn.same_shape(&f.to) => (self.drawn.clone(), f.to.clone(), f.grow.clone(), f.ghosts.clone()),
             _ => {
                 let drawn: Node = if self.drawn.same_shape(&self.tree) { self.drawn.clone() } else { self.tree.clone() };
-                (drawn, self.tree.clone(), Vec::new(), Vec::new(), Vec::new())
+                (drawn, self.tree.clone(), Vec::new(), Vec::new())
             }
         }
     }
@@ -685,7 +692,7 @@ impl Panes {
     pub(crate) fn fly_split(&mut self, tree: &crate::split::Node, at: PaneId, side: crate::split::Side, new: PaneId) {
         use crate::split::Flight;
         self.hand_over();
-        let (mut drawn, mut to, mut grow, mut ghosts, mut wrap) = self.flight_ends();
+        let (mut drawn, mut to, mut grow, mut ghosts) = self.flight_ends();
         // A closing pane's id handed out again (all four in use): its share
         // keeps closing under a ghost's id, its ground only (its content
         // goes: [`crate::app::AppView::reap_closing`]), and no pane moves
@@ -694,13 +701,12 @@ impl Panes {
             let ghost = (0u8..).map(PaneId::ghost).find(|g| !ghosts.contains(g)).unwrap_or(PaneId::ghost(0));
             ghosts.iter_mut().filter(|g| **g == new).for_each(|g| *g = ghost);
             grow.retain(|g| *g != new);
-            wrap.retain(|(g, _)| *g != new);
             (drawn, to) = (drawn.renamed(new, ghost), to.renamed(new, ghost));
         }
         let flight = match (drawn.split_as(at, side, new), to.split_as(at, side, new)) {
             (Some(from), Some(to)) if from.same_shape(&to) => {
                 grow.push(new);
-                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
+                Flight { from: from.grown_beside(new, Some(at)), to, grow, ghosts, travel: 0., ride: None }
             }
             _ => Flight::new(tree.grown_beside(new, Some(at)), tree.clone(), vec![new], Vec::new()),
         };
@@ -712,12 +718,12 @@ impl Panes {
     /// beside it taking it, every pane from where it is drawn.
     pub(crate) fn fly_close(&mut self, id: PaneId) {
         self.hand_over();
-        let (drawn, to, mut grow, mut ghosts, wrap) = self.flight_ends();
+        let (drawn, to, mut grow, mut ghosts) = self.flight_ends();
         grow.retain(|g| *g != id);
         ghosts.push(id);
         let to = to.zeroed(id);
         self.drawn = drawn.clone();
-        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None });
+        self.flight = Some(crate::split::Flight { from: drawn, to, grow, ghosts, travel: 0., ride: None });
     }
 
     /// The layout's flight to `to` (split.md §10: an equalise, a detent),
@@ -728,15 +734,15 @@ impl Panes {
     pub(crate) fn fly_to(&mut self, to: crate::split::Node, area: crate::split::Rect) {
         use crate::split::Flight;
         self.hand_over();
-        let (drawn, end, grow, ghosts, wrap) = self.flight_ends();
+        let (drawn, end, grow, ghosts) = self.flight_ends();
         let was = std::mem::replace(&mut self.tree, to.clone());
         let flight = if !ghosts.is_empty() && drawn.same_shape(&end) {
             let to = end.fitted(&to.rects(area), &ghosts);
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., ride: None }
         } else if ghosts.is_empty() && drawn.same_shape(&to) {
-            Flight { from: drawn, to, grow, ghosts, travel: 0., wrap, wrap_at: None, ride: None }
+            Flight { from: drawn, to, grow, ghosts, travel: 0., ride: None }
         } else {
-            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., wrap, wrap_at: None, ride: None }
+            Flight { from: was, to, grow: Vec::new(), ghosts: Vec::new(), travel: 0., ride: None }
         };
         self.drawn = flight.from.clone();
         self.flight = Some(flight);

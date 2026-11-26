@@ -114,7 +114,8 @@ pub(crate) struct Entry {
     /// [`crate::waiting`]'s order, this one at `at`.
     pub(crate) batch: Vec<Painted>,
     pub(crate) at: usize,
-    /// The highlighted option (Enter's), from the default.
+    /// The highlighted option (Enter's), from the choice remembered for
+    /// this question here ([`crate::recall`]), else the default.
     pub(crate) hi: Option<usize>,
     pub(crate) spot: Spot,
     /// A field to put the keys in once the card is painted: a form's
@@ -482,10 +483,10 @@ impl AppView {
         let tool = painted.tool_id.clone();
         self.panes.cur.ask.entry = Some(Entry {
             session,
+            hi: self.recall_start(&painted).or_else(|| start_on(&doc)),
             painted,
             batch,
             at,
-            hi: start_on(&doc),
             spot: Spot::Body,
             field,
             shown: Rc::default(),
