@@ -17,9 +17,9 @@
 //! once a second under ten minutes, once a minute above, only while the
 //! panel shows them, and not at all once nothing counts.
 //!
-//! An answer ages on both of this machine's clocks ([`Moment`]): a suspended
+//! An answer ages on both of this machine's clocks ([`Age`]): a suspended
 //! laptop wakes to the cache's real age, not to the minutes it showed when
-//! it slept.
+//! it slept, and a clock set back gives none of it back.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -43,8 +43,9 @@ const SLEPT: Duration = Duration::from_secs(5);
 /// A moment on both local clocks. The monotonic one (Linux
 /// `CLOCK_MONOTONIC`) stops while the machine is suspended; the wall clock
 /// does not, but can be set back. A snapshot ages by the larger of the two
-/// (the provider's TTL keeps running while this machine sleeps), never by
-/// the daemon's clock: a forwarded socket's daemon may disagree with ours.
+/// ([`Age`]: the provider's TTL keeps running while this machine sleeps),
+/// never by the daemon's clock: a forwarded socket's daemon may disagree
+/// with ours.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Moment {
     pub mono: Instant,
@@ -61,13 +62,44 @@ impl Moment {
         };
         now
     }
+}
 
-    /// Since `self`: the larger of the two clocks' (a wall clock set back
-    /// counts nothing; a suspended machine's sleep counts).
-    fn age(&self, now: Moment) -> Duration {
-        let mono = now.mono.saturating_duration_since(self.mono);
-        let wall = now.wall.duration_since(self.wall).unwrap_or_default();
-        mono.max(wall)
+/// How old an answer is: what it was last read as, and the larger of the
+/// two clocks' steps since (a wall clock set back counts nothing; a
+/// suspended machine's sleep counts). Each read keeps what it saw, so the
+/// age never goes back (Shady #100 F3): a wall clock that ran ahead and
+/// was then corrected, or a suspend and then a correction, gives none of
+/// it back. Only a new answer counts afresh.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Age {
+    /// When the answer came.
+    at: Moment,
+    /// The last read, and the age it saw.
+    seen: std::cell::Cell<(Moment, Duration)>,
+}
+
+impl Age {
+    pub fn new(at: Moment) -> Age {
+        Age { at, seen: std::cell::Cell::new((at, Duration::ZERO)) }
+    }
+
+    /// The age at `now` (kept: no later read says less).
+    pub fn at(&self, now: Moment) -> Duration {
+        let (last, age) = self.seen.get();
+        let step = now.mono.saturating_duration_since(last.mono).max(now.wall.duration_since(last.wall).unwrap_or_default());
+        let age = age + step;
+        // A read with an earlier monotonic moment than the last: the age
+        // stands, and the last read stays the base.
+        if now.mono >= last.mono {
+            self.seen.set((now, age));
+        }
+        age
+    }
+
+    /// The wall clock ran more than [`SLEPT`] ahead of the monotonic one
+    /// since the answer: the machine slept (or its clock was stepped).
+    pub fn slept(&self, now: Moment) -> bool {
+        self.at(now) > now.mono.saturating_duration_since(self.at.mono) + SLEPT
     }
 }
 
@@ -102,7 +134,7 @@ fn step(d: Duration) -> Option<Duration> {
 /// One `Status` answer's keep-warm, read at `at`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Warm {
-    pub at: Moment,
+    pub at: Age,
     /// `off`, `auto`, `<N>h`; empty: the daemon did not say (parked).
     pub mode: String,
     pub pinned: bool,
@@ -116,7 +148,7 @@ impl Warm {
     pub fn from_status(v: &Value, at: Moment) -> Warm {
         let kw = &v["keepwarm"];
         Warm {
-            at,
+            at: Age::new(at),
             mode: kw["mode"].as_str().unwrap_or_default().to_string(),
             pinned: v["pinned"].as_bool().unwrap_or(false),
             pings: kw["session_pings"].as_u64().unwrap_or(0),
@@ -127,20 +159,19 @@ impl Warm {
 
     /// Until the next keep-warm ping, now.
     pub fn ping_in(&self, now: Moment) -> Option<Duration> {
-        self.next_ping.map(|d| d.saturating_sub(self.at.age(now)))
+        self.next_ping.map(|d| d.saturating_sub(self.at.at(now)))
     }
 
     /// The machine slept (or its clock jumped ahead) since the answer.
     pub fn slept(&self, now: Moment) -> bool {
-        let mono = now.mono.saturating_duration_since(self.at.mono);
-        now.wall.duration_since(self.at.wall).is_ok_and(|wall| wall > mono + SLEPT)
+        self.at.slept(now)
     }
 
     /// The snapshot as it stands now, read again at `now` (after a sleep:
     /// both clocks agree from here on).
     pub fn rebase(&mut self, now: Moment) {
         self.next_ping = self.ping_in(now);
-        self.at = now;
+        self.at = Age::new(now);
     }
 
     /// When the next-ping countdown next changes; `None`: no ping due.
@@ -152,14 +183,14 @@ impl Warm {
     /// (it moves the cache's anchor), and not within [`REFRESH_MIN`] of the
     /// last answer. `None`: no ping is due.
     pub fn refresh_at(&self, now: Moment) -> Option<Instant> {
-        self.next_ping.map(|d| now.mono + (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.at.age(now)))
+        self.next_ping.map(|d| now.mono + (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.at.at(now)))
     }
 }
 
 /// One `cache_expiry` answer, read at `at`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Expiry {
-    pub at: Moment,
+    pub at: Age,
     pub answer: Result<CacheExpiry, QueryError>,
     /// The `warm` countdown reached zero and the daemon was asked once more.
     pub asked_at_zero: bool,
@@ -167,13 +198,13 @@ pub(crate) struct Expiry {
 
 impl Expiry {
     pub fn new(answer: Result<CacheExpiry, QueryError>, at: Moment) -> Expiry {
-        Expiry { at, answer, asked_at_zero: false }
+        Expiry { at: Age::new(at), answer, asked_at_zero: false }
     }
 
     /// `warm`: what is left of `warm_for_secs` now (zero: the band).
     pub fn warm_left(&self, now: Moment) -> Option<Duration> {
         let c = self.answer.as_ref().ok().filter(|c| c.state == CacheState::Warm)?;
-        Some(Duration::from_secs(c.warm_for_secs?).saturating_sub(self.at.age(now)))
+        Some(Duration::from_secs(c.warm_for_secs?).saturating_sub(self.at.at(now)))
     }
 
     /// The answer as it stands now: its durations aged (lower bounds
@@ -181,7 +212,7 @@ impl Expiry {
     /// Never extended: nothing here counts up.
     pub fn aged(&self, now: Moment) -> Result<CacheExpiry, QueryError> {
         let mut c = self.answer.clone()?;
-        let age = self.at.age(now);
+        let age = self.at.at(now);
         let down = |s: Option<u64>| s.map(|s| Duration::from_secs(s).saturating_sub(age).as_secs());
         let up = |s: Option<u64>| {
             s.map(|s| {
@@ -426,7 +457,7 @@ mod tests {
     #[test]
     fn warm_counts_down_then_is_the_band() {
         let t0 = Moment::now();
-        let mut e = expiry(json!({"state": "warm", "warm_for_secs": 222, "lapse_by_secs": 3600, "proof_ttl_secs": 300}), t0);
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 222, "lapse_by_secs": 3600, "proof_ttl_secs": 300}), t0);
         assert_eq!(says(&expires(Some(&e), true, after(t0, 100))), ("about 2:02", Tone::Ink));
         let zero = after(t0, 222);
         let c = expires(Some(&e), true, zero);
@@ -435,6 +466,7 @@ mod tests {
         let c = expires(Some(&e), true, after(t0, 9999));
         assert_eq!((says(&c), c.tip.as_deref()), (("expired?", Tone::Warn), Some("May have expired")), "never cold by itself");
         assert_eq!(e.next_change(zero), None, "nothing ticks at zero");
+        let mut e = expiry(json!({"state": "warm", "warm_for_secs": 222}), t0);
         assert_eq!(e.zero_at(t0), Some(t0.mono + Duration::from_secs(222)));
         e.asked_at_zero = true;
         assert_eq!(e.zero_at(t0), None, "asked once");
@@ -508,6 +540,44 @@ mod tests {
         let far = Moment { mono: t0.mono + Duration::from_secs(86_400), wall: t0.wall - Duration::from_secs(1) };
         assert_eq!(e.warm_left(far), Some(Duration::ZERO));
         assert_eq!(e.next_change(far), None);
+    }
+
+    /// Shady #100 F3: what one answer has been read as aged stays aged. A
+    /// wall clock that ran ahead and was set back, or a suspend and then a
+    /// correction, never gives a countdown back: the remaining time never
+    /// rises, and a run-out answer never counts again, before the daemon
+    /// answers anew.
+    #[test]
+    fn a_clock_corrected_back_never_raises_the_countdown() {
+        let t0 = Moment::now();
+        let at = |mono: u64, wall: u64| Moment { mono: t0.mono + Duration::from_secs(mono), wall: t0.wall + Duration::from_secs(wall) };
+        // The wall clock 4 s ahead (under the 5 s sleep line), then corrected.
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
+        assert_eq!(expires(Some(&e), true, at(10, 14)).text, "about 3:46");
+        assert_eq!(expires(Some(&e), true, at(11, 11)).text, "about 3:45", "one second on, not three back");
+        let w = Warm::from_status(&status(), t0);
+        assert_eq!(w.ping_in(at(10, 14)), Some(Duration::from_secs(2986)));
+        assert_eq!(w.ping_in(at(11, 11)), Some(Duration::from_secs(2985)), "the next ping's countdown too");
+        // Run out by a wall clock far ahead, then corrected: still run out.
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
+        assert_eq!(expires(Some(&e), true, at(10, 610)).text, "expired?");
+        let back = at(20, 20);
+        assert_eq!(expires(Some(&e), true, back).text, "expired?", "not resurrected");
+        assert_eq!((e.warm_left(back), e.next_change(back)), (Some(Duration::ZERO), None));
+        // Awake a minute, a suspend, then the clock corrected before any
+        // new answer: the band stays.
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
+        assert_eq!(expires(Some(&e), true, at(60, 60)).text, "about 3:00");
+        assert_eq!(expires(Some(&e), true, at(60, 660)).text, "expired?");
+        assert_eq!(expires(Some(&e), true, at(61, 61)).text, "expired?");
+        // Read in any order, never more left than the last read said.
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 240}), t0);
+        let mut last = Duration::MAX;
+        for (mono, wall) in [(1, 3), (2, 2), (3, 9), (4, 4), (5, 5), (5, 1), (9, 9)] {
+            let left = e.warm_left(at(mono, wall)).unwrap();
+            assert!(left <= last, "at ({mono}, {wall}): {left:?} after {last:?}");
+            last = left;
+        }
     }
 
     /// The TTL the server is known to honour, and what was asked when it
