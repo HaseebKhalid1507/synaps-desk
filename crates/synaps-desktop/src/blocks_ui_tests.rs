@@ -892,7 +892,7 @@ fn a_path_keeps_its_file_name_at_320(cx: &mut TestAppContext) {
     for text in [crate::theme::Panels::default().text_size, 22] {
         let (w, view) = blocks_at(cx, 320. + 2. * crate::app::STRIP, text);
         let m = view.read_with(cx, |v, _| v.panes.cur.metrics_last.get().expect("drawn"));
-        let whole = |name: &str| crate::blocks::cols(name) as f32 * m.mono * 0.6 - 1.;
+        let whole = |name: &str| crate::blocks::cols(name) as f32 * m.mono * 0.6 - 0.25;
         let rows = edit_rows(cx, &view);
         assert!(!rows.is_empty(), "the demo's edit calls");
         for r in rows {
@@ -908,6 +908,15 @@ fn a_path_keeps_its_file_name_at_320(cx: &mut TestAppContext) {
                 assert!(name.size.width >= target.size.width - px(0.5) && target.size.width > px(90.), "{text} row {r}: {target:?}");
             } else {
                 assert!(f32::from(name.size.width) >= whole("token_store.rs"), "{text} row {r}: the name whole ({name:?})");
+            }
+            // Cut in its middle only once its folder is gone (to `…`).
+            if f32::from(name.size.width) < whole("token_store.rs")
+                && let Some(dir) = bounds(cx, w, format!("tool-dir {r}"))
+            {
+                assert!(
+                    f32::from(dir.size.width) <= 2. * m.mono * 0.6 + 1.,
+                    "{text} row {r}: the folder gave way first ({dir:?}, {name:?})"
+                );
             }
             if let Some(facts) = bounds(cx, w, format!("tool-facts {r}")).filter(|f| f.top() < target.bottom()) {
                 assert!(facts.left() >= name.right() - px(0.5), "{text} row {r}: the facts after the name");
@@ -935,6 +944,14 @@ fn a_path_keeps_its_file_name_at_320(cx: &mut TestAppContext) {
                 assert!(f32::from(path.size.width) >= 6. * m.mono * 0.6, "{text} {name}: `{shown}` stays ({path:?})");
             } else {
                 assert!(f32::from(path.size.width) >= whole(shown).min(most - 1.), "{text} {name}: `{shown}` whole ({path:?})");
+            }
+            if f32::from(path.size.width) < whole(shown).min(most - 1.)
+                && let Some(dir) = bounds(cx, w, format!("block-dir {b}"))
+            {
+                assert!(
+                    f32::from(dir.size.width) <= 2. * m.mono * 0.6 + 1.,
+                    "{text} {name}: the folder gave way first ({dir:?}, {path:?})"
+                );
             }
             if titled && let Some(t) = bounds(cx, w, format!("block-title {b}")).filter(|t| t.size.width > px(0.5)) {
                 assert!(t.right() <= path.left() + px(0.5), "{text} {name}: the title before the path");
