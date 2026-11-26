@@ -653,3 +653,105 @@ fn a_glow_asks_for_frames_only_while_it_runs(cx: &mut TestAppContext) {
         }
     }
 }
+
+/// Re-folds (`cards_spec::board` guarantee 6): one at a time, off the
+/// frame; the board at a position is the reference's; a request while one
+/// runs stops it and waits for its end; another history drops it; asked
+/// again once done, nothing runs; withdrawn, nothing is kept.
+#[gpui_kit::test]
+fn refolds_run_one_at_a_time_and_drop_when_their_history_changes(cx: &mut TestAppContext) {
+    use cards_spec::board::{Pos, Refold, Target};
+    let (w, view) = blocks(cx, 1500.);
+    let live = view.read_with(cx, |v, _| v.panes.cur.live);
+    let (events, generation) = view.read_with(cx, |v, _| {
+        let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
+        (i.events(), i.generation)
+    });
+    let want = |at: Target| {
+        let mut rf = Refold::to(generation, &events, at).unwrap();
+        while !rf.step(usize::MAX).unwrap() {}
+        rf.state().cloned()
+    };
+    let (a, b) = (Target::Revision(Pos::event(8)), Target::Revision(Pos::event(events.len() - 1)));
+    let done = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.refolds.done.clone());
+    let started = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.refolds.started);
+    view.update(cx, |v, cx| v.refold(live, a, cx));
+    // Another request before it ends: it stops, and B runs after it.
+    view.update(cx, |v, cx| v.refold(live, b, cx));
+    assert_eq!(started(cx), 1, "one at a time: B waits");
+    cx.run_until_parked();
+    let d = done(cx).expect("B finished");
+    assert_eq!(d.target, b, "A was dropped, never finished");
+    assert_eq!(started(cx), 2);
+    assert_eq!(d.state.clone().unwrap().map(|s| (*s).clone()), want(b));
+    assert!(d.visited >= events.len());
+    // Asked again: nothing runs.
+    view.update(cx, |v, cx| v.refold(live, b, cx));
+    cx.run_until_parked();
+    assert_eq!(started(cx), 2);
+    // A on its own: the board at event 8.
+    view.update(cx, |v, cx| v.refold(live, a, cx));
+    cx.run_until_parked();
+    assert_eq!(started(cx), 3);
+    let d = done(cx).expect("A finished");
+    assert_eq!((d.target, d.state.unwrap().map(|s| (*s).clone())), (a, want(a)));
+    // Withdrawn: nothing kept.
+    view.update(cx, |v, _| v.refold_cancel());
+    assert!(done(cx).is_none());
+    // Another history while it runs (before it has had a turn): dropped,
+    // not finished.
+    let epoch = view.read_with(cx, |v, _| v.model.lives[live].transcript.blocks_epoch());
+    view.update(cx, |v, cx| {
+        v.refold(live, b, cx);
+        v.model.lives[live].transcript.apply_history(&synaps_client::synthetic::blocks_history()[..4]);
+        v.sync_board(live, cx);
+    });
+    assert_ne!(view.read_with(cx, |v, _| v.model.lives[live].transcript.blocks_epoch()), epoch, "another history");
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert!(done(cx).is_none(), "a re-fold of another history is dropped");
+    assert_eq!(started(cx), 4, "A, B, A again, then B on the old history");
+}
+
+/// Bounded caches (§1.8: renderer caches per pane): a pane's state per
+/// block (its fold, a well's scroll, `more`, its painted target) keeps
+/// only the blocks the board draws, and its edit previews one per file
+/// at most.
+#[gpui_kit::test]
+fn a_panes_block_caches_keep_only_what_the_board_draws(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let why = show_block(cx, w, &view, "why");
+    let at = head_at(cx, w, why);
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    mouse(cx, w, at, "up");
+    assert!(!folded(cx, &view, why));
+    let kept = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            let p = &v.panes.cur;
+            let mut rows: Vec<u64> = p.block_folds.rows();
+            rows.extend(p.lease.painted.borrow().keys());
+            rows.extend(p.block_scroll.borrow().keys());
+            rows.extend(p.block_more.iter());
+            rows
+        })
+    };
+    assert!(kept(cx).contains(&why), "its fold and its painted target kept");
+    // The pointer off the list (no lease), then the group removed.
+    mouse(cx, w, gpui_kit::point(px(2.), px(500.)), "move");
+    turn(cx, w, &view);
+    round(cx, w, &view, &[("toolu_x", json!([{"op":"remove","id":"why"}]), true)]);
+    assert!(row(cx, &view, "why").is_none(), "removed");
+    let drawn: std::collections::HashSet<u64> = view.read_with(cx, |v, _| {
+        let d = v.model.lives[v.panes.cur.live].transcript.drawn().cloned().expect("a board");
+        d.rows
+            .values()
+            .flat_map(|r| r.blocks.iter().flat_map(|s| std::iter::once(s).chain(&s.members)))
+            .map(|s| crate::blocks::row_id(&s.block.id))
+            .collect()
+    });
+    let left: Vec<u64> = kept(cx).into_iter().filter(|r| !drawn.contains(r)).collect();
+    assert!(left.is_empty(), "kept for blocks not drawn: {left:?}");
+    let files = view.read_with(cx, |v, _| v.panes.cur.block_edits.borrow().len());
+    assert!(files <= 32, "{files} edit previews");
+}

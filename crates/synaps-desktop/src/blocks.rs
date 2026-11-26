@@ -64,6 +64,8 @@ pub(crate) const NOTE_LINES: usize = 6;
 const EDIT_GROUPS: usize = 12;
 const EDIT_LINES: usize = 120;
 const EDIT_LINE_CHARS: usize = 160;
+/// Edit previews kept per pane (a board holds at most 32 blocks).
+const EDIT_FILES: usize = 32;
 
 fn hash(v: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -331,6 +333,17 @@ impl Folds {
         }
     }
 
+    /// Only the rows `keep` says.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&u64) -> bool) {
+        self.0.retain(|r, _| keep(r));
+    }
+
+    /// The rows it keeps a fold for (tests).
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> Vec<u64> {
+        self.0.keys().copied().collect()
+    }
+
     pub(crate) fn toggle(&mut self, id: u64, s: &Shown) {
         let folded = self.folded(id, s);
         self.0.insert(id, (folded, s.block.folded_at));
@@ -350,7 +363,12 @@ impl AppView {
             return v.clone();
         }
         let v = edit_preview(t.items(), l.shown_files(), file);
-        self.panes.cur.block_edits.borrow_mut().insert(file.to_string(), (key, v.clone()));
+        let mut kept = self.panes.cur.block_edits.borrow_mut();
+        // A preview per file the board draws: at most [`EDIT_FILES`] kept.
+        if kept.len() >= EDIT_FILES && !kept.contains_key(file) {
+            kept.clear();
+        }
+        kept.insert(file.to_string(), (key, v.clone()));
         v
     }
 

@@ -142,3 +142,93 @@ fn the_worker_reads_on_stops_between_slices_and_starts_over_on_another_epoch() {
     assert_eq!(w3.position(), other.history_len);
     assert!(again.live < one.live);
 }
+
+/// A history of one batch: `n` block calls (every third refused by the
+/// extension, every fifth another tool's call between), their results,
+/// then a results-only tail and another tool's calls after.
+fn big_batch(n: usize) -> Vec<Value> {
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    for k in 0..n {
+        let ops = json!([{"op":"patch","id":"plan","state":{"a": if k % 2 == 0 { "doing" } else { "done" }}}]);
+        let id = format!("t{k}");
+        calls.push(json!({"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}));
+        let text = if k % 3 == 0 { "cards_block: ops[0]: refused".to_string() } else { block_receipt(&ops) };
+        results.push(json!({"type": "tool_result", "tool_use_id": id, "content": text}));
+        if k % 5 == 0 {
+            let o = format!("o{k}");
+            calls.push(json!({"type": "tool_use", "id": o, "name": "bash", "input": {"command": "true"}}));
+            results.push(json!({"type": "tool_result", "tool_use_id": o, "content": "ok"}));
+        }
+    }
+    let put = json!([{"op":"put","id":"plan","kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"todo"}]}}]);
+    vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": "p", "name": "cards_block", "input": block_input(put.clone())}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "p", "content": block_receipt(&put)}]}),
+        json!({"role": "assistant", "content": calls}),
+        json!({"role": "user", "content": results}),
+        // Results only, then other tools' calls.
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "late"}]}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": "z", "name": "read", "input": {"path": "a"}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "z", "content": "a"}]}),
+    ]
+}
+
+/// D5's traces: at and past a replay's 256-call pass (`cards_spec::board`),
+/// with refused block calls, a results-only tail and other tools' calls,
+/// the worker's board is the reference fold's, read whole or a slice at a
+/// time, and each call's fate is its batch's.
+#[test]
+fn traces_at_and_past_a_replays_pass() {
+    for n in [255, 256, 257, 600] {
+        let h = big_batch(n);
+        let i = input(&h, Live::default());
+        let events = i.events();
+        let want = Board::fold(i.generation, &events);
+        let mut w = Worker::default();
+        let mut asked = 0;
+        let mut d = None;
+        while d.is_none() {
+            d = w.run(&i, &mut || {
+                asked += 1;
+                false
+            });
+        }
+        let d = d.unwrap();
+        assert_eq!(d.live, want.view(&events).live(), "{n}");
+        assert_eq!(d, Worker::default().run(&i, &mut || true).unwrap(), "{n}: sliced or whole, the same");
+        // Fates: every third refused (unbound), the rest bound; the late
+        // result after the batch's end binds nothing.
+        let mut f = Fates::default();
+        for at in 0..events.len() {
+            f.read(&events, at);
+        }
+        let mut fates: Vec<Fate> = f.done.values().copied().collect();
+        fates.extend(f.fates(&events, true).into_iter().map(|x| x.1));
+        let count = |x: Fate| fates.iter().filter(|f| **f == x).count();
+        assert_eq!(count(Fate::Unbound), n.div_ceil(3), "{n}");
+        assert_eq!(count(Fate::Bound), 1 + n - n.div_ceil(3), "{n}");
+        assert_eq!(count(Fate::Pending), 0, "{n}");
+    }
+}
+
+/// A history replaced during a job (another epoch: a clear, a compaction):
+/// the job for the old one stops between slices, and the next one starts
+/// over on the new history; what it publishes is the new history's board,
+/// whole, never a mix.
+#[test]
+fn a_history_replaced_during_a_job_starts_over() {
+    let long: Vec<Value> = blocks_history().into_iter().chain(crate::synthetic::history(20_000, 5)).collect();
+    let old = input(&long, Live::default());
+    let mut w = Worker::default();
+    assert!(w.run(&old, &mut || false).is_none(), "stopped after its first slice");
+    assert_eq!(w.position(), SLICE);
+    let new_h = blocks_history()[..6].to_vec();
+    let new = input(&new_h, Live::default());
+    assert_ne!(new.epoch, old.epoch);
+    let d = w.run(&new, &mut || true).expect("done");
+    assert_eq!(d.epoch, new.epoch);
+    assert_eq!(d, Worker::default().run(&new, &mut || true).unwrap(), "the new history's board, whole");
+    assert_eq!(w.position(), new.history_len);
+}

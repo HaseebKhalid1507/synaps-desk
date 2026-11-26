@@ -213,8 +213,23 @@ impl AppView {
                 this.panes.cur.lease.agent_op.set(Some(now));
             });
         }
-        self.model.lives[live].transcript.set_drawn(Some(drawn));
+        self.model.lives[live].transcript.set_drawn(Some(drawn.clone()));
         self.model.lives[live].board.published += 1;
+        // The panes' caches keep only the blocks this board draws (§1.8:
+        // renderer caches are bounded, per pane).
+        let rows: std::collections::HashSet<u64> = drawn
+            .rows
+            .values()
+            .flat_map(|r| r.blocks.iter().flat_map(|s| std::iter::once(s).chain(&s.members)))
+            .map(|s| crate::blocks::row_id(&s.block.id))
+            .collect();
+        for p in self.panes.iter_mut().filter(|p| p.live == live) {
+            p.lease.painted.borrow_mut().retain(|r, _| rows.contains(r));
+            p.lease.above.borrow_mut().retain(|r| rows.contains(r));
+            p.block_scroll.borrow_mut().retain(|r, _| rows.contains(r));
+            p.block_more.retain(|r| rows.contains(r));
+            p.block_folds.retain(|r| rows.contains(r));
+        }
         cx.notify();
     }
 

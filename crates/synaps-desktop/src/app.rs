@@ -2221,6 +2221,8 @@ pub struct AppView {
     pub(crate) attach_source: Option<AttachSource>,
     /// The pointer lease's one wake, while a board waits ([`crate::lease`]).
     pub(crate) lease_wake: Option<Task<()>>,
+    /// The re-fold slot (`crate::board::Refolds`): one at a time, app-wide.
+    pub(crate) refolds: crate::board::Refolds,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
     /// they read, this app's own new settings, the gear's menu (and where
     /// the mouse-down that closed it from outside was), and the view on
@@ -2931,6 +2933,7 @@ impl AppView {
             once: None,
             attach_source: None,
             lease_wake: None,
+            refolds: crate::board::Refolds::default(),
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),

@@ -20,11 +20,21 @@
 //! - **Only a finished board is published**, one board for one input, and
 //!   only onto the history it was folded from ([`Drawn::epoch`]). Until it
 //!   lands, the rows draw the last one.
+//!
+//! **Re-folds** ([`Refolds`], guarantee 6): the board at a past position (a
+//! revision view, an evicted outcome: D7 and D8 ask for them). One runs at
+//! a time, app-wide (§1.8's one scratch): a request while one runs stops
+//! it and waits until it has ended. It runs off the frame in steps of
+//! [`REFOLD_STEP`] visits, the 30 ms clock checked between them, yielding
+//! when it is up. A re-fold whose request changed (another target, the
+//! view closed) or whose history did (another epoch) is dropped, never
+//! finished; `too far back to show` is its result like any other.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use cards_spec::board::{Event, Refold, State, Target, TooFar};
 use gpui_kit::*;
 use synaps_client::blocks::{Drawn, Input, Worker};
 
@@ -49,6 +59,91 @@ pub(crate) struct Work {
     /// A finished board that waits for a pane's pointer lease to end
     /// ([`crate::lease`]).
     pub(crate) waiting: Option<Arc<Drawn>>,
+}
+
+/// A re-fold step's budget in visits ([`Refold::step`]): small, so the
+/// 30 ms clock is checked often.
+pub(crate) const REFOLD_STEP: usize = 2_048;
+
+/// The re-fold slot (module docs): one running, the next request waiting.
+#[derive(Default)]
+pub(crate) struct Refolds {
+    running: Option<Running>,
+    /// The next request, run once the running one has ended.
+    next: Option<(LiveId, Target)>,
+    /// The last one finished, while its request stands.
+    pub(crate) done: Option<Refolded>,
+    /// Re-folds started (tests).
+    pub(crate) started: u64,
+}
+
+struct Running {
+    live: LiveId,
+    target: Target,
+    epoch: u64,
+    stop: Arc<AtomicBool>,
+    _task: Task<()>,
+}
+
+/// A finished re-fold: store `live`'s board at `target`, of the history
+/// `epoch`. `Ok(None)`: the target never took effect (its call didn't
+/// bind, or it is pending).
+#[derive(Clone, Debug)]
+pub(crate) struct Refolded {
+    pub(crate) live: LiveId,
+    pub(crate) target: Target,
+    pub(crate) epoch: u64,
+    pub(crate) state: Result<Option<Arc<State>>, TooFar>,
+    /// Its work, in visits ([`Refold::visited`]).
+    pub(crate) visited: usize,
+}
+
+/// What one turn of a re-fold came to, `budget` of the clock spent.
+#[derive(Debug)]
+pub(crate) enum Chunk {
+    Done(Result<Option<State>, TooFar>),
+    Paused,
+    Stopped,
+}
+
+/// Steps of [`REFOLD_STEP`] visits until it is done, stopped or `budget`
+/// is up (one step at least).
+pub(crate) fn chunk(rf: &mut Refold, stop: &AtomicBool, budget: Duration) -> Chunk {
+    let start = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Chunk::Stopped;
+        }
+        match rf.step(REFOLD_STEP) {
+            // Taken out at once: the re-fold is dropped right after, so two
+            // boards are kept only for that moment.
+            Ok(true) => return Chunk::Done(Ok(rf.state().cloned())),
+            Err(far) => return Chunk::Done(Err(far)),
+            Ok(false) if start.elapsed() >= budget => return Chunk::Paused,
+            Ok(false) => {}
+        }
+    }
+}
+
+/// A re-fold of `events` to `target`, run to its end or its stop, the
+/// executor given a turn each time the clock is up.
+async fn refold(
+    events: Vec<Event>,
+    generation: cards_spec::block::Generation,
+    target: Target,
+    stop: Arc<AtomicBool>,
+) -> Option<(Result<Option<State>, TooFar>, usize)> {
+    let mut rf = match Refold::to(generation, &events, target) {
+        Ok(rf) => rf,
+        Err(far) => return Some((Err(far), 0)),
+    };
+    loop {
+        match chunk(&mut rf, &stop, STEP) {
+            Chunk::Done(out) => return Some((out, rf.visited())),
+            Chunk::Stopped => return None,
+            Chunk::Paused => futures_lite::future::yield_now().await,
+        }
+    }
 }
 
 /// What one step came to.
@@ -98,6 +193,17 @@ impl AppView {
         l.board.asked = Some(rev);
         l.board.stop.store(true, Ordering::Relaxed);
         l.board.job = None;
+        // A re-fold of another history is dropped (module docs).
+        let epoch = l.transcript.blocks_epoch();
+        let r = &mut self.refolds;
+        if r.running.as_ref().is_some_and(|j| j.live == live && j.epoch != epoch) {
+            r.running.as_ref().inspect(|j| j.stop.store(true, Ordering::Relaxed));
+            r.next = r.next.filter(|n| n.0 != live);
+        }
+        if r.done.as_ref().is_some_and(|d| d.live == live && d.epoch != epoch) {
+            r.done = None;
+        }
+        let l = &mut self.model.lives[live];
         let Some(input) = l.transcript.blocks_input() else {
             l.board.waiting = None;
             if l.transcript.drawn().is_some() {
@@ -129,6 +235,78 @@ impl AppView {
         }));
     }
 
+    /// Store `live`'s board at `target` (module docs): a re-fold, run when
+    /// the slot is free; the one running for another request is stopped.
+    /// Asked again while it runs or once done, nothing new.
+    pub(crate) fn refold(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
+        let epoch = self.model.lives[live].transcript.blocks_epoch();
+        let r = &mut self.refolds;
+        if r.done.as_ref().is_some_and(|d| (d.live, d.target, d.epoch) == (live, target, epoch)) {
+            return;
+        }
+        r.done = None;
+        match &r.running {
+            Some(j) if (j.live, j.target, j.epoch) == (live, target, epoch) && !j.stop.load(Ordering::Relaxed) => {
+                r.next = None;
+            }
+            Some(j) => {
+                j.stop.store(true, Ordering::Relaxed);
+                r.next = Some((live, target));
+            }
+            None => self.refold_start(live, target, cx),
+        }
+    }
+
+    /// The re-fold's request withdrawn (its view closed): stopped, and
+    /// nothing kept.
+    pub(crate) fn refold_cancel(&mut self) {
+        let r = &mut self.refolds;
+        r.running.as_ref().inspect(|j| j.stop.store(true, Ordering::Relaxed));
+        r.next = None;
+        r.done = None;
+    }
+
+    fn refold_start(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
+        let t = &self.model.lives[live].transcript;
+        let Some(input) = t.blocks_input() else {
+            let epoch = t.blocks_epoch();
+            self.refolds.done = Some(Refolded { live, target, epoch, state: Ok(None), visited: 0 });
+            cx.notify();
+            return;
+        };
+        let (epoch, generation) = (input.epoch, input.generation);
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        self.refolds.started += 1;
+        let task = cx.spawn(async move |this, cx| {
+            let out = cx.background_spawn(async move { refold(input.events(), generation, target, s).await }).await;
+            let _ = this.update(cx, |v, cx| v.refold_ended(live, target, epoch, out, cx));
+        });
+        self.refolds.running = Some(Running { live, target, epoch, stop, _task: task });
+    }
+
+    /// A re-fold ended: kept if it finished and its request and history
+    /// still stand; then the request that waited runs.
+    fn refold_ended(
+        &mut self,
+        live: LiveId,
+        target: Target,
+        epoch: u64,
+        out: Option<(Result<Option<State>, TooFar>, usize)>,
+        cx: &mut Context<Self>,
+    ) {
+        let r = &mut self.refolds;
+        let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
+        let now = self.model.lives.get_mut(live).map(|l| l.transcript.blocks_epoch());
+        if let (Some((state, visited)), false, Some(true)) = (out, stopped, now.map(|e| e == epoch)) {
+            r.done = Some(Refolded { live, target, epoch, state: state.map(|s| s.map(Arc::new)), visited });
+            cx.notify();
+        }
+        if let Some((live, target)) = r.next.take() {
+            self.refold(live, target, cx);
+        }
+    }
+
     /// A finished board for store `live`: drawn if its history is still the
     /// store's (the same epoch), else dropped.
     fn board_landed(&mut self, live: LiveId, rev: u64, drawn: Arc<Drawn>, cx: &mut Context<Self>) {
@@ -145,7 +323,8 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, Input, Step, Worker, step};
+    use super::{Chunk, Duration, Input, REFOLD_STEP, Step, Worker, chunk, step};
+    use cards_spec::board::{Board, Pos, REFOLD_MAX, Refold, Target, TooFar};
     use serde_json::Value;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -189,5 +368,41 @@ mod tests {
         assert!(matches!(step(&w, &i, &stop, Duration::MAX), Step::Stopped));
         assert_eq!(w.lock().unwrap().position(), at);
         assert!(matches!(step(&w, &i, &go, Duration::MAX), Step::Done(_)));
+    }
+
+    /// Guarantee 6: a re-fold runs in steps of [`REFOLD_STEP`] visits, the
+    /// clock checked between them: with none left, one step and a pause;
+    /// stopped, it ends without a board; run on, it finishes with the
+    /// board a single run gives. Past [`REFOLD_MAX`] events it is too far
+    /// back, as a result like any other.
+    #[test]
+    fn a_refold_runs_in_small_steps_under_the_clock() {
+        let long: Vec<Value> = blocks_history().into_iter().chain(history(4_000, 9)).collect();
+        let i = input(&long);
+        let events = i.events();
+        let at = Target::Revision(Pos::event(events.len() - 1));
+        let mut whole = Refold::to(i.generation, &events, at).unwrap();
+        while !whole.step(usize::MAX).unwrap() {}
+        let mut rf = Refold::to(i.generation, &events, at).unwrap();
+        let go = AtomicBool::new(false);
+        let mut chunks = 0;
+        let state = loop {
+            let before = rf.visited();
+            match chunk(&mut rf, &go, Duration::ZERO) {
+                Chunk::Paused => assert_eq!(rf.visited() - before, REFOLD_STEP, "one step a chunk"),
+                Chunk::Done(s) => break s,
+                Chunk::Stopped => panic!("not stopped"),
+            }
+            chunks += 1;
+        };
+        assert!(chunks >= events.len() / REFOLD_STEP, "{chunks} chunks for {} events", events.len());
+        assert_eq!(state.unwrap().as_ref(), whole.state());
+        assert_eq!(whole.state(), Some(&Board::fold(i.generation, &events).bound(&events)));
+        let mut rf = Refold::to(i.generation, &events, at).unwrap();
+        assert!(matches!(chunk(&mut rf, &AtomicBool::new(true), Duration::MAX), Chunk::Stopped));
+        assert_eq!(rf.visited(), 0, "stopped before a step");
+        let many = vec![cards_spec::board::Event::User { text: String::new() }; REFOLD_MAX + 10];
+        let mut rf = Refold::to(i.generation, &many, Target::Outcome(Pos::event(0)));
+        assert!(rf.is_err() || matches!(chunk(rf.as_mut().unwrap(), &go, Duration::MAX), Chunk::Done(Err(TooFar))));
     }
 }
