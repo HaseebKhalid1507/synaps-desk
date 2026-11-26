@@ -13,7 +13,7 @@
 //! swapped exactly as before.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -95,6 +95,13 @@ pub struct Pane {
     pub(crate) toggled: Toggled,
     /// Runs the user unfolded (by their first item's id).
     pub(crate) open_runs: HashSet<u64>,
+    /// Blocks the user folded or unfolded here ([`crate::blocks::Folds`]),
+    /// notes opened past their 6 lines, diff wells' scroll, and edit
+    /// previews' groups (by file), by block row.
+    pub(crate) block_folds: crate::blocks::Folds,
+    pub(crate) block_more: HashSet<u64>,
+    pub(crate) block_scroll: std::cell::RefCell<HashMap<u64, gpui_kit::ScrollHandle>>,
+    pub(crate) block_edits: std::cell::RefCell<HashMap<String, (u64, crate::blocks::Preview)>>,
     /// The rows an unfold under Full is revealing: tail-follow is held
     /// paused while they do ([`AppView::hold_unfold`]).
     pub(crate) unfold_hold: Vec<u64>,
@@ -468,6 +475,10 @@ impl Pane {
             list,
             toggled: Toggled::default(),
             open_runs: HashSet::new(),
+            block_folds: Default::default(),
+            block_more: HashSet::new(),
+            block_scroll: Default::default(),
+            block_edits: Default::default(),
             unfold_hold: Vec::new(),
             synced_busy: false,
             files_gen: 0,

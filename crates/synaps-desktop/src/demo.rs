@@ -35,6 +35,11 @@ pub(crate) const ASK_FORM: &str = "20261124-101600-cd02";
 /// (ASKED, D3): `--offline --session 20261124-101700-cd03`; not in the
 /// session list either. `SYNAPS_DEMO_CARDS=1` lists the three (stills).
 pub(crate) const ASK_OPEN: &str = "20261124-101700-cd03";
+/// A session whose agent keeps blocks (synaps-cards `docs/blocks.md`, D5),
+/// every kind and most states ([`synaps_client::synthetic::blocks_history`]):
+/// `--offline --session 20261126-093000-bk01`; listed with
+/// `SYNAPS_DEMO_BLOCKS=1` (stills).
+pub(crate) const BLOCKS: &str = "20261126-093000-bk01";
 
 /// Message times (`_synaps_at`) on a demo history, as the host records
 /// them: from the local wall time in the session's id on, `step` seconds
@@ -132,6 +137,10 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
             rows.push(json!({"id": id, "name": "token-store", "title": title, "model": opus, "cwd": CWD, "lifecycle": "live",
                 "messages": 8, "cost_usd": 1.12, "state_since": ago(at / 2), "created_at": ago(at)}));
         }
+    }
+    if std::env::var("SYNAPS_DEMO_BLOCKS").as_deref() == Ok("1") {
+        rows.push(json!({"id": BLOCKS, "name": "relay-refresh", "title": "Close the refresh race", "model": opus, "cwd": CWD,
+            "lifecycle": "live", "messages": 13, "cost_usd": 2.31, "state_since": ago(3), "created_at": ago(25)}));
     }
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
 }
@@ -559,6 +568,9 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     }
     if id == ASK_OPEN {
         return attach_asks(attach_seq, ASK_OPEN, ask_open(), "Relay log levels");
+    }
+    if id == BLOCKS {
+        return attach_asks(attach_seq, BLOCKS, synaps_client::synthetic::blocks_history(), "Close the refresh race");
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let Some(m) = sessions(now, true).into_iter().find(|s| s.id == id) else { return Vec::new() };

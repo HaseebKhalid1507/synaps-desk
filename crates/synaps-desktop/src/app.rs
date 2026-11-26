@@ -7090,13 +7090,16 @@ impl AppView {
         let items = shown.items();
         let rows = &self.panes.cur.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
-        let new = turns::build(
+        // The session's own transcript has a board (a worker's view has none).
+        let board = shown.has_blocks() && self.model.lives[self.panes.cur.live].watch.focused().is_none();
+        let new = turns::build_with(
             items,
             &day,
             start,
             shown.busy(),
             &self.panes.cur.open_runs,
             self.model.lives[self.panes.cur.live].shown_subagents(),
+            board,
         );
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
@@ -7156,13 +7159,14 @@ impl AppView {
             items.len() > 2_000
                 || self.panes.cur.disp
                     == crate::cards::mark_edges(crate::authorize::with_prompts(
-                        turns::build(
+                        turns::build_with(
                             items,
                             &day,
                             0,
                             shown.busy(),
                             &self.panes.cur.open_runs,
-                            self.model.lives[self.panes.cur.live].shown_subagents()
+                            self.model.lives[self.panes.cur.live].shown_subagents(),
+                            board
                         ),
                         &prompts,
                         0
@@ -9285,6 +9289,9 @@ impl AppView {
                 self.find.clear();
             }
         }
+        // The board's work, if its input moved (off the frame: it lands as
+        // a later frame's change).
+        self.sync_board(self.panes.cur.live, cx);
         // The card first: its row in the list is its state's.
         self.read_list_view();
         self.sync_card(window, cx);

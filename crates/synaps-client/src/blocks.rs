@@ -138,7 +138,7 @@ impl HistoryBlocks {
     }
 
     /// History message `m`, its rows `rows` (the rows it pushed, in order).
-    pub(crate) fn message(&mut self, m: &Value, rows: &[Item]) {
+    pub fn message(&mut self, m: &Value, rows: &[Item]) {
         if self.generation.is_none() {
             self.generation = Some(block::Generation::of(m));
         }

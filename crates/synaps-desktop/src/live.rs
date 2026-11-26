@@ -71,6 +71,8 @@ pub struct Live {
     pub watch: Watch,
     /// Worker cancels armed and on their way ([`crate::wtabs`]).
     pub cancels: crate::wtabs::Cancels,
+    /// Its transcript's board, worked off the frame ([`crate::board`]).
+    pub(crate) board: crate::board::Work,
 }
 
 impl Default for Live {
@@ -89,6 +91,7 @@ impl Default for Live {
             stats: Stats::default(),
             watch: Watch::default(),
             cancels: Default::default(),
+            board: Default::default(),
         }
     }
 }
@@ -434,6 +437,11 @@ impl Lives {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Live> {
         self.slots.iter().map(|(_, l)| l)
+    }
+
+    /// Store `id`, if it still exists (a job that outlived its pane).
+    pub(crate) fn get_mut(&mut self, id: LiveId) -> Option<&mut Live> {
+        self.slots.iter_mut().find(|(i, _)| *i == id).map(|(_, l)| l)
     }
 
     /// Every store's id, oldest first.

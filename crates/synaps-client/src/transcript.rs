@@ -609,6 +609,17 @@ impl Transcript {
         crate::blocks::Input::of(&self.blocks, self.blocks_live.clone())
     }
 
+    /// A block call in the history or the live turn: the board draws them.
+    pub fn has_blocks(&self) -> bool {
+        self.blocks.has_blocks() || self.blocks_live.blocks
+    }
+
+    /// The history's epoch ([`crate::blocks::HistoryBlocks::epoch`]): a
+    /// board folded from another epoch's input is another history's.
+    pub fn blocks_epoch(&self) -> u64 {
+        self.blocks.epoch()
+    }
+
     /// The board the rows draw, the last one published.
     pub fn drawn(&self) -> Option<&Arc<crate::blocks::Drawn>> {
         self.drawn.as_ref()

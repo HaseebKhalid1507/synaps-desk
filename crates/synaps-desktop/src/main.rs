@@ -39,6 +39,8 @@ mod ask_keys;
 mod authorize;
 mod beat;
 mod bench;
+mod blocks;
+mod board;
 mod cards;
 mod chart;
 mod choice;

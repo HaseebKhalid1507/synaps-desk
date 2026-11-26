@@ -333,6 +333,13 @@ pub(crate) enum Kind {
     /// A user message that answers a card: the user's turn, drawn as one
     /// slim line, not the message's two ([`crate::ask`]).
     Answer,
+    /// A block the agent keeps (synaps-cards `docs/blocks.md` §1.2): the
+    /// `at`th of those anchored at its item's call, drawn after the run
+    /// that call is in (or after its card), never inside it
+    /// ([`crate::blocks`]).
+    Block {
+        at: u16,
+    },
 }
 
 /// A day line's row id: its item's, with this bit (item ids count up from 1).
@@ -430,6 +437,7 @@ fn live_call(x: &Item, subs: &Subagents) -> bool {
 /// the runs the user unfolded (by their first item's id); `subs`: a run
 /// holding a running subagent's call is live too; `day`: item `i`'s date
 /// (its row strings', `RowCache::time`), for the day lines.
+#[cfg(test)]
 pub(crate) fn build(
     items: &[Item],
     day: &dyn Fn(usize) -> Option<NaiveDate>,
@@ -437,6 +445,21 @@ pub(crate) fn build(
     busy: bool,
     open: &HashSet<u64>,
     subs: &Subagents,
+) -> Vec<Disp> {
+    build_with(items, day, from, busy, open, subs, false)
+}
+
+/// [`build`], `board`: the transcript's board draws its block calls, so a
+/// block call it hasn't drawn yet draws no row either ([`crate::blocks::silent`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with(
+    items: &[Item],
+    day: &dyn Fn(usize) -> Option<NaiveDate>,
+    from: usize,
+    busy: bool,
+    open: &HashSet<u64>,
+    subs: &Subagents,
+    board: bool,
 ) -> Vec<Disp> {
     let mut out = Vec::new();
     let mut agent = from > 0
@@ -469,6 +492,8 @@ pub(crate) fn build(
             ItemKind::Tool if crate::ask::asks(it) => {
                 out.push(row(Kind::Ask, gap(i), if agent { Who::None } else { Who::Agent }));
                 agent = true;
+                // A converted card's block, under its receipt (§1.5).
+                crate::blocks::rows(items, i..i + 1, &mut out, &mut agent, true);
                 i += 1;
             }
             ItemKind::User => {
@@ -493,18 +518,29 @@ pub(crate) fn build(
                         break;
                     }
                     days.next(day(end));
-                    if x.kind == ItemKind::Tool {
+                    if x.kind == ItemKind::Tool && !crate::blocks::silent(x, board) {
                         tools += 1;
                         done &= !live_call(x, subs);
                     }
                     (x.id, rev(x, subs)).hash(&mut h);
                     end += 1;
                 }
+                // A block call the board draws has no row: its blocks draw
+                // after the run (§1.2), and the run is the rest.
+                let shows = |k: usize| !crate::blocks::silent(&items[k], board);
+                let Some(first_row) = (start..end).find(|&k| shows(k)) else {
+                    crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
+                    i = end;
+                    continue;
+                };
                 let live = !done || (end == items.len() && busy);
                 let who = if agent { Who::None } else { Who::Agent };
                 agent = true;
                 let first = gap(start);
-                if !live && tools >= FOLD_AT {
+                // The agent titled it (`collapse` with `run`, §1.3): it folds
+                // under that title once finished, however short.
+                let titled = (start..end).any(|k| items[k].blocks.as_ref().is_some_and(|b| b.run.is_some()));
+                if !live && (tools >= FOLD_AT || titled && tools > 0) {
                     let unfolded = open.contains(&it.id);
                     out.push(Disp {
                         item: start,
@@ -515,7 +551,7 @@ pub(crate) fn build(
                         who,
                     });
                     if unfolded {
-                        out.extend((start..end).map(|k| Disp {
+                        out.extend((start..end).filter(|&k| shows(k)).map(|k| Disp {
                             item: k,
                             id: items[k].id,
                             rev: rev(&items[k], subs),
@@ -525,15 +561,16 @@ pub(crate) fn build(
                         }));
                     }
                 } else {
-                    out.extend((start..end).map(|k| Disp {
+                    out.extend((start..end).filter(|&k| shows(k)).map(|k| Disp {
                         item: k,
                         id: items[k].id,
                         rev: rev(&items[k], subs),
                         kind: Kind::Work,
-                        gap: if k == start { first } else { Gap::None },
-                        who: if k == start { who } else { Who::None },
+                        gap: if k == first_row { first } else { Gap::None },
+                        who: if k == first_row { who } else { Who::None },
                     }));
                 }
+                crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
                 i = end;
             }
             // An event: a message the agent answers, as a user's is (a
@@ -588,6 +625,8 @@ pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str
                 Kind::Summary { .. } => m.summary,
                 // Level with the card's head line, under its slot's top.
                 Kind::Ask => return Some((label::AGENT, p.agent, crate::ask::label_top(m))),
+                // Level with a block's header.
+                Kind::Block { .. } => crate::blocks::Geo::of(m).head,
                 _ => m.row,
             };
             Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
@@ -1171,6 +1210,9 @@ fn plus(n: usize) -> SharedString {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunSummary {
     pub tools: usize,
+    /// The agent's title for it (`collapse` with `run`, blocks.md §1.3):
+    /// drawn where `N tool calls` is.
+    pub title: Option<SharedString>,
     pub label: SharedString,
     /// Most used first (then first used first).
     pub tally: Vec<Tally>,
@@ -1202,7 +1244,8 @@ impl RunSummary {
         let (mut tools, mut ok, mut failed, mut denied, mut cancelled, mut stopped) = (0, 0, 0, 0, 0, 0);
         let mut delta = CallDelta::default();
         let mut last = (Glyph::Ok, Family::Ok);
-        for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool) {
+        let title = items.iter().find_map(|i| i.blocks.as_ref()?.run.as_deref().map(SharedString::new));
+        for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool && !crate::blocks::silent(i, true)) {
             tools += 1;
             let (g, _, family) = glyph::call(status(it), false, false);
             last = (g, family);
@@ -1255,6 +1298,7 @@ impl RunSummary {
             parts.into_iter().filter(|p| p.0 > 0).map(|(n, word, family)| (format!("{n} {word}").into(), family)).collect();
         RunSummary {
             tools,
+            title,
             label: format!("{tools} calls").into(),
             tally,
             ok,
@@ -1683,6 +1727,7 @@ impl AppView {
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
             Kind::Ask => self.render_ask(item, d.id, &p, &m, cx),
             Kind::Answer => self.render_answer(item, d.id, &p, &m),
+            Kind::Block { at } => self.render_block(item, at, d.id, &p, &m, cx),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
         // its slice, the first and last its edges. The slice (fill,
@@ -2006,7 +2051,11 @@ impl AppView {
         // mono cell's width: a little room to spare), then `+N more`.
         let cw = m.meta * 0.6;
         let calls = format!("{} tool call{}", s.tools, if s.tools == 1 { "" } else { "s" });
-        let label_w = text_w(calls.chars().count(), m.label * 0.6);
+        // The agent's title, at most half the column (it ellipsizes).
+        let label_w = match &s.title {
+            Some(t) => text_w(t.chars().count(), m.label * 0.55).min(lay.column / 2.),
+            None => text_w(calls.chars().count(), m.label * 0.6),
+        };
         // The card's edges and inset, the row's padding, the glyph, the
         // label, the trail and the chevron, the four gaps between them.
         let trail = s.trail_w(m.meta, tight);
@@ -2089,18 +2138,35 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
             .child(glyph::life(life, glyph::life_ink(life, p.card_d, p)))
-            .child(
+            .child(match &s.title {
+                // The agent's title (blocks.md §1.3), the count in the tally's tip.
+                Some(t) => div()
+                    .flex_shrink(1.)
+                    .max_w(px(label_w))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family(fonts::SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_px(m.label)
+                    .text_color(p.prose_t)
+                    .debug_selector(move || format!("run-title {id}"))
+                    .child(t.clone())
+                    .into_any_element(),
                 // `N tool calls` rolls while the run grows (polish.md P5).
-                motion::roll_count(self.fx.col(self.panes.cur.id), motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
-                    div()
-                        .flex_none()
-                        .font_family(fonts::SANS)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_px(m.label)
-                        .text_color(p.prose_t)
-                        .child(t)
-                }),
-            )
+                None => {
+                    motion::roll_count(self.fx.col(self.panes.cur.id), motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
+                        div()
+                            .flex_none()
+                            .font_family(fonts::SANS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_px(m.label)
+                            .text_color(p.prose_t)
+                            .child(t)
+                    })
+                }
+            })
             .child(tally)
             .child(crate::cards::facts(parts, p, m))
             .child(
@@ -2943,6 +3009,7 @@ mod tests {
                 Kind::Prompt => "prompt",
                 Kind::Ask => "ask",
                 Kind::Answer => "answer",
+                Kind::Block { .. } => "block",
             })
             .collect()
     }
