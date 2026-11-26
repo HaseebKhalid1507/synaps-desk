@@ -1242,6 +1242,79 @@ fn a_tabs_block_inputs_count_against_the_cache_budget(cx: &mut TestAppContext) {
     }
 }
 
+/// Shady #101 R3-2: cached sessions count what their boards keep (the
+/// published board with the inputs), a split pane's alias of a session
+/// caches nothing as it leaves (the store stays the other pane's, its
+/// board too), and past the aggregate budget the oldest entry goes whole:
+/// once evicted, nothing holds its worker or its published board. Two
+/// sessions of 120 block calls with 6 KB inputs each; the budget one and a
+/// half of them.
+#[gpui_kit::test]
+fn cached_boards_are_counted_and_go_whole_past_the_budget(cx: &mut TestAppContext) {
+    let pad = "q".repeat(6_000);
+    let n = 120;
+    let msgs = |tag: &str| {
+        let mut msgs = vec![json!({"role": "user", "content": "notes"})];
+        for k in 0..n {
+            let id = format!("toolu_{tag}{k}");
+            let ops = json!([{"op":"put","id":format!("{tag}{k}"),"kind":"note","body":{"text":pad}}]);
+            msgs.push(
+                json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops)}]}),
+            );
+            msgs.push(
+                json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "cards_block: refused (a test)"}]}),
+            );
+        }
+        msgs
+    };
+    let payload = n * pad.len();
+    let (w, view) = blocks(cx, 1500.);
+    view.update(cx, |v, _| v.app_settings.split = true);
+    land(cx, w, &view, msgs("a"));
+    board(cx, w, &view);
+    let (worker, drawn, drawn_bytes) = view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        let d = t.drawn().expect("A's board");
+        (std::sync::Arc::downgrade(&t.blocks_input().expect("blocks").worker), std::sync::Arc::downgrade(d), d.bytes)
+    });
+    let first = view.read_with(cx, |v, _| v.panes.cur.id);
+    let a = crate::demo::BLOCKS.to_string();
+    // A split: the new pane on A's store, then on another session.
+    {
+        use gpui_kit::AppContext as _;
+        cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
+    }
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 2, "split");
+    new_tab(cx, w, &view, crate::demo::SID);
+    assert!(!view.read_with(cx, |v, _| v.tab_cache.contains(&a)), "an alias leaving caches nothing");
+    assert!(worker.upgrade().is_some() && drawn.upgrade().is_some(), "A's board is the other pane's still");
+    // The first pane leaves A: cached, its board counted with its inputs.
+    view.update(cx, |v, cx| v.focus_pane(first, crate::pane::KeysTo::Pane, cx));
+    cx.run_until_parked();
+    new_tab(cx, w, &view, crate::demo::BLOCKS_TWIN);
+    let kept = view.update(cx, |v, _| {
+        let e = v.tab_cache.take(&a).expect("A cached as its last pane left it");
+        let bytes = e.bytes();
+        v.tab_cache = crate::tabs::Lru::new(crate::app::TAB_CACHE, bytes * 3 / 2);
+        v.tab_cache.put(a.clone(), e, bytes, |_| true);
+        bytes
+    });
+    assert!(drawn_bytes > 0 && kept >= 3 * payload + drawn_bytes, "{kept} bytes cached; {payload} of inputs, the board {drawn_bytes}");
+    assert!(worker.upgrade().is_some() && drawn.upgrade().is_some(), "cached: kept");
+    // B the same, then left: past the budget A goes, and with it the last
+    // owner of its worker and its board.
+    land(cx, w, &view, msgs("b"));
+    board(cx, w, &view);
+    new_tab(cx, w, &view, crate::demo::IDLE_CPU);
+    let b = crate::demo::BLOCKS_TWIN.to_string();
+    let (has_a, has_b, bytes) = view.read_with(cx, |v, _| (v.tab_cache.contains(&a), v.tab_cache.contains(&b), v.tab_cache.bytes()));
+    assert!(!has_a && has_b, "past the budget the oldest goes: A {has_a}, B {has_b}, {bytes} bytes");
+    wait(cx, w, &view, 200);
+    assert!(worker.upgrade().is_none() && drawn.upgrade().is_none(), "A's worker and board let go with it");
+}
+
 /// Session `sid` in a new tab of the pane acted on, shown.
 fn new_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sid: &str) {
     let client = view.update(cx, |v, cx| {

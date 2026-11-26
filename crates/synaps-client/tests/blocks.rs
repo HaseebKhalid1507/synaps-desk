@@ -17,7 +17,7 @@ use cards_spec::block::{BlockId, Ref};
 use cards_spec::board::Event;
 use cards_spec::fold::events;
 use serde_json::{Value, json};
-use synaps_client::blocks::{Drawn, Fate, RowBlocks, SLICE, Worker};
+use synaps_client::blocks::{Drawn, Fate, HOLD, RowBlocks, SLICE, Shown, Worker, event_bytes};
 use synaps_client::history::HistoryUpdate;
 use synaps_client::protocol::*;
 use synaps_client::synthetic::{BLOCKS_CARD, block_input, block_receipt, blocks_history};
@@ -693,6 +693,327 @@ fn a_job_reads_the_live_turn_a_slice_at_a_time_and_keeps_its_place() {
     assert!(w.run(&more, &mut || true).is_none(), "an input its log changed: a newer one stands");
     let done = w.run(&reset, &mut || true).expect("done");
     assert_eq!(of(done), reference(&mut r));
+}
+
+/// A live block call's two events: it starts, then its input is whole.
+fn live_pair(k: usize) -> [SessionEvent; 2] {
+    let id = format!("toolu_l{k}");
+    let ops = json!([{"op":"put","id":format!("n{k}"),"kind":"note","body":{"text":format!("note {k}")}}]);
+    [
+        llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})),
+        tool_use(&id, "cards_block", block_input(ops)),
+    ]
+}
+
+/// A history of one prompt, no card in it (a card's row makes the
+/// transcript fold the cards on every event, which these tests don't
+/// measure).
+fn plain() -> Vec<Value> {
+    vec![json!({"role": "user", "content": "notes"})]
+}
+
+/// A turn's start and a response's.
+fn live_start() -> [SessionEvent; 2] {
+    [
+        ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "go"})),
+        llm(json!({"kind": "llm", "llm": "response_start"})),
+    ]
+}
+
+/// `0..n` scrambled: a fixed permutation (a step coprime to `n`).
+fn scrambled(n: usize) -> Vec<usize> {
+    let step = (n / 2..n).find(|s| gcd(*s, n) == 1).unwrap_or(1);
+    (0..n).map(|j| j * step % n).collect()
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Shady #101 R3-1: a live call costs the frame no scan of the calls before
+/// it and moves none of them. Counted as the elements a fact reads or
+/// writes under the live log's lock (slots, rank nodes, cuts), not the
+/// events it writes: 255, 256, 257, 600, 3,000 and 12,000 calls, in order
+/// (each starts, then its input is whole) and out of order (all start,
+/// then they are whole scrambled); then their results. In order, every
+/// event touches O(log n) at most and the turn O(1) an event; out of
+/// order, O(log n) an event. Either way the events are in model order, the
+/// same.
+#[test]
+fn a_live_call_is_placed_without_reading_the_calls_before_it() {
+    for n in [255usize, 256, 257, 600, 3_000, 12_000] {
+        let log2 = (usize::BITS - n.leading_zeros()) as usize;
+        let mut drawn = Vec::new();
+        for out_of_order in [false, true] {
+            let mut d = Desk::of(attach(&plain()));
+            let (mut worst, mut events) = (0, 0);
+            let mut each = |d: &mut Desk, e: &SessionEvent| {
+                let v0 = d.t.blocks_live().visits();
+                d.apply(e);
+                worst = worst.max(d.t.blocks_live().visits() - v0);
+                events += 1;
+            };
+            for e in live_start() {
+                each(&mut d, &e);
+            }
+            if out_of_order {
+                for k in 0..n {
+                    each(&mut d, &live_pair(k)[0]);
+                }
+                for k in scrambled(n) {
+                    each(&mut d, &live_pair(k)[1]);
+                }
+            } else {
+                for k in 0..n {
+                    for e in live_pair(k) {
+                        each(&mut d, &e);
+                    }
+                }
+            }
+            for k in 0..n {
+                each(&mut d, &tool_result(&format!("toolu_l{k}"), "cards_block: refused (a test)"));
+            }
+            let total = d.t.blocks_live().visits();
+            let (each_at_most, in_all) = if out_of_order { (6 * log2 + 16, 4 * log2 + 8) } else { (log2 + 12, 8) };
+            assert!(worst <= each_at_most, "{n}, out of order {out_of_order}: an event touched {worst}");
+            assert!(total <= in_all * events, "{n}, out of order {out_of_order}: {total} touched for {events} events");
+            let input = d.t.blocks_input().unwrap();
+            let calls: Vec<String> = input.events()[input.history_len..]
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Call { tool_id, .. } => Some(tool_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls, (0..n).map(|k| format!("toolu_l{k}")).collect::<Vec<_>>(), "{n}: model order");
+            drawn.push(input.events());
+        }
+        assert_eq!(drawn[0], drawn[1], "{n}: the same events, in order or not");
+    }
+}
+
+/// Shady #101 R3-1: a reader holds the live log's lock for a batch of
+/// handles at most (about HOLD elements touched), whatever it reads and
+/// however long the turn: a job reading 14,000 live events, in order and
+/// out of order (a round's ranks read for each), a re-fold's copy of
+/// them, then a reset of them all (the worker cuts its copy of them off
+/// the lock) and its tiny replacement. Its events are made events off the
+/// lock, and what the reset let go is dropped off it too.
+#[test]
+fn a_reader_holds_the_live_log_for_a_batch_at_most() {
+    for out_of_order in [false, true] {
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        let n = 7_000;
+        if out_of_order {
+            for k in 0..n {
+                d.apply(&live_pair(k)[0]);
+            }
+            for k in scrambled(n) {
+                d.apply(&live_pair(k)[1]);
+            }
+        } else {
+            for k in 0..n {
+                for e in live_pair(k) {
+                    d.apply(&e);
+                }
+            }
+        }
+        for k in 0..n {
+            d.apply(&tool_result(&format!("toolu_l{k}"), "cards_block: refused (a test)"));
+        }
+        let input = d.t.blocks_input().unwrap();
+        assert!(input.live_len() > 3 * SLICE, "{}", input.live_len());
+        let _ = d.fold();
+        assert_eq!(d.w.retained().live, input.live_len(), "read whole");
+        assert_eq!(input.live_events().map(|e| e.len()), Some(input.live_len()), "a re-fold's copy");
+        let most = d.t.blocks_live().most_held();
+        assert!(most <= HOLD + 64, "out of order {out_of_order}: a hold touched {most}");
+        d.apply(&llm(json!({"kind": "llm", "llm": "response_reset"})));
+        d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+        for e in live_pair(n) {
+            d.apply(&e);
+        }
+        let _ = d.fold();
+        assert!(d.w.retained().live < 8, "cut: {}", d.w.retained().live);
+        let most = d.t.blocks_live().most_held();
+        assert!(most <= HOLD + 64, "out of order {out_of_order}: after the reset, a hold touched {most}");
+    }
+}
+
+/// Shady #101 R3-1 and R3-2: the worker cuts a long live turn (a reset
+/// after it read 14,000 events of it) off the log's lock, a slice at a
+/// time, asked between. Paused there on its own thread, the frame (a third
+/// thread: this fails, never hangs) adds live events and takes its input
+/// at once. Stopped there, its next run cuts on and ends on the board a
+/// fresh worker draws, and the room the cut events took is given back:
+/// the worker counts its journal as allocated, at least its events'
+/// bytes enumerated apart (the history's events and the live turn's).
+#[test]
+fn a_worker_cutting_a_long_turn_never_makes_the_frame_wait() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let h = plain();
+    let (mut d, mut r) = (Desk::of(attach(&h)), Desk::of(attach(&h)));
+    let both = |d: &mut Desk, r: &mut Desk, e: &SessionEvent| {
+        d.apply(e);
+        r.apply(e);
+    };
+    for e in live_start() {
+        both(&mut d, &mut r, &e);
+    }
+    let n = 7_000;
+    for k in 0..n {
+        for e in live_pair(k) {
+            both(&mut d, &mut r, &e);
+        }
+        both(&mut d, &mut r, &tool_result(&format!("toolu_l{k}"), "cards_block: refused (a test)"));
+    }
+    let _ = d.fold();
+    let read = d.w.retained();
+    assert!(read.live > 3 * SLICE, "{read:?}");
+    // The response again from its start: a tiny one.
+    let again = [llm(json!({"kind": "llm", "llm": "response_reset"})), llm(json!({"kind": "llm", "llm": "response_start"}))];
+    for e in again.iter().chain(&live_pair(n)) {
+        both(&mut d, &mut r, e);
+    }
+    let reset = d.t.blocks_input().unwrap();
+    let w = std::mem::take(&mut d.w);
+    let (paused_tx, paused) = mpsc::channel();
+    let (go_tx, go) = mpsc::channel::<()>();
+    let job = std::thread::spawn(move || {
+        let mut w = w;
+        let mut asked = 0;
+        let out = w.run(&reset, &mut || {
+            asked += 1;
+            if asked == 1 {
+                paused_tx.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            asked < 2
+        });
+        (w, asked, out.is_some())
+    });
+    paused.recv_timeout(Duration::from_secs(60)).expect("the worker paused inside its cut");
+    // The frame, meanwhile: live events and its input.
+    let (frame_tx, frame) = mpsc::channel();
+    let more: Vec<SessionEvent> = live_pair(n + 1).into_iter().chain(live_pair(n + 2)).collect();
+    let more2 = more.clone();
+    std::thread::spawn(move || {
+        for e in &more {
+            d.apply(e);
+        }
+        let len = d.t.blocks_input().unwrap().live_len();
+        frame_tx.send((d, len)).unwrap();
+    });
+    let (mut d, len) = frame.recv_timeout(Duration::from_secs(20)).expect("the frame never waits for the worker's cut");
+    for e in &more2 {
+        r.apply(e);
+    }
+    assert!(len > 0 && len < 16, "{len}");
+    go_tx.send(()).unwrap();
+    let (w, asked, done) = job.join().unwrap();
+    assert!(asked >= 2 && !done, "asked {asked}: stopped inside its cut");
+    let cut = w.retained();
+    assert!(cut.live < read.live && cut.live > 16, "cut on a slice at a time: {} of {}", cut.live, read.live);
+    d.w = w;
+    // The next run: cuts on, reads on, the board a fresh worker draws.
+    let input = d.t.blocks_input().unwrap();
+    let done = d.w.run(&input, &mut || true).expect("done");
+    let fresh = (*r.fold()).clone();
+    assert_eq!((done.rows, done.live, done.history, done.events), (fresh.rows, fresh.live, fresh.history, fresh.events));
+    let kept = d.w.retained();
+    assert_eq!(kept.journal, input.history_len + input.live_len());
+    assert!(kept.capacity <= 2 * kept.journal + SLICE, "the room given back: {} for {} events", kept.capacity, kept.journal);
+    let enumerated: usize = events(&h).iter().chain(&input.live_events().unwrap()).map(event_bytes).sum();
+    let room = (kept.capacity - kept.journal) * std::mem::size_of::<Event>();
+    assert!(kept.bytes >= enumerated + room + kept.board_bytes, "{} counted; {enumerated} of events, {room} of room", kept.bytes);
+}
+
+/// Shady #101 R3-2: the worker counts the card folds it keeps, the
+/// board's and the overlay's (each its own copy), as B2 counts them
+/// ([`cards_spec::board::Board::card_fold_bytes`]): a history of cards
+/// and blocks, then a live turn of both. The folds enumerated apart: a
+/// board of the history's events, and a copy of it read on over the live
+/// turn's.
+#[test]
+fn the_worker_counts_its_card_folds() {
+    let card = |k: usize| json!({"question": format!("Card {k}?"), "detail": "d".repeat(1_500), "options": ["Yes", "No", "Later"]});
+    let mut h = blocks_history();
+    for k in 0..40 {
+        let id = format!("toolu_c{k}");
+        h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_ui", "input": card(k)}]}));
+        h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "shown"}]}));
+    }
+    let mut d = Desk::of(attach(&h));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    for k in 0..20 {
+        let id = format!("toolu_lc{k}");
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": id})));
+        d.apply(&tool_use(&id, "cards_ui", card(100 + k)));
+        d.apply(&tool_result(&id, "shown"));
+    }
+    for e in live_pair(0) {
+        d.apply(&e);
+    }
+    let _ = d.fold();
+    let input = d.t.blocks_input().unwrap();
+    let history = events(&h);
+    let generation = cards_spec::block::Generation::of(&h[0]);
+    let mut base = cards_spec::board::Board::new(generation);
+    base.read(&history);
+    let mut over = base.clone();
+    let all: Vec<Event> = history.iter().cloned().chain(input.live_events().unwrap()).collect();
+    over.read(&all);
+    let (a, b) = (base.card_fold_bytes(), over.card_fold_bytes());
+    assert!(b > a && a > 40 * 1_500, "{a} {b}");
+    let kept = d.w.retained();
+    assert_eq!(kept.card_bytes, a + b, "the board's fold and the overlay's");
+    assert!(kept.bytes >= a + b + kept.board_bytes, "{kept:?}");
+    assert!(d.t.blocks_bytes() >= kept.bytes, "the tab counts them");
+}
+
+/// Shady #101 R3-2: the board the rows draw is counted with the input, at
+/// least its blocks' bodies and titles enumerated apart; a row's blocks are
+/// the board's, counted once; and a board published again (the same
+/// blocks) lets the one before go: its rows take the new board's, so the
+/// last owner of the old one is gone.
+#[test]
+fn the_published_board_is_counted_once_and_let_go() {
+    let mut h = vec![json!({"role": "user", "content": "notes"})];
+    for k in 0..30 {
+        let id = format!("toolu_p{k}");
+        let ops = json!([{"op":"put","id":format!("p{k}"),"kind":"note","title":format!("Note {k}"),"body":{"text":"n".repeat(1_400)}}]);
+        h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}]}));
+        h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": block_receipt(&ops)}]}));
+    }
+    let mut d = Desk::of(attach(&h));
+    let input = d.t.blocks_input().unwrap();
+    let first = Arc::new(d.w.run(&input, &mut || true).expect("done"));
+    let before = d.t.blocks_bytes();
+    d.t.set_drawn(Some(first.clone()));
+    let after = d.t.blocks_bytes();
+    let shown: Vec<&Shown> = first.rows.values().flat_map(|r| &r.blocks).collect();
+    assert!(shown.len() >= 30, "{} shown", shown.len());
+    let bodies: usize = shown
+        .iter()
+        .map(|s| std::mem::size_of::<cards_spec::board::Block>() + s.block.body.bytes() + s.block.title.as_ref().map_or(0, |t| t.len()))
+        .sum();
+    assert!(after - before >= bodies, "{} counted for the board, its blocks {bodies} at least", after - before);
+    assert!(after - before <= 4 * bodies + 64 * 1024, "{} counted for the board, once", after - before);
+    // The same board again: the rows take it; the one before goes.
+    let old = Arc::downgrade(first.rows.values().find(|r| !r.blocks.is_empty()).unwrap());
+    let old_block = Arc::downgrade(&shown[0].block);
+    drop(shown);
+    drop(first);
+    let _ = d.fold();
+    assert!(old.upgrade().is_none() && old_block.upgrade().is_none(), "the board before is let go");
+    let again = d.t.blocks_bytes();
+    assert!(again.abs_diff(after) <= after / 10, "counted once: {after} then {again}");
 }
 
 /// `h`'s board three ways, at each of its message boundaries from `from`

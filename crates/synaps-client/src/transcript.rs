@@ -633,11 +633,22 @@ impl Transcript {
         self.blocks.len()
     }
 
-    /// What the board's input keeps, heap included (bytes): the history's
-    /// blocks with its worker's fold ([`crate::blocks::HistoryBlocks::bytes`])
-    /// and the live turn's log ([`crate::blocks::LiveLog::bytes`]).
+    /// What the board's input and its output keep, heap included (bytes):
+    /// the history's blocks with its worker's fold
+    /// ([`crate::blocks::HistoryBlocks::bytes`]), the live turn's log
+    /// ([`crate::blocks::LiveLog::bytes`]), and the board the rows draw
+    /// ([`crate::blocks::Drawn::bytes`]), each owner once: a row's blocks
+    /// are the board's, but for a row's own entry (a committed fate added
+    /// to the board's: [`crate::blocks::RowBlocks::of`]).
     pub fn blocks_bytes(&self) -> usize {
-        self.blocks.bytes() + self.live_log.bytes()
+        use crate::blocks::RowBlocks;
+        let drawn = self.drawn.as_deref();
+        let own = |(id, b): (u64, &Arc<RowBlocks>)| {
+            let board = drawn.and_then(|d| d.rows.get(&id)).is_some_and(|r| Arc::ptr_eq(r, b));
+            if board || RowBlocks::is_shared(b) { 0 } else { b.own_bytes() }
+        };
+        let rows: usize = self.items.iter().filter_map(|i| Some((i.id, i.blocks.as_ref()?))).map(own).sum();
+        self.blocks.bytes() + self.live_log.bytes() + drawn.map_or(0, |d| d.bytes) + rows
     }
 
     /// The frame's work for the board's live input so far: the events its
@@ -697,11 +708,13 @@ impl Transcript {
                 if let Some(&f) = committed.get(&it.id) {
                     it.fate = Some(f);
                 }
+                // The board's own, even if the same as the one before: an
+                // older board's copy is let go (one owner, counted once).
                 let want = crate::blocks::RowBlocks::of(Some(&d), it.id, it.fate);
                 if it.blocks != want {
-                    it.blocks = want;
                     changed.push(ix);
                 }
+                it.blocks = want;
             }
             for ix in changed {
                 self.touch(ix);
@@ -719,9 +732,9 @@ impl Transcript {
         for (ix, it) in self.items.iter_mut().enumerate() {
             let want = crate::blocks::RowBlocks::of(self.drawn.as_deref(), it.id, it.fate);
             if it.blocks != want {
-                it.blocks = want;
                 changed.push(ix);
             }
+            it.blocks = want;
         }
         for ix in changed {
             self.touch(ix);

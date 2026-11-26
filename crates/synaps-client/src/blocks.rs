@@ -40,12 +40,21 @@
 //! its log's ([`LiveLog`]): its events written once each, as their facts
 //! come (a call's input is its row's, shared, not copied), and a job's
 //! input is a cursor into it, not a copy ([`Input`]). The frame's work for
-//! a live event is the events it adds, never the turn so far. A job
-//! copies the live turn's events after the history in its journal a slice
-//! at a time, off the frame, and reads the overlay on from where the last
-//! job stopped while what it read holds. Everything counted is counted
-//! with its heap ([`event_bytes`]): staged, journal, the live log, the
-//! overlay. **The worker is the history's** ([`HistoryBlocks::worker`]): what
+//! a live event is the events it adds, never the turn so far, and no scan
+//! or move of the calls before it: a call is placed in its slot (its rank
+//! a Fenwick tree's when it came out of order), so an event touches
+//! O(log n) elements at most, O(1) amortized in order ([`LiveLog::visits`]).
+//! **The frame never waits on a job.** Under the log's lock a reader takes
+//! nothing but whether its input holds, the cuts since, and a batch of
+//! handles (at most [`COPY`], about [`HOLD`] elements touched:
+//! [`LiveLog::most_held`]); it makes them events, cuts what no longer
+//! holds (a slice at a time, `go_on` asked between), copies the board and
+//! drops what a reset let go after letting go of the lock. A job reads the
+//! overlay on from where the last job stopped while what it read holds.
+//! Everything counted is counted with its heap ([`event_bytes`]) and its
+//! room as allocated: staged, journal, the live log, the overlay, the card
+//! folds (the board's and the overlay's, each its own), and the board
+//! published ([`Drawn::bytes`]). **The worker is the history's** ([`HistoryBlocks::worker`]): what
 //! owns the transcript (a store, the tab cache) owns its fold, and a new
 //! history (another epoch) has a new worker, so a store left, a tab
 //! evicted or a history replaced lets its fold go with it, and a tab shown
@@ -59,8 +68,8 @@
 //! the live turn read on it) and the bound prefix. It runs off the UI
 //! frame (the desk schedules it, guarantees 6 and 7): its staged events
 //! taken and read, and the live turn's copied and read, a slice of at most
-//! [`SLICE`] events at a time, `go_on` asked between slices; a stopped job
-//! keeps what it read. B2's `read` of a slice, its `view` and `bound`
+//! [`SLICE`] events at a time, `go_on` asked between slices (and between
+//! slices of a cut); a stopped job keeps what it read, and what it cut. B2's `read` of a slice, its `view` and `bound`
 //! can't be preempted, and the projection runs after the last slice
 //! without a check. It publishes only a finished board, one [`Drawn`] for
 //! one input.
@@ -342,7 +351,8 @@ pub fn event_bytes(e: &Event) -> usize {
 
 /// One of the live turn's events as its log keeps it ([`LiveLog`]): a
 /// call's input is its row's ([`Item::kept_input`], shared, not copied),
-/// made an event's only when a job reads it, off the frame.
+/// made an event's only when a job reads it, off the frame and off the
+/// log's lock (a reader takes [`Handle`]s under it, nothing more).
 #[derive(Clone, Debug)]
 enum Fact {
     Call { tool_id: String, name: String, input: Option<Arc<Value>>, row: u64 },
@@ -351,7 +361,11 @@ enum Fact {
     End,
 }
 
-static END: Fact = Fact::End;
+/// A fact as the log holds it: shared, so a reader takes one under the
+/// log's lock for the cost of a pointer.
+type Handle = Arc<Fact>;
+
+static END: LazyLock<Handle> = LazyLock::new(|| Arc::new(Fact::End));
 
 impl Fact {
     /// The board's event and its row.
@@ -367,10 +381,11 @@ impl Fact {
         }
     }
 
-    /// What it keeps of its own (bytes, heap included; a call's input is
-    /// its row's).
+    /// What it keeps of its own (bytes, heap included, its handle's count
+    /// too; a call's input is its row's).
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Fact>()
+        2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Fact>()
             + match self {
                 Fact::Call { tool_id, name, .. } => tool_id.capacity() + name.capacity(),
                 Fact::Result { tool_id, text } => tool_id.capacity() + text.capacity(),
@@ -380,43 +395,273 @@ impl Fact {
     }
 }
 
+/// Elements read or written under a log's lock ([`Store::touched`]): the
+/// frame's work per fact, and how long a reader holds the lock.
+#[derive(Debug, Default)]
+struct Touched {
+    now: std::cell::Cell<usize>,
+}
+
+impl Touched {
+    fn add(&self, n: usize) {
+        self.now.set(self.now.get() + n);
+    }
+}
+
+/// Which of a segment's slots hold a fact, as a Fenwick tree (one node a
+/// slot): a fact's rank among them, and the slot of the `j`th, each in
+/// O(log n) nodes touched. A slot added at the end touches its node's
+/// children (O(1) amortized, O(log n) at most); the last slot filled, one
+/// node.
+#[derive(Clone, Debug, Default)]
+struct Ranks {
+    tree: Vec<u32>,
+}
+
+impl Ranks {
+    /// Facts in slots `[0, k)`.
+    fn prefix(&self, k: usize, t: &Touched) -> usize {
+        let (mut i, mut n) = (k, 0);
+        while i > 0 {
+            n += self.tree[i - 1] as usize;
+            i &= i - 1;
+            t.add(1);
+        }
+        n
+    }
+
+    /// A slot at the end (`one`: a fact in it).
+    fn push(&mut self, one: bool, t: &Touched) {
+        let i = self.tree.len() + 1;
+        let low = i.isolate_lowest_one();
+        let (mut v, mut step) = (u32::from(one), 1);
+        while step < low {
+            v += self.tree[i - step - 1];
+            step <<= 1;
+            t.add(1);
+        }
+        self.tree.push(v);
+    }
+
+    /// Slot `k` gets a fact.
+    fn add(&mut self, k: usize, t: &Touched) {
+        let mut i = k + 1;
+        while i <= self.tree.len() {
+            self.tree[i - 1] += 1;
+            i += i.isolate_lowest_one();
+            t.add(1);
+        }
+    }
+
+    /// The slot of the `j`th fact (from 0).
+    fn select(&self, j: usize, t: &Touched) -> usize {
+        let n = self.tree.len();
+        let (mut at, mut left) = (0, j as u32 + 1);
+        let mut step = if n == 0 { 0 } else { 1 << (usize::BITS - 1 - n.leading_zeros()) };
+        while step > 0 {
+            if at + step <= n && self.tree[at + step - 1] < left {
+                at += step;
+                left -= self.tree[at - 1];
+            }
+            step >>= 1;
+            t.add(1);
+        }
+        at
+    }
+}
+
+/// A run of the live turn's events: slots in model order, a slot empty
+/// for a call whose input still streams (the open round's calls, by the
+/// round's index: a call whole out of order fills its slot, and nothing
+/// moves). Until a fact is past an empty slot (`gaps`) its first `len`
+/// slots are its facts, a fact's rank its slot; from then on its
+/// [`Ranks`] tell, kept from its first slot on.
+#[derive(Clone, Debug, Default)]
+struct Seg {
+    slots: Vec<Option<Handle>>,
+    len: usize,
+    ranks: Ranks,
+    gaps: bool,
+    /// Its facts' bytes ([`Fact::bytes`]).
+    bytes: usize,
+}
+
+impl Seg {
+    fn get(&self, k: usize, t: &Touched) -> &Handle {
+        t.add(1);
+        let at = if self.gaps { self.ranks.select(k, t) } else { k };
+        self.slots[at].as_ref().expect("a fact")
+    }
+
+    /// Slot `k`'s fact's rank: the facts before it.
+    fn rank(&self, k: usize, t: &Touched) -> usize {
+        if self.gaps { self.ranks.prefix(k, t) } else { k }
+    }
+
+    /// A slot at the end: fact `f`, or empty.
+    fn push(&mut self, f: Option<Handle>, t: &Touched) {
+        t.add(1);
+        let one = f.is_some();
+        self.bytes += f.as_deref().map_or(0, Fact::bytes);
+        self.gaps |= one && self.len < self.slots.len();
+        self.ranks.push(one, t);
+        self.slots.push(f);
+        self.len += usize::from(one);
+    }
+
+    /// Empty slot `k` gets fact `f`: its rank.
+    fn fill(&mut self, k: usize, f: Handle, t: &Touched) -> usize {
+        t.add(1);
+        self.bytes += f.bytes();
+        debug_assert!(self.slots[k].is_none());
+        self.slots[k] = Some(f);
+        self.gaps |= k != self.len;
+        self.len += 1;
+        self.ranks.add(k, t);
+        self.rank(k, t)
+    }
+
+    /// Slot `k`'s fact is `f` now: its rank.
+    fn set(&mut self, k: usize, f: Handle, t: &Touched) -> usize {
+        t.add(1);
+        self.bytes += f.bytes();
+        let old = self.slots[k].replace(f).expect("a fact");
+        self.bytes -= old.bytes();
+        self.rank(k, t)
+    }
+
+    /// What its slots and ranks hold besides the facts (bytes).
+    fn spare(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<Option<Handle>>() + self.ranks.tree.capacity() * 4
+    }
+}
+
+/// A log's cuts ([`Store`]), in order, and the lowest of each run of them
+/// a Fenwick tree's node spans: a cut adds its node (O(log n) nodes read
+/// at most, O(1) amortized), and the lowest since any cut is read from
+/// O(log² n) of them, none let go.
+#[derive(Debug, Default)]
+struct Cuts {
+    at: Vec<usize>,
+    low: Vec<usize>,
+}
+
+impl Cuts {
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    fn push(&mut self, at: usize, t: &Touched) {
+        let i = self.at.len() + 1;
+        let span = i.isolate_lowest_one();
+        let (mut low, mut step) = (at, 1);
+        while step < span {
+            low = low.min(self.low[i - step - 1]);
+            step <<= 1;
+            t.add(1);
+        }
+        self.at.push(at);
+        self.low.push(low);
+        t.add(1);
+    }
+
+    /// The lowest cut since the first `from`.
+    fn since(&self, from: usize, t: &Touched) -> Option<usize> {
+        let (mut i, mut low) = (self.at.len(), None::<usize>);
+        while i > from {
+            let start = i - i.isolate_lowest_one();
+            let v = if start >= from {
+                let v = self.low[i - 1];
+                i = start;
+                v
+            } else {
+                i -= 1;
+                self.at[i]
+            };
+            low = Some(low.map_or(v, |l| l.min(v)));
+            t.add(1);
+        }
+        low
+    }
+}
+
 /// The live turn's events in order (module docs): those before the open
 /// round, then the open round's (its leading `ResultsEnd`, its whole calls
 /// in model order, its results, its `ResultsEnd`). The one copy: the
 /// transcript adds to it a fact at a time ([`LiveLog`]), and a job reads
-/// it through its cursor, a slice at a time, off the frame. A change other
-/// than an event added at its end (a reset, a call whole after its round's
-/// results, a call's input again) is a cut, at the lowest place it
-/// changed: a cursor holds for every cut past its length.
+/// it through its cursor, a batch of handles at a time, off the frame. A
+/// change other than an event added at its end (a reset, a call whole
+/// after its round's results, a call's input again) is a cut, at the
+/// lowest place it changed: a cursor holds for every cut past its length.
+/// Nothing under its lock costs more than a fact's events, or a reader's
+/// batch: O(1) amortized, and O(log n) nodes for a call whole out of
+/// order or a cut asked about ([`Store::touched`] counts them).
 #[derive(Debug, Default)]
 struct Store {
     /// The events before the open round, in segments (a sealed round's
     /// calls and results are moved in whole: a seal moves no event), and
     /// where each starts.
-    done: Vec<Vec<Fact>>,
+    done: Vec<Seg>,
     starts: Vec<usize>,
     done_len: usize,
     /// The last segment takes single events (a sealed round's don't).
     loose: bool,
     lead: bool,
-    calls: Vec<Fact>,
-    results: Vec<Fact>,
+    calls: Seg,
+    results: Seg,
     end: bool,
-    cuts: Vec<usize>,
-    /// Its facts' bytes ([`Fact::bytes`]).
-    bytes: usize,
+    cuts: Cuts,
+    /// The facts its events let go (a reset's), for a job to drop off the
+    /// frame and off the lock (else a fact at a time, a few per fact).
+    dead: Vec<Seg>,
+    /// Elements read or written under its lock: in all, and the most in
+    /// one hold ([`Held`]).
+    touched: Touched,
+    visits: usize,
+    most: usize,
+}
+
+/// A log's store, locked: what it touched counted when it lets go.
+struct Held<'a>(std::sync::MutexGuard<'a, Store>);
+
+impl std::ops::Deref for Held<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.0
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let s = &mut *self.0;
+        let n = s.touched.now.replace(0);
+        s.visits += n;
+        s.most = s.most.max(n);
+    }
+}
+
+fn hold(store: &Mutex<Store>) -> Held<'_> {
+    Held(store.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 impl Store {
     fn len(&self) -> usize {
-        self.done_len + usize::from(self.lead) + self.calls.len() + self.results.len() + usize::from(self.end)
+        self.done_len + usize::from(self.lead) + self.calls.len + self.results.len + usize::from(self.end)
     }
 
     /// Its `k`th event.
-    fn get(&self, mut k: usize) -> &Fact {
+    fn get(&self, mut k: usize) -> &Handle {
+        let t = &self.touched;
         if k < self.done_len {
+            t.add(usize::BITS as usize - self.starts.len().leading_zeros() as usize + 1);
             let seg = self.starts.partition_point(|&s| s <= k) - 1;
-            return &self.done[seg][k - self.starts[seg]];
+            return self.done[seg].get(k - self.starts[seg], t);
         }
         k -= self.done_len;
         if self.lead {
@@ -425,44 +670,67 @@ impl Store {
             }
             k -= 1;
         }
-        if k < self.calls.len() {
-            return &self.calls[k];
+        if k < self.calls.len {
+            return self.calls.get(k, t);
         }
-        k -= self.calls.len();
-        self.results.get(k).unwrap_or(&END)
+        k -= self.calls.len;
+        if k < self.results.len {
+            return self.results.get(k, t);
+        }
+        &END
     }
 
     /// How many of its first `len` events still hold for a reader that
     /// saw its first `cuts` cuts.
     fn kept(&self, cuts: usize, len: usize) -> usize {
-        self.cuts.get(cuts..).unwrap_or_default().iter().fold(len, |a, &c| a.min(c))
+        self.cuts.since(cuts, &self.touched).map_or(len, |c| c.min(len))
     }
 
-    fn push(v: &mut Vec<Fact>, bytes: &mut usize, f: Fact) {
-        *bytes += f.bytes();
-        v.push(f);
+    /// A cut at `at`.
+    fn cut(&mut self, at: usize) {
+        self.cuts.push(at, &self.touched);
     }
 
-    /// Event `f` after the events before the open round.
+    /// Its facts' bytes ([`Fact::bytes`]), those its events let go too.
+    fn fact_bytes(&self) -> usize {
+        self.done.iter().chain(&self.dead).map(|s| s.bytes).sum::<usize>() + self.calls.bytes + self.results.bytes
+    }
+
+    /// What it keeps (bytes, heap included; the calls' inputs are their
+    /// rows'): its facts, and its slots, ranks and cuts as allocated.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Store>()
+            + self.fact_bytes()
+            + self.done.iter().chain(&self.dead).map(Seg::spare).sum::<usize>()
+            + self.calls.spare()
+            + self.results.spare()
+            + (self.done.capacity() + self.dead.capacity()) * std::mem::size_of::<Seg>()
+            + self.starts.capacity() * std::mem::size_of::<usize>()
+            + (self.cuts.at.capacity() + self.cuts.low.capacity()) * std::mem::size_of::<usize>()
+    }
+
+    /// Event `f` at the end of the events before the open round.
     fn push_done(&mut self, f: Fact) {
-        self.bytes += f.bytes();
         if !self.loose {
             self.starts.push(self.done_len);
-            self.done.push(Vec::new());
+            self.done.push(Seg::default());
             self.loose = true;
         }
-        self.done.last_mut().expect("a loose segment").push(f);
+        self.done.last_mut().expect("a loose segment").push(Some(Arc::new(f)), &self.touched);
         self.done_len += 1;
     }
 
-    /// Events `v` after the events before the open round, moved in whole.
-    fn append_done(&mut self, v: Vec<Fact>) {
-        if v.is_empty() {
+    /// Events `s` at the end of the events before the open round, moved in
+    /// whole.
+    fn append_done(&mut self, s: Seg) {
+        if s.len == 0 {
+            self.dead.push(s);
             return;
         }
+        self.touched.add(1);
         self.starts.push(self.done_len);
-        self.done_len += v.len();
-        self.done.push(v);
+        self.done_len += s.len;
+        self.done.push(s);
         self.loose = false;
     }
 
@@ -474,6 +742,25 @@ impl Store {
     /// Its calls' start.
     fn calls_at(&self) -> usize {
         self.done_len + usize::from(self.lead)
+    }
+
+    /// Drops at most `n` slots of the facts its events let go (a job takes
+    /// them all, off the frame: [`Store::take_dead`]): a fact adds a few
+    /// and drops a few, so none waits on a reset's.
+    fn let_go(&mut self, n: usize) {
+        for _ in 0..n {
+            let Some(s) = self.dead.last_mut() else { return };
+            self.touched.add(1);
+            match s.slots.pop() {
+                Some(f) => s.bytes -= f.as_deref().map_or(0, Fact::bytes),
+                None => drop(self.dead.pop()),
+            }
+        }
+    }
+
+    /// The facts its events let go, for a job to drop off the lock.
+    fn take_dead(&mut self) -> Vec<Seg> {
+        std::mem::take(&mut self.dead)
     }
 }
 
@@ -547,11 +834,6 @@ impl Round {
         !self.calls.is_empty() && self.done == self.calls.len()
     }
 
-    /// Where whole call `k` is among its whole calls.
-    fn place(&self, k: usize) -> usize {
-        self.calls[..k].iter().filter(|c| c.whole).count()
-    }
-
     /// What it keeps (bytes, heap included; an input is its row's).
     fn bytes(&self) -> usize {
         self.calls.iter().map(|c| std::mem::size_of::<LiveCall>() + c.tool_id.capacity() + c.name.capacity()).sum::<usize>()
@@ -598,7 +880,7 @@ impl Default for LiveLog {
 /// A copy is another log, of the same facts.
 impl Clone for LiveLog {
     fn clone(&self) -> Self {
-        let s = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = hold(&self.store);
         let store = Store {
             done: s.done.clone(),
             starts: s.starts.clone(),
@@ -608,8 +890,7 @@ impl Clone for LiveLog {
             calls: s.calls.clone(),
             results: s.results.clone(),
             end: s.end,
-            cuts: Vec::new(),
-            bytes: s.bytes,
+            ..Store::default()
         };
         LiveLog {
             store: Arc::new(Mutex::new(store)),
@@ -669,32 +950,56 @@ impl LiveLog {
         self.work
     }
 
+    /// Elements read or written under its lock so far, by the facts and
+    /// by its readers: the slots, rank nodes, cuts and handles each
+    /// touched (tests: the frame's work per fact, besides the events it
+    /// writes). A slot vector's growth is not counted (doubling: O(1)
+    /// amortized a slot).
+    pub fn visits(&self) -> usize {
+        self.lock().visits
+    }
+
+    /// The most elements touched in one hold of its lock (tests: how long
+    /// a reader, a job's or the frame's, makes the other wait).
+    pub fn most_held(&self) -> usize {
+        self.lock().most
+    }
+
     /// What it keeps (bytes, heap included; the calls' inputs are their
     /// rows').
     pub fn bytes(&self) -> usize {
         let s = self.lock();
-        std::mem::size_of::<Store>()
-            + s.bytes
-            + (s.done.iter().map(Vec::capacity).sum::<usize>() + s.calls.capacity() + s.results.capacity()
-                - s.done_len
-                - s.calls.len()
-                - s.results.len())
-                * std::mem::size_of::<Fact>()
-            + (s.done.capacity() * std::mem::size_of::<Vec<Fact>>())
-            + (s.starts.capacity() + s.cuts.capacity()) * std::mem::size_of::<usize>()
+        s.bytes()
             + self.open.as_ref().map_or(0, Round::bytes)
             + self.sealed.as_ref().map_or(0, Round::bytes)
             + self.head_answered.iter().map(|k| k.capacity() + 48).sum::<usize>()
     }
 
-    /// Its events (tests).
+    /// Its events (tests), [`COPY`] in one hold of its lock at most.
     pub fn events(&self) -> Vec<Event> {
-        let s = self.lock();
-        (0..s.len()).map(|k| s.get(k).event().0).collect()
+        let mut out = Vec::new();
+        loop {
+            let s = self.lock();
+            let to = s.len().min(out.len() + COPY);
+            for k in out.len()..to {
+                out.push(s.get(k).event().0);
+            }
+            if to == s.len() {
+                return out;
+            }
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> Held<'_> {
+        hold(&self.store)
+    }
+
+    /// Its store, locked for a fact: a few of the facts a reset let go are
+    /// dropped ([`Store::let_go`]).
+    fn store(store: &Mutex<Store>) -> Held<'_> {
+        let mut s = hold(store);
+        s.let_go(2);
+        s
     }
 
     /// Read at its first fact: the history's last message.
@@ -764,7 +1069,7 @@ impl LiveLog {
         } else {
             let at = s.len() - 1;
             s.end = false;
-            s.cuts.push(at);
+            s.cut(at);
         }
         true
     }
@@ -777,7 +1082,7 @@ impl LiveLog {
             self.first = Some(block::Generation::of(&serde_json::json!({"role": "user", "content": text})));
         }
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = LiveLog::store(&store);
         let s = &mut *s;
         self.seal(s);
         if std::mem::take(&mut self.after) {
@@ -800,16 +1105,15 @@ impl LiveLog {
             return;
         }
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = LiveLog::store(&store);
         let at = s.open();
-        let gone: usize = s.calls.iter().chain(&s.results).map(Fact::bytes).sum();
         let had = s.len() > at;
         (s.lead, s.end) = (false, false);
-        s.calls.clear();
-        s.results.clear();
-        s.bytes -= gone;
+        // Its facts handed on, whole (a job drops them, off the frame).
+        let (calls, results) = (std::mem::take(&mut s.calls), std::mem::take(&mut s.results));
+        s.dead.extend([calls, results]);
         if had {
-            s.cuts.push(at);
+            s.cut(at);
             self.changed();
         }
         self.open = None;
@@ -820,7 +1124,7 @@ impl LiveLog {
     pub fn content(&mut self, history: &HistoryBlocks) {
         self.init(history);
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = LiveLog::store(&store);
         if self.opened(&mut s) {
             self.changed();
         }
@@ -832,15 +1136,18 @@ impl LiveLog {
         let was = self.blocks;
         self.blocks |= is_block_tool(name);
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut moved = self.opened(&mut s) | (was != self.blocks);
+        let mut s = LiveLog::store(&store);
+        let s = &mut *s;
+        let mut moved = self.opened(s) | (was != self.blocks);
         let r = self.open.as_mut().expect("opened");
         if !r.rows.contains_key(&row) {
             let k = r.calls.len();
             r.ids.insert(tool_id.to_string(), k);
             r.rows.insert(row, k);
             r.calls.push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: None, whole: false, answered: false });
-            moved |= self.sync_end(&mut s);
+            // Its slot, in model order: empty until its input is whole.
+            s.calls.push(None, &s.touched);
+            moved |= self.sync_end(s);
         }
         if moved {
             self.changed();
@@ -854,7 +1161,7 @@ impl LiveLog {
         let was = self.blocks;
         self.blocks |= is_block_tool(name);
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = LiveLog::store(&store);
         let s = &mut *s;
         let mut moved = self.opened(s) | (was != self.blocks);
         let r = self.open.as_mut().expect("opened");
@@ -881,30 +1188,27 @@ impl LiveLog {
                     if c.answered {
                         r.done += 1;
                     }
-                    // In model order: after its round's whole calls, else
-                    // among them (a cut).
-                    let at = r.place(k);
-                    if r.last_whole.is_none_or(|l| l < k) {
+                    // In model order, in its slot: after its round's whole
+                    // calls (its rank their count: nothing read), else
+                    // among them (a cut at its rank). Nothing moves.
+                    let last = r.last_whole.is_none_or(|l| l < k);
+                    let end = s.calls_at() + s.calls.len;
+                    if last {
                         r.last_whole = Some(k);
-                        if !s.results.is_empty() || s.end {
-                            s.cuts.push(s.calls_at() + s.calls.len());
+                        if s.results.len > 0 || s.end {
+                            s.cut(end);
                         }
-                        Store::push(&mut s.calls, &mut s.bytes, fact(&input));
-                    } else {
-                        s.cuts.push(s.calls_at() + at);
-                        let f = fact(&input);
-                        s.bytes += f.bytes();
-                        s.calls.insert(at, f);
+                    }
+                    let at = s.calls.fill(k, Arc::new(fact(&input)), &s.touched);
+                    if !last {
+                        s.cut(s.calls_at() + at);
                     }
                     self.work += 1;
                     moved = true;
                 } else if !same {
                     // Its input again, another: in its place (a cut).
-                    let at = r.place(k);
-                    s.cuts.push(s.calls_at() + at);
-                    let f = fact(&input);
-                    s.bytes = s.bytes + f.bytes() - s.calls[at].bytes();
-                    s.calls[at] = f;
+                    let at = s.calls.set(k, Arc::new(fact(&input)), &s.touched);
+                    s.cut(s.calls_at() + at);
                     self.work += 1;
                     moved = true;
                 }
@@ -915,10 +1219,10 @@ impl LiveLog {
                 r.rows.insert(row, k);
                 r.calls.push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: input.clone(), whole: true, answered: false });
                 r.last_whole = Some(k);
-                if !s.results.is_empty() || s.end {
-                    s.cuts.push(s.calls_at() + s.calls.len());
+                if s.results.len > 0 || s.end {
+                    s.cut(s.calls_at() + s.calls.len);
                 }
-                Store::push(&mut s.calls, &mut s.bytes, fact(&input));
+                s.calls.push(Some(Arc::new(fact(&input))), &s.touched);
                 self.work += 1;
                 moved = true;
             }
@@ -936,7 +1240,7 @@ impl LiveLog {
     pub fn result(&mut self, history: &HistoryBlocks, tool_id: &str, text: &str) {
         self.init(history);
         let store = self.store.clone();
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = LiveLog::store(&store);
         let s = &mut *s;
         let fact = || Fact::Result { tool_id: tool_id.to_string(), text: text.to_string() };
         match self.target {
@@ -958,7 +1262,7 @@ impl LiveLog {
                     // At the events' end: the open round's results, or, the
                     // open round reset, the one before it, last.
                     if open {
-                        Store::push(&mut s.results, &mut s.bytes, fact());
+                        s.results.push(Some(Arc::new(fact())), &s.touched);
                     } else {
                         s.push_done(fact());
                     }
@@ -1048,6 +1352,7 @@ impl Input {
         }
         let (cuts, len) = {
             let s = log.lock();
+            s.touched.add(1);
             (s.cuts.len(), s.len())
         };
         // The generation is the history's first message's (§1.2). With no
@@ -1077,17 +1382,48 @@ impl Input {
     }
 
     /// Its live turn's events, copied (a re-fold of the whole input's);
-    /// `None` if its log changed them since (a newer input stands).
+    /// `None` if its log changed them since (a newer input stands). Read
+    /// as a job reads them: a batch of handles under the log's lock at a
+    /// time ([`Input::handles`]), made events after it.
     pub fn live_events(&self) -> Option<Vec<Event>> {
-        let s = self.live.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (s.kept(self.live.cuts, self.live.len) == self.live.len).then(|| (0..self.live.len).map(|k| s.get(k).event().0).collect())
+        Some(self.live_facts()?.iter().map(|f| f.event().0).collect())
+    }
+
+    /// Its live turn's facts, a batch at a time; `None` if its log changed
+    /// them since.
+    fn live_facts(&self) -> Option<Vec<Handle>> {
+        let mut all = Vec::with_capacity(self.live.len);
+        while all.len() < self.live.len {
+            let (batch, dead) = self.handles(self.live.cuts, all.len())?;
+            drop(dead);
+            all.extend(batch);
+        }
+        Some(all)
+    }
+
+    /// Under its log's lock, nothing but this: whether its live turn still
+    /// holds, and the handles of its events from `from` on, at most
+    /// [`COPY`] of them and about [`HOLD`] elements touched (a reader makes
+    /// the frame wait no longer); and the facts the log let go, to drop
+    /// after it. `None` if a cut since its `cuts` changed its first `len`.
+    fn handles(&self, cuts: usize, from: usize) -> Option<(Vec<Handle>, Vec<Seg>)> {
+        let mut s = hold(&self.live.store);
+        if s.kept(cuts, self.live.len) < self.live.len {
+            return None;
+        }
+        let mut batch = Vec::with_capacity(COPY.min(self.live.len - from));
+        let mut k = from;
+        while k < self.live.len && batch.len() < COPY && s.touched.now.get() < HOLD {
+            batch.push(s.get(k).clone());
+            k += 1;
+        }
+        Some((batch, s.take_dead()))
     }
 
     /// Its live turn's events' rows (tests).
     #[cfg(test)]
     fn live_rows(&self) -> Vec<Option<u64>> {
-        let s = self.live.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (0..self.live.len).map(|k| s.get(k).event().1).collect()
+        self.live_facts().unwrap_or_default().iter().map(|f| f.event().1).collect()
     }
 
     /// Its events: the staged history's (all of it, if no worker took
@@ -1199,7 +1535,29 @@ pub struct RowBlocks {
     pub run: Option<Arc<str>>,
 }
 
+/// An [`Arc`]'s counts, besides what it holds (bytes).
+const ARC: usize = 2 * std::mem::size_of::<usize>();
+
 impl RowBlocks {
+    /// What it keeps of its own, its [`Arc`]'s included (bytes): its
+    /// shown blocks' entries and its run's title, not the blocks (the
+    /// board's copies, counted with it: [`Drawn::bytes`]).
+    pub fn own_bytes(&self) -> usize {
+        fn shown(s: &Shown) -> usize {
+            s.members.capacity() * std::mem::size_of::<Shown>() + s.members.iter().map(shown).sum::<usize>()
+        }
+        ARC + std::mem::size_of::<RowBlocks>()
+            + self.blocks.capacity() * std::mem::size_of::<Shown>()
+            + self.blocks.iter().map(shown).sum::<usize>()
+            + self.run.as_ref().map_or(0, |r| ARC + r.len())
+    }
+
+    /// One of the rows every committed call shares ([`RowBlocks::committed`]):
+    /// nobody's to count.
+    pub fn is_shared(r: &Arc<RowBlocks>) -> bool {
+        [Fate::Bound, Fate::Unbound].iter().any(|&f| Arc::ptr_eq(r, &Self::committed(f)))
+    }
+
     /// A call whose ops apply, or will: no tool row of its own.
     pub fn silent(&self) -> bool {
         matches!(self.call, Some(Fate::Bound | Fate::Pending))
@@ -1255,25 +1613,37 @@ pub struct Drawn {
     pub committed_to: u64,
     /// Live blocks on the board, groups and members included.
     pub live: usize,
+    /// What it keeps, heap included (bytes): its rows and their blocks
+    /// (copies of the boards' blocks, counted at B2's count of those: an
+    /// upper bound), its committed fates. A row's [`Arc`] of it is its.
+    pub bytes: usize,
 }
 
 /// What a [`Worker`] keeps, counted: the journal's events (and a row
-/// each), those of them the live turn's, the committed calls' fates the
-/// rows haven't taken yet, the board's owned bytes (B2's working set, its
-/// card fold apart), and all it keeps in bytes, heap included.
+/// each) and the events it has room for, those of them the live turn's,
+/// the committed calls' fates the rows haven't taken yet, the board's
+/// owned bytes (B2's working set, its card fold apart), the card folds'
+/// (the board's and the overlay's, each its own), and all it keeps in
+/// bytes, heap included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Retained {
     pub journal: usize,
+    pub capacity: usize,
     pub rows: usize,
     pub live: usize,
     pub committed: usize,
     pub board_bytes: usize,
+    pub card_bytes: usize,
     pub bytes: usize,
 }
 
-/// Live events copied from a log while holding it (the frame waits at
-/// most this long to add one).
-const COPY: usize = 256;
+/// Handles a reader takes from a log in one hold of its lock, at most
+/// (the frame waits at most this long to add a fact).
+pub const COPY: usize = 256;
+
+/// Elements a reader touches in one hold of a log's lock, about (a batch
+/// stops there: its last handle's rank nodes past it at most).
+pub const HOLD: usize = 4 * COPY;
 
 /// The board's work for one session, kept across jobs (module docs).
 #[derive(Debug)]
@@ -1289,6 +1659,10 @@ pub struct Worker {
     /// events come and go.
     bytes: usize,
     board: Board,
+    /// The board's card fold's bytes ([`Board::card_fold_bytes`], an
+    /// estimate that reads every card), as of its position then: read
+    /// again when the history is read on, not per slice.
+    cards: (usize, usize),
     batch: Batch,
     /// Committed calls' rows and fates the rows haven't taken, and how
     /// many before them they took.
@@ -1310,8 +1684,15 @@ struct Over {
     /// they committed.
     board: Board,
     read: usize,
+    /// The live turn's events copied that still hold (the journal's from
+    /// `hist` on past these are cut, a slice at a time).
+    valid: usize,
     batch: Batch,
     fates: Vec<(usize, Fate)>,
+    /// Its card fold's bytes (a copy of the board's: the board's, until it
+    /// reads a card call; then read again at the run's end).
+    cards: usize,
+    cards_read: bool,
 }
 
 impl Default for Worker {
@@ -1323,6 +1704,7 @@ impl Default for Worker {
             hist: 0,
             bytes: 0,
             board: Board::new(block::Generation::of(&Value::Null)),
+            cards: (0, 0),
             batch: Batch::default(),
             committed: VecDeque::new(),
             committed_from: 0,
@@ -1343,24 +1725,29 @@ impl Worker {
         self.gap
     }
 
-    /// What it keeps (bytes, heap included): its journal and rows, the
-    /// committed fates not taken yet, its board and the overlay's.
+    /// What it keeps (bytes, heap included): its journal and rows as
+    /// allocated, the committed fates not taken yet (their queue as
+    /// allocated), its board and the overlay's, each with its card fold.
     pub fn bytes(&self) -> usize {
         self.bytes
+            + (self.journal.capacity() - self.journal.len()) * std::mem::size_of::<Event>()
             + self.rows.capacity() * std::mem::size_of::<Option<u64>>()
-            + self.committed.len() * std::mem::size_of::<(u64, Fate)>()
+            + self.committed.capacity() * std::mem::size_of::<(u64, Fate)>()
             + self.board.owned_bytes()
-            + self.over.as_ref().map_or(0, |o| o.board.owned_bytes() + o.fates.capacity() * std::mem::size_of::<(usize, Fate)>())
+            + self.cards.1
+            + self.over.as_ref().map_or(0, |o| o.board.owned_bytes() + o.cards + o.fates.capacity() * std::mem::size_of::<(usize, Fate)>())
     }
 
     /// What it keeps ([`Retained`]).
     pub fn retained(&self) -> Retained {
         Retained {
             journal: self.journal.len(),
+            capacity: self.journal.capacity(),
             rows: self.rows.len(),
             live: self.journal.len() - self.hist,
             committed: self.committed.len(),
             board_bytes: self.board.owned_bytes(),
+            card_bytes: self.cards.1 + self.over.as_ref().map_or(0, |o| o.cards),
             bytes: self.bytes(),
         }
     }
@@ -1388,12 +1775,42 @@ impl Worker {
 
     /// The live turn's events in the journal cut to `n`.
     fn live_to(&mut self, n: usize) {
-        let to = self.hist + n;
-        if self.journal.len() > to {
-            let journal = Arc::make_mut(&mut self.journal);
-            self.bytes -= journal[to..].iter().map(event_bytes).sum::<usize>();
-            journal.truncate(to);
-            self.rows.truncate(to);
+        while !self.rewind(self.hist + n, &mut || true) {}
+    }
+
+    /// The journal cut to `to` events (the history's at least), a slice of
+    /// them at a time, `go_on` asked between; `false` if it said stop (what
+    /// is cut stays cut: the next run cuts on). Shared (a re-fold reads
+    /// it), the events kept are copied, not those cut. A journal with room
+    /// for more than twice its events past a slice gives the room back.
+    fn rewind(&mut self, to: usize, go_on: &mut dyn FnMut() -> bool) -> bool {
+        while self.journal.len() > to {
+            let from = self.journal.len().saturating_sub(SLICE).max(to);
+            self.bytes -= self.journal[from..].iter().map(event_bytes).sum::<usize>();
+            match Arc::get_mut(&mut self.journal) {
+                Some(journal) => journal.truncate(from),
+                None => self.journal = Arc::new(self.journal[..from].to_vec()),
+            }
+            self.rows.truncate(from);
+            if from > to && !go_on() {
+                return false;
+            }
+        }
+        let (len, room) = (self.journal.len(), self.journal.capacity());
+        if room > 2 * len + SLICE {
+            if let Some(journal) = Arc::get_mut(&mut self.journal) {
+                journal.shrink_to(len + len / 2);
+            }
+            self.rows.shrink_to(len + len / 2);
+        }
+        true
+    }
+
+    /// The board's card fold's bytes, read again if it read on since.
+    fn count_cards(&mut self) {
+        let at = self.board.position();
+        if self.cards.0 != at {
+            self.cards = (at, self.board.card_fold_bytes());
         }
     }
 
@@ -1454,8 +1871,11 @@ impl Worker {
             return None;
         }
         if self.board.position() < input.history_len {
-            self.live_to(0);
             self.over = None;
+            if !self.rewind(self.hist, go_on) {
+                input.shared.bytes.store(self.bytes(), Ordering::Relaxed);
+                return None;
+            }
         }
         while self.board.position() < input.history_len {
             let at = self.board.position();
@@ -1476,42 +1896,77 @@ impl Worker {
                 return None;
             }
         }
+        self.count_cards();
         // The overlay: another log's, or on another history, starts over.
         let history = input.history_len;
         let (log, want) = (input.live.log, input.live.len);
         if !self.over.as_ref().is_some_and(|o| o.log == log && o.history == history) {
-            self.live_to(0);
             let board = self.board.clone();
-            self.over = Some(Over { log, cuts: 0, history, board, read: 0, batch: self.batch, fates: Vec::new() });
+            let cards = self.cards.1;
+            self.over = Some(Over {
+                log,
+                cuts: 0,
+                history,
+                board,
+                read: 0,
+                valid: 0,
+                batch: self.batch,
+                fates: Vec::new(),
+                cards,
+                cards_read: false,
+            });
         }
+        let stop = |w: &Worker| {
+            input.shared.bytes.store(w.bytes(), Ordering::Relaxed);
+            None
+        };
         loop {
-            // A slice of the live turn's events from its log.
-            {
-                let s = input.live.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Under the log's lock, nothing but this (module docs): whether
+            // the input still holds, what of the events copied still holds,
+            // and the handles of the next ones (at most COPY, about HOLD
+            // elements touched); and the facts it let go, to drop after.
+            let (batch, dead) = {
+                let mut s = hold(&input.live.store);
                 if s.kept(input.live.cuts, want) < want {
                     return None;
                 }
                 let o = self.over.as_mut().expect("the overlay");
-                let have = self.journal.len() - self.hist;
-                let kept = s.kept(o.cuts, have).min(want);
+                o.valid = s.kept(o.cuts, o.valid).min(want);
                 o.cuts = s.cuts.len();
-                if kept < o.read {
-                    // What it read changed: it reads again from the history's end.
-                    (o.board, o.read, o.batch) = (self.board.clone(), 0, self.batch);
-                    o.fates.clear();
+                let mut batch = Vec::with_capacity(COPY.min(want - o.valid));
+                let mut k = o.valid;
+                while k < want && batch.len() < COPY && s.touched.now.get() < HOLD {
+                    batch.push(s.get(k).clone());
+                    k += 1;
                 }
-                self.live_to(kept);
-                let journal = Arc::make_mut(&mut self.journal);
-                for k in kept..want.min(kept + COPY) {
-                    let (e, row) = s.get(k).event();
-                    self.bytes += event_bytes(&e);
-                    journal.push(e);
-                    self.rows.push(row);
-                }
-            }
-            // Read on over what is copied, a slice at most.
+                (batch, s.take_dead())
+            };
+            // Off the lock: what was let go dropped, what no longer holds
+            // cut (a slice at a time), the board copied, the inputs too.
+            drop(dead);
             let o = self.over.as_mut().expect("the overlay");
-            let have = self.journal.len() - self.hist;
+            let valid = o.valid;
+            if valid < o.read {
+                // What it read changed: it reads again from the history's end.
+                (o.board, o.read, o.batch, o.cards, o.cards_read) = (self.board.clone(), 0, self.batch, self.cards.1, false);
+                o.fates.clear();
+            }
+            if !self.rewind(self.hist + valid, go_on) {
+                return stop(self);
+            }
+            let journal = Arc::make_mut(&mut self.journal);
+            let o = self.over.as_mut().expect("the overlay");
+            for f in &batch {
+                let (e, row) = f.event();
+                o.cards_read |= matches!(&e, Event::Call { name, .. } if CARD_NAMES.contains(&name.as_str()));
+                self.bytes += event_bytes(&e);
+                journal.push(e);
+                self.rows.push(row);
+            }
+            o.valid += batch.len();
+            drop(batch);
+            // Read on over what is copied, a slice at most.
+            let have = o.valid;
             let to = have.min(o.read + SLICE);
             let events = &self.journal[..];
             for at in history + o.read..history + to {
@@ -1525,9 +1980,12 @@ impl Worker {
                 break;
             }
             if !go_on() {
-                input.shared.bytes.store(self.bytes(), Ordering::Relaxed);
-                return None;
+                return stop(self);
             }
+        }
+        let o = self.over.as_mut().expect("the overlay");
+        if std::mem::take(&mut o.cards_read) {
+            o.cards = o.board.card_fold_bytes();
         }
         let o = self.over.as_ref().expect("the overlay");
         let events = &self.journal[..];
@@ -1572,15 +2030,35 @@ impl Worker {
                 rows.entry(r).or_default().run = Some(Arc::from(&*run.summary));
             }
         }
+        // Its blocks are copies of the boards' (each block once at most):
+        // B2's count of their blocks bounds them, heap included (its
+        // own: a block's item ids and last writers are B2's to read).
+        let (mut shown_n, mut bound_n) = (0, 0);
+        for s in rows.values().flat_map(|r| &r.blocks).flat_map(|s| std::iter::once(s).chain(&s.members)) {
+            shown_n += 1;
+            bound_n += usize::from(s.bound.is_some());
+        }
+        let blocks = if shown_n > 0 { view.owned_by_owner()[0] } else { 0 }
+            + if bound_n > 0 { bound.owned_by_owner()[0] } else { 0 }
+            + (shown_n + bound_n) * ARC;
+        let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
+        let bytes = std::mem::size_of::<Drawn>()
+            + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
+            + rows.values().map(|r| r.own_bytes()).sum::<usize>()
+            + blocks
+            + ARC
+            + committed.len() * std::mem::size_of::<(u64, Fate)>();
         Drawn {
             epoch: input.epoch,
             generation: Some(input.generation),
             history: input.history_len,
             events: self.journal.len(),
-            rows: rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
-            committed: self.committed.iter().copied().collect(),
+            rows,
+            committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
+            bytes,
         }
     }
 }
