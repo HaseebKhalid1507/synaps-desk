@@ -23,8 +23,9 @@
 //!   then the final results (`ToolResult`, never `ToolResultDelta`) of the
 //!   round's calls, a call's first only, in the order they came; then
 //!   `ResultsEnd` once every call of the round has its result, or once a
-//!   later message started; a prompt (`TurnStarted`) as the user message
-//!   the history will hold. A result whose
+//!   later message started; a prompt (`TurnStarted`) and a steer
+//!   (`SteeringDelivered`) as the user messages the history will hold, the
+//!   steer after its round's `ResultsEnd` (guarantee 3). A result whose
 //!   round has ended is left out: the history's results message for that
 //!   round is written, and nothing moves back across a commit. A history
 //!   that ends with an assistant message (an attach mid-turn) has its

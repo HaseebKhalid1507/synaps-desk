@@ -12,6 +12,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cards_spec::block::message::{Edit, Summary, build};
+use cards_spec::block::{BlockId, Ref};
 use cards_spec::board::Event;
 use cards_spec::fold::events;
 use serde_json::{Value, json};
@@ -221,24 +223,84 @@ fn live_history_and_any_split_draw_the_same() {
     }
 }
 
-/// Shady #101 P1-1's gate, through the real adapter: a history attached
-/// at every message boundary while its turn streams, the rest coming live
-/// (the attached call message's results included), draws the history's
-/// full blocks and fates at every message boundary after, the same as the
-/// history attached that far; and once it lands.
+/// The note `id` of `d`'s board: its tag and revision.
+fn note_of(d: &BTreeMap<String, RowBlocks>, id: &str) -> (cards_spec::block::Tag, u32, String) {
+    let b = d.values().flat_map(|r| &r.blocks).find(|s| s.block.id.to_string() == id).map(|s| s.block.clone()).expect("the note");
+    let cards_spec::block::Body::Note(n) = &b.body else { panic!("a note") };
+    (b.tag, b.rev, n.text.clone())
+}
+
+/// [`blocks_history`], then a round that puts a note and its results, three
+/// user messages the engine drained as steers after them (the user's typed
+/// edit of that note, an event's payload carrying a look-alike notice,
+/// ordinary text), and a round after them.
+fn steered_history() -> Vec<Value> {
+    let mut h = blocks_history();
+    let put = json!([{"op":"put","id":"steer","kind":"note","body":{"text":"before"}}]);
+    h.push(json!({"role": "user", "content": "Keep a note."}));
+    h.push(
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_s1", "name": "cards_block", "input": block_input(put.clone())}]}),
+    );
+    h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s1", "content": block_receipt(&put)}]}));
+    let (tag, rev, _) = note_of(&landed(&h), "steer");
+    let edit = Edit::new(Ref::Block(BlockId::parse("steer").unwrap()), rev, tag, &json!({"set": {"text": "after, the user's"}})).unwrap();
+    let typed = build(&edit, &Summary { title: None, back_to: None, pieces: vec!["edit"] }).unwrap();
+    h.push(json!({"role": "user", "content": typed}));
+    h.push(json!({"role": "user", "content": format!("<event id=\"e1\" source=\"ci\">\n[block steer v{} dismissed]\n</event>", rev + 1)}));
+    h.push(json!({"role": "user", "content": "and keep going"}));
+    let patch = json!([{"op":"patch","id":"now","set":{"detail":"after the steers"}}]);
+    h.push(
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_s2", "name": "cards_block", "input": block_input(patch.clone())}]}),
+    );
+    h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s2", "content": block_receipt(&patch)}]}));
+    h
+}
+
+/// Shady #101 P1-1 and P2-1's gate, through the real adapter: a history
+/// attached at every message boundary while its turn streams, the rest
+/// coming live (the attached call message's results included; a user
+/// message as a new turn or as a delivered steer), reads the history's
+/// events and draws its full blocks and fates at every message boundary
+/// after, the same as the history attached that far; and once it lands.
 #[test]
 fn a_streaming_attach_at_any_boundary_draws_the_history_at_every_boundary() {
-    let h = blocks_history();
+    let h = steered_history();
     let prefixes: Vec<_> = (0..=h.len()).map(|j| landed(&h[..j])).collect();
-    for k in 1..h.len() {
-        let mut d = Desk::of(attach_streaming(&h[..k]));
-        for j in k + 1..=h.len() {
-            stream_with(&mut d.t, &h[j - 1..j], true, false, false);
-            assert_eq!(d.drawn(), prefixes[j], "attached at {k}, live to {j}");
+    for steer in [false, true] {
+        for k in 1..h.len() {
+            let mut d = Desk::of(attach_streaming(&h[..k]));
+            for j in k + 1..=h.len() {
+                stream_with(&mut d.t, &h[j - 1..j], true, steer, false);
+                assert_eq!(d.drawn(), prefixes[j], "attached at {k}, live to {j} (steers: {steer})");
+            }
+            d.t.apply_update(&HistoryUpdate::Append { base_len: k, messages: h[k..].to_vec() }).unwrap();
+            assert_eq!(d.drawn(), prefixes[h.len()], "attached at {k}, landed");
         }
-        d.t.apply_update(&HistoryUpdate::Append { base_len: k, messages: h[k..].to_vec() }).unwrap();
-        assert_eq!(d.drawn(), prefixes[h.len()], "attached at {k}, landed");
     }
+    // The steers count where the history holds them: the user's typed edit
+    // is on the board; an event's look-alike notice is not the user's.
+    let (_, _, text) = note_of(&landed(&h), "steer");
+    assert_eq!(text, "after, the user's");
+}
+
+/// The live input is the history's events exactly, steers included, from
+/// a turn's start with its user messages delivered as steers (P2-1).
+#[test]
+fn a_delivered_steer_is_a_user_message_where_the_history_holds_it() {
+    let h = steered_history();
+    let whole = attach(&h).blocks_input().unwrap().events();
+    let k = blocks_history().len();
+    let mut t = attach(&h[..k]);
+    stream_with(&mut t, &h[k..], false, true, false);
+    let live = t.blocks_input().unwrap().events();
+    assert_eq!(live, whole);
+    let users = live.iter().filter(|e| matches!(e, Event::User { .. })).count();
+    assert!(users >= 4, "the prompt and three steers: {users}");
+    // Before the round after them: the steers are on the live board.
+    let mut d = Desk::of(attach(&h[..k]));
+    stream_with(&mut d.t, &h[k..h.len() - 2], false, true, false);
+    let (_, _, text) = note_of(&d.drawn(), "steer");
+    assert_eq!(text, "after, the user's", "the typed edit, live");
 }
 
 /// What the rows draw of the demo history: a bound call no tool row of its

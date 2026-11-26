@@ -1794,8 +1794,9 @@ impl Transcript {
                 let ix = self.push_new(ItemKind::User, text.clone(), None, false);
                 self.live_log.user(text, Some(self.items[ix].id));
             }
-            // A drained event's payload: its parent's business.
-            WatchEvent::Steered { .. } => {}
+            // A drained event's payload: its parent's business (its history
+            // holds it as a user message all the same).
+            WatchEvent::Steered { text } => self.live_log.user(text, None),
             WatchEvent::Failed { category } => self.notice(ItemKind::Error, format!("subagent failed [{category}]")),
             other => {
                 if let Some(s) = other.to_stream() {
@@ -2132,6 +2133,11 @@ impl Transcript {
             },
             StreamEvent::Agent(a) => match a {
                 AgentEvent::SteeringDelivered { message } => {
+                    // The engine drained it into the history, after the
+                    // round's results: a user message of its text there
+                    // (an event's payload too; the board reads which text
+                    // is the user's own, blocks.md §7).
+                    self.live_log.user(message, None);
                     if let Some(ev) = steered_event(message) {
                         self.delivered(ev);
                     }
