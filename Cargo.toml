@@ -20,7 +20,7 @@ anyhow = "1"
 # Agent cards (synaps-cards docs/design.md v1.2, §9.1): the doc, the digest,
 # the answer message and the fold, the same code the `cards` extension runs.
 # Pinned to a revision: a new catalog version is a new pin.
-cards-spec = { git = "https://github.com/HaseebKhalid1507/synaps-cards", rev = "c971966b6672a6778136fe2743255819cbf4ecd4" }
+cards-spec = { git = "https://github.com/HaseebKhalid1507/synaps-cards", rev = "335e45621ef68ee2fb528501d3e76b5d1c22b871" }
 
 [profile.release]
 opt-level = 3
