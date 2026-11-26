@@ -249,8 +249,8 @@ impl AppView {
     }
 
     /// What a drop of `carry` (`copy`: Ctrl or Alt held) on `zone` of pane
-    /// `pane` does (split.md §2–§3): an edge a limit would refuse (a 5th
-    /// pane, a 4th column, a 3rd row, a minimum; folded) is the centre,
+    /// `pane` does (split.md §2–§3): an edge a limit would refuse (a 10th
+    /// pane, a minimum; folded) is the centre,
     /// with the refusal's note; a pane's own last tab to its edge, or a
     /// tab to its own pane's centre, is nothing. A view's or a worker's tab
     /// only reorders in its own strip.

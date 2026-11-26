@@ -1,7 +1,8 @@
 //! Split panes, step 3 (split/split.md §1, §4; split/architecture.md §2.1):
 //! the layout tree. VS Code's grid: n-ary and normalised, at most
-//! [`PANES_MAX`] panes, at most 3 across and 2 down, each at least
-//! [`PANE_MIN_W`] × [`PANE_MIN_H`].
+//! [`PANES_MAX`] panes, as many across or down as the room allows (the
+//! 2026-11-25 note under split.md §0), each at least [`PANE_MIN_W`] ×
+//! [`PANE_MIN_H`].
 
 use crate::pane::{PANES_MAX, PaneId};
 
@@ -12,10 +13,6 @@ pub(crate) const PANE_MIN_W: f32 = 320.;
 pub(crate) const PANE_MIN_H: f32 = 240.;
 /// The rule between two panes (split.md §4: a 1 px `hair` rule).
 pub(crate) const DIVIDER: f32 = 1.;
-/// The most panes side by side, and stacked (split.md §0).
-pub(crate) const ACROSS_MAX: usize = 3;
-pub(crate) const DOWN_MAX: usize = 2;
-
 /// Side by side (`Row`) or stacked (`Column`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Axis {
@@ -160,20 +157,15 @@ pub(crate) struct Grab {
 pub(crate) enum Refused {
     /// [`PANES_MAX`] panes already.
     Most,
-    /// A 4th column (`across`) or a 3rd row: the layout's cap, not the
-    /// window's size (the design gate #59 M1: "no room" blamed a maximised
-    /// window for the 2-row cap).
-    Cap { across: bool },
-    /// No room: a pane would go under its minimum.
+    /// No room: a pane would go under its minimum (the only limit across
+    /// or down: the 2026-11-25 note under split.md §0).
     Room,
 }
 
 impl Refused {
     pub(crate) const fn note(self) -> &'static str {
         match self {
-            Refused::Most => "4 panes is the most",
-            Refused::Cap { across: true } => "3 columns is the most",
-            Refused::Cap { across: false } => "2 rows is the most",
+            Refused::Most => "9 panes is the most",
             Refused::Room => "no room to split this pane",
         }
     }
@@ -185,25 +177,6 @@ impl Refused {
 pub(crate) enum Node {
     Leaf(PaneId),
     Split { axis: Axis, kids: Vec<Node>, ratios: Vec<f32> },
-}
-
-/// Whether a saved tree keeps the caps: at most [`ACROSS_MAX`] panes side
-/// by side and [`DOWN_MAX`] stacked.
-pub(crate) fn fits_caps(tree: &crate::theme::LayoutNode) -> bool {
-    fn extent(n: &crate::theme::LayoutNode) -> (usize, usize) {
-        match n {
-            crate::theme::LayoutNode::Pane(_) => (1, 1),
-            crate::theme::LayoutNode::Split { axis, kids, .. } => {
-                let ex: Vec<(usize, usize)> = kids.iter().map(extent).collect();
-                match axis {
-                    Axis::Row => (ex.iter().map(|e| e.0).sum(), ex.iter().map(|e| e.1).max().unwrap_or(1)),
-                    Axis::Column => (ex.iter().map(|e| e.0).max().unwrap_or(1), ex.iter().map(|e| e.1).sum()),
-                }
-            }
-        }
-    }
-    let (across, down) = extent(tree);
-    across <= ACROSS_MAX && down <= DOWN_MAX
 }
 
 /// A rectangle in the centre's own pixels.
@@ -235,7 +208,7 @@ impl Node {
     }
 
     /// The most panes this tree puts side by side, and stacked.
-    fn extent(&self) -> (usize, usize) {
+    pub(crate) fn extent(&self) -> (usize, usize) {
         match self {
             Node::Leaf(_) => (1, 1),
             Node::Split { axis, kids, .. } => {
@@ -313,21 +286,25 @@ impl Node {
     }
 
     /// Split `at` (split.md §2): `new` on `side`, or why not in a centre
-    /// of `area` (the caps and the minimums of every pane).
+    /// of `area`: [`PANES_MAX`] in all, and the minimums of every pane
+    /// (room is the only limit across or down: the 2026-11-25 note under
+    /// split.md §0). `at`'s share is halved between them; where that puts
+    /// a pane under its minimum, the split `new` joins is evened out
+    /// instead ([`Node::equalise`]), if that fits.
     pub(crate) fn split(&self, at: PaneId, side: Side, new: PaneId, area: (f32, f32)) -> Result<Node, Refused> {
         if self.len() >= PANES_MAX {
             return Err(Refused::Most);
         }
+        let area = Rect { x: 0., y: 0., w: area.0, h: area.1 };
+        let fits = |t: &Node| t.rects(area).iter().all(|(_, r)| r.w + 0.5 >= PANE_MIN_W && r.h + 0.5 >= PANE_MIN_H);
         let next = self.with_split(at, side, new).ok_or(Refused::Room)?;
-        let (across, down) = next.extent();
-        if across > ACROSS_MAX || down > DOWN_MAX {
-            return Err(Refused::Cap { across: across > ACROSS_MAX });
+        if fits(&next) {
+            return Ok(next);
         }
-        let rects = next.rects(Rect { x: 0., y: 0., w: area.0, h: area.1 });
-        if rects.iter().any(|(_, r)| r.w + 0.5 < PANE_MIN_W || r.h + 0.5 < PANE_MIN_H) {
-            return Err(Refused::Room);
-        }
-        Ok(next)
+        let mut even = next;
+        let path = even.path_of(new).ok_or(Refused::Room)?;
+        even.equalise(&path[..path.len().saturating_sub(1)], area);
+        if fits(&even) { Ok(even) } else { Err(Refused::Room) }
     }
 
     /// Ctrl+\ (split.md §2): right, else down if the pane is too narrow
@@ -986,23 +963,60 @@ mod tests {
         assert!(r.iter().all(|(_, r)| r.w.fract() == 0. && r.x.fract() == 0.), "whole pixels: {r:?}");
     }
 
-    /// The caps (split.md §0): 4 panes at most, 3 across, 2 down, and no
-    /// pane under 320 × 240.
+    /// The caps (split.md §0, the 2026-11-25 note): [`PANES_MAX`] panes at
+    /// most, as many across or down as fit, and no pane under 320 × 240.
     #[test]
     fn the_caps_and_the_minimums_refuse() {
         let one = Node::Leaf(p(0));
         let two = one.split(p(0), Side::Down, p(1), A).unwrap();
-        assert_eq!(two.split(p(1), Side::Down, p(2), A), Err(Refused::Cap { across: false }), "a 3rd row");
+        assert!(two.split(p(1), Side::Down, p(2), A).is_ok(), "a 3rd row: room for it");
         let three = Node::Leaf(p(0)).split(p(0), Side::Right, p(1), (2000., 1000.)).unwrap();
         let three = three.split(p(0), Side::Right, p(2), (2000., 1000.)).unwrap();
-        assert_eq!(three.split(p(2), Side::Right, p(3), (4000., 1000.)), Err(Refused::Cap { across: true }), "a 4th column");
+        assert!(three.split(p(2), Side::Right, p(3), (4000., 1000.)).is_ok(), "a 4th column: room for it");
         let four = three.split(p(0), Side::Down, p(3), (2000., 1000.)).unwrap();
         assert_eq!(four.len(), 4);
-        assert_eq!(four.split(p(1), Side::Down, PaneId::nth(3), (2000., 1000.)), Err(Refused::Most));
+        let mut nine = four;
+        for i in 4..9 {
+            nine = nine.split(p(i - 1), Side::Right, p(i), (8000., 2000.)).unwrap();
+        }
+        assert_eq!(nine.split(p(1), Side::Down, PaneId::ghost(0), (8000., 2000.)), Err(Refused::Most));
         // 640 px wide: two of 319.5 would be under 320.
         assert_eq!(one.split(p(0), Side::Right, p(1), (640., 1000.)), Err(Refused::Room));
         assert!(one.split(p(0), Side::Right, p(1), (641., 1000.)).is_ok());
         assert_eq!(one.split(p(0), Side::Down, p(1), (1000., 480.)), Err(Refused::Room));
+    }
+
+    /// Room is the only limit (split.md §0, the 2026-11-25 note): no cap
+    /// across or down, only each pane's 320 × 240 and [`PANES_MAX`] in all.
+    /// A pane halved under its minimum evens out the split it joins
+    /// instead, when that fits.
+    #[test]
+    fn room_is_the_only_limit() {
+        // 1920 with both panels at their strips.
+        let a = (1856., 1040.);
+        let area = Rect { x: 0., y: 0., w: a.0, h: a.1 };
+        let mut t = Node::Leaf(p(0));
+        for i in 1..5 {
+            t = t.split(p(i - 1), Side::Right, p(i), a).unwrap_or_else(|e| panic!("pane {i} across: {e:?}"));
+        }
+        let r = t.rects(area);
+        assert_eq!(r.len(), 5);
+        assert!(r.iter().all(|(_, b)| b.y == 0. && b.h == a.1 && b.w >= PANE_MIN_W), "five across, each at least 320: {r:?}");
+        // A sixth across would be 308: refused, and Ctrl+\ splits down.
+        assert_eq!(t.split(p(4), Side::Right, p(5), a), Err(Refused::Room));
+        let (t, side) = t.split_right(p(4), p(5), a).expect("down");
+        assert_eq!(side, Side::Down);
+        // Four down in a column where they fit (4 × 240 + 3 ≤ 1040).
+        let t = t.split(p(5), Side::Down, p(6), a).expect("a third row");
+        let t = t.split(p(6), Side::Down, p(7), a).expect("a fourth row, the column evened");
+        assert!(t.rects(area).iter().all(|(_, b)| b.w >= PANE_MIN_W && b.h >= PANE_MIN_H), "{:?}", t.rects(area));
+        assert_eq!(t.split(p(7), Side::Down, p(8), a), Err(Refused::Room), "a fifth row: 5 × 240 + 4 > 1040");
+        let t = t.split(p(0), Side::Down, p(8), a).expect("the ninth");
+        assert_eq!(t.len(), PANES_MAX);
+        assert_eq!(PANES_MAX, 9);
+        // The tenth: the total's cap, whatever the room.
+        assert_eq!(t.split(p(1), Side::Down, PaneId::ghost(0), (8000., 4000.)), Err(Refused::Most));
+        assert_eq!(Refused::Most.note(), "9 panes is the most");
     }
 
     /// Ctrl+\ on a pane too narrow for two splits it down (split.md §2).
@@ -1128,8 +1142,8 @@ mod tests {
         let r = t.rects(area);
         assert!(r.iter().all(|(_, r)| r.w >= PANE_MIN_W), "every pane keeps 320: {r:?}");
         assert_eq!(at(&t, p(3)).w, PANE_MIN_W, "A′ stops it: {r:?}");
-        // Stacked: `[A / A′ | B] / C` (three down is past `DOWN_MAX`
-        // today, so laid out by hand: the minimum holds all the same).
+        // Stacked: `[A / A′ | B] / C`, laid out by hand (as when three
+        // down was past the old cap): the minimum holds all the same.
         let t = Node::Leaf(p(0)).split(p(0), Side::Down, p(2), a).unwrap();
         let t = t.split(p(0), Side::Right, p(1), a).unwrap();
         let mut t = t.split_as(p(0), Side::Down, p(3)).unwrap();

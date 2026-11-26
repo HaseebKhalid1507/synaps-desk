@@ -544,11 +544,12 @@ fn four_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
         })
     });
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "2×2 at 1280×800");
-    // A fifth is refused, with the reason on the composer's line.
-    key(cx, window, "ctrl-\\");
+    // A split with no room is refused, with the reason on the composer's
+    // line (room is the only limit: the 2026-11-25 note under split.md §0).
+    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.split_pane(Some(crate::split::Side::Right), w, cx)));
     view.read_with(cx, |v, _| {
         assert_eq!(v.panes.len(), 4);
-        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("4 panes is the most"));
+        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("no room to split this pane"));
     });
     // The keys on the window's root, as at launch: a focused composer's
     // caret blinks (a frame every 500 ms, as on main), a left one's never
@@ -664,8 +665,9 @@ fn in_pane_at(cx: &mut TestAppContext, window: AnyWindowHandle, sel: &'static st
     // Allow is drawn filled or outlined (the theme's style).
     let alt = if sel == "allow-fill" { "allow-outline" } else { sel };
     let b = vcx.debug_bounds(sel).or_else(|| vcx.debug_bounds(alt)).unwrap_or_else(|| panic!("{sel} drawn"));
-    let from =
-        (0..4).find(|j| vcx.debug_bounds(format!("pane {j}").leak()).is_some_and(|p| p.contains(&b.center()))).expect("drawn in a pane");
+    let from = (0..crate::pane::PANES_MAX)
+        .find(|j| vcx.debug_bounds(format!("pane {j}").leak()).is_some_and(|p| p.contains(&b.center())))
+        .expect("drawn in a pane");
     let card =
         |vcx: &mut VisualTestContext, j: usize| vcx.debug_bounds(format!("card {j}").leak()).unwrap_or_else(|| panic!("pane {j}'s card"));
     let (c_from, c_to) = (card(&mut vcx, from), card(&mut vcx, id.index()));
@@ -678,8 +680,10 @@ fn composer_at(cx: &mut TestAppContext, window: AnyWindowHandle, id: crate::pane
     let mut vcx = VisualTestContext::from_window(window, cx);
     let bar = vcx.debug_bounds("composer-bar").expect("the focused composer's bar");
     let at = gpui_kit::point(bar.origin.x + px(80.), bar.center().y);
-    let from =
-        (0..4).filter_map(|j| vcx.debug_bounds(format!("pane {j}").leak())).find(|p| p.contains(&bar.center())).expect("drawn in a pane");
+    let from = (0..crate::pane::PANES_MAX)
+        .filter_map(|j| vcx.debug_bounds(format!("pane {j}").leak()))
+        .find(|p| p.contains(&bar.center()))
+        .expect("drawn in a pane");
     let to = vcx.debug_bounds(format!("pane {}", id.index()).leak()).expect("the pane drawn");
     at - from.origin + to.origin
 }
@@ -2268,7 +2272,7 @@ fn a_card_in_an_unfocused_pane_fires_its_cues_there(cx: &mut TestAppContext) {
 
 /// split.md §2, §8 (A19): with split panes on, the palette lists every pane
 /// action with its key and greys what can't run, with why ("one pane",
-/// "4 panes is the most"). Equalise pane sizes evens every split (on
+/// "no room to split this pane"). Equalise pane sizes evens every split (on
 /// `sheet`, as a double-click), Join all panes puts the other panes' session tabs into the
 /// focused one (once each) and closes them, and Close pane closes the
 /// focused pane's tabs and the pane.
@@ -2297,6 +2301,7 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
         "Split down",
         "Focus pane 1",
         "Focus pane 4",
+        "Focus pane 9",
         "Focus next pane",
         "Focus previous pane",
         "Move tab to the next pane",
@@ -2332,11 +2337,12 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
     let _ = (names(&mut a), names(&mut b));
     assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 3, "three panes");
     let three = entries(cx);
-    // A third row is the layout's cap, not the window (design gate #59 M1:
-    // "no room at this window size" in a maximised window).
-    assert_eq!(find(&three, AppAct::SplitDown).3.as_deref(), Some("2 rows is the most"), "a third row: the cap named");
+    // A third row: no cap, only the room (the 2026-11-25 note under
+    // split.md §0); three rows fit at 800 tall, so it runs, and the pane
+    // menu agrees.
+    assert_eq!(find(&three, AppAct::SplitDown).3.as_deref(), None, "a third row: room for it");
     let menu_says = view.read_with(cx, |v, _| v.split_refusal(Some(crate::split::Side::Down)));
-    assert_eq!(menu_says, Some("2 rows is the most"), "the pane menu's reason, the same words");
+    assert_eq!(menu_says, None, "the pane menu's reason, the same words");
     // Even as split: greyed (Shady #44 n16); uneven, it runs (below).
     assert_eq!(find(&three, AppAct::Equalise).3.as_deref(), Some("already even"), "split even: Equalise greyed");
     assert_eq!(find(&three, AppAct::FocusPane(3)).3.as_deref(), Some("no such pane"), "a fourth pane isn't there");
@@ -2367,7 +2373,7 @@ fn the_palette_lists_the_pane_actions_and_runs_them(cx: &mut TestAppContext) {
     act(cx, AppAct::SplitDown);
     let four = entries(cx);
     if view.read_with(cx, |v, _| v.panes.len()) == 4 {
-        assert_eq!(find(&four, AppAct::SplitRight).3.as_deref(), Some("4 panes is the most"), "four panes");
+        assert_eq!(find(&four, AppAct::SplitRight).3.as_deref(), Some("no room to split this pane"), "four panes at 1280: no room");
     }
     // Join: every session tab in the focused pane, once each; one pane.
     // One flight for all the closing panes (each its ghost), landing on
@@ -3197,8 +3203,9 @@ fn a_closing_pane_slides_out_with_its_rows(cx: &mut TestAppContext) {
     let _ = client.shutdown();
 }
 
-/// Shady #42 r2-L1: four panes, one closes, and a split within its flight
-/// is handed the closing pane's id (the only one free): no pane jumps
+/// Shady #42 r2-L1: nine panes (all the ids), one closes, and a split
+/// within its flight is handed the closing pane's id (the only one free):
+/// no pane jumps
 /// (its share keeps closing, a ghost's ground), and every frame steps by
 /// at most one frame's spring. The new pane and the closing share draw
 /// under different element ids (Shady #59 L5.1).
@@ -3208,11 +3215,7 @@ fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppC
     level(cx, crate::motion::Level::Full);
     VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
     frame(cx, window);
-    for k in ["ctrl-\\", "ctrl-shift-\\", "alt-1", "ctrl-shift-\\"] {
-        key(cx, window, k);
-        land(cx, window, &view);
-    }
-    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "four panes");
+    nine_panes(cx, window, &view);
     let closing = view.read_with(cx, |v, _| v.panes.focused);
     key(cx, window, "ctrl-w");
     for _ in 0..3 {
@@ -3229,10 +3232,10 @@ fn a_split_that_takes_a_closing_panes_id_moves_no_pane_at_once(cx: &mut TestAppC
     let mut bound = step(cx);
     let open = |b: Vec<(u8, [f32; 4])>| b.into_iter().filter(|(i, _)| *i != closing.index() as u8).collect::<Vec<_>>();
     let mut was = open(boxes(cx, window, &view));
-    // Down, where the closing pane was: a split across (a third column)
-    // would make the right panel yield, every pane moving with it (§5).
+    // Down, where the closing pane was: a split across would even out
+    // the row, every pane in it moving with it.
     key(cx, window, "ctrl-shift-\\");
-    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "the split took the id");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), crate::pane::PANES_MAX, "the split took the id");
     assert!(view.read_with(cx, |v, _| v.panes.get(closing).is_some()), "the closing pane's id is the new pane's");
     // Shady #59 L5.1 (#55 n1), the id's reuse: in the same frame the new
     // pane draws under its own `("pane", n)` and the closing share under a
@@ -4820,22 +4823,17 @@ fn a_drop_on_a_pane_closed_since_the_last_move_leaves_the_tab(cx: &mut TestAppCo
     let _ = client.shutdown();
 }
 
-/// The brief's 5th pane: with 4 panes, a tab dragged to another pane's
-/// edge never makes a 5th. The preview shows the centre (the drop that
-/// will happen), the tab moves there, and the focused composer says
-/// "4 panes is the most", as Ctrl+\ does.
+/// The brief's 5th pane, now the 10th (the 2026-11-25 note under split.md
+/// §0): with 9 panes, a tab dragged to another pane's edge never makes a
+/// 10th. The preview shows the centre (the drop that will happen), the
+/// tab moves there, and the focused composer says "9 panes is the most",
+/// as Ctrl+\ does.
 #[gpui_kit::test]
 fn a_drag_to_a_fifth_pane_is_refused_with_the_note(cx: &mut TestAppContext) {
     let (window, view, client, _a, attaches, events) = on_a(cx, "dnd-fifth", None);
     VisualTestContext::from_window(window, cx).simulate_resize(size(px(1920.), px(1080.)));
     frame(cx, window);
-    key(cx, window, "ctrl-\\");
-    key(cx, window, "ctrl-|");
-    let p0 = view.read_with(cx, |v, _| v.reading_order()[0]);
-    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
-    frame(cx, window);
-    key(cx, window, "ctrl-|");
-    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "four panes");
+    nine_panes(cx, window, &view);
     for _ in 0..80 {
         frame(cx, window);
     }
@@ -4849,7 +4847,7 @@ fn a_drag_to_a_fifth_pane_is_refused_with_the_note(cx: &mut TestAppContext) {
     let hint = view.read_with(cx, |v, _| v.dnd.hint).expect("a hint");
     assert_eq!(
         (hint.pane, hint.zone, hint.note),
-        (target, Some(crate::dnd::Zone::Center), Some("4 panes is the most")),
+        (target, Some(crate::dnd::Zone::Center), Some("9 panes is the most")),
         "the edge is the centre"
     );
     // Its reason on the preview while it shows (finish gate #48 S1).
@@ -4857,9 +4855,9 @@ fn a_drag_to_a_fifth_pane_is_refused_with_the_note(cx: &mut TestAppContext) {
     assert!(drawn(cx, window, "drop-label-note".into()).is_some(), "the preview's label says why, during the drag");
     mouse_m(cx, window, to, "up", gpui_kit::Modifiers::default());
     frame(cx, window);
-    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4, "no 5th pane");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 9, "no 10th pane");
     assert!(tabs_of(cx, &view, target).contains(&B.to_string()), "moved to that pane's centre");
-    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.watch_note.as_deref().map(str::to_string)), Some("4 panes is the most".into()));
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.watch_note.as_deref().map(str::to_string)), Some("9 panes is the most".into()));
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
 }
@@ -6976,4 +6974,304 @@ fn the_composer_pickers_are_each_panes_own(cx: &mut TestAppContext) {
     assert!(sets(&mut a).is_empty() && sets(&mut b).is_empty(), "nothing set");
     view.update(cx, |v, _| v.client = None);
     let _ = client.shutdown();
+}
+
+// ── Room is the only limit (split.md §0, the 2026-11-25 note) ───────────
+
+/// Nine panes at 1920 × 1080 by the keys, as a user makes them (the
+/// 2026-11-25 note under split.md §0): Ctrl+\ three times (four across,
+/// the rail open: a halved pane under 320 evens out its row), each top
+/// pane split down (Alt+1–4, Ctrl+Shift+\), and the last again. Each
+/// change landed. The last new pane is focused.
+fn nine_panes(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>) {
+    let mut keys: Vec<String> = vec!["ctrl-\\".into(); 3];
+    for n in 1..=4 {
+        keys.push(nth_key(n));
+        keys.push("ctrl-shift-\\".into());
+    }
+    keys.push("ctrl-shift-\\".into());
+    for k in keys {
+        key(cx, window, &k);
+        land(cx, window, view);
+    }
+    for _ in 0..4 {
+        frame(cx, window);
+    }
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), crate::pane::PANES_MAX, "nine panes: {tree:?}");
+}
+
+/// A split that evens out its row (a halved pane would be under 320)
+/// flies there: its panes' last frame in the air is where they land, not
+/// where halving the pane would have put them (a jump of ~90 px at the
+/// landing). Four across at 1920 × 1080, both panels at their strips;
+/// Ctrl+\ evens the row to five.
+#[gpui_kit::test]
+fn an_evened_split_flies_to_where_it_lands(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    let (rail, right) = crate::app::panel_keys(cfg!(target_os = "macos"));
+    press(cx, window, rail);
+    press(cx, window, right);
+    land(cx, window, &view);
+    for _ in 0..3 {
+        key(cx, window, "ctrl-\\");
+        land(cx, window, &view);
+    }
+    let at = view.read_with(cx, |v, _| v.panes.focused);
+    let halved = view.read_with(cx, |v, _| v.panes.tree.split_as(at, crate::split::Side::Right, crate::pane::PaneId::nth(4)));
+    key(cx, window, "ctrl-\\");
+    let (tree, order) = view.read_with(cx, |v, _| (v.panes.tree.clone(), v.reading_order()));
+    assert_eq!(order.len(), 5);
+    assert_ne!(Some(&tree), halved.as_ref(), "the row evened, not the pane halved");
+    let mut frames: Vec<Vec<[f32; 4]>> = Vec::new();
+    for _ in 0..400 {
+        frame_144(cx, window, &view);
+        frames.push(order.iter().map(|id| pane_box(cx, window, *id)).collect());
+        if view.read_with(cx, |v, _| v.panes.flight.is_none()) {
+            break;
+        }
+    }
+    assert!(frames.len() > 2, "a flight: {} frames", frames.len());
+    let (last, rest) = (&frames[frames.len() - 2], &frames[frames.len() - 1]);
+    for (a, b) in last.iter().zip(rest) {
+        assert!((a[0] - b[0]).abs() <= 2. && (a[2] - b[2]).abs() <= 2., "the last frame in the air {last:?} is where it lands {rest:?}");
+    }
+    assert!(rest.iter().all(|b| b[2] >= crate::split::PANE_MIN_W), "five across, each at least 320: {rest:?}");
+}
+
+/// The pane key `n` (1-based) as this platform binds it: Alt+N, Ctrl+N on
+/// macOS.
+fn nth_key(n: usize) -> String {
+    format!("{}-{n}", if cfg!(target_os = "macos") { "ctrl" } else { "alt" })
+}
+
+/// Haseeb, 2026-11-25: "i can only have 3 columns?? thats too less." No
+/// cap across or down: at 1920 × 1080 with both panels at their strips,
+/// Ctrl+\ four times gives five panes side by side, each at least 320
+/// wide (a halved pane under 320 evens out its row instead). A sixth
+/// across would be under 320: an explicit split right is refused with "no
+/// room to split this pane", and Ctrl+\ splits down instead. Nine panes
+/// in all; the tenth is refused, "9 panes is the most". Alt+1–9 focus
+/// each in reading order.
+#[gpui_kit::test]
+fn five_across_fit_at_1920_with_both_panels_folded_and_a_tenth_is_refused(cx: &mut TestAppContext) {
+    use crate::split::{PANE_MIN_H, PANE_MIN_W};
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    let (rail, right) = crate::app::panel_keys(cfg!(target_os = "macos"));
+    press(cx, window, rail);
+    press(cx, window, right);
+    frame(cx, window);
+    let strip = crate::app::STRIP;
+    let shown = view.read_with(cx, |v, _| (v.panel_fx.sides[0].shown, v.panel_fx.sides[1].shown));
+    assert_eq!(shown, (strip, strip), "both panels at their strips");
+    for n in 2..=5 {
+        key(cx, window, "ctrl-\\");
+        frame(cx, window);
+        assert_eq!(view.read_with(cx, |v, _| v.panes.len()), n, "Ctrl+\\ made pane {n}");
+    }
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    let boxes: Vec<[f32; 4]> = order.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert!(boxes.iter().all(|b| b[1] == boxes[0][1] && b[3] == boxes[0][3]), "five across, one row: {boxes:?}");
+    assert!(boxes.windows(2).all(|w| w[1][0] > w[0][0]), "side by side: {boxes:?}");
+    assert!(boxes.iter().all(|b| b[2] >= PANE_MIN_W), "each at least 320 wide: {boxes:?}");
+    assert!(!view.read_with(cx, |v, _| v.panes.folded), "not folded");
+    // A sixth across: refused, in the composer's words; nothing changed.
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    let _ = cx.update_window(window, |_, w, cx| view.update(cx, |v, cx| v.split_pane(Some(crate::split::Side::Right), w, cx)));
+    frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.tree, tree, "no sixth across");
+        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("no room to split this pane"));
+    });
+    // Ctrl+\ splits the narrow pane down instead.
+    let at = view.read_with(cx, |v, _| v.panes.focused);
+    let above = pane_box(cx, window, at);
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let below = view.read_with(cx, |v, _| v.panes.focused);
+    assert_ne!(below, at, "a new pane");
+    let (a, b) = (pane_box(cx, window, at), pane_box(cx, window, below));
+    assert!(a[0] == above[0] && b[0] == above[0] && b[1] > a[1], "split down: {a:?} over {b:?}");
+    // Down to nine: the other columns' tops split down too.
+    for n in 1..=3 {
+        key(cx, window, &nth_key(n));
+        key(cx, window, "ctrl-\\");
+        frame(cx, window);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 9, "nine panes");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert!(
+        order.iter().map(|id| pane_box(cx, window, *id)).all(|b| b[2] >= PANE_MIN_W && b[3] >= PANE_MIN_H),
+        "every pane at least 320 × 240"
+    );
+    // The tenth: refused, by the total alone.
+    key(cx, window, "ctrl-\\");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 9, "no tenth pane");
+        assert_eq!(v.panes.cur.watch_note.as_deref(), Some("9 panes is the most"));
+    });
+    // Alt+1–9 (Ctrl on macOS): pane N in reading order, each.
+    for n in (1..=9).rev() {
+        key(cx, window, &nth_key(n));
+        assert_eq!(view.read_with(cx, |v, _| v.panes.focused), order[n - 1], "{} focuses pane {n}", nth_key(n));
+    }
+}
+
+/// A saved layout is read by its total alone (split.md §0, the 2026-11-25
+/// note): six across restored into a 1280 window takes the too-small path
+/// (folded, nothing lost); widened to 2560 it is six across, each at
+/// least 320; narrowed to 1920 (six need 1925 between the strips) it
+/// folds again, the tree untouched. Five across at 1920 keep the rail at
+/// its strip when Ctrl+B would open it (the panes win, split.md §5).
+#[gpui_kit::test]
+fn six_across_restored_into_1280_fold_and_widened_lay_out(cx: &mut TestAppContext) {
+    use crate::split::PANE_MIN_W;
+    let six = crate::theme::Layout {
+        focused: 0,
+        tree: crate::theme::LayoutNode::Split {
+            axis: crate::split::Axis::Row,
+            ratios: vec![1. / 6.; 6],
+            kids: (0..6).map(crate::theme::LayoutNode::Pane).collect(),
+        },
+        panes: (0..6).map(|_| saved(&[A])).collect(),
+    };
+    let (window, view, client, attaches, _events) = launch_in(cx, "six-across", Some(six), None, true, (1280., 800.));
+    let (len, folded) = view.read_with(cx, |v, _| (v.panes.len(), v.panes.folded));
+    assert_eq!(len, 6, "the six panes restored");
+    assert!(folded, "1280: too small for six, folded");
+    let tree = view.read_with(cx, |v, _| v.panes.tree.clone());
+    resize(cx, window, 2560., 1080.);
+    let (order, folded) = view.read_with(cx, |v, _| (v.reading_order(), v.panes.folded));
+    assert!(!folded, "2560: laid out");
+    let boxes: Vec<[f32; 4]> = order.iter().map(|id| pane_box(cx, window, *id)).collect();
+    assert!(boxes.iter().all(|b| b[1] == boxes[0][1] && b[2] >= PANE_MIN_W), "six across, each at least 320: {boxes:?}");
+    resize(cx, window, 1920., 1080.);
+    assert!(view.read_with(cx, |v, _| v.panes.folded), "1920: six don't fit between the strips, folded");
+    assert!(view.read_with(cx, |v, _| v.panes.tree.same_shape(&tree)), "the tree untouched");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+    // Five across restored at 1920: laid out (the rail yields), and Ctrl+B
+    // opening the rail leaves it at its strip, no pane under 320.
+    let five = crate::theme::Layout {
+        focused: 0,
+        tree: crate::theme::LayoutNode::Split {
+            axis: crate::split::Axis::Row,
+            ratios: vec![0.2; 5],
+            kids: (0..5).map(crate::theme::LayoutNode::Pane).collect(),
+        },
+        panes: (0..5).map(|_| saved(&[A])).collect(),
+    };
+    let (window, view, client, attaches, _events) = launch_in(cx, "five-across", Some(five), None, true, (1920., 1080.));
+    view.update(cx, |v, cx| {
+        v.panels.rail_collapsed = true;
+        cx.notify();
+    });
+    frame(cx, window);
+    assert!(!view.read_with(cx, |v, _| v.panes.folded), "five fit at 1920");
+    let strip = crate::app::STRIP;
+    press(cx, window, crate::app::panel_keys(cfg!(target_os = "macos")).0);
+    frame(cx, window);
+    frame(cx, window);
+    let (rail, open, folded) = view.read_with(cx, |v, _| (v.panel_fx.sides[0].shown, !v.panels.rail_collapsed, v.panes.folded));
+    assert!(open, "Ctrl+B opened the rail");
+    assert!(rail <= strip + 0.5 && !folded, "the rail yields to five across: {rail}, folded {folded}");
+    let order = view.read_with(cx, |v, _| v.reading_order());
+    assert!(order.iter().all(|id| pane_box(cx, window, *id)[2] >= PANE_MIN_W), "every pane at least 320");
+    while attaches.try_recv().is_ok() {}
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// split.md A18 with nine panes (the 2026-11-25 note under split.md §0):
+/// at rest they ask for no frame, as four do; only the rail's spinners
+/// keep their beat.
+#[gpui_kit::test]
+fn nine_panes_at_rest_draw_nothing(cx: &mut TestAppContext) {
+    let (window, view) = demo_split(cx, 1920., 1080.);
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Full), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    nine_panes(cx, window, &view);
+    let _ = cx.update_window(window, |_, window, cx| view.update(cx, |v, cx| window.focus(&v.focus, cx)));
+    for _ in 0..240 {
+        let ran = idle_step(cx, window, &view, Duration::from_micros(6944));
+        if ran == 0 && !view.read_with(cx, |v, _| v.fx.pending().0) {
+            break;
+        }
+    }
+    assert!(!view.read_with(cx, |v, _| v.fx.pending().0), "nine panes at rest: a display frame");
+    for _ in 0..60 {
+        idle_step(cx, window, &view, Duration::from_millis(50));
+    }
+    let f0 = view.read_with(cx, |v, _| v.fx.frames());
+    for i in 0..40 {
+        idle_step(cx, window, &view, Duration::from_millis(50));
+        assert_eq!(view.read_with(cx, |v, _| v.fx.frames()), f0, "at rest, {} ms on: a render", (i + 1) * 50);
+    }
+    let (sites, rail) = view.read_with(cx, |v, _| (v.fx.sites(), v.rail_width));
+    assert!(sites.iter().all(|s| matches!(s.beat, crate::motion::Beat::Spin(_)) && f32::from(s.origin.x) < rail), "{sites:?}");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 9);
+        assert!(v.panes.iter().all(|p| !p.disp.is_empty()), "every pane's list built");
+    });
+}
+
+/// A window that is not active (opened behind another, or left for
+/// one): GPUI sends it no focus events, so a composer the keys went to
+/// and left there never hears its blur, and its caret blinked on for the
+/// window's life, each blink a frame of every pane (three of four split
+/// panes' at once: 6 frames a second). No caret blinks there; active
+/// again, the focused composer's does, alone (a frame every 500 ms).
+#[gpui_kit::test]
+fn panes_split_in_a_window_not_active_leave_no_caret_blinking(cx: &mut TestAppContext) {
+    let (window, view) = open_sized(cx, 2560., 1440.);
+    cx.update(|cx| {
+        cx.set_global(crate::motion::Setting { level: Some(crate::motion::Level::Off), lock: None });
+        crate::motion::Level::apply(cx);
+    });
+    view.update(cx, |v, cx| {
+        v.app_settings.split = true;
+        let other = crate::app::Open::Attach { session_id: crate::demo::IDLE_CPU.into(), fallback: None, open: false };
+        v.open_tab(other, crate::tabs::Place::Current);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx));
+    // As `SYNAPS_DESK_PANES=4` splits them: each new pane's composer
+    // takes the keys, frames drawn between.
+    for (at, side) in crate::pane::shape(4) {
+        let _ = cx.update_window(window, |_, w, cx| {
+            view.update(cx, |v, cx| {
+                if let Some(i) = at {
+                    v.focus_nth(i, cx);
+                }
+                v.split_pane(side, w, cx);
+            })
+        });
+        for _ in 0..20 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.panes.len()), 4);
+    let frames = |cx: &mut TestAppContext| {
+        for _ in 0..40 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+        let f0 = view.read_with(cx, |v, _| v.fx.frames());
+        for _ in 0..80 {
+            idle_step(cx, window, &view, Duration::from_millis(50));
+        }
+        view.read_with(cx, |v, _| v.fx.frames()) - f0
+    };
+    assert_eq!(frames(cx), 0, "not active: no caret blinks, 4 s at rest");
+    let _ = cx.update_window(window, |_, window, _| window.activate_window());
+    let n = frames(cx);
+    assert!((7..=9).contains(&n), "active: the focused composer's caret alone, a frame every 500 ms: {n} in 4 s");
 }
