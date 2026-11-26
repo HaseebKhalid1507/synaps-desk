@@ -373,6 +373,11 @@ impl Item {
         self.kept_input.as_deref()
     }
 
+    /// Its kept input's allocation (tests: who else keeps it).
+    pub fn kept_allocation(&self) -> Option<&Arc<Value>> {
+        self.kept_input.as_ref()
+    }
+
     /// Its place in the live stream: its call's (or message's), its
     /// result's; 0 for not yet.
     pub(crate) fn seq(&self) -> [u64; 2] {
@@ -2113,12 +2118,17 @@ impl Transcript {
                         t.status = Some(ToolStatus::Running);
                     }
                     let card = crate::cards::is_card_tool(tool_name);
-                    self.items[ix].kept_input = crate::blocks::keeps_input(tool_name).then(|| Arc::new(input.clone()));
+                    let kept = crate::blocks::keeps_input(tool_name).then(|| Arc::new(input.clone()));
                     // A live call; the history's own (an attach's replay of
-                    // a call its history holds) is the history's.
-                    if ix >= self.history_end {
-                        self.live_log.call(&self.blocks, self.items[ix].id, tool_id, tool_name, self.items[ix].kept_input.clone());
-                    }
+                    // a call its history holds) is the history's. The row
+                    // keeps the input as the log does: the same input again
+                    // is the one both kept, one allocation (counted once,
+                    // the row's).
+                    self.items[ix].kept_input = if ix >= self.history_end {
+                        self.live_log.call(&self.blocks, self.items[ix].id, tool_id, tool_name, kept)
+                    } else {
+                        kept
+                    };
                     self.live_cards |= card;
                     self.came(ix, false);
                     self.touch(ix);

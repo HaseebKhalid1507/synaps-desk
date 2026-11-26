@@ -1016,6 +1016,369 @@ fn the_published_board_is_counted_once_and_let_go() {
     assert!(again.abs_diff(after) <= after / 10, "counted once: {after} then {again}");
 }
 
+/// A response of `n` block calls (each starts, then its input is whole),
+/// then their results, every call refused: a large round, block-only, its
+/// results in. Its tool ids are `toolu_{tag}{k}`.
+fn big_round(d: &mut Desk, tag: &str, n: usize) {
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    for k in 0..n {
+        let id = format!("toolu_{tag}{k}");
+        let ops = json!([{"op":"put","id":format!("{tag}{k}"),"kind":"note","body":{"text":format!("note {k}")}}]);
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
+        d.apply(&tool_use(&id, "cards_block", block_input(ops)));
+    }
+    for k in 0..n {
+        d.apply(&tool_result(&format!("toolu_{tag}{k}"), "cards_block: refused (a test)"));
+    }
+}
+
+/// `big_round(tag, n)` as the history holds it, after the turn's prompt.
+fn big_round_landed(tag: &str, n: usize) -> Vec<Value> {
+    let calls: Vec<Value> = (0..n)
+        .map(|k| {
+            let ops = json!([{"op":"put","id":format!("{tag}{k}"),"kind":"note","body":{"text":format!("note {k}")}}]);
+            json!({"type": "tool_use", "id": format!("toolu_{tag}{k}"), "name": "cards_block", "input": block_input(ops)})
+        })
+        .collect();
+    let results: Vec<Value> = (0..n)
+        .map(|k| json!({"type": "tool_result", "tool_use_id": format!("toolu_{tag}{k}"), "content": "cards_block: refused (a test)"}))
+        .collect();
+    vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": calls}),
+        json!({"role": "user", "content": results}),
+    ]
+}
+
+/// Shady #101 R4-1: no event destroys a round. A large block-only round
+/// (3,000 calls and their refused results, no card anywhere) goes at a
+/// delivered steer, at the next response but one (the round before the
+/// one it seals), at a reset, and when the history lands (its log
+/// replaced). Each time its calls and ids (and a reset's facts, a log's
+/// store) are handed to the disposer, gated here: the event finishes
+/// before any of it is dropped (a reset's inputs held: the gate holds
+/// them), the frame destroys O(1) elements (a hand-over is one) and
+/// touches O(1) under the log's lock. A reset's facts are counted with
+/// their inputs (their rows went with the response, the inputs are the
+/// disposer's now); the gate open, the disposer lets every one of them go.
+#[test]
+fn a_round_let_go_is_destroyed_off_the_frame() {
+    use synaps_client::blocks::dispose;
+    let n = 3_000;
+    // Every boundary checked, the ones that miss listed together.
+    let mut wrong = Vec::new();
+    for boundary in ["steer", "next response", "reset", "history"] {
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        big_round(&mut d, "big", n);
+        let event = match boundary {
+            "steer" => Some(llm(json!({"kind": "agent", "agent": "steering_delivered", "message": "and the tests"}))),
+            "next response" => {
+                // A small round after it; the next response's first call
+                // seals the small one, and the big one goes.
+                d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+                for e in live_pair(0) {
+                    d.apply(&e);
+                }
+                d.apply(&tool_result("toolu_l0", "cards_block: refused (a test)"));
+                d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+                Some(llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": "toolu_next"})))
+            }
+            "reset" => Some(llm(json!({"kind": "llm", "llm": "response_reset"}))),
+            _ => None,
+        };
+        let inputs: Vec<std::sync::Weak<Value>> =
+            d.t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big"))).filter_map(|i| i.kept_allocation()).map(Arc::downgrade).collect();
+        let payload: usize = d.t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big"))).map(|i| i.kept_bytes()).sum();
+        assert_eq!(inputs.len(), n, "{boundary}: the round's inputs");
+        let gate = dispose::gate();
+        let (destroyed, visits) = (dispose::destroyed(), d.t.blocks_live().visits());
+        match &event {
+            Some(e) => d.apply(e),
+            None => d.t.apply_update(&HistoryUpdate::Append { base_len: 1, messages: big_round_landed("big", n) }).unwrap(),
+        }
+        let frame = dispose::destroyed() - destroyed;
+        let (items, elements, bytes) = gate.held();
+        if frame > 4 {
+            wrong.push(format!("{boundary}: the frame destroyed {frame} elements"));
+        }
+        if elements < 2 * n {
+            wrong.push(format!("{boundary}: the disposer's {elements} elements ({items} items), the round's {}", 2 * n));
+        }
+        if event.is_some() {
+            let touched = d.t.blocks_live().visits() - visits;
+            if touched > 16 {
+                wrong.push(format!("{boundary}: the frame touched {touched} under the log's lock"));
+            }
+        }
+        if boundary == "reset" {
+            assert!(d.t.items().iter().all(|i| i.kept_allocation().is_none()), "the response's rows went");
+            let alive = inputs.iter().filter(|w| w.strong_count() > 0).count();
+            assert_eq!(alive, n, "the reset's inputs alive, the gate shut: the event finished before any was dropped");
+            if bytes < payload {
+                wrong.push(format!("reset: its facts' {alive} live inputs ({payload} bytes, their rows gone) counted {bytes}"));
+            }
+        }
+        drop(gate);
+        dispose::flush();
+        if boundary == "reset" {
+            let alive = inputs.iter().filter(|w| w.strong_count() > 0).count();
+            if alive > 0 {
+                wrong.push(format!("reset: {alive} of its inputs outlive their rows"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "rounds let go on the frame: {wrong:#?}");
+}
+
+/// Shady #101 R4-2: a call whole again with the same input keeps one
+/// allocation: its row, its call and its fact share it, so the row's count
+/// is every copy the transcript keeps (the worker's event is its own,
+/// counted with its journal), and when the transcript goes none outlives
+/// it.
+#[test]
+fn the_same_input_again_is_one_allocation() {
+    use synaps_client::blocks::dispose;
+    let mut d = Desk::of(attach(&plain()));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    let calls = 40;
+    let input = |d: &Desk, k: usize| -> Arc<Value> {
+        let id = format!("toolu_l{k}");
+        let row = d.t.items().iter().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == id)).expect("its row");
+        row.kept_allocation().expect("its input").clone()
+    };
+    let mut seen = Vec::new();
+    for k in 0..calls {
+        for e in live_pair(k) {
+            d.apply(&e);
+        }
+        seen.push(Arc::downgrade(&input(&d, k)));
+    }
+    let _ = d.fold();
+    for _ in 0..3 {
+        for k in 0..calls {
+            d.apply(&live_pair(k)[1]);
+            seen.push(Arc::downgrade(&input(&d, k)));
+        }
+        let _ = d.fold();
+    }
+    let rows: Vec<Arc<Value>> = (0..calls).map(|k| input(&d, k)).collect();
+    let alive: Vec<Arc<Value>> = seen.iter().filter_map(std::sync::Weak::upgrade).collect();
+    let lost = alive.iter().filter(|a| !rows.iter().any(|r| Arc::ptr_eq(a, r))).count();
+    assert_eq!(lost, 0, "{} inputs alive for {calls} rows: {lost} no row's (uncounted)", alive.len());
+    let kept: usize = d.t.items().iter().map(|i| i.kept_bytes()).sum();
+    let distinct: usize = rows.iter().map(|r| std::mem::size_of::<Value>() + synaps_client::blocks::value_bytes(r)).sum();
+    assert_eq!(kept, distinct, "the rows count every allocation once");
+    drop((rows, alive));
+    drop(d);
+    dispose::flush();
+    assert!(seen.iter().all(|w| w.strong_count() == 0), "none outlives the transcript");
+}
+
+fn card(k: usize) -> Value {
+    json!({"question": format!("Card {k}?"), "detail": "d".repeat(600), "options": ["Yes", "No", "Later"]})
+}
+
+fn card_id(k: usize) -> cards_spec::CardId {
+    cards_spec::CardId::parse(&format!("c{k:06}")).expect("a card id")
+}
+
+fn card_doc(k: usize) -> (cards_spec::CardDoc, bool) {
+    match cards_spec::parse_input(&card(k)).expect("a card") {
+        cards_spec::Input::Create { doc, wait } => (doc, wait),
+        cards_spec::Input::Close(_) => unreachable!(),
+    }
+}
+
+/// Card `k`'s result: shown, it binds.
+fn card_shown(k: usize) -> String {
+    let (doc, wait) = card_doc(k);
+    format!("{}\nIts answer will come as a user message starting \"[card {}]\".", cards_spec::Envelope::showing(card_id(k), &doc, wait), card_id(k).as_str())
+}
+
+/// A user's answer to card `k`.
+fn card_answer(k: usize, choice: &str) -> String {
+    let (doc, _) = card_doc(k);
+    let reply = cards_spec::Reply::Answer(cards_spec::parse_answer(&doc, &json!({"choice": choice})).expect("an answer"));
+    cards_spec::message::build(&card_id(k), &doc, &reply)
+}
+
+/// Cards asked and bound in a history, after its prompt.
+fn bound_cards(h: &mut Vec<Value>, ks: &[usize]) {
+    for &k in ks {
+        let id = format!("toolu_c{k}");
+        h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_ui", "input": card(k)}]}));
+        h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": card_shown(k)}]}));
+    }
+}
+
+/// What the worker's card folds keep, as B2's own folds count them: the
+/// history's board read as far as the worker read it and, once it read
+/// all of it, the overlay's, read on over the live turn's events as far
+/// as the worker read them.
+fn card_counts(d: &Desk, h: &[Value]) -> usize {
+    let history = events(h);
+    let mut base = cards_spec::board::Board::new(cards_spec::block::Generation::of(&h[0]));
+    base.read(&history[..d.w.position()]);
+    if d.w.position() < history.len() {
+        return base.card_fold_bytes();
+    }
+    let live = d.t.blocks_input().unwrap().live_events().unwrap();
+    let all: Vec<Event> = history.iter().cloned().chain(live[..d.w.live_read()].iter().cloned()).collect();
+    let mut over = base.clone();
+    over.read(&all);
+    base.card_fold_bytes() + over.card_fold_bytes()
+}
+
+fn steer(text: &str) -> SessionEvent {
+    llm(json!({"kind": "agent", "agent": "steering_delivered", "message": text}))
+}
+
+/// Shady #101 R4-2: the worker's card counts are B2's folds' at every
+/// boundary that changes them, a card call's or not: a pending card call,
+/// its valid result (the card binds), a user's valid answer and another
+/// (allowed while the card is answerable), an answer to the history's
+/// card. And wherever a job stops, the history read part way (between
+/// its slices) or the live turn (between its batches), what it publishes
+/// counts what it holds then.
+#[test]
+fn the_card_counts_follow_every_fold_and_pause() {
+    let mut h = plain();
+    bound_cards(&mut h, &[0, 2, 3]);
+    let mut d = Desk::of(attach(&h));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    let start = |id: &str| llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_ui", "tool_id": id}));
+    let steps: Vec<(&str, Vec<SessionEvent>)> = vec![
+        ("a block call", live_pair(0).to_vec()),
+        ("a pending card", vec![start("toolu_c1"), tool_use("toolu_c1", "cards_ui", card(1))]),
+        ("its result binds it", vec![tool_result("toolu_c1", &card_shown(1))]),
+        ("answered", vec![steer(&card_answer(1, "Yes"))]),
+        ("answered again", vec![steer(&card_answer(1, "No"))]),
+        ("the history's card answered", vec![steer(&card_answer(0, "Later"))]),
+    ];
+    // Every boundary checked, the ones that miss listed together.
+    let mut wrong = Vec::new();
+    let mut last = 0;
+    for (step, events) in steps {
+        for e in &events {
+            d.apply(e);
+        }
+        let _ = d.fold();
+        let (kept, want) = (d.w.retained(), card_counts(&d, &h));
+        if kept.card_bytes != want {
+            wrong.push(format!("{step}: {} for {want}", kept.card_bytes));
+        }
+        assert!(want != last, "{step}: B2's fold changed");
+        assert!(d.t.blocks_bytes() >= kept.bytes, "{step}: published");
+        last = want;
+    }
+    // Paused: a history longer than a slice (its cards in the first), then
+    // a live turn longer than a batch (a card, its binding, an answer).
+    let mut h = plain();
+    bound_cards(&mut h, &[0, 2, 3]);
+    for m in 0..50 {
+        let calls: Vec<Value> = (0..100).map(|k| json!({"type": "tool_use", "id": format!("toolu_r{m}_{k}"), "name": "read", "input": {"path": "a"}})).collect();
+        let results: Vec<Value> = (0..100).map(|k| json!({"type": "tool_result", "tool_use_id": format!("toolu_r{m}_{k}"), "content": "a"})).collect();
+        h.push(json!({"role": "assistant", "content": calls}));
+        h.push(json!({"role": "user", "content": results}));
+    }
+    assert!(events(&h).len() > SLICE + 64);
+    let mut d = Desk::of(attach(&h));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    for e in live_pair(0).into_iter().chain([start("toolu_c1"), tool_use("toolu_c1", "cards_ui", card(1)), tool_result("toolu_c1", &card_shown(1)), steer(&card_answer(1, "Yes"))]) {
+        d.apply(&e);
+    }
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    for k in 0..600 {
+        let id = format!("toolu_p{k}");
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "read", "tool_id": id})));
+        d.apply(&tool_use(&id, "read", json!({"path": "b"})));
+    }
+    let input = d.t.blocks_input().unwrap();
+    let (mut history, mut live) = (0, 0);
+    while d.w.run(&input, &mut || false).is_none() {
+        let (kept, want) = (d.w.retained(), card_counts(&d, &h));
+        let at = (d.w.position(), d.w.live_read());
+        if kept.card_bytes != want {
+            wrong.push(format!("paused at {at:?}: {} for {want}", kept.card_bytes));
+        }
+        assert!(d.t.blocks_bytes() >= kept.bytes, "paused at {at:?}: published as it is");
+        if at.0 < events(&h).len() { history += 1 } else { live += 1 }
+        assert!(history + live < 100, "it reads on");
+    }
+    assert!(history >= 1 && live >= 1, "paused in the history {history}, in the live turn {live}");
+    let (kept, want) = (d.w.retained().card_bytes, card_counts(&d, &h));
+    if kept != want {
+        wrong.push(format!("done: {kept} for {want}"));
+    }
+    assert!(wrong.is_empty(), "the card counts missed B2's folds: {wrong:#?}");
+}
+
+/// Shady #101 R4-1, the bound: one hold of the live log's lock touches at
+/// most max(HOLD, P + G) elements. A reader's batch stops before the next
+/// handle's read could pass HOLD (G: the most one read touches, its
+/// segment found among S and its slot's rank-select among N slots,
+/// ⌊log₂ S⌋ + ⌊log₂ N⌋ + 4), one handle at least; before it come its cut
+/// queries, P: two at most, each b(b+1)/2 tree nodes for b = ⌊log₂ C⌋ + 1,
+/// C the log's cuts. Here the 7,000-call scrambled turn, read whole, and
+/// a stale input (taken before 4,000 calls whole out of order: its cut
+/// queries read every cut since).
+#[test]
+fn a_hold_of_the_live_log_is_bounded_by_its_batch_and_its_cut_queries() {
+    let bound = |d: &Desk| {
+        let (cuts, segments, widest) = d.t.blocks_live().shape();
+        let bits = |n: usize| (usize::BITS - n.leading_zeros()) as usize;
+        let per_query = bits(cuts) * (bits(cuts) + 1) / 2;
+        HOLD.max(2 * per_query + bits(segments) + 2 + bits(widest))
+    };
+    let mut d = Desk::of(attach(&plain()));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    let n = 7_000;
+    for k in 0..n {
+        d.apply(&live_pair(k)[0]);
+    }
+    for k in scrambled(n) {
+        d.apply(&live_pair(k)[1]);
+    }
+    for k in 0..n {
+        d.apply(&tool_result(&format!("toolu_l{k}"), "cards_block: refused (a test)"));
+    }
+    let _ = d.fold();
+    let (most, b) = (d.t.blocks_live().most_held(), bound(&d));
+    assert!(most <= b, "scrambled: a hold touched {most}, bound {b} ({:?})", d.t.blocks_live().shape());
+    let mut d = Desk::of(attach(&plain()));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    for k in 0..2_000 {
+        for e in live_pair(k) {
+            d.apply(&e);
+        }
+    }
+    let stale = d.t.blocks_input().unwrap();
+    for k in 2_000..6_000 {
+        d.apply(&live_pair(k)[0]);
+    }
+    for k in scrambled(4_000) {
+        d.apply(&live_pair(2_000 + k)[1]);
+    }
+    assert!(d.t.blocks_live().shape().0 > 2_000, "cuts {:?}", d.t.blocks_live().shape());
+    assert!(d.w.run(&stale, &mut || true).is_some(), "the stale input holds (every cut past it)");
+    let _ = d.fold();
+    let (most, b) = (d.t.blocks_live().most_held(), bound(&d));
+    assert!(most <= b, "stale: a hold touched {most}, bound {b} ({:?})", d.t.blocks_live().shape());
+}
+
 /// `h`'s board three ways, at each of its message boundaries from `from`
 /// (a turn's start) on: streamed live a message at a time, each board the
 /// landed prefix's there (every block's body, revision, pending and bound
