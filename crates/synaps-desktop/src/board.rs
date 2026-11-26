@@ -46,6 +46,9 @@ pub(crate) struct Work {
     /// Steps run and boards published (tests, the bench).
     pub(crate) steps: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) published: u64,
+    /// A finished board that waits for a pane's pointer lease to end
+    /// ([`crate::lease`]).
+    pub(crate) waiting: Option<Arc<Drawn>>,
 }
 
 /// What one step came to.
@@ -96,6 +99,7 @@ impl AppView {
         l.board.stop.store(true, Ordering::Relaxed);
         l.board.job = None;
         let Some(input) = l.transcript.blocks_input() else {
+            l.board.waiting = None;
             if l.transcript.drawn().is_some() {
                 l.transcript.set_drawn(None);
             }
@@ -135,9 +139,7 @@ impl AppView {
         if l.transcript.blocks_epoch() != drawn.epoch {
             return;
         }
-        l.transcript.set_drawn(Some(drawn));
-        l.board.published += 1;
-        cx.notify();
+        self.board_ready(live, drawn, cx);
     }
 }
 

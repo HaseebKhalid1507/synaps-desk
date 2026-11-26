@@ -365,6 +365,7 @@ impl AppView {
         let head = self.block_head(s, id, folded, streaming, fit, &g, p, m, cx);
         let body = (!folded).then(|| self.block_body(s, id, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
+        let tag = s.block.tag;
         div()
             .id(("block", id))
             .debug_selector(move || format!("block {id}"))
@@ -379,7 +380,9 @@ impl AppView {
             )
             .child(head)
             .children(body)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, id, cx)))
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag))
+            .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, id, tag, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, cx)))
             .into_any_element()
     }
@@ -423,7 +426,8 @@ impl AppView {
             (_, w) => w.map(str::to_string),
         };
         let word_c = glow(2, bound_value(s, |b| life_of(b, true).1), word_color(life, p));
-        let ink = glyph::life_ink(life, p.card_d, p);
+        // The lease's note on it (§6.2), until the next input.
+        let note = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1);
         h_flex()
             .h(px(g.head))
             .w_full()
@@ -434,7 +438,14 @@ impl AppView {
             .text_px(m.label)
             .cursor_pointer()
             .debug_selector(move || format!("block-head {id}"))
-            .child(div().flex_none().debug_selector(move || format!("block-life {id} {life:?}")).child(glyph::life(life, ink)))
+            .child(div().flex_none().debug_selector(move || format!("block-life {id} {life:?}")).child(glyph::indicator(
+                &self.fx,
+                life,
+                p.card_d,
+                p,
+                self.fx.col(self.panes.cur.id).change(motion::Tag::Outcome, id, life.code(), None),
+                None,
+            )))
             .child(
                 div()
                     .min_w_0()
@@ -461,20 +472,27 @@ impl AppView {
                 )
             })
             .child(div().flex_1().min_w(px(8.)))
-            .when(fit.rev, |d| {
+            .when_some(note, |d, n| {
+                d.child(div().flex_none().text_px(m.meta).text_color(p.acc).debug_selector(move || format!("block-says {id} {n}")).child(n))
+            })
+            .when(fit.rev && note.is_none(), |d| {
                 d.child(
                     div()
                         .flex_none()
                         .font_family(fonts::MONO)
                         .text_px(m.meta)
                         .text_color(p.dim_t)
-                        .debug_selector(move || format!("block-rev {id}"))
+                        .debug_selector({
+                            let t = format!("block-rev {id} {kind} · {rev}");
+                            move || t.clone()
+                        })
                         .child(format!("{kind} · {rev}")),
                 )
             })
             .when(!fit.rev && b.pending, |d| d.child(div().flex_none().text_px(m.meta).text_color(p.dim_t).child("pending")))
             .when_some(word.filter(|_| fit.word), |d, w| {
-                d.child(div().flex_none().text_px(m.meta).text_color(word_c).debug_selector(move || format!("block-word {id}")).child(w))
+                let t = format!("block-word {id} {w}");
+                d.child(div().flex_none().text_px(m.meta).text_color(word_c).debug_selector(move || t.clone()).child(w))
             })
             .child(
                 div()
@@ -534,7 +552,19 @@ impl AppView {
                             .font_family(fonts::SANS)
                             .text_px(m.label)
                             .debug_selector(move || format!("block-step {id} {step_id}"))
-                            .child(div().flex_none().child(glyph::life(life, glyph::life_ink(life, p.card_d, p))))
+                            .child(div().flex_none().child(glyph::indicator(
+                                &self.fx,
+                                life,
+                                p.card_d,
+                                p,
+                                self.fx.col(self.panes.cur.id).change(
+                                    motion::Tag::Outcome,
+                                    id ^ (sid & 0xFFFF_FFFF) << 8,
+                                    life.code(),
+                                    None,
+                                ),
+                                None,
+                            )))
                             .child(
                                 div()
                                     .min_w_0()
@@ -835,22 +865,6 @@ impl AppView {
         let items = self.model.lives[self.panes.cur.live].shown().items();
         let s = items.get(d.item)?.blocks.as_deref()?.blocks.get(at as usize)?.clone();
         Some((ix, s))
-    }
-
-    /// Pointer-down on block row `id` in pane `pane`.
-    pub(crate) fn block_down(&mut self, pane: crate::pane::PaneId, id: u64, cx: &mut Context<Self>) {
-        let _ = (pane, id, cx);
-    }
-
-    /// Pointer-up on block row `id`: its fold, the user's (§3.5).
-    pub(crate) fn block_up(&mut self, pane: crate::pane::PaneId, id: u64, cx: &mut Context<Self>) {
-        self.in_pane(pane, |this| {
-            if let Some((ix, s)) = this.block_shown(id) {
-                this.panes.cur.block_folds.toggle(id, &s);
-                this.panes.cur.list.remeasure_items(ix..ix + 1);
-            }
-        });
-        cx.notify();
     }
 
     /// `more` or `less` on a note.

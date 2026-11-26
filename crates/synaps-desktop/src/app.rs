@@ -2219,6 +2219,8 @@ pub struct AppView {
     once: Option<OnceKey>,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
+    /// The pointer lease's one wake, while a board waits ([`crate::lease`]).
+    pub(crate) lease_wake: Option<Task<()>>,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
     /// they read, this app's own new settings, the gear's menu (and where
     /// the mouse-down that closed it from outside was), and the view on
@@ -2928,6 +2930,7 @@ impl AppView {
             dnd: Default::default(),
             once: None,
             attach_source: None,
+            lease_wake: None,
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),
@@ -9164,10 +9167,14 @@ impl AppView {
                 )
                 .child(
                     div()
+                        .id(("pane-list", id.index()))
                         .debug_selector(move || format!("pane-list {}", id.index()))
                         .flex_1()
                         .min_h_0()
                         .relative()
+                        // The pointer lease (blocks.md §6.2): a move asks for no frame.
+                        .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, _| this.lease_move(id)))
+                        .on_hover(cx.listener(move |this, over: &bool, _, cx| this.lease_over(id, *over, cx)))
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
                         // Held (a dropped row's flight), nothing drawn
                         // from the rows (finish gate #48 r2 N1): no list,
@@ -9181,7 +9188,8 @@ impl AppView {
                         .children(landing)
                         .children(hold_back.filter(|_| !hold))
                         .children(rehint.filter(|_| !hold))
-                        .children((!hold).then_some(transcript_bar)),
+                        .children((!hold).then_some(transcript_bar))
+                        .children((!hold).then(|| self.blocks_pill(&p, &m, cx)).flatten()),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
@@ -10307,6 +10315,11 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // A key releases the pointer lease (blocks.md §6.2), after
+                // it acts.
+                if this.panes.iter().any(|p| p.lease.moved.is_some() || p.lease.note.is_some()) {
+                    cx.defer_in(window, |this, _, cx| this.lease_key(cx));
+                }
                 // Esc while a tab or a row is dragged: the drag ends, and
                 // nothing drops (split.md §3); nothing else hears it.
                 if ev.keystroke.key == "escape" && this.cancel_drag(window, cx) {

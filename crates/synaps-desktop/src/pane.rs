@@ -99,6 +99,8 @@ pub struct Pane {
     /// notes opened past their 6 lines, diff wells' scroll, and edit
     /// previews' groups (by file), by block row.
     pub(crate) block_folds: crate::blocks::Folds,
+    /// The pointer lease and painted targets ([`crate::lease`]).
+    pub(crate) lease: crate::lease::Lease,
     pub(crate) block_more: HashSet<u64>,
     pub(crate) block_scroll: std::cell::RefCell<HashMap<u64, gpui_kit::ScrollHandle>>,
     pub(crate) block_edits: std::cell::RefCell<HashMap<String, (u64, crate::blocks::Preview)>>,
@@ -476,6 +478,7 @@ impl Pane {
             toggled: Toggled::default(),
             open_runs: HashSet::new(),
             block_folds: Default::default(),
+            lease: Default::default(),
             block_more: HashSet::new(),
             block_scroll: Default::default(),
             block_edits: Default::default(),

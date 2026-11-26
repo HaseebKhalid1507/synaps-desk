@@ -1,0 +1,440 @@
+//! The pointer lease and painted targets in the transcript (synaps-cards
+//! `docs/blocks.md` v1.3, §6.2), for the blocks the agent changes.
+//!
+//! - **The lease** starts when the pointer moves over the list, and lasts
+//!   while it moves and [`LEASE`] after its last move, or while a press is
+//!   held. A parked pointer releases it (the weaker promise, stated: a
+//!   mouse left over the transcript freezes nothing).
+//! - **Under it, a board that would move or replace what is under the
+//!   pointer waits** (the old geometry stays drawn): the hovered block
+//!   removed, moved, merged or replaced (another incarnation is another
+//!   block), its own height changing, or a block row in view above it
+//!   added, removed or changing height. A change that keeps all that draws
+//!   at once, in place. The board is one coherent board: all of it waits,
+//!   or none (decision: rather than scroll the content above, §6.2's
+//!   "position" rule waits too, the calmer of the two; listed in the PR).
+//! - **Release**: the lease's end (one timer wake, armed only while a
+//!   board waits), the pointer leaving the list, or a key. What waited
+//!   draws at once; what it moved or replaced counts as just moved.
+//! - **Painted targets**: a block's hit region is painted as its block row
+//!   and its incarnation's tag. Pointer-down takes the target, and the
+//!   press holds the lease; pointer-up acts on that same target only if
+//!   the board drawn still holds it (the same tag), else it does nothing
+//!   and the block says `this block changed · look again` until the next
+//!   input. It never redirects to whatever holds the name now.
+//! - **Just moved**: a pointer-down on a block an agent op moved (its
+//!   painted rect) or replaced (its tag) in the last [`JUST_MOVED`] does
+//!   nothing, once, and says `this moved just now`. "An agent op" is a
+//!   frame within [`JUST_MOVED`] of a board drawn; a slide's frames each
+//!   restart the window, so it runs from the motion's end. A timestamp per
+//!   hit region, compared when input arrives: no timer, no frame. Keys
+//!   never meet it.
+//! - **The pill**: blocks that changed above the view, `2 blocks changed
+//!   above ↑` at the list's top; a click walks to the first, and a block
+//!   painted in view leaves it.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gpui_kit::*;
+use synaps_client::blocks::{Body, Drawn, Fate, RowBlocks, Shown, Tag};
+
+use crate::app::AppView;
+use crate::live::LiveId;
+use crate::pane::PaneId;
+
+/// The lease lasts this long after the pointer's last move.
+pub(crate) const LEASE: Duration = Duration::from_millis(1500);
+/// A target an agent op moved or replaced this recently does nothing, once.
+pub(crate) const JUST_MOVED: Duration = Duration::from_millis(600);
+
+pub(crate) const CHANGED: &str = "this block changed · look again";
+pub(crate) const MOVED: &str = "this moved just now";
+
+/// What a block's hit region was painted as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Target {
+    pub row: u64,
+    pub tag: Tag,
+}
+
+/// A block row's last paint: its rect and tag, and when an agent op last
+/// moved or replaced it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Painted {
+    pub bounds: Bounds<Pixels>,
+    pub tag: Tag,
+    pub moved: Option<Instant>,
+}
+
+/// One pane's lease and targets.
+#[derive(Default)]
+pub(crate) struct Lease {
+    /// The pointer's last move over the list.
+    pub moved: Option<Instant>,
+    pub over: bool,
+    /// A press taken on a block, held.
+    pub pressed: bool,
+    pub hover: Option<Target>,
+    pub down: Option<Target>,
+    /// A block's note until the next input.
+    pub note: Option<(u64, &'static str)>,
+    pub painted: Rc<RefCell<HashMap<u64, Painted>>>,
+    /// When a board was last drawn: frames within [`JUST_MOVED`] of it
+    /// draw an agent op.
+    pub agent_op: Rc<Cell<Option<Instant>>>,
+    /// Block rows changed above the view, oldest first (the pill).
+    pub above: Rc<RefCell<Vec<u64>>>,
+}
+
+impl Lease {
+    pub(crate) fn active(&self, now: Instant) -> bool {
+        self.pressed || (self.over && self.moved.is_some_and(|t| now < t + LEASE))
+    }
+}
+
+fn hash(v: impl Hash) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// What a block's height follows (§6.2: structure and bounded line
+/// counts): a change of it moves what is under it.
+pub(crate) fn shape(s: &Shown) -> u64 {
+    let b = &s.block;
+    let body = match &b.body {
+        Body::Plan(p) => p.steps.len() as u64,
+        Body::Status(_) | Body::File(_) => 0,
+        Body::Diff(d) => d.hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>().min(crate::blocks::DIFF_LINES) as u64,
+        Body::Note(n) => crate::blocks::note_lines(&n.text, 60.).min(crate::blocks::NOTE_LINES + 1) as u64,
+        Body::Metric(m) => u64::from(m.series.is_empty()),
+        Body::Group(_) => hash(s.members.iter().map(shape).collect::<Vec<_>>()),
+    };
+    hash((b.body.kind().as_str(), b.collapsed, body))
+}
+
+/// A row's blocks' shapes, and whether its call draws a row.
+fn shapes(r: Option<&Arc<RowBlocks>>) -> u64 {
+    r.map_or(0, |r| hash((matches!(r.call, Some(Fate::Unbound)), r.blocks.iter().map(shape).collect::<Vec<_>>())))
+}
+
+/// Where block row `row` is on board `d`: its anchor's item id, its place
+/// there, and the block.
+fn find(d: &Drawn, row: u64) -> Option<(u64, usize, &Shown)> {
+    d.rows.iter().find_map(|(item, rb)| {
+        rb.blocks.iter().enumerate().find(|(_, s)| crate::blocks::row_id(&s.block.id) == row).map(|(j, s)| (*item, j, s))
+    })
+}
+
+/// A block's content as its pill and glow see it.
+fn content(s: &Shown) -> u64 {
+    hash((s.block.tag, s.block.rev, s.block.collapsed, s.block.pending, s.members.iter().map(content).collect::<Vec<_>>()))
+}
+
+impl AppView {
+    /// Whether board `new` would move or replace what is under the pointer
+    /// in the pane acted on (module docs), its board drawn `old`.
+    fn disturbs(&self, old: Option<&Drawn>, new: &Drawn) -> bool {
+        let lease = &self.panes.cur.lease;
+        let Some(hover) = lease.hover.filter(|_| lease.active(self.fx.now())) else { return false };
+        let Some(old) = old else { return false };
+        let Some((oi, oj, os)) = find(old, hover.row) else { return false };
+        let Some((ni, nj, ns)) = find(new, hover.row) else { return true };
+        if (ni, nj) != (oi, oj) || ns.block.tag != hover.tag || shape(ns) != shape(os) {
+            return true;
+        }
+        // The rows in view above it.
+        let disp = &self.panes.cur.disp;
+        let Some(h) = disp.iter().position(|d| d.id == hover.row) else { return false };
+        let top = self.panes.cur.list.logical_scroll_top().item_ix.min(h);
+        let items = self.model.lives[self.panes.cur.live].shown().items();
+        let mut seen = Vec::new();
+        for d in &disp[top..=h] {
+            let Some(id) = items.get(d.item).map(|i| i.id) else { continue };
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            if id == oi {
+                // Its own anchor: the blocks before it there.
+                let before = |d: &Drawn| {
+                    d.rows.get(&id).map_or(0, |r| hash(r.blocks[..oj.min(r.blocks.len())].iter().map(shape).collect::<Vec<_>>()))
+                };
+                if before(old) != before(new) {
+                    return true;
+                }
+                continue;
+            }
+            if shapes(old.rows.get(&id)) != shapes(new.rows.get(&id)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A finished board for store `live`, drawn now, or kept waiting under
+    /// a pane's lease ([`crate::board`] lands it here).
+    pub(crate) fn board_ready(&mut self, live: LiveId, drawn: Arc<Drawn>, cx: &mut Context<Self>) {
+        let old = self.model.lives[live].transcript.drawn().cloned();
+        let panes: Vec<PaneId> = self.panes.iter().filter(|p| p.live == live).map(|p| p.id).collect();
+        let held = panes.iter().any(|&p| self.in_pane(p, |this| this.disturbs(old.as_deref(), &drawn)).unwrap_or(false));
+        if held {
+            self.model.lives[live].board.waiting = Some(drawn);
+            self.arm_lease_wake(cx);
+            return;
+        }
+        self.model.lives[live].board.waiting = None;
+        let now = self.fx.now();
+        for p in panes {
+            self.in_pane(p, |this| {
+                // Changed above the view: the pill.
+                let top = this.panes.cur.list.logical_scroll_top().item_ix;
+                let items = this.model.lives[live].transcript.items();
+                let mut above = this.panes.cur.lease.above.borrow_mut();
+                for d in this.panes.cur.disp.iter().take(top) {
+                    let crate::turns::Kind::Block { .. } = d.kind else { continue };
+                    let Some(item) = items.get(d.item) else { continue };
+                    let was = old.as_deref().and_then(|o| find(o, d.id)).map(|(_, _, s)| content(s));
+                    let now_is = drawn
+                        .rows
+                        .get(&item.id)
+                        .and_then(|r| r.blocks.iter().find(|s| crate::blocks::row_id(&s.block.id) == d.id))
+                        .map(content);
+                    if now_is.is_some() && was != now_is && !above.contains(&d.id) {
+                        above.push(d.id);
+                    }
+                }
+                drop(above);
+                this.panes.cur.lease.agent_op.set(Some(now));
+            });
+        }
+        self.model.lives[live].transcript.set_drawn(Some(drawn));
+        self.model.lives[live].board.published += 1;
+        cx.notify();
+    }
+
+    /// The lease's end, the pointer gone or a key: a board that waited
+    /// draws, unless a lease still holds it.
+    pub(crate) fn lease_release(&mut self, cx: &mut Context<Self>) {
+        for live in self.model.lives.ids() {
+            if let Some(d) = self.model.lives[live].board.waiting.take()
+                && d.epoch == self.model.lives[live].transcript.blocks_epoch()
+            {
+                self.board_ready(live, d, cx);
+            }
+        }
+    }
+
+    /// One wake, at the lease's end, while a board waits (§6.2 "Frames").
+    fn arm_lease_wake(&mut self, cx: &mut Context<Self>) {
+        let now = self.fx.now();
+        let due = self.panes.iter().filter(|p| !p.lease.pressed).filter_map(|p| p.lease.moved).map(|t| t + LEASE).max();
+        let Some(due) = due.filter(|d| *d > now) else {
+            if !self.panes.iter().any(|p| p.lease.pressed) {
+                self.lease_release(cx);
+            }
+            return;
+        };
+        let wait = due.saturating_duration_since(now);
+        self.lease_wake = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |v, cx| {
+                v.lease_wake = None;
+                if v.model.lives.ids().into_iter().any(|l| v.model.lives[l].board.waiting.is_some()) {
+                    v.arm_lease_wake(cx);
+                }
+            });
+        }));
+    }
+
+    /// The pointer moved over pane `pane`'s list: the lease (no frame).
+    pub(crate) fn lease_move(&mut self, pane: PaneId) {
+        let now = self.fx.now();
+        self.in_pane(pane, |this| {
+            this.panes.cur.lease.moved = Some(now);
+            this.panes.cur.lease.over = true;
+        });
+    }
+
+    /// The pointer over pane `pane`'s list or not.
+    pub(crate) fn lease_over(&mut self, pane: PaneId, over: bool, cx: &mut Context<Self>) {
+        self.in_pane(pane, |this| {
+            this.panes.cur.lease.over = over;
+            if !over {
+                this.panes.cur.lease.hover = None;
+            }
+        });
+        if !over {
+            self.lease_release(cx);
+        }
+    }
+
+    /// A key: the note goes, and what waited draws.
+    pub(crate) fn lease_key(&mut self, cx: &mut Context<Self>) {
+        for p in self.panes.iter_mut() {
+            p.lease.note = None;
+            p.lease.moved = None;
+        }
+        self.lease_release(cx);
+    }
+
+    /// The pointer over block row `row` (painted as `tag`) or off it.
+    pub(crate) fn block_hover(&mut self, pane: PaneId, row: u64, tag: Tag, over: bool) {
+        self.in_pane(pane, |this| {
+            let l = &mut this.panes.cur.lease;
+            if over {
+                l.hover = Some(Target { row, tag });
+            } else if l.hover.is_some_and(|h| h.row == row) {
+                l.hover = None;
+            }
+        });
+    }
+
+    /// Pointer-down on block row `row` painted as `tag`: the target taken
+    /// and the lease held, or, just moved, nothing (once).
+    pub(crate) fn block_down(&mut self, pane: PaneId, row: u64, tag: Tag, cx: &mut Context<Self>) {
+        let now = self.fx.now();
+        self.in_pane(pane, |this| {
+            let l = &mut this.panes.cur.lease;
+            l.note = None;
+            let moved = l.painted.borrow().get(&row).and_then(|p| p.moved).is_some_and(|t| now.saturating_duration_since(t) < JUST_MOVED);
+            if moved {
+                if let Some(p) = l.painted.borrow_mut().get_mut(&row) {
+                    p.moved = None;
+                }
+                l.down = None;
+                l.note = Some((row, MOVED));
+                return;
+            }
+            l.down = Some(Target { row, tag });
+            l.pressed = true;
+            l.moved = Some(now);
+        });
+        cx.notify();
+    }
+
+    /// Pointer-up on block row `row`: the press's target, if it is this one
+    /// and the board drawn still holds it, folds or unfolds (§3.5: local);
+    /// else nothing, and the note.
+    pub(crate) fn block_up(&mut self, pane: PaneId, row: u64, cx: &mut Context<Self>) {
+        self.in_pane(pane, |this| {
+            let l = &mut this.panes.cur.lease;
+            l.pressed = false;
+            let Some(down) = l.down.take().filter(|d| d.row == row) else { return };
+            // The bound board now: the newest, drawn or waiting.
+            let bound = match &this.model.lives[this.panes.cur.live].board.waiting {
+                Some(d) => find(d, row).and_then(|(_, _, s)| s.bound.as_ref().map(|b| b.tag)),
+                None => this.block_shown(row).and_then(|(_, s)| s.bound.as_ref().map(|b| b.tag)),
+            };
+            match this.block_shown(row) {
+                Some((ix, s)) if bound == Some(down.tag) => {
+                    this.panes.cur.block_folds.toggle(row, &s);
+                    this.panes.cur.list.remeasure_items(ix..ix + 1);
+                }
+                _ => this.panes.cur.lease.note = Some((row, CHANGED)),
+            }
+        });
+        // A board that waited on the press: its wake, or now.
+        if self.model.lives.ids().into_iter().any(|l| self.model.lives[l].board.waiting.is_some()) {
+            self.arm_lease_wake(cx);
+        }
+        cx.notify();
+    }
+
+    /// The pill's click: the first block changed above, walked to.
+    pub(crate) fn walk_above(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.in_pane(pane, |this| {
+            let first = this.panes.cur.lease.above.borrow().first().copied();
+            if let Some(ix) = first.and_then(|r| this.panes.cur.disp.iter().position(|d| d.id == r)) {
+                // The user's jump: it leaves the end (a list following its
+                // tail would snap back at its next layout).
+                this.panes.cur.list.pause_following_tail();
+                this.panes.cur.scroller.touch();
+                this.panes.cur.list.scroll_to_reveal_item(ix);
+            }
+        });
+        cx.notify();
+    }
+}
+
+/// A block's probe (a child of the block, which is positioned): each paint
+/// notes its rect and tag; a change in a frame that draws an agent op
+/// marks it just moved; painted in view, it leaves the pill.
+pub(crate) fn probe(l: &Lease, fx: &Rc<crate::motion::Motion>, row: u64, tag: Tag) -> impl IntoElement + use<> {
+    let (painted, agent, above, fx) = (l.painted.clone(), l.agent_op.clone(), l.above.clone(), fx.clone());
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let now = fx.now();
+            let agent = agent.get().is_some_and(|t| now.saturating_duration_since(t) < JUST_MOVED);
+            let mut map = painted.borrow_mut();
+            match map.get_mut(&row) {
+                Some(p) if p.bounds != bounds || p.tag != tag => {
+                    if agent {
+                        p.moved = Some(now);
+                    }
+                    (p.bounds, p.tag) = (bounds, tag);
+                }
+                Some(_) => {}
+                None => {
+                    map.insert(row, Painted { bounds, tag, moved: agent.then_some(now) });
+                }
+            }
+            let seen = bounds.intersect(&window.content_mask().bounds);
+            let mut above = above.borrow_mut();
+            if seen.size.height > px(0.) && above.contains(&row) {
+                above.retain(|r| *r != row);
+                // The pill drawn this frame counted it: the next one doesn't.
+                window.request_animation_frame();
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+impl AppView {
+    /// The pill (§6.2): `N blocks changed above ↑` at the list's top, a
+    /// layer over it; a click walks to the first.
+    pub(crate) fn blocks_pill(&self, p: &crate::theme::Palette, m: &crate::theme::Metrics, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::fonts::{self, TextPx as _};
+        use gpui_kit::component::h_flex;
+        let n = self.panes.cur.lease.above.borrow().len();
+        if n == 0 {
+            return None;
+        }
+        let pane = self.panes.cur.id;
+        let text = format!("{n} block{} changed above ↑", if n == 1 { "" } else { "s" });
+        Some(
+            div()
+                .absolute()
+                .top(px((8. * m.r).round()))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    h_flex()
+                        .id(("blocks-above", pane.index()))
+                        .debug_selector(move || format!("blocks-above {}", pane.index()))
+                        .h(px((26. * m.r).round()))
+                        .px(px((10. * m.r).round()))
+                        .items_center()
+                        .bg(p.card_d)
+                        .font_family(fonts::SANS)
+                        .text_px(m.meta)
+                        .text_color(p.acc)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.hover))
+                        .child(text)
+                        .on_click(cx.listener(move |this, _, _, cx| this.walk_above(pane, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+}
