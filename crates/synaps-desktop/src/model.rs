@@ -528,10 +528,12 @@ impl Model {
     }
 
     /// Ask store `lid`'s attachment `seq` for its status: what its timer
-    /// would have asked of the answer it holds (a scheduled ping's) is asked.
+    /// would have asked of the answer it holds is asked ([`Warm::asked`]).
+    ///
+    /// [`Warm::asked`]: crate::warm::Warm::asked
     fn ask_status(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
         if let Some(w) = self.lives[lid].stats.warm.as_mut() {
-            w.refresh = false;
+            w.asked();
         }
         effects.push(Effect::Status(seq));
     }
@@ -620,7 +622,8 @@ impl Model {
             }
             self.ask_panel(lid, seq, &mut effects);
         } else {
-            // A scheduled ping is due: its schedule.
+            // A scheduled ping is due, or one in flight is looked at: its
+            // status.
             if ping {
                 self.ask_status(lid, seq, &mut effects);
             }
@@ -1739,7 +1742,7 @@ impl Model {
             Event::SessionStatus { attach_seq, value } => {
                 if self.lives[lid].current(attach_seq) && self.cache_expiry {
                     let stats = &mut self.lives[lid].stats;
-                    stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now()));
+                    stats.warm = Some(crate::warm::Warm::from_status(&value, crate::warm::Moment::now(), stats.warm.as_ref()));
                     stats.cache_epoch = self.cache_epoch;
                     self.view_dirty = true;
                 }
@@ -3412,6 +3415,43 @@ mod tests {
         assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(31)), []);
         assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(46)), [Effect::Status(1), Effect::CacheExpiry(1)], "the ping's, the zero's");
         assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(46)), [], "once");
+    }
+
+    /// Shady #100 R2.1: reconnected while a ping is in flight, which then
+    /// fails unbilled (SynapsCLI says nothing of it). The re-attach's
+    /// status says the same ping is in flight: looked at once (twice as
+    /// long: the same ping), status only; the look sees the period ended.
+    /// Then nothing but the cache's own zero, and after it nothing at all.
+    #[test]
+    fn a_reconnect_during_a_ping_in_flight_sees_it_end() {
+        use crate::warm::Moment;
+        use std::time::Duration;
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        let flying = || Event::SessionStatus {
+            attach_seq: 1,
+            value: json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}}),
+        };
+        m.apply(flying());
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 250})));
+        let mut a = attached("s");
+        a.connection = 2;
+        m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: true });
+        m.apply(flying());
+        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 250})));
+        let t0 = Moment::now();
+        let at = |s: u64| Moment { mono: t0.mono + Duration::from_secs(s), wall: t0.wall + Duration::from_secs(s) };
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(61)), [], "no poll");
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(121)), [Effect::Status(1)], "looked at: status only");
+        m.apply(Event::SessionStatus {
+            attach_seq: 1,
+            value: json!({"keepwarm": {"mode": "auto", "period": null, "last_end": "transient"}}),
+        });
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(240)), [], "ended: nothing");
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(251)), [Effect::CacheExpiry(1)], "the cache's zero");
+        assert_eq!(m.panel_wake(LiveId::FIRST, Some(1), at(252)), None, "then nothing at all");
     }
 
     /// `Event::CacheExpiry` for attachment `seq`, the daemon's `value`.

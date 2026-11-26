@@ -148,9 +148,10 @@ pub struct Stats {
     pub expiry: Option<crate::warm::Expiry>,
     /// A `stale` answer was asked once more (and not answered since).
     pub expiry_retried: bool,
-    /// The keep-warm pings' tokens, as last said (the attach, a digest): a
-    /// digest whose differ says a ping was booked ([`CacheNews::Pinged`]).
-    pub keepwarm: Option<Tokens>,
+    /// The keep-warm pings' tokens and spend, as last said (the attach, a
+    /// digest): a digest whose differ says a ping was booked
+    /// ([`CacheNews::Pinged`]).
+    pub keepwarm: Option<(Tokens, f64)>,
     /// The model's [`crate::model::Model::cache_epoch`] when `warm` and
     /// `expiry` were answered: a tab's numbers restored under a later one
     /// (the daemon refused the query, or lost it, since) keep neither.
@@ -164,9 +165,11 @@ pub enum CacheNews {
     /// Not what it was (the history replaced, the model changed): the
     /// countdown is dropped and the daemon asked again.
     New,
-    /// A keep-warm ping was booked (an idle digest's keep-warm tokens grew:
-    /// SynapsCLI books every ping it sent, success or not): the daemon is
-    /// asked again, the countdown kept until it answers.
+    /// A keep-warm ping was booked (a digest's keep-warm tokens or spend
+    /// grew: a measured ping, or one sent and unmeasured, billed its worst
+    /// case): the daemon is asked again, the countdown kept until it
+    /// answers. One that failed unbilled books nothing, and says nothing
+    /// ([`crate::warm::Flight`]).
     Pinged,
 }
 
@@ -201,7 +204,7 @@ impl Stats {
             warm,
             expiry,
             expiry_retried: false,
-            keepwarm: Tokens::from_value(&a.conversation.keepwarm_tokens),
+            keepwarm: Tokens::from_value(&a.conversation.keepwarm_tokens).map(|t| (t, a.conversation.keepwarm_cost)),
             cache_epoch,
         };
         self.subagents.replaying(true);
@@ -248,6 +251,7 @@ impl Stats {
                     self.tokens = Some(t);
                 }
                 if let Some(k) = Tokens::from_value(kw) {
+                    let k = (k, raw["digest"]["keepwarm_cost"].as_f64().unwrap_or(0.));
                     pinged = self.keepwarm.is_some_and(|was| was != k);
                     self.keepwarm = Some(k);
                 }
@@ -427,6 +431,24 @@ mod tests {
         assert_eq!(s.on_session(&e, &raw), CacheNews::Pinged, "a ping booked since the attach");
         assert_eq!(s.tokens.unwrap().cache_read, 100);
         assert_eq!(s.on_session(&e, &raw), CacheNews::Nothing, "nothing booked since");
+        // Sent, never measured: billed its worst case, the tokens as they were
+        // (Shady #100 R2.1).
+        let (e, raw) = ev(json!({"ev": "conversation", "digest": {"messages_len": 2, "messages_hash": 1, "cost": 0.35,
+            "tokens": {"input": 100, "output": 50, "cache_read": 1900, "cache_creation": 100}, "keepwarm_cost": 0.25,
+            "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": 1800, "cache_creation": 0}}}));
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Pinged, "billed, unmeasured");
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Nothing, "the same digest again");
+        // An attach says the spend too: the same digest after it is no news.
+        let mut again = attached(json!({"type": "attached", "client": 2, "meta": {"id": "s"},
+            "conversation": {"api_messages": [], "cost": 0.35, "keepwarm_cost": 0.25,
+                "tokens": {"input": 100, "output": 50, "cache_read": 1900, "cache_creation": 100},
+                "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": 1800, "cache_creation": 0}}}));
+        assert_eq!(again.conversation.keepwarm_cost, 0.25);
+        s.on_attached(&again);
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Nothing, "booked before the attach");
+        again.conversation.keepwarm_cost = 0.;
+        s.on_attached(&again);
+        assert_eq!(s.on_session(&e, &raw), CacheNews::Pinged, "booked since");
         assert!(!s.detached);
         s.on_detached();
         assert!(s.detached);

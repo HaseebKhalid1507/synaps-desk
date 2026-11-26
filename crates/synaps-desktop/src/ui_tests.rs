@@ -9534,7 +9534,7 @@ fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
             let now = crate::warm::Moment::now();
             (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
             let stats = &mut v.model.lives[v.panes.cur.live].stats;
-            stats.warm = keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now));
+            stats.warm = keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now, None));
             stats.expiry = answer.map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now));
             cx.notify();
         });
@@ -9703,43 +9703,84 @@ fn an_answer_does_not_outlive_the_daemon_s_cache_query(cx: &mut TestAppContext) 
     assert!(!drawn(cx, "right-cache-expires cold"), "a restored tab's answer is the old daemon's");
 }
 
-/// Shady #100 F4: a keep-warm ping in flight is no poll. The status says
-/// it is due (`next_ping_in_secs: 0`, `in_flight`), and says so again
-/// whenever asked: nothing is asked however long it stays so. Its booking
-/// (an idle `Conversation` whose keep-warm tokens grew: SynapsCLI books
-/// every ping so) asks both once; a digest that books nothing, nothing.
+/// Shady #100 F4, R2.1: a keep-warm ping in flight is no poll, and its end
+/// is seen however it ends. SynapsCLI emits nothing for a ping that failed
+/// unbilled (refused, or a connection that failed), whether it retries or
+/// ends the period. A ping scheduled: its status, once, after it is due.
+/// In flight: none of it asked for a minute, then looked at once, status
+/// only. Failed unbilled: the look sees the retry, the retry's look the
+/// period ended; then nothing. The same ping still in flight: twice as
+/// long each look, none past the period's TTL. Billed (measured, or sent
+/// and unmeasured: the spend grew, not the tokens): both, once; the same
+/// digest again, nothing.
 #[gpui_kit::test]
-fn an_in_flight_ping_is_not_polled_and_its_booking_asks_once(cx: &mut TestAppContext) {
+fn a_ping_in_flight_is_seen_to_end_however_it_ends(cx: &mut TestAppContext) {
     use serde_json::json;
     let (window, view, _events, seq) = cache_panel(cx);
     let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"));
-    let in_flight = || synaps_client::Event::SessionStatus {
+    let status = |period: serde_json::Value| synaps_client::Event::SessionStatus {
         attach_seq: seq,
-        value: json!({"keepwarm": {"mode": "auto", "active": true, "session_pings": 2,
-            "period": {"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}}),
+        value: json!({"keepwarm": {"mode": "auto", "active": true, "session_pings": 2, "period": period}}),
     };
-    let digest = |kw_read: u64| {
-        let v = json!({"ev": "conversation", "digest": {"messages_len": 4, "messages_hash": 1, "cost": 0.5,
-            "tokens": {"input": 100, "output": 50, "cache_read": 900 + kw_read, "cache_creation": 100},
+    let period = |id: u64, next: u64, in_flight: bool| json!({"id": id, "pings": 2, "ledger_usd": 0.5, "ttl_secs": 300, "next_ping_in_secs": next, "in_flight": in_flight});
+    let digest = |kw_read: u64, kw_cost: f64| {
+        let v = json!({"ev": "conversation", "digest": {"messages_len": 4, "messages_hash": 1, "cost": 0.5 + kw_cost,
+            "tokens": {"input": 100, "output": 50, "cache_read": 900 + kw_read, "cache_creation": 100}, "keepwarm_cost": kw_cost,
             "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": kw_read, "cache_creation": 0}}});
         let e = synaps_client::protocol::decode_event(&v).expect("a digest");
         synaps_client::Event::session(seq, sid.clone(), 0, e, std::sync::Arc::new(v))
     };
-    deliver(cx, window, &view, vec![digest(800), in_flight(), cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3000}))]);
+    let next_ping =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.warm.as_ref().and_then(|w| w.next_ping));
+    // Nothing asked until about second `secs` (the panel's clock is the
+    // test's plus the real time the test takes): what it asked by then.
+    let look = |cx: &mut TestAppContext, secs: u64| {
+        pass(cx, window, &view, secs - 2);
+        assert_eq!(panel_asks(cx, &view), [], "nothing before {secs} s");
+        pass(cx, window, &view, 3);
+        panel_asks(cx, &view)
+    };
+    deliver(
+        cx,
+        window,
+        &view,
+        vec![digest(800, 0.5), status(period(1, 20, false)), cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3600}))],
+    );
     panel_asks(cx, &view);
-    for _ in 0..5 {
-        pass(cx, window, &view, 31);
-        // Asked: the daemon answers as it stands, the ping still in flight.
-        let asked = panel_asks(cx, &view);
-        if asked.iter().any(|a| a.1 == "status") {
-            deliver(cx, window, &view, vec![in_flight()]);
-        }
-        assert_eq!(asked, [], "no poll while the ping is in flight");
+    assert_eq!(look(cx, 30), [(seq, "status")], "scheduled: its status, once, after it is due");
+    deliver(cx, window, &view, vec![status(period(1, 0, true))]);
+    assert_eq!(look(cx, 60), [(seq, "status")], "in flight: no poll; looked at a minute on, status only");
+    // It failed unbilled: no word of it. The look sees the retry.
+    deliver(cx, window, &view, vec![status(period(1, 15, false))]);
+    assert_eq!(look(cx, 30), [(seq, "status")], "the retry's status");
+    deliver(cx, window, &view, vec![status(period(1, 0, true))]);
+    assert_eq!(look(cx, 60), [(seq, "status")], "the retry in flight: looked at");
+    // It failed too, the period ended: seen, and nothing more.
+    deliver(cx, window, &view, vec![status(serde_json::Value::Null)]);
+    assert_eq!(next_ping(cx), None, "the period's end is on screen");
+    pass(cx, window, &view, 600);
+    assert_eq!(panel_asks(cx, &view), [], "ended: nothing");
+    // Another period, its ping stuck in flight: a few looks at most.
+    deliver(cx, window, &view, vec![status(period(2, 0, true))]);
+    let mut looks = Vec::new();
+    for wait in [60, 120, 240] {
+        assert_eq!(look(cx, wait), [(seq, "status")], "after {wait} s");
+        looks.push(wait);
+        deliver(cx, window, &view, vec![status(period(2, 0, true))]);
     }
-    deliver(cx, window, &view, vec![digest(1600)]);
-    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "the ping booked: both, once");
-    deliver(cx, window, &view, vec![digest(1600)]);
+    assert_eq!(looks, [60, 120, 240]);
+    pass(cx, window, &view, 600);
+    assert_eq!(panel_asks(cx, &view), [], "none past the 5m TTL");
+    // Sent and never measured: billed its worst case (the spend, not the
+    // tokens). Then a measured one.
+    deliver(cx, window, &view, vec![digest(800, 0.75)]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "billed unmeasured: both, once");
+    deliver(cx, window, &view, vec![digest(800, 0.75)]);
     assert_eq!(panel_asks(cx, &view), [], "nothing booked: nothing");
+    deliver(cx, window, &view, vec![digest(1600, 0.9)]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "measured: both, once");
+    deliver(cx, window, &view, vec![digest(1600, 0.9)]);
+    assert_eq!(panel_asks(cx, &view), [], "the same digest: nothing");
 }
 
 /// Shady #100 F5: every fresh ask has its own `stale` retry, the timers'

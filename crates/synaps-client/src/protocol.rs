@@ -1237,6 +1237,10 @@ pub struct ConversationSnapshot {
     /// (`ConversationTokens`); `Null` from a daemon that predates them.
     #[serde(default)]
     pub keepwarm_tokens: Value,
+    /// What keep-warm pings cost (already in `cost`); 0 from a daemon that
+    /// predates them.
+    #[serde(default)]
+    pub keepwarm_cost: f64,
     /// Events the engine holds, not in the history yet (buffered in a
     /// turn, or kept after a failed turn or compaction until the next
     /// turn's end), as on [`ConversationDigest::pending_events_len`].
