@@ -95,7 +95,7 @@ pub fn is_card_tool(name: &str) -> bool {
 }
 
 /// The fold over the history folded so far, read message by message (and,
-/// a copy of it, the live turn read on top: [`rows`]).
+/// the live turn read on top of it: [`LiveCards`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HistoryCards {
     /// Each event's row: a call's, a user message's (the row its text is
@@ -123,8 +123,12 @@ impl HistoryCards {
         &self.fold
     }
 
-    /// Read event `e`, drawn on `row` (a result's: none).
-    fn push(&mut self, e: &Event, row: Option<u64>) {
+    /// Read event `e`, drawn on `row` (a result's: none). `base`: the
+    /// history this reads on top of, if it is a live layer
+    /// ([`LiveCards::read`]): its latest calls are read under this one's,
+    /// as a copy of it would read them (a live result's call is on the
+    /// result's own row, read before it: the layer has it).
+    fn push(&mut self, e: &Event, row: Option<u64>, base: Option<&HistoryCards>) {
         // The tool id of a close this result may close.
         let closing = match e {
             Event::Call { tool_id, name, .. } => {
@@ -143,7 +147,7 @@ impl HistoryCards {
         if let Some(tool_id) = closing
             && let Some(close) = self.fold.close(tool_id).filter(|c| c.closed)
             && let Some(doc) = self.fold.bound(&close.card).and_then(|c| c.doc.as_ref())
-            && let Some(&(_, Some(r))) = self.calls.get(tool_id)
+            && let Some(&(_, Some(r))) = self.calls.get(tool_id).or_else(|| base.and_then(|b| b.calls.get(tool_id)))
         {
             self.closes.push((r, Arc::new(doc.clone())));
         }
@@ -157,7 +161,7 @@ impl HistoryCards {
                 for e in events(std::slice::from_ref(m)) {
                     let Event::Call { tool_id, .. } = &e else { continue };
                     let row = tools.by_ref().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == *tool_id)).map(|i| i.id);
-                    self.push(&e, row);
+                    self.push(&e, row, None);
                 }
             }
             Some("user") => {
@@ -167,14 +171,14 @@ impl HistoryCards {
                     if let Some(id) = b["tool_use_id"].as_str().filter(|id| self.calls.get(*id).is_some_and(|c| c.0))
                         && let Some(text) = result_text(&b["content"])
                     {
-                        self.push(&Event::Result { tool_id: id.to_string(), text }, None);
+                        self.push(&Event::Result { tool_id: id.to_string(), text }, None, None);
                     }
                 }
                 // Its text, if the host's rule leaves it one string: no
                 // result in a one-message slice (its call is outside it).
                 let row = rows.iter().find(|i| i.kind == ItemKind::User).map(|i| i.id);
                 for e in events(std::slice::from_ref(m)).iter().filter(|e| matches!(e, Event::User { .. })) {
-                    self.push(e, row);
+                    self.push(e, row, None);
                 }
             }
             _ => {}
@@ -197,11 +201,79 @@ fn result_text(content: &Value) -> Option<String> {
     }
 }
 
+/// A live row's event, borrowed from the row: the event is built for the
+/// fold to read ([`RowEvent::event`]), and the sync keeps its digest only.
+enum RowEvent<'a> {
+    /// A non-card call's input is `Null` to the fold (`input`: none).
+    Call {
+        tool_id: &'a str,
+        name: &'a str,
+        input: Option<&'a Value>,
+    },
+    Result {
+        tool_id: &'a str,
+        text: &'a str,
+    },
+    User {
+        text: &'a str,
+    },
+}
+
+impl RowEvent<'_> {
+    /// The event, for the fold to read (a copy, dropped once read: of a
+    /// card call's input the fold keeps the doc it validates, if any).
+    fn event(&self) -> Event {
+        match *self {
+            RowEvent::Call { tool_id, name, input } => {
+                Event::Call { tool_id: tool_id.to_string(), name: name.to_string(), input: input.cloned().unwrap_or(Value::Null) }
+            }
+            RowEvent::Result { tool_id, text } => Event::Result { tool_id: tool_id.to_string(), text: text.to_string() },
+            RowEvent::User { text } => Event::User { text: text.to_string() },
+        }
+    }
+
+    /// What [`LiveCards::seen`] keeps of it to tell whether it changed
+    /// since: a digest of all of it (an input as its JSON), not a copy.
+    /// Two events of a row at one place that differ but digest alike
+    /// would go unnoticed: 64 bits of SipHash make that a 2⁻⁶⁴ chance an
+    /// event changed in place, itself rare (a result's text streaming on
+    /// after it reported).
+    fn digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        struct Write<'h>(&'h mut std::collections::hash_map::DefaultHasher);
+        impl std::io::Write for Write<'_> {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.write(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match *self {
+            RowEvent::Call { tool_id, name, input } => {
+                (0u8, tool_id, name).hash(&mut h);
+                // Writing to a hasher can't fail.
+                let _ = serde_json::to_writer(Write(&mut h), input.unwrap_or(&Value::Null));
+            }
+            RowEvent::Result { tool_id, text } => (1u8, tool_id, text).hash(&mut h),
+            RowEvent::User { text } => (2u8, text).hash(&mut h),
+        }
+        h.finish()
+    }
+
+    /// The row it is drawn on, of row `id`'s: a result's, none.
+    fn drawn_on(&self, id: u64) -> Option<u64> {
+        (!matches!(self, RowEvent::Result { .. })).then_some(id)
+    }
+}
+
 /// A live row's events, each with its place in the stream: a call once
 /// its input is whole (the history never holds a call that is still
 /// streaming), a card call's result (no other binds: it is nothing to the
 /// fold), the user message that started a turn.
-fn row_events(it: &Item) -> Vec<(u64, Event)> {
+fn row_events(it: &Item) -> Vec<(u64, RowEvent<'_>)> {
     let mut out = Vec::new();
     if it.is_note() {
         return out;
@@ -213,35 +285,56 @@ fn row_events(it: &Item) -> Vec<(u64, Event)> {
                 return out;
             };
             let card = is_card_tool(&t.name);
-            let input = if card { it.card_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
-            out.push((came, Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input }));
+            let input = if card { it.card_input() } else { None };
+            out.push((came, RowEvent::Call { tool_id: &t.tool_id, name: &t.name, input }));
             if card && t.status.is_some_and(ToolStatus::is_terminal) {
-                out.push((reported, Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() }));
+                out.push((reported, RowEvent::Result { tool_id: &t.tool_id, text: &t.result }));
             }
         }
-        ItemKind::User => out.push((came, Event::User { text: it.text.clone() })),
+        ItemKind::User => out.push((came, RowEvent::User { text: &it.text })),
         _ => {}
     }
     out
 }
 
-/// The row an event of row `id` is drawn on: a result's, none.
-fn drawn_on(e: &Event, id: u64) -> Option<u64> {
-    (!matches!(e, Event::Result { .. })).then_some(id)
+/// The bytes of `m`'s table (hashbrown's: a slot and a control byte per
+/// bucket, a group of control bytes more), its keys' and values' own heap
+/// not included.
+pub(crate) fn map_bytes<K, V>(m: &HashMap<K, V>) -> usize {
+    let cap = m.capacity();
+    if cap == 0 {
+        return 0;
+    }
+    let buckets = if cap < 8 { (cap + 1).next_power_of_two() } else { (cap * 8 / 7).next_power_of_two() };
+    buckets * (std::mem::size_of::<(K, V)>() + 1) + 16
 }
 
 /// The cards the rows draw: the history's fold, then the live rows read on
 /// top, in the order their events came. Kept between syncs, it reads only
 /// the rows that changed ([`LiveCards::step`]).
+///
+/// What it keeps beyond the fold (main's `card_fold`) is the sync's, to
+/// read what changed: a digest per live event, the live events' rows and
+/// latest calls, and an id and a place per row drawn. No event's input or
+/// text: those are the rows'. [`LiveCards::bytes`] counts it, and
+/// [`LiveCards::unkeep`] lets it go (the next sync reads every row).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LiveCards {
+    /// The fold (the history's, then the live events read on top); the
+    /// rows, latest calls and closes of the live events alone (the
+    /// history's are its own: [`HistoryCards::push`]'s `base`).
     read: HistoryCards,
-    /// Each live row's events read, by row id.
-    seen: HashMap<u64, Vec<(u64, Event)>>,
+    /// The history's events, as read: a history that moved since is not
+    /// stepped on ([`LiveCards::step`]).
+    base: usize,
+    /// Each live row's events read, by row id: where each came, and its
+    /// digest ([`RowEvent::digest`]).
+    seen: HashMap<u64, Vec<(u64, u64)>>,
     /// The place of the last live event read (0: none).
     last: u64,
-    /// What each row draws, by row id.
-    pub(crate) want: HashMap<u64, CardRow>,
+    /// What each row draws, by row id: the row's own ([`Item::card`]), not
+    /// a copy.
+    pub(crate) want: HashMap<u64, Arc<CardRow>>,
     /// Where each row that draws a card was when it was drawn (it may have
     /// moved since: the caller checks).
     pub(crate) at: HashMap<u64, usize>,
@@ -264,18 +357,18 @@ impl LiveCards {
         for it in live {
             let e = row_events(it);
             if !e.is_empty() {
-                events.extend(e.iter().map(|(at, e)| (*at, e.clone(), drawn_on(e, it.id))));
-                seen.insert(it.id, e);
+                events.extend(e.iter().map(|(at, e)| (*at, e.event(), e.drawn_on(it.id))));
+                seen.insert(it.id, e.iter().map(|(at, e)| (*at, e.digest())).collect());
             }
         }
         events.sort_by_key(|(at, ..)| *at);
-        let mut read = history.clone();
+        let mut read = HistoryCards { fold: history.fold.clone(), ..HistoryCards::default() };
         for (_, e, row) in &events {
-            read.push(e, *row);
+            read.push(e, *row, Some(history));
         }
         let last = events.last().map_or(0, |(at, ..)| *at);
-        let want = want(&read);
-        LiveCards { read, seen, last, want, at: HashMap::new() }
+        let want = want(history, &read).into_iter().map(|(id, c)| (id, Arc::new(c))).collect();
+        LiveCards { read, base: history.rows.len(), seen, last, want, at: HashMap::new() }
     }
 
     /// The fold the rows draw.
@@ -283,26 +376,54 @@ impl LiveCards {
         &self.read.fold
     }
 
+    /// Let go of what reads what changed, the fold kept: until the next
+    /// [`LiveCards::of`], [`LiveCards::step`] must not be called.
+    pub(crate) fn unkeep(&mut self) {
+        let fold = std::mem::take(&mut self.read.fold);
+        *self = LiveCards { read: HistoryCards { fold, ..HistoryCards::default() }, ..LiveCards::default() };
+    }
+
+    /// The heap it keeps beyond the fold, capacities counted: what
+    /// [`LiveCards::unkeep`] lets go. (A row's card is the row's: counted
+    /// as a pointer.)
+    pub(crate) fn bytes(&self) -> usize {
+        let r = &self.read;
+        map_bytes(&self.seen)
+            + self.seen.values().map(|v| v.capacity() * std::mem::size_of::<(u64, u64)>()).sum::<usize>()
+            + r.rows.capacity() * std::mem::size_of::<Option<u64>>()
+            + map_bytes(&r.calls)
+            + r.calls.keys().map(String::capacity).sum::<usize>()
+            + r.closes.capacity() * std::mem::size_of::<(u64, Arc<CardDoc>)>()
+            + map_bytes(&self.want)
+            + map_bytes(&self.at)
+    }
+
     /// Read what `rows` (live rows that may have changed since) have new:
-    /// events that came after every one read, read on top. `None` if a row
-    /// changed otherwise (an event read is gone or different, or a new one
-    /// came before one read): read them all again ([`LiveCards::of`]).
-    pub(crate) fn step<'a>(&mut self, rows: impl IntoIterator<Item = &'a Item>) -> Option<Step> {
+    /// events that came after every one read, read on top of `history`
+    /// (the one it was read on). `None` if a row changed otherwise (an
+    /// event read is gone or different, or a new one came before one
+    /// read), or the history did: read them all again ([`LiveCards::of`]).
+    pub(crate) fn step<'a>(&mut self, history: &HistoryCards, rows: impl IntoIterator<Item = &'a Item>) -> Option<Step> {
+        if history.rows.len() != self.base {
+            return None;
+        }
         let mut new: Vec<(u64, Event, Option<u64>)> = Vec::new();
         for it in rows {
             let now = row_events(it);
-            let had = self.seen.get(&it.id).map_or(0, Vec::len);
-            if now.len() < had || self.seen.get(&it.id).is_some_and(|h| h[..] != now[..had]) {
+            let had = self.seen.get(&it.id).map_or(&[][..], Vec::as_slice);
+            if now.len() < had.len() || had.iter().zip(&now).any(|(&(was, d), (at, e))| was != *at || d != e.digest()) {
                 return None;
             }
-            for (at, e) in &now[had..] {
+            for (at, e) in &now[had.len()..] {
                 if *at <= self.last {
                     return None;
                 }
-                new.push((*at, e.clone(), drawn_on(e, it.id)));
+                new.push((*at, e.event(), e.drawn_on(it.id)));
             }
-            if now.len() > had {
-                self.seen.insert(it.id, now);
+            if now.len() > had.len() {
+                let mut d: Vec<(u64, u64)> = had.to_vec();
+                d.extend(now[had.len()..].iter().map(|(at, e)| (*at, e.digest())));
+                self.seen.insert(it.id, d);
             }
         }
         new.sort_by_key(|(at, ..)| *at);
@@ -319,23 +440,38 @@ impl LiveCards {
             if !inert && before.is_none() {
                 before = Some(self.read.fold.cards().to_vec());
             }
-            self.read.push(e, *row);
+            self.read.push(e, *row, Some(history));
             self.last = *at;
         }
+        drop(new);
         let Some(before) = before else {
             return Some(Step { cards: false, rows: Vec::new() });
         };
-        let want = want(&self.read);
-        let mut rows: Vec<u64> = want.iter().filter(|(id, c)| self.want.get(id) != Some(c)).map(|(id, _)| *id).collect();
-        rows.extend(self.want.keys().filter(|id| !want.contains_key(id)));
-        self.want = want;
+        // A row whose card is the same keeps it (the row holds it too).
+        let mut rows = Vec::new();
+        let mut next = HashMap::new();
+        for (id, c) in want(history, &self.read) {
+            let c = match self.want.remove(&id) {
+                Some(was) if *was == c => was,
+                _ => {
+                    rows.push(id);
+                    Arc::new(c)
+                }
+            };
+            next.insert(id, c);
+        }
+        rows.extend(self.want.keys());
+        self.want = next;
         Some(Step { cards: before != self.read.fold.cards(), rows })
     }
 }
 
-/// What each row draws of `read`'s fold, by row id.
-fn want(read: &HistoryCards) -> HashMap<u64, CardRow> {
-    let row = |at: usize| read.rows.get(at).copied().flatten();
+/// What each row draws of `read`'s fold, by row id: `read` a live layer
+/// on `history` ([`LiveCards::read`]), its events numbered after the
+/// history's.
+fn want(history: &HistoryCards, read: &HistoryCards) -> HashMap<u64, CardRow> {
+    let base = history.rows.len();
+    let row = |at: usize| if at < base { history.rows.get(at) } else { read.rows.get(at - base) }.copied().flatten();
     let mut out = HashMap::new();
     for c in read.fold.cards() {
         let (Some(doc), Some(r)) = (c.doc.as_ref().filter(|_| c.state != State::Plain), row(c.at)) else { continue };
@@ -356,7 +492,7 @@ fn want(read: &HistoryCards) -> HashMap<u64, CardRow> {
             }
         }
     }
-    for (r, doc) in &read.closes {
+    for (r, doc) in history.closes.iter().chain(&read.closes) {
         out.insert(*r, CardRow::Close(Closed { doc: doc.clone() }));
     }
     out

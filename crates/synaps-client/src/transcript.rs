@@ -502,8 +502,9 @@ pub struct Transcript {
     card_live: crate::cards::LiveCards,
     /// [`Transcript::card_live`] read every live row up to now but those
     /// in [`Transcript::card_touched`]: the next sync reads only those.
-    /// Unset by what takes live rows away (a history's fold, a reset
-    /// response, a trim): the next sync reads them all.
+    /// Unset, what it kept let go ([`Transcript::card_unkeep`]), by what
+    /// takes live rows away (a history's fold, a reset response, a trim)
+    /// and by a detach: the next sync reads them all.
     card_kept: bool,
     /// The calls and user rows changed since the last sync, by id: where
     /// they were then.
@@ -568,6 +569,20 @@ impl Transcript {
     /// ([`Transcript::history_cards`]).
     pub fn cards(&self) -> &cards_spec::fold::Fold {
         self.card_live.fold()
+    }
+
+    /// The heap the card sync keeps to read what changed since it last read
+    /// (beyond [`Transcript::cards`]), capacities counted: digests and
+    /// places of the live events, not their inputs or text (the rows').
+    /// A tab cache counts it.
+    pub fn card_sync_bytes(&self) -> usize {
+        self.card_live.bytes() + crate::cards::map_bytes(&self.card_touched)
+    }
+
+    /// Let go of what the card sync keeps to read what changed (a tab left
+    /// for the cache: its next sync, if any, reads every row).
+    pub fn shed_card_sync(&mut self) {
+        self.card_unkeep();
     }
 
     /// Moves whenever the cards of [`Transcript::cards`] change, or the
@@ -947,6 +962,15 @@ impl Transcript {
         self.card_touch(ix);
     }
 
+    /// Let go of what the card sync keeps to read what changed (the cards'
+    /// fold kept): the next sync reads every row. What takes live rows
+    /// away frees it here, not at the next sync.
+    fn card_unkeep(&mut self) {
+        self.card_kept = false;
+        self.card_touched = HashMap::new();
+        self.card_live.unkeep();
+    }
+
     /// Row `ix` changed: the next card sync reads it, if it is a call or a
     /// user message ([`Transcript::card_touched`]).
     fn card_touch(&mut self, ix: usize) {
@@ -971,7 +995,7 @@ impl Transcript {
                 self.before.push(it);
             }
         }
-        self.card_kept = false;
+        self.card_unkeep();
         (notes, reuse)
     }
 
@@ -1403,6 +1427,8 @@ impl Transcript {
         self.settle();
         self.cards_dirty = true;
         self.sync_cards();
+        // Nothing streams into it now: what reads what changed is no use.
+        self.card_unkeep();
     }
 
     fn fold_message(&mut self, m: &Value, reuse: &mut Reuse) {
@@ -1438,7 +1464,7 @@ impl Transcript {
             }
             self.card_live = crate::cards::LiveCards::default();
             self.card_kept = false;
-            self.card_touched.clear();
+            self.card_touched = HashMap::new();
             return;
         }
         #[cfg(test)]
@@ -1458,13 +1484,23 @@ impl Transcript {
         let mut changed = Vec::new();
         self.card_visits += self.items.len() as u64;
         for (ix, it) in self.items.iter_mut().enumerate() {
-            let card = self.card_live.want.get(&it.id);
-            if card.is_some() {
-                self.card_live.at.insert(it.id, ix);
-            }
-            if it.card.as_deref() != card {
-                it.card = card.cloned().map(Arc::new);
-                changed.push(ix);
+            match self.card_live.want.get_mut(&it.id) {
+                Some(card) => {
+                    self.card_live.at.insert(it.id, ix);
+                    match &it.card {
+                        // The same card: the row's, kept, not a copy.
+                        Some(was) if **was == **card => *card = was.clone(),
+                        _ => {
+                            it.card = Some(card.clone());
+                            changed.push(ix);
+                        }
+                    }
+                }
+                None => {
+                    if it.card.take().is_some() {
+                        changed.push(ix);
+                    }
+                }
             }
         }
         for ix in changed {
@@ -1484,7 +1520,7 @@ impl Transcript {
             return false;
         }
         let rows = touched.values().filter(|&&ix| ix >= live).map(|&ix| &self.items[ix]);
-        let Some(step) = self.card_live.step(rows) else {
+        let Some(step) = self.card_live.step(&self.cards, rows) else {
             return false;
         };
         if step.cards {
@@ -1523,17 +1559,20 @@ impl Transcript {
             };
             self.card_visits += 1;
             let card = self.card_live.want.get(id);
-            asks |= asked(card) != asked(self.items[ix].card.as_deref());
+            asks |= asked(card.map(|c| &**c)) != asked(self.items[ix].card.as_deref());
             match card {
                 Some(_) => self.card_live.at.insert(*id, ix),
                 None => self.card_live.at.remove(id),
             };
-            if self.items[ix].card.as_deref() != card {
-                self.items[ix].card = card.cloned().map(Arc::new);
+            if self.items[ix].card.as_deref() != card.map(|c| &**c) {
+                self.items[ix].card = card.cloned();
                 changed.push(ix);
             }
         }
         let rows = self.card_live.want.len();
+        // Redundant now (Shady #102): a row drawn first or last is an ask
+        // whose own change set `asks` above. Kept, cheap, for a fold that
+        // may draw an answer or a close with no ask.
         asks |= (rows == 0) != (self.card_rows == 0);
         self.card_rows = rows;
         // Its own touches are no change to read again.
@@ -1546,7 +1585,7 @@ impl Transcript {
         if asks {
             let mut ixs = Vec::new();
             for (id, c) in &self.card_live.want {
-                if !asked(Some(c)) {
+                if !asked(Some(&**c)) {
                     continue;
                 }
                 self.card_visits += 1;
@@ -1802,7 +1841,7 @@ impl Transcript {
             *ix -= n;
         }
         self.response_start = self.response_start.map(|s| s.saturating_sub(n));
-        self.card_kept = false;
+        self.card_unkeep();
         self.mark(0);
         n
     }
@@ -1971,7 +2010,7 @@ impl Transcript {
                 LlmEvent::ResponseReset => {
                     if let Some(s) = self.response_start.filter(|&s| s >= self.history_end && s <= self.items.len()) {
                         let kept: Vec<Item> = self.items.drain(s..).filter(|i| i.kind == ItemKind::Event && i.is_note()).collect();
-                        self.card_kept = false;
+                        self.card_unkeep();
                         self.items.extend(kept);
                         self.tools.retain(|_, ix| *ix < s);
                         self.mark(s);

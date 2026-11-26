@@ -286,6 +286,20 @@ fn seen(t: &mut Transcript) -> String {
     format!("{:?}\n{:?}\n{calls:?}\n{bound:?}\n{:?}\n{splice:?}", t.items, f.cards(), (t.card_rows, t.card_times))
 }
 
+/// What the card sync keeps is the rows' own (Shady #102 P2-1): a card it
+/// says a row draws is that row's (the same `Arc`, not a copy); kept
+/// unset, it keeps nothing.
+fn shares(t: &Transcript, what: &str) {
+    if !t.card_kept {
+        assert_eq!(t.card_sync_bytes(), 0, "{what}: not kept, and keeps {} bytes", t.card_sync_bytes());
+        return;
+    }
+    for (id, c) in &t.card_live.want {
+        let row = t.items.iter().find(|i| i.id == *id).and_then(|i| i.card.as_ref());
+        assert!(row.is_some_and(|r| Arc::ptr_eq(r, c)), "{what}: row {id}'s card kept apart from the row's");
+    }
+}
+
 /// `ops` on a transcript attached to `h`, the sync that reads only what
 /// changed against reading every row, at every step.
 fn both(h: &[Value], ops: &[Op], what: &str) -> Transcript {
@@ -297,6 +311,8 @@ fn both(h: &[Value], ops: &[Op], what: &str) -> Transcript {
         run(&mut b, op);
         CARD_REREAD.set(false);
         assert_eq!(seen(&mut a), seen(&mut b), "{what}, step {k}");
+        shares(&a, what);
+        shares(&b, what);
     }
     a
 }
@@ -365,6 +381,8 @@ fn reading_what_changed_draws_what_reading_every_row_draws() {
             run(&mut b, &op);
             CARD_REREAD.set(false);
             assert_eq!(seen(&mut a), seen(&mut b), "seed {seed}, step {k}");
+            shares(&a, &format!("seed {seed}, step {k}"));
+            shares(&b, &format!("seed {seed}, step {k}, every row read"));
             assert_eq!(a.cards_rev() != revs.0, b.cards_rev() != revs.1, "seed {seed}, step {k}: the fold's revision");
             revs = (a.cards_rev(), b.cards_rev());
         }
