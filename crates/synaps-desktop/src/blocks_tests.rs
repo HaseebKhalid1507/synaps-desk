@@ -1296,6 +1296,15 @@ fn cached_boards_are_counted_and_go_whole_past_the_budget(cx: &mut TestAppContex
     new_tab(cx, w, &view, crate::demo::BLOCKS_TWIN);
     let kept = view.update(cx, |v, _| {
         let e = v.tab_cache.take(&a).expect("A cached as its last pane left it");
+        // Its board published is counted with it: a copy of its transcript
+        // with no board counts that much less.
+        let board = e.transcript.drawn().map_or(0, |d| d.bytes);
+        let mut copy = e.transcript.clone();
+        let with = copy.blocks_bytes();
+        copy.set_drawn(None);
+        let without = copy.blocks_bytes();
+        drop(copy);
+        assert!(with >= without + board, "{with} counted with its board, {without} without, the board {board}");
         let bytes = e.bytes();
         v.tab_cache = crate::tabs::Lru::new(crate::app::TAB_CACHE, bytes * 3 / 2);
         v.tab_cache.put(a.clone(), e, bytes, |_| true);
