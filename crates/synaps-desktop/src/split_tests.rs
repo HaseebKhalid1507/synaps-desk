@@ -7536,6 +7536,57 @@ fn two_panes_on_one_session_ask_once_at_the_zero(cx: &mut TestAppContext) {
     let _ = client.shutdown();
 }
 
+/// Shady #100 R3.1 on a split: two panes on one session share its store
+/// and its ping's look. The ping in flight, three transport reconnects in
+/// its first seconds (the same attachment, a new connection: each asks
+/// both, once; each status says the same ping), the focus moving between
+/// the panes: the one look comes a minute on, status only, and sees the
+/// period ended. Then nothing, whichever pane is focused.
+#[gpui_kit::test]
+fn two_panes_on_one_session_look_at_a_ping_in_flight_once(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "cache-flight-split", attached(A, None), (1920., 1080.));
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(ids.len(), 2);
+    let a = attachment_of(cx, &view, ids[0]);
+    assert_eq!(attachment_of(cx, &view, ids[1]), a, "one store, one attachment");
+    cache_on(cx, &view);
+    crate::warm::freeze();
+    let status = |period: Value| Event::SessionStatus { attach_seq: a, value: json!({"keepwarm": {"mode": "auto", "period": period}}) };
+    let flying = || status(json!({"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}));
+    let no_match = || cache_reply(a, json!({"state": "unknown", "reason": "no_matching_request"}));
+    give(cx, window, &view, vec![flying(), no_match()]);
+    assert_eq!(panel_asks(cx, &view), []);
+    for (k, focus) in [ids[0], ids[1], ids[0]].into_iter().enumerate() {
+        pass(cx, window, 1);
+        view.update(cx, |v, cx| v.focus_pane(focus, crate::pane::KeysTo::Pane, cx));
+        let mut again = match synaps_client::protocol::decode_frame(&attached(A, None).to_string()).expect("a frame") {
+            synaps_client::protocol::DaemonFrame::Attached(a) => a,
+            other => panic!("{other:?}"),
+        };
+        again.connection = 10 + k as u64;
+        let ev = Event::Attached { attach_seq: a, attached: again, mode: synaps_client::AttachMode::Mirror, reconnect: true };
+        give(cx, window, &view, vec![ev]);
+        assert_eq!(panel_asks(cx, &view), [(a, "status"), (a, "cache_expiry")], "reconnect {k}: both, once");
+        give(cx, window, &view, vec![flying(), no_match()]);
+        assert_eq!(panel_asks(cx, &view), [], "reconnect {k}'s answers: nothing more");
+    }
+    view.update(cx, |v, cx| v.focus_pane(ids[1], crate::pane::KeysTo::Pane, cx));
+    pass(cx, window, 56);
+    assert_eq!(panel_asks(cx, &view), [], "no poll before a minute");
+    pass(cx, window, 1);
+    assert_eq!(panel_asks(cx, &view), [(a, "status")], "a minute on: the look, once, status only");
+    give(cx, window, &view, vec![status(Value::Null)]);
+    for focus in [ids[0], ids[1]] {
+        view.update(cx, |v, cx| v.focus_pane(focus, crate::pane::KeysTo::Pane, cx));
+        pass(cx, window, 300);
+        assert_eq!(panel_asks(cx, &view), [], "ended: nothing");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
 /// Shady #100 F2 on a split: a refusal of the query, and a daemon without
 /// it, reach every store, not only the focused pane's: the other pane,
 /// focused, shows no old `cold`.

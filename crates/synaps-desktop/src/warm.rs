@@ -19,7 +19,9 @@
 //!   looked at once more [`SETTLE`] on, its status only: SynapsCLI says
 //!   nothing of a ping that failed unbilled (a refusal, a connection that
 //!   failed), whether it retries or ends the period. The same ping still in
-//!   flight waits twice as long, while that is within its period's TTL.
+//!   flight at that look waits twice as long for the next, while one wait
+//!   is within its period's TTL ([`Flight`]). A fallback, at best: a ping
+//!   still in flight after its last look is not looked for again.
 //!
 //! The countdowns cost no idle frames: redrawn when what they say changes,
 //! once a second under ten minutes, once a minute above, only while the
@@ -41,8 +43,10 @@ const AFTER_PING: Duration = Duration::from_secs(5);
 /// ... and never sooner than this after the answer that scheduled it.
 const REFRESH_MIN: Duration = Duration::from_secs(30);
 /// A ping in flight has its status looked at again this long after the
-/// answer that said so. A ping is one request (the transport retries none
-/// of it), long over by then: booked, retried (in 5, 15 or 30 s) or ended.
+/// answer that first said so. A ping is one request (the transport retries
+/// none of it), most often over by then: booked, retried (in 5, 15 or
+/// 30 s) or ended. Not always (a slow provider's deadlines run minutes):
+/// the looks after wait longer.
 pub(crate) const SETTLE: Duration = Duration::from_secs(60);
 /// A period's TTL when its status doesn't say (the longest there is).
 const TTL_MAX: Duration = Duration::from_secs(3600);
@@ -175,34 +179,62 @@ pub(crate) struct Warm {
 }
 
 /// A ping in flight, as a status said it. SynapsCLI emits nothing when a
-/// ping fails unbilled, so its end is looked for: once, [`SETTLE`] after
-/// the answer; an answer that says the same ping waits twice as long as
-/// the last, and none past the period's TTL (no retry is scheduled past
-/// it), so one ping costs a few asks at most, status only (Shady #100 R2.1).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// ping fails unbilled, so its end is looked for: [`SETTLE`] after the
+/// first answer that says it. Time spends the looks, not answers (Shady
+/// #100 R3.1): an answer that says the same ping before its look is due
+/// (a reconnect's, a notice's) leaves the look where it was; one that
+/// comes when it is due or after (the look's own) has looked, and the next
+/// waits twice as long, from it. No wait is longer than the period's TTL
+/// (no retry is scheduled past it): one ping costs a few asks at most,
+/// status only (R2.1). Then none, for good, whatever else says it (R3.2).
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Flight {
     /// The period's `id`, `pings` and `ledger_usd`: what its booking changes.
     key: (Option<u64>, Option<u64>, Option<u64>),
-    /// The look, from the answer.
-    pub wait: Duration,
-    /// Looked (asked since), or none: past the TTL.
-    pub looked: bool,
+    /// The answer the look waits from: the first that said this ping, or
+    /// the last look's.
+    from: Age,
+    /// The look, from `from`; `None`: no more.
+    wait: Option<Duration>,
+    /// Asked since `from`: the look, or an ask that covered it.
+    looked: bool,
+}
+
+impl Flight {
+    /// Of the status `period` (in flight), answered at `at`, after `prev`.
+    fn of(period: &Value, at: Moment, prev: Option<&Flight>) -> Flight {
+        let key = (period["id"].as_u64(), period["pings"].as_u64(), period["ledger_usd"].as_f64().map(f64::to_bits));
+        let ttl = period["ttl_secs"].as_u64().map_or(TTL_MAX, Duration::from_secs);
+        let within = |w: Duration| Some(w).filter(|w| *w <= ttl);
+        match prev.filter(|f| f.key == key) {
+            // Another ping (booked, retried, another period): a look anew.
+            None => Flight { key, from: Age::new(at), wait: within(SETTLE), looked: false },
+            // Its looks are over, and stay so.
+            Some(f) if f.wait.is_none() => f.clone(),
+            // Due: looked at. The next twice as long, from here.
+            Some(f) if f.wait.is_some_and(|w| f.from.at(at) >= w) => {
+                Flight { key, from: Age::new(at), wait: f.wait.and_then(|w| w.checked_mul(2)).and_then(within), looked: false }
+            }
+            // Before it: the look stands, still to be asked.
+            Some(f) => Flight { looked: false, ..f.clone() },
+        }
+    }
+
+    /// Until its look, at `now`; `None`: asked, or no more.
+    fn look_in(&self, now: Moment) -> Option<Duration> {
+        self.wait.filter(|_| !self.looked).map(|w| w.saturating_sub(self.from.at(now)))
+    }
 }
 
 impl Warm {
     /// The status `v`, answered at `at`; `prev`: what the store held (the
-    /// same ping still in flight waits twice as long as its last look).
+    /// same ping still in flight keeps its look, [`Flight`]).
     pub fn from_status(v: &Value, at: Moment, prev: Option<&Warm>) -> Warm {
         let kw = &v["keepwarm"];
         let period = &kw["period"];
         let next_ping = period["next_ping_in_secs"].as_u64().map(Duration::from_secs);
         let in_flight = period.is_object() && (period["in_flight"] == true || next_ping.is_some_and(|d| d.is_zero()));
-        let flight = in_flight.then(|| {
-            let key = (period["id"].as_u64(), period["pings"].as_u64(), period["ledger_usd"].as_f64().map(f64::to_bits));
-            let wait = prev.and_then(|w| w.flight).filter(|f| f.key == key).map_or(SETTLE, |f| f.wait * 2);
-            let ttl = period["ttl_secs"].as_u64().map_or(TTL_MAX, Duration::from_secs);
-            Flight { key, wait, looked: wait > ttl }
-        });
+        let flight = in_flight.then(|| Flight::of(period, at, prev.and_then(|w| w.flight.as_ref())));
         Warm {
             at: Age::new(at),
             mode: kw["mode"].as_str().unwrap_or_default().to_string(),
@@ -249,9 +281,12 @@ impl Warm {
     /// schedules is due, and not within [`REFRESH_MIN`] of the answer; or a
     /// ping in flight's look ([`Flight`]). `None`: neither, or asked already.
     pub fn refresh_at(&self, now: Moment) -> Option<Instant> {
-        let ping = self.next_ping.filter(|d| self.refresh && !d.is_zero()).map(|d| (d + AFTER_PING).max(REFRESH_MIN));
-        let look = self.flight.filter(|f| !f.looked).map(|f| f.wait);
-        Some(now.mono + ping.or(look)?.saturating_sub(self.at.at(now)))
+        let ping = self
+            .next_ping
+            .filter(|d| self.refresh && !d.is_zero())
+            .map(|d| (d + AFTER_PING).max(REFRESH_MIN).saturating_sub(self.at.at(now)));
+        let look = || self.flight.as_ref().and_then(|f| f.look_in(now));
+        Some(now.mono + ping.or_else(look)?)
     }
 }
 
@@ -589,16 +624,16 @@ mod tests {
         }
         // No period: nothing in flight, nothing scheduled.
         let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null, "last_end": "4xx"}}), t0, None);
-        assert_eq!((w.flight, w.refresh_at(t0)), (None, None));
+        assert_eq!((w.flight.clone(), w.refresh_at(t0)), (None, None));
         let mut w = Warm::from_status(&status(), t0, None);
         w.next_ping = None;
         assert_eq!((w.next_change(t0), w.refresh_at(t0)), (None, None));
     }
 
     /// Shady #100 R2.1: a ping in flight is looked at once, a minute on;
-    /// each answer that says the same ping (its period, pings and ledger)
-    /// waits twice as long as the last, and none past the period's TTL.
-    /// Anything else (booked, retried, another period) starts again.
+    /// each look that sees the same ping (its period, pings and ledger)
+    /// waits twice as long for the next, and no wait past the period's
+    /// TTL. Anything else (booked, retried, another period) starts again.
     #[test]
     fn a_ping_in_flight_is_looked_at_a_few_times_at_most() {
         let t0 = Moment::now();
@@ -606,43 +641,100 @@ mod tests {
             json!({"keepwarm": {"mode": "auto", "period": {"id": id, "pings": pings, "ledger_usd": ledger,
                 "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}})
         };
-        let look = |w: &Warm| w.refresh_at(t0).map(|at| at.duration_since(t0.mono).as_secs());
-        let mut w = Warm::from_status(&st(1, 2, 0.5), t0, None);
-        let mut looks = vec![look(&w)];
-        for _ in 0..4 {
-            w.asked();
-            w = Warm::from_status(&st(1, 2, 0.5), t0, Some(&w));
-            looks.push(look(&w));
-        }
-        assert_eq!(looks, [Some(60), Some(120), Some(240), None, None], "within the 5m TTL, then none");
+        // Each look, answered as it is asked: how long it waited.
+        let looks = |v: &Value| {
+            let (mut w, mut t, mut looks) = (Warm::from_status(v, t0, None), t0, Vec::new());
+            while let Some(at) = w.refresh_at(t) {
+                let wait = at.duration_since(t.mono).as_secs();
+                looks.push(wait);
+                t = after(t, wait);
+                w.asked();
+                w = Warm::from_status(v, t, Some(&w));
+            }
+            (looks, w, t)
+        };
+        let (five, w, t) = looks(&st(1, 2, 0.5));
+        assert_eq!(five, [60, 120, 240], "within the 5m TTL, then none");
+        let look = |w: &Warm| w.refresh_at(t).map(|at| at.duration_since(t.mono).as_secs());
         // Booked (pings, or a worst case's ledger), or another period: anew.
         for other in [st(1, 3, 0.5), st(1, 2, 0.75), st(2, 2, 0.5)] {
-            assert_eq!(look(&Warm::from_status(&other, t0, Some(&w))), Some(60), "{other}");
+            assert_eq!(look(&Warm::from_status(&other, t, Some(&w))), Some(60), "{other}");
         }
         // Scheduled in between (a retry): the next flight starts anew.
         let retry = Warm::from_status(
             &json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 2, "ledger_usd": 0.5,
             "ttl_secs": 300, "next_ping_in_secs": 15}}}),
-            t0,
+            t,
             Some(&w),
         );
-        assert_eq!((retry.flight, look(&retry)), (None, Some(30)));
-        assert_eq!(look(&Warm::from_status(&st(1, 2, 0.5), t0, Some(&retry))), Some(60));
-        // An hour's period: six looks at most.
-        let hour = |prev: Option<&Warm>| {
-            Warm::from_status(
-                &json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "in_flight": true, "next_ping_in_secs": 0}}}),
-                t0,
-                prev,
-            )
-        };
-        let mut w = hour(None);
-        let mut n = 0;
-        while look(&w).is_some() {
-            n += 1;
-            w = hour(Some(&w));
+        assert_eq!((retry.flight.clone(), look(&retry)), (None, Some(30)));
+        assert_eq!(look(&Warm::from_status(&st(1, 2, 0.5), t, Some(&retry))), Some(60));
+        // An hour's period (or one that doesn't say): six looks at most.
+        let (hour, ..) = looks(&json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "in_flight": true, "next_ping_in_secs": 0}}}));
+        assert_eq!(hour, [60, 120, 240, 480, 960, 1920], "60 s to 32 min");
+    }
+
+    /// Shady #100 R3.1: time spends a ping's looks, not answers. Answers
+    /// that say the same ping before its look is due (three reconnects'
+    /// in its first seconds) leave the look where it was, a minute on.
+    /// That look sees it still in flight: the next twice as long, from
+    /// there, and an early answer again moves nothing. The next look sees
+    /// the period ended: nothing more.
+    #[test]
+    fn early_answers_do_not_spend_a_ping_s_looks() {
+        let t0 = Moment::now();
+        let st = json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 2, "ledger_usd": 0.5,
+            "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}});
+        let mut w = Warm::from_status(&st, t0, None);
+        for s in 1..=3 {
+            // The reconnect's ask, and its answer.
+            w.asked();
+            w = Warm::from_status(&st, after(t0, s), Some(&w));
+            assert_eq!(w.refresh_at(after(t0, s)), Some(after(t0, 60).mono), "answer {s}: the look stands");
         }
-        assert_eq!(n, 6, "60 s to 32 min");
+        assert_eq!(w.refresh_at(after(t0, 59)), Some(after(t0, 60).mono));
+        w.asked();
+        w = Warm::from_status(&st, after(t0, 60), Some(&w));
+        assert_eq!(w.refresh_at(after(t0, 60)), Some(after(t0, 180).mono), "looked: twice as long");
+        w.asked();
+        w = Warm::from_status(&st, after(t0, 61), Some(&w));
+        assert_eq!(w.refresh_at(after(t0, 61)), Some(after(t0, 180).mono), "an early answer again: the look stands");
+        w.asked();
+        let w = Warm::from_status(&json!({"keepwarm": {"mode": "auto", "period": null}}), after(t0, 180), Some(&w));
+        assert_eq!(w.refresh_at(after(t0, 180)), None, "ended: nothing");
+    }
+
+    /// Shady #100 R3.2: a ping's looks run out, and stay out. A hundred
+    /// more answers that say it, each long after the last, change nothing
+    /// and ask nothing (no wait grows past what a `Duration` holds).
+    /// Another ping is looked at a minute on again.
+    #[test]
+    fn a_ping_s_looks_run_out_for_good() {
+        let t0 = Moment::now();
+        let st = |pings: u64| {
+            json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": pings, "ledger_usd": 0.5,
+                "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}})
+        };
+        let mut w = Warm::from_status(&st(2), t0, None);
+        let (mut t, mut looks) = (t0, Vec::new());
+        while let Some(at) = w.refresh_at(t) {
+            let wait = at.duration_since(t.mono).as_secs();
+            looks.push(wait);
+            t = after(t, wait);
+            w.asked();
+            w = Warm::from_status(&st(2), t, Some(&w));
+        }
+        assert_eq!(looks, [60, 120, 240], "within the 5m TTL");
+        for k in 0..100 {
+            t = after(t, 3600);
+            w.asked();
+            let next = Warm::from_status(&st(2), t, Some(&w));
+            assert_eq!(next.flight, w.flight, "answer {k}: no further");
+            assert_eq!(next.refresh_at(t), None, "answer {k}: nothing asked");
+            w = next;
+        }
+        let new = Warm::from_status(&st(3), t, Some(&w));
+        assert_eq!(new.refresh_at(t), Some(after(t, 60).mono), "another ping: a minute on");
     }
 
     /// Suspend: the monotonic clock stops, the wall clock (and the

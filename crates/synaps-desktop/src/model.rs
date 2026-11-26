@@ -3417,15 +3417,18 @@ mod tests {
         assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(46)), [], "once");
     }
 
-    /// Shady #100 R2.1: reconnected while a ping is in flight, which then
-    /// fails unbilled (SynapsCLI says nothing of it). The re-attach's
-    /// status says the same ping is in flight: looked at once (twice as
-    /// long: the same ping), status only; the look sees the period ended.
+    /// Shady #100 R2.1, R3.1: transport reconnects while a ping is in
+    /// flight (the same attachment, a new connection), three in its first
+    /// seconds, each asking both once, each status saying the same ping;
+    /// the ping then fails unbilled (SynapsCLI says nothing of it). Its
+    /// look stays a minute on, status only, and sees the period ended.
     /// Then nothing but the cache's own zero, and after it nothing at all.
     #[test]
     fn a_reconnect_during_a_ping_in_flight_sees_it_end() {
         use crate::warm::Moment;
         use std::time::Duration;
+        crate::warm::freeze();
+        let tick = || crate::warm::skew(Duration::from_secs(1), Duration::from_secs(1));
         let mut m = Model::new(ConnState::Connecting);
         m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
         m.want(LiveId::FIRST, 1);
@@ -3436,22 +3439,73 @@ mod tests {
         };
         m.apply(flying());
         m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 250})));
-        let mut a = attached("s");
-        a.connection = 2;
-        m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: true });
-        m.apply(flying());
-        m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 250})));
-        let t0 = Moment::now();
-        let at = |s: u64| Moment { mono: t0.mono + Duration::from_secs(s), wall: t0.wall + Duration::from_secs(s) };
-        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(61)), [], "no poll");
-        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(121)), [Effect::Status(1)], "looked at: status only");
+        for t in 1..=3 {
+            tick();
+            let mut a = attached("s");
+            a.connection = 1 + t;
+            let fx = m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: true });
+            let asks: Vec<_> = fx.into_iter().filter(|e| matches!(e, Effect::Status(_) | Effect::CacheExpiry(_))).collect();
+            assert_eq!(asks, [Effect::Status(1), Effect::CacheExpiry(1)], "reconnect {t}: both, once");
+            m.apply(flying());
+            m.apply(expiry(1, json!({"state": "warm", "warm_for_secs": 250 - t})));
+        }
+        for t in 4..60 {
+            tick();
+            assert_eq!(m.panel_due(LiveId::FIRST, Some(1), Moment::now()), [], "{t} s: no poll");
+        }
+        tick();
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), Moment::now()), [Effect::Status(1)], "a minute on: looked at, status only");
         m.apply(Event::SessionStatus {
             attach_seq: 1,
             value: json!({"keepwarm": {"mode": "auto", "period": null, "last_end": "transient"}}),
         });
-        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(240)), [], "ended: nothing");
-        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), at(251)), [Effect::CacheExpiry(1)], "the cache's zero");
-        assert_eq!(m.panel_wake(LiveId::FIRST, Some(1), at(252)), None, "then nothing at all");
+        for t in 61..250 {
+            tick();
+            assert_eq!(m.panel_due(LiveId::FIRST, Some(1), Moment::now()), [], "{t} s: ended, nothing");
+        }
+        tick();
+        assert_eq!(m.panel_due(LiveId::FIRST, Some(1), Moment::now()), [Effect::CacheExpiry(1)], "the cache's zero");
+        assert_eq!(m.panel_wake(LiveId::FIRST, Some(1), Moment::now()), None, "then nothing at all");
+    }
+
+    /// Shady #100 R3.1: a ping stuck in flight, a reconnect ten seconds
+    /// into each look's wait and every 100 s besides, each status saying
+    /// the same ping: looked at 60, 120 and 240 s after the answers that
+    /// saw it, status only, and never again, however many reconnects ask.
+    #[test]
+    fn a_ping_stuck_in_flight_is_looked_at_a_few_times_through_reconnects() {
+        use crate::warm::Moment;
+        use std::time::Duration;
+        crate::warm::freeze();
+        let mut m = Model::new(ConnState::Connecting);
+        m.apply(connected(&[synaps_client::FEATURE_CACHE_EXPIRY]));
+        m.want(LiveId::FIRST, 1);
+        m.apply(Event::Attached { attach_seq: 1, attached: attached("s"), mode: AttachMode::Mirror, reconnect: false });
+        let flying = || Event::SessionStatus {
+            attach_seq: 1,
+            value: json!({"keepwarm": {"mode": "auto", "period": {"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}}}),
+        };
+        m.apply(flying());
+        let (mut since, mut looks, mut reconnects) = (0, Vec::new(), 0);
+        for t in 1..=3000u64 {
+            crate::warm::skew(Duration::from_secs(1), Duration::from_secs(1));
+            if t - since == 10 || t % 100 == 0 {
+                reconnects += 1;
+                let mut a = attached("s");
+                a.connection = 1 + reconnects;
+                m.apply(Event::Attached { attach_seq: 1, attached: a, mode: AttachMode::Mirror, reconnect: true });
+                m.apply(flying());
+            }
+            let fx = m.panel_due(LiveId::FIRST, Some(1), Moment::now());
+            if !fx.is_empty() {
+                assert_eq!(fx, [Effect::Status(1)], "{t} s: status only");
+                looks.push(t - since);
+                since = t;
+                m.apply(flying());
+            }
+        }
+        assert!(reconnects > 30);
+        assert_eq!(looks, [60, 120, 240], "within the 5m TTL, then none");
     }
 
     /// `Event::CacheExpiry` for attachment `seq`, the daemon's `value`.
