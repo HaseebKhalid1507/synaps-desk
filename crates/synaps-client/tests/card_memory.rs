@@ -4,11 +4,15 @@
 //! those); counted (`Transcript::card_sync_bytes`); and let go as soon as
 //! it can't be used: a detach, a trim, a tab cached.
 //!
-//! The heap is this thread's, counted by the allocator below: what a test
-//! allocated and has not freed. Each test's thread is its own.
+//! The heap is the process's, counted by the allocator below: what is
+//! allocated and not freed, whichever thread frees it (a disposer thread
+//! may drop what a transcript lets go: what is let go is waited for,
+//! [`settled`]). The tests here run one at a time ([`one`]).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use synaps_client::protocol::*;
@@ -16,12 +20,10 @@ use synaps_client::transcript::Transcript;
 
 struct Counting;
 
-thread_local! {
-    static HELD: Cell<isize> = const { Cell::new(0) };
-}
+static HELD: AtomicIsize = AtomicIsize::new(0);
 
 fn count(n: isize) {
-    let _ = HELD.try_with(|h| h.set(h.get() + n));
+    HELD.fetch_add(n, Ordering::Relaxed);
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -55,9 +57,32 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// The bytes this thread holds.
+/// The bytes the process holds.
 fn held() -> isize {
-    HELD.with(Cell::get)
+    HELD.load(Ordering::Relaxed)
+}
+
+/// One test at a time: the heap counted is the process's.
+fn one() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The bytes held over `base` once what was let go is freed: once `done`
+/// holds of them, or, if it never does, once they stopped moving (5 s at
+/// most).
+fn settled(base: isize, done: impl Fn(isize) -> bool) -> isize {
+    let start = Instant::now();
+    let mut last = held() - base;
+    while !done(last) && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = held() - base;
+        if now == last && start.elapsed() > Duration::from_millis(500) {
+            break;
+        }
+        last = now;
+    }
+    last
 }
 
 const MIB: usize = 1 << 20;
@@ -140,6 +165,7 @@ fn turn(t: &mut Transcript) {
 /// the cards and lets the sync's state go; a reattach keeps none of it.
 #[test]
 fn nine_refused_inputs_of_8_mib_are_kept_once() {
+    let _one = one();
     let mut t = attach(&with_a_card());
     let base = held();
     turn(&mut t);
@@ -147,7 +173,7 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
         refused(&mut t, &format!("r{k}"), 8 * MIB);
     }
     let inputs = (9 * 8 * MIB) as isize;
-    let kept = held() - base;
+    let kept = settled(base, |n| n < inputs + 2 * MIB as isize);
     assert!(kept >= inputs, "the rows keep their inputs: {kept} bytes held");
     assert!(kept < inputs + 2 * MIB as isize, "{kept} bytes held for {inputs} of inputs: a copy more");
     let sync = t.card_sync_bytes();
@@ -155,12 +181,12 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
     let cards = t.cards().cards().to_vec();
     assert_eq!(cards.len(), 10, "the history's card and the nine refused");
     t.set_detached();
-    let detached = held() - base;
+    let detached = settled(base, |n| n < inputs + 2 * MIB as isize);
     assert!(detached < inputs + 2 * MIB as isize, "detached: {detached} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "detached: the card sync's state let go");
     assert_eq!(t.cards().cards(), &cards[..], "detached: the cards kept");
     t.load_attached(&attached(&with_a_card())).unwrap();
-    let again = held() - base;
+    let again = settled(base, |n| n < MIB as isize);
     assert!(again < MIB as isize, "reattached: the live rows gone, {again} bytes held");
 }
 
@@ -170,6 +196,7 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
 /// next sync).
 #[test]
 fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
+    let _one = one();
     let mut t = attach(&[]);
     let base = held();
     turn(&mut t);
@@ -183,7 +210,7 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
     assert!(t.card_sync_bytes() > 0, "the card sync kept");
     let n = t.trim_live_front(10, usize::MAX);
     assert!(n > 4, "the front trimmed: {n} rows");
-    let kept = held() - base;
+    let kept = settled(base, |n| n < MIB as isize);
     assert!(kept < MIB as isize, "trimmed, no event since: {kept} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "trimmed: the card sync's state let go");
     // The next event reads every row again, and keeps what it reads.
@@ -196,6 +223,7 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
 /// a little more (its tables' estimate), never less.
 #[test]
 fn the_card_sync_counts_what_it_keeps() {
+    let _one = one();
     let mut t = attach(&with_a_card());
     turn(&mut t);
     for k in 0..2_000 {
@@ -205,6 +233,8 @@ fn the_card_sync_counts_what_it_keeps() {
         }
     }
     let counted = t.card_sync_bytes();
+    // Nothing let go before is still being freed.
+    settled(0, |_| false);
     let before = held();
     t.shed_card_sync();
     let freed = before - held();
