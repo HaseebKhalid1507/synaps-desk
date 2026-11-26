@@ -2003,22 +2003,58 @@ impl Geo {
 }
 
 /// A row's target (cards4/proposal.md §2): mono, the scanned part (a
-/// path's file, a command) in `prose_t`, a path's folder in `dim_t` (the
-/// folder gives way first), ellipsised. `quiet` (cancelled, denied): all
-/// of it `dim_t`.
-fn target_el(card: &Card, arg: &SharedString, quiet: bool, p: &Palette) -> Div {
+/// path's file, a command) in `prose_t`, a path's folder in `dim_t`,
+/// ellipsised. `quiet` (cancelled, denied): all of it `dim_t`. A path's
+/// folder gives way first; its file's name then middle-ellipsizes (its
+/// start and extension stay), never cut. Its flex basis is the name's own
+/// width, so the row's facts give way before the name ([`target_line`]).
+fn target_el(card: &Card, arg: &SharedString, quiet: bool, id: u64, p: &Palette, m: &Metrics) -> Div {
     let text = if card.target.is_empty() { arg.clone() } else { card.target.clone() };
     let lit = if quiet { p.dim_t } else { p.prose_t };
     match &card.path {
-        Some((dir, base)) => h_flex()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir.clone()))
-            .child(div().flex_none().text_color(lit).child(base.clone())),
+        Some((dir, base)) => {
+            let name_w = (crate::blocks::cols(base) as f32 * m.mono * 0.6).ceil();
+            let t = format!("tool-file {id} {base}");
+            h_flex()
+                .flex_grow(1.)
+                .flex_shrink(1.)
+                .flex_basis(px(name_w))
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .debug_selector(move || format!("tool-target {id}"))
+                .child(div().min_w_0().flex_shrink(1000.).overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir.clone()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .text_ellipsis_middle()
+                        .text_color(lit)
+                        .debug_selector(move || t)
+                        .child(base.clone()),
+                )
+        }
         None => div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(lit).child(text),
     }
+}
+
+/// A path row's target and its facts on one line that wraps: the facts
+/// come after the target only while its file's name fits whole beside
+/// them; else they take a second line, out of sight, and the name has the
+/// row (a 320 px pane: `Edit token_store.rs`, not `token_store.r +3 −1`).
+fn target_line(target: Div, facts: Div, line: f32, gap: f32, id: u64) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .h(px(line))
+        .flex_wrap()
+        .gap_x(px(gap))
+        .items_center()
+        .overflow_hidden()
+        .debug_selector(move || format!("tool-line {id}"))
+        .child(target)
+        .child(facts)
 }
 
 /// A running call's clock (the TUI's `running 1.2s`): whole seconds since
@@ -2232,7 +2268,7 @@ impl AppView {
                 .text_color(p.think)
                 .child(row.arg.clone())
         } else {
-            target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), p)
+            target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), id, p, m)
         };
         // The call a prompt waits on ([`waiting_call`]).
         let waiting = !think
@@ -2333,7 +2369,15 @@ impl AppView {
         }
         let after = !parts.is_empty();
         let receipt_el = receipt.and_then(|_| self.receipt_el(call_id, st, after, running, p));
-        let facts = crate::cards::facts(parts, p, m).children(receipt_el);
+        // A path's facts may give way to its name ([`target_line`]); its
+        // receipt never does.
+        let path = !think && row.card.path.is_some() && after;
+        let (facts, receipt_el) = if path {
+            (crate::cards::facts(parts, p, m), receipt_el)
+        } else {
+            (crate::cards::facts(parts, p, m).children(receipt_el), None)
+        };
+        let facts = facts.debug_selector(move || format!("tool-facts {id}"));
         // "Exit N" slides in from +6 as the cross writes on (§8 #6).
         let word_el = word.map(|w| {
             let since = change.filter(|c| glyph::Life::was_live(c.1) || c.1 == glyph::Life::Queued.code()).map(|c| c.0);
@@ -2385,8 +2429,8 @@ impl AppView {
             .when(has_body && wash.is_some(), |d| d.cursor_pointer())
             .child(div().flex_none().size(px(g.glyph)).children(status_glyph).debug_selector(move || format!("tool-status {id}")))
             .child(verb)
-            .child(target)
-            .child(facts)
+            .map(|d| if path { d.child(target_line(target, facts, m.mono_line, g.gap, id)) } else { d.child(target).child(facts) })
+            .children(receipt_el.map(|r| div().flex_none().font_family(fonts::SANS).text_px(m.meta).whitespace_nowrap().child(r)))
             .children(word_el)
             .child(div().flex_none().w(px(g.chevron)).flex().items_center().justify_end().children(fold))
             .when(has_body, |d| {
