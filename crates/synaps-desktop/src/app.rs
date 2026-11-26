@@ -2391,6 +2391,10 @@ pub struct AppView {
     /// its text.
     #[cfg(test)]
     pub(crate) card_sends: Vec<crate::deliver::Outgoing>,
+    /// The right panel's asks handed to the client, by attachment: the UI
+    /// tests' record of each `status` and `cache_expiry`.
+    #[cfg(test)]
+    pub(crate) panel_asks: Vec<(u64, &'static str)>,
     /// The agent cards' answers being made, by session and call
     /// ([`crate::answer::Draft`]).
     pub(crate) card_drafts: HashMap<(String, String), crate::answer::Draft>,
@@ -3012,6 +3016,8 @@ impl AppView {
             halts: 0,
             #[cfg(test)]
             card_sends: Vec::new(),
+            #[cfg(test)]
+            panel_asks: Vec::new(),
             card_drafts: HashMap::new(),
             card_open: HashSet::new(),
             card_changing: HashSet::new(),
@@ -3214,11 +3220,15 @@ impl AppView {
             Effect::Status(seq) => {
                 if let Some(c) = &self.client {
                     let _ = c.on(seq).status();
+                    #[cfg(test)]
+                    self.panel_asks.push((seq, "status"));
                 }
             }
             Effect::CacheExpiry(seq) => {
                 if let Some(c) = &self.client {
                     let _ = c.on(seq).cache_expiry();
+                    #[cfg(test)]
+                    self.panel_asks.push((seq, "cache_expiry"));
                 }
             }
         }
@@ -5020,7 +5030,7 @@ impl AppView {
             return;
         }
         let task = cx.spawn(async move |this, cx| {
-            let left = due.saturating_duration_since(Instant::now());
+            let left = due.saturating_duration_since(crate::warm::Moment::now().mono);
             if !left.is_zero() {
                 cx.background_executor().timer(left).await;
             }
@@ -5042,9 +5052,13 @@ impl AppView {
                     && let (Some(c), Some(seq)) = (&v.client, seq)
                 {
                     let _ = c.on(seq).status();
+                    #[cfg(test)]
+                    v.panel_asks.push((seq, "status"));
                     let stats = &mut v.model.lives[v.panes.cur.live].stats;
                     if asks {
                         let _ = c.on(seq).cache_expiry();
+                        #[cfg(test)]
+                        v.panel_asks.push((seq, "cache_expiry"));
                         // Its answer counts down afresh.
                         if let Some(e) = stats.expiry.as_mut() {
                             e.asked_at_zero = true;
@@ -5060,6 +5074,8 @@ impl AppView {
                     // The countdown reached zero: the band, and once more.
                     e.asked_at_zero = true;
                     let _ = c.on(seq).cache_expiry();
+                    #[cfg(test)]
+                    v.panel_asks.push((seq, "cache_expiry"));
                 }
                 cx.notify();
             });

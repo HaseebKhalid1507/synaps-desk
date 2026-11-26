@@ -53,7 +53,13 @@ pub(crate) struct Moment {
 
 impl Moment {
     pub fn now() -> Moment {
-        Moment { mono: Instant::now(), wall: SystemTime::now() }
+        let now = Moment { mono: Instant::now(), wall: SystemTime::now() };
+        #[cfg(test)]
+        let now = {
+            let (mono, wall) = SKEW.with(std::cell::Cell::get);
+            Moment { mono: now.mono + mono, wall: now.wall + wall }
+        };
+        now
     }
 
     /// Since `self`: the larger of the two clocks' (a wall clock set back
@@ -63,6 +69,19 @@ impl Moment {
         let wall = now.wall.duration_since(self.wall).unwrap_or_default();
         mono.max(wall)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How far a test moved this thread's clocks ([`skew`]): monotonic, wall.
+    static SKEW: std::cell::Cell<(Duration, Duration)> = const { std::cell::Cell::new((Duration::ZERO, Duration::ZERO)) };
+}
+
+/// Tests: [`Moment::now`] on this thread `mono` and `wall` later than it
+/// was (a suspend: the wall clock alone).
+#[cfg(test)]
+pub(crate) fn skew(mono: Duration, wall: Duration) {
+    SKEW.with(|s| s.set((s.get().0 + mono, s.get().1 + wall)));
 }
 
 /// How long until a countdown showing `d` next changes (its next second
