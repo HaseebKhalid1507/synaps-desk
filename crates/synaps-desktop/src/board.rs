@@ -70,6 +70,9 @@ pub(crate) struct Work {
     /// A finished board that waits for a pane's pointer lease to end
     /// ([`crate::lease`]).
     pub(crate) waiting: Option<Arc<Drawn>>,
+    /// A step's budget, if not [`STEP`] (tests: none, a slice a step).
+    #[cfg(test)]
+    pub(crate) budget: Option<Duration>,
 }
 
 impl Work {
@@ -326,13 +329,17 @@ impl AppView {
         let stop = Arc::new(AtomicBool::new(false));
         l.board.stop = stop.clone();
         let (worker, steps, input) = (input.worker.clone(), l.board.steps.clone(), Arc::new(input));
+        #[cfg(test)]
+        let budget = l.board.budget.unwrap_or(STEP);
+        #[cfg(not(test))]
+        let budget = STEP;
         l.board.job = Some(cx.spawn(async move |this, cx| {
             loop {
                 let (w, s, i, n) = (worker.clone(), stop.clone(), input.clone(), steps.clone());
                 let out = cx
                     .background_spawn(async move {
                         n.fetch_add(1, Ordering::Relaxed);
-                        step(&w, &i, &s, STEP)
+                        step(&w, &i, &s, budget)
                     })
                     .await;
                 match out {

@@ -178,7 +178,7 @@ fn note(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<&'static str>
 /// way first, then `rN`, never the glyph or the title. A bound block call
 /// draws no row; a refused one is a plain row.
 #[gpui_kit::test]
-fn every_kind_and_state_draws_narrow_and_wide(cx: &mut TestAppContext) {
+fn every_kind_draws_at_its_heights_narrow_and_wide(cx: &mut TestAppContext) {
     for width in [320. + 2. * crate::app::STRIP, 1500.] {
         let (w, view) = blocks(cx, width);
         let g = geo(cx, &view);
@@ -756,6 +756,165 @@ fn a_local_fold_yields_only_to_a_collapse_naming_that_block(cx: &mut TestAppCont
     land_round(cx, w, &view, "toolu_fi", json!([{"op":"collapse","ids":["plan","now"]}]));
     wait(cx, w, &view, 1000);
     assert!(folded(cx, &view, plan), "named among ids: the agent's fold over the user's opening");
+}
+
+/// Every state draws its own glyph and word, at 320 px and wide (§6.1,
+/// §6.4; Shady #101 P3-1: the demo doesn't hold every state, so a broken
+/// branch it never reaches stayed green). A block per agent state, each
+/// header's glyph and word as the table says (at 320 px the word stays:
+/// it gives way below 250); a plan per step state, its glyph the steps'
+/// aggregate; and a diff's hunks kept and dropped by a genuine user edit
+/// in the history (§3.4: the user's, never the agent's), each hunk's
+/// header saying so.
+#[gpui_kit::test]
+fn every_state_draws_its_glyph_and_word_narrow_and_wide(cx: &mut TestAppContext) {
+    use crate::glyph::Life;
+    let table: &[(&str, &str, Value, Life, Option<&str>)] = &[
+        ("s1", "status", json!({"text":"t","state":"working"}), Life::Seen, Some("working")),
+        ("s2", "status", json!({"text":"t","state":"waiting"}), Life::Wait, Some("waiting")),
+        ("s3", "status", json!({"text":"t","state":"blocked"}), Life::Failed, Some("blocked")),
+        ("s4", "status", json!({"text":"t","state":"done"}), Life::Done, Some("done")),
+        ("d1", "diff", json!({"file":"a.rs","state":"editing","hunks":[{"id":"h","lines":["+a"]}]}), Life::Seen, Some("editing")),
+        ("d2", "diff", json!({"file":"a.rs","state":"proposed","hunks":[{"id":"h","lines":["+a"]}]}), Life::Wait, Some("proposed")),
+        ("d3", "diff", json!({"file":"a.rs","state":"written","hunks":[{"id":"h","lines":["+a"]}]}), Life::Done, Some("written")),
+        ("d4", "diff", json!({"file":"a.rs","state":"reverted","hunks":[{"id":"h","lines":["+a"]}]}), Life::Cancelled, Some("reverted")),
+        ("m1", "metric", json!({"label":"l","value":"1","state":"ok"}), Life::Done, Some("ok")),
+        ("m2", "metric", json!({"label":"l","value":"1","state":"warn"}), Life::Wait, Some("warn")),
+        ("m3", "metric", json!({"label":"l","value":"1","state":"bad"}), Life::Failed, Some("bad")),
+        ("m4", "metric", json!({"label":"l","value":"1","state":"neutral"}), Life::Queued, None),
+        ("f1", "file", json!({"path":"a.rs","state":"reading"}), Life::Seen, Some("reading")),
+        ("f2", "file", json!({"path":"a.rs","state":"editing"}), Life::Seen, Some("editing")),
+        ("f3", "file", json!({"path":"a.rs","state":"written"}), Life::Done, Some("written")),
+        ("f4", "file", json!({"path":"a.rs","state":"done"}), Life::Done, Some("done")),
+        ("p1", "plan", json!({"steps":[{"id":"a","label":"A","state":"todo"}]}), Life::Queued, None),
+        ("p2", "plan", json!({"steps":[{"id":"a","label":"A","state":"doing"}]}), Life::Seen, None),
+        ("p3", "plan", json!({"steps":[{"id":"a","label":"A","state":"done"}]}), Life::Done, None),
+        ("p4", "plan", json!({"steps":[{"id":"a","label":"A","state":"failed"}]}), Life::Failed, None),
+        ("p5", "plan", json!({"steps":[{"id":"a","label":"A","state":"skipped"}]}), Life::Done, None),
+        ("p6", "plan", json!({"steps":[{"id":"a","label":"A","state":"done"},{"id":"b","label":"B","state":"doing"}]}), Life::Seen, None),
+        ("n1", "note", json!({"text":"a note"}), Life::Done, None),
+    ];
+    for width in [320. + 2. * crate::app::STRIP, 1500.] {
+        let (w, view) = blocks(cx, width);
+        // Eight at a time (a call's ops and the board's blocks are capped),
+        // each eight removed once read.
+        for (k, chunk) in table.chunks(8).enumerate() {
+            let ops: Vec<Value> =
+                chunk.iter().map(|(id, kind, body, ..)| json!({"op":"put","id":id,"kind":kind,"title":id,"body":body})).collect();
+            land_round(cx, w, &view, &format!("toolu_st{k}"), Value::Array(ops));
+            for (name, kind, _, life, word) in chunk {
+                let id = show_block(cx, w, &view, name);
+                assert!(has(cx, w, format!("block-life {id} {life:?}")), "{width}: {name} ({kind}): its glyph, {life:?}");
+                assert!(has(cx, w, format!("block-title {id}")), "{width}: {name}: its title");
+                for other in
+                    ["working", "waiting", "blocked", "done", "editing", "proposed", "written", "reverted", "ok", "warn", "bad", "reading"]
+                {
+                    let drawn = has(cx, w, format!("block-word {id} {other}"));
+                    assert_eq!(drawn, *word == Some(other), "{width}: {name} ({kind}): the word {other}");
+                }
+            }
+            let ids: Vec<&str> = chunk.iter().map(|c| c.0).collect();
+            land_round(cx, w, &view, &format!("toolu_sr{k}"), json!([{"op":"remove","ids":ids}]));
+        }
+        // Hunks: the user keeps one and drops one (a genuine edit message).
+        let diff = json!({"file":"a.rs","state":"proposed","hunks":[
+            {"id":"h1","at":"one()","lines":["+a"]},{"id":"h2","at":"two()","lines":["-b"]},{"id":"h3","at":"three()","lines":["+c"]}]});
+        land_round(cx, w, &view, "toolu_hk", json!([{"op":"put","id":"hk","kind":"diff","title":"Hunks","body":diff}]));
+        let hk = id(cx, &view, "hk");
+        let (rf, rev, tag) = view.read_with(cx, |v, _| {
+            let (_, s) = v.block_shown(hk).expect("drawn");
+            (s.block.id.clone(), s.block.rev, s.block.tag)
+        });
+        let parts = json!({"set": {"hunks.h1.state": "kept", "hunks.h2.state": "dropped"}});
+        let edit = cards_spec::block::message::Edit::new(rf, rev, tag, &parts).expect("a user edit");
+        let summary = cards_spec::block::message::Summary { title: Some("Hunks"), back_to: None, pieces: vec!["keep one()", "drop two()"] };
+        let text = cards_spec::block::message::build(&edit, &summary).expect("built");
+        land(cx, w, &view, vec![json!({"role": "user", "content": text})]);
+        board(cx, w, &view);
+        show_block(cx, w, &view, "hk");
+        for line in ["@@ one() · kept", "@@ two() · dropped", "@@ three()"] {
+            assert!(has(cx, w, format!("block-line {hk} {line}")), "{width}: {line}");
+        }
+    }
+}
+
+/// Only a finished board is published, and only the input's snapshot it
+/// ends on (Shady #101 P3-1: the worker returning a whole value is not
+/// the app publishing one). A long history lands (its fold: many slices, a
+/// step each here) and the job runs a step at a time on the executor; in
+/// between, frames draw and the old board stays drawn, nothing published.
+/// A live round lands mid-fold: the job for the old input stops at its
+/// next step, and the next one reads on. When it ends, one board is
+/// published, of the input as it is then (its history and live events,
+/// the live round's block drawn), and nothing else ever was.
+#[gpui_kit::test]
+fn a_job_paused_mid_fold_publishes_only_the_snapshot_it_ends_on(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let live = view.read_with(cx, |v, _| v.panes.cur.live);
+    view.update(cx, |v, _| v.model.lives[live].board.budget = Some(std::time::Duration::ZERO));
+    let frame = |cx: &mut TestAppContext| {
+        use gpui_kit::AppContext as _;
+        cx.update_window(w, |_, window, cx| window.simulate_next_frame(cx)).expect("the window");
+    };
+    let at = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            (v.model.lives[live].board.steps.load(std::sync::atomic::Ordering::Relaxed), v.model.lives[live].board.published)
+        })
+    };
+    let drawn = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[live].transcript.drawn().cloned().expect("a board"));
+    let before = drawn(cx);
+    // A long history: its events past many slices.
+    let (seq, sid) = super::answer_tests::attachment(cx, &view);
+    view.update(cx, |v, cx| {
+        let base_len = v.model.lives[live].transcript.history_len();
+        let messages = synaps_client::synthetic::history(30_000, 3);
+        let update = synaps_client::HistoryUpdate::Append { base_len, messages };
+        v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid.clone(), seq: 0, update }], cx);
+    });
+    frame(cx);
+    let (s0, p0) = at(cx);
+    let mut ran = 0;
+    while at(cx).0 < s0 + 3 && at(cx).1 == p0 && ran < 10_000 {
+        cx.executor().tick();
+        ran += 1;
+    }
+    let (s1, p1) = at(cx);
+    assert_eq!(p1, p0, "paused mid-fold: nothing published");
+    assert!(s1 >= s0 + 3, "the job ran three steps ({s0} → {s1})");
+    frame(cx);
+    assert!(std::sync::Arc::ptr_eq(&drawn(cx), &before), "the frames draw the board before it");
+    // A live round mid-fold: another input.
+    let evs = vec![
+        json!({"ev": "turn_started", "turn_baseline": 13, "trigger": "user", "user_text": "go on"}),
+        llm(json!({"kind": "llm", "llm": "response_start"})),
+        llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": "toolu_snap"})),
+        llm(
+            json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": "toolu_snap", "input": block_input(json!([{"op":"put","id":"snap","kind":"note","body":{"text":"the snapshot"}}]))}),
+        ),
+    ];
+    view.update(cx, |v, cx| {
+        let batch = evs
+            .into_iter()
+            .map(|e| {
+                let ev = synaps_client::protocol::decode_event(&e).unwrap();
+                synaps_client::Event::session(seq, sid.clone(), 0, ev, std::sync::Arc::new(e))
+            })
+            .collect();
+        v.apply_batch(batch, cx);
+    });
+    frame(cx);
+    assert_eq!(at(cx).1, p0, "still nothing published");
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    let (_, p2) = at(cx);
+    assert_eq!(p2, p0 + 1, "one board published, once");
+    let d = drawn(cx);
+    let (epoch, history, events) = view.read_with(cx, |v, _| {
+        let i = v.model.lives[live].transcript.blocks_input().expect("blocks");
+        (i.epoch, i.history_len, i.history_len + i.live.events.len())
+    });
+    assert_eq!((d.epoch, d.history, d.events), (epoch, history, events), "the input as it is now, whole");
+    assert!(row(cx, &view, "snap").is_some(), "the live round's block drawn");
 }
 
 /// Re-folds (`cards_spec::board` guarantee 6): one at a time, off the

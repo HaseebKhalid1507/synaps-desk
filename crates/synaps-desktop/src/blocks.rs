@@ -796,6 +796,11 @@ impl AppView {
                     .items_center()
                     .whitespace_nowrap()
                     .when_some(bg, |d, bg| d.bg(bg))
+                    // Tests read a hunk's header and the notes by their text.
+                    .when(kind.is_none(), |d| {
+                        let t = format!("block-line {id} {text}");
+                        d.debug_selector(move || t.clone())
+                    })
                     .child(div().w(px(18.)).flex_none().flex().justify_center().text_color(sign_fg).child(sign))
                     .child(div().flex_none().text_color(fg).child(text)),
             );
