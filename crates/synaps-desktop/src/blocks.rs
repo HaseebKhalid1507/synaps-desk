@@ -1011,6 +1011,9 @@ impl AppView {
             }
             if groups.is_empty() && l.shown_files().shell().iter().any(|f| crate::files::same_file(&f.path, &d.file)) {
                 lines.push((None, "changed by a shell command · no preview".into()));
+            } else if groups.is_empty() && l.shown_files().edits_dropped(&d.file) {
+                // Its preview went to the ledger's cap (`files::EDIT_FILES`).
+                lines.push((None, "edits not kept · too many files changed".into()));
             }
             "as requested · not read from disk"
         } else {
@@ -1052,10 +1055,15 @@ impl AppView {
                     .items_center()
                     .whitespace_nowrap()
                     .when_some(bg, |d, bg| d.bg(bg))
-                    // Tests read a hunk's header and the notes by their text.
+                    // Tests read a hunk's header and the notes by their text,
+                    // and a line by its text.
                     .when(kind.is_none(), |d| {
                         let t = format!("block-line {id} {text}");
                         d.debug_selector(move || t.clone())
+                    })
+                    .when(kind.is_some(), |d| {
+                        let t = text.clone();
+                        d.debug_selector(move || format!("block-text {id} {}", t.trim_start()))
                     })
                     .child(div().w(px(18.)).flex_none().flex().justify_center().text_color(sign_fg).child(sign))
                     .child(div().flex_none().text_color(fg).child(text)),

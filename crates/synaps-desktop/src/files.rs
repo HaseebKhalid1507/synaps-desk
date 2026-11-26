@@ -173,6 +173,17 @@ struct Analysed {
     /// A `multi_edit`'s changes per op (its index in `edits`): an op its
     /// `unless_present` skipped is left out once the result says so.
     ops: Vec<(usize, Change)>,
+    /// A call of several files: each file's own part of the preview, by
+    /// path as `changes` has it (Shady #101 R2-2: a file's edit preview is
+    /// its lines only, clipped on its own). Empty: one file, `preview`.
+    sections: Vec<(String, Arc<Preview>)>,
+}
+
+impl Analysed {
+    /// The preview of its edits of `path` (as `changes` has it).
+    fn section(&self, path: &str) -> Arc<Preview> {
+        self.sections.iter().find(|(p, _)| p == path).map_or_else(|| self.preview.clone(), |(_, s)| s.clone())
+    }
 }
 
 /// What one file tool call counted for once it succeeded: exactly what it
@@ -193,6 +204,12 @@ pub struct CallDelta {
 pub const EDIT_CALLS: usize = 12;
 pub const EDIT_LINES: usize = 120;
 pub const EDIT_LINE_CHARS: usize = 160;
+/// The edit previews a ledger keeps, in all (Shady #101 R2-1): at most
+/// this many files', and this many bytes of them; the file edited least
+/// recently goes first ([`Ledger::edits`]). A file whose preview went says
+/// so ([`Ledger::edits_dropped`]).
+pub const EDIT_FILES: usize = 64;
+pub const EDIT_BYTES: usize = 1 << 20;
 
 /// A file's successful file tool calls, for its edit preview: the newest
 /// [`EDIT_CALLS`] in call order, how many earlier ones there were, and the
@@ -203,6 +220,11 @@ pub struct Edits {
     pub recent: VecDeque<Edit>,
     pub earlier: usize,
     pub preview: Arc<EditPreview>,
+    /// When it was last recorded (the ledger's count): the least recent
+    /// goes first.
+    used: u64,
+    /// What it keeps (bytes: [`Edits::bytes`]).
+    bytes: usize,
 }
 
 /// One call's part of an edit preview: its diff preview (the call's, shared)
@@ -237,6 +259,16 @@ thread_local! {
 }
 
 impl Edits {
+    /// What it keeps, heap included (bytes): its projection's lines, and
+    /// per call kept a share (the call's own preview is the ledger's,
+    /// counted with its calls).
+    fn bytes(&self) -> usize {
+        let lines = self.preview.groups.iter().map(|g| {
+            std::mem::size_of::<EditGroup>() + g.lines.iter().map(|l| std::mem::size_of::<DiffLine>() + l.text.len() + 16).sum::<usize>()
+        });
+        std::mem::size_of::<Edits>() + lines.sum::<usize>() + self.recent.len() * std::mem::size_of::<Edit>()
+    }
+
     /// The preview of its calls: the newest of them, at most
     /// [`EDIT_LINES`] lines in all, the oldest kept ones folding first.
     fn project(&self) -> EditPreview {
@@ -300,8 +332,20 @@ pub struct Ledger {
     generation: u64,
     /// Calls seen so far: the next call's `seq`.
     seq: u64,
-    /// Each file's edits ([`Edits`]), by path.
+    /// Each file's edits ([`Edits`]), by path: [`EDIT_FILES`] files and
+    /// [`EDIT_BYTES`] at most, the least recently edited going first
+    /// (`lru`: by its `used`).
     edits: HashMap<String, Edits>,
+    lru: std::collections::BTreeMap<u64, String>,
+    edit_bytes: usize,
+    used: u64,
+    /// Files whose edit preview went to the cap (ever, in this history).
+    dropped: usize,
+    /// A reset of the same session: the analysed calls of the history
+    /// before it, reused for the calls the new one still holds; the rest
+    /// go once it is read ([`Ledger::reset`]).
+    reuse: HashMap<String, Arc<Analysed>>,
+    reuse_shell: HashMap<String, Option<Arc<Vec<Touch>>>>,
     cwd: Option<String>,
     added: u32,
     removed: u32,
@@ -316,20 +360,25 @@ pub fn is_file_tool(name: &str) -> bool {
 impl Ledger {
     /// Start over from a whole history (attach, replacement). `same`: the
     /// same session as before, whose analysed calls are reused.
+    /// The analysed calls of the history before are reused for the calls
+    /// this one still holds, and the rest let go (Shady #101 R2-1: nothing
+    /// of a replaced history stays beside the new one).
     pub fn reset(&mut self, messages: &[Value], cwd: Option<&str>, same: bool) {
         static IDS: AtomicU64 = AtomicU64::new(1);
-        let (calls, shell_calls) =
+        let (reuse, reuse_shell) =
             if same { (std::mem::take(&mut self.calls), std::mem::take(&mut self.shell_calls)) } else { Default::default() };
         *self = Ledger {
             id: if same && self.id != 0 { self.id } else { IDS.fetch_add(1, Ordering::Relaxed) },
             cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()),
-            calls,
-            shell_calls,
+            reuse,
+            reuse_shell,
             generation: self.generation + 1,
             seq: self.seq,
+            used: self.used,
             ..Ledger::default()
         };
         self.append(messages);
+        (self.reuse, self.reuse_shell) = Default::default();
     }
 
     /// Fold history messages after the ones seen so far.
@@ -371,7 +420,7 @@ impl Ledger {
                             let mut paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
                             paths.dedup();
                             for p in paths {
-                                self.record(p, Edit { seq: call.seq, preview: call.preview.clone(), written });
+                                self.record(p, Edit { seq: call.seq, preview: call.section(p), written });
                             }
                             self.committed.insert(id.to_string(), delta);
                             self.generation += 1;
@@ -387,6 +436,9 @@ impl Ledger {
     /// the live `ToolUse` event (the history repeats it; same id, no double count).
     pub fn tool_use(&mut self, name: &str, id: &str, input: &Value) {
         if name == "bash" && !id.is_empty() {
+            if let Some(t) = self.reuse_shell.remove(id) {
+                self.shell_calls.insert(id.to_string(), t);
+            }
             if !self.shell_calls.contains_key(id) {
                 let touches = shell::writes(str_of(input, "command")).filter(|t| !t.is_empty());
                 let touches = touches.map(|t| Arc::new(t.into_iter().map(|t| Touch { path: self.relative(&t.path), ..t }).collect()));
@@ -400,17 +452,36 @@ impl Ledger {
         if !is_file_tool(name) || id.is_empty() {
             return;
         }
+        if let Some(a) = self.reuse.remove(id) {
+            self.calls.insert(id.to_string(), a);
+        }
         if !self.calls.contains_key(id) {
-            let (mut preview, changes, ops) = analyse(name, input);
+            let (mut preview, changes, ops, parts) = analyse(name, input);
             let changes: Vec<Change> = changes.into_iter().map(|c| Change { path: self.relative(&c.path), ..c }).collect();
             let ops: Vec<(usize, Change)> = ops.into_iter().map(|(i, c)| (i, Change { path: self.relative(&c.path), ..c })).collect();
+            // Each file's part, by its path as `changes` has it (two names
+            // of one file are one part).
+            let mut sections: Vec<(String, Preview)> = Vec::new();
+            for (path, part) in parts {
+                let path = self.relative(&path);
+                match sections.iter_mut().find(|(p, _)| *p == path) {
+                    Some((_, s)) => {
+                        for l in &part.lines {
+                            put(s, l);
+                        }
+                        (s.more, s.added, s.removed) = (s.more + part.more, s.added + part.added, s.removed + part.removed);
+                    }
+                    None => sections.push((path.clone(), Preview { title: path, ..part })),
+                }
+            }
+            let sections = if sections.len() > 1 { sections.into_iter().map(|(p, s)| (p, Arc::new(s))).collect() } else { Vec::new() };
             preview.title = match changes.as_slice() {
                 [] => String::new(),
                 [one] => one.path.clone(),
                 [first, rest @ ..] => format!("{} +{} files", first.path, rest.len()),
             };
             self.seq += 1;
-            self.calls.insert(id.to_string(), Arc::new(Analysed { seq: self.seq, preview: Arc::new(preview), changes, ops }));
+            self.calls.insert(id.to_string(), Arc::new(Analysed { seq: self.seq, preview: Arc::new(preview), changes, ops, sections }));
         }
         self.pending.insert(id.to_string());
     }
@@ -430,6 +501,36 @@ impl Ledger {
             }
         }
         f.preview = Arc::new(f.project());
+        // The cap, in all (EDIT_FILES, EDIT_BYTES): this file is the most
+        // recent, so it stays.
+        let now = f.bytes();
+        let old = std::mem::replace(&mut f.bytes, now);
+        self.edit_bytes = self.edit_bytes + f.bytes - old;
+        self.used += 1;
+        if f.used != 0 {
+            self.lru.remove(&f.used);
+        }
+        f.used = self.used;
+        self.lru.insert(self.used, path.to_string());
+        while self.edits.len() > EDIT_FILES || (self.edit_bytes > EDIT_BYTES && self.edits.len() > 1) {
+            let Some((_, gone)) = self.lru.pop_first() else { break };
+            if let Some(e) = self.edits.remove(&gone) {
+                self.edit_bytes -= e.bytes;
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// Files with an edit preview kept, and their bytes (tests: the cap).
+    #[cfg(test)]
+    pub fn edits_kept(&self) -> (usize, usize) {
+        (self.edits.len(), self.edit_bytes)
+    }
+
+    /// Whether file `file` changed in this history and its edit preview
+    /// went to the cap ([`EDIT_FILES`]): its block says so.
+    pub fn edits_dropped(&self, file: &str) -> bool {
+        self.dropped > 0 && self.edits(file).is_none() && self.index.contains_key(&self.relative(file))
     }
 
     /// File `file`'s edits ([`Edits`]): its path as the ledger keeps it
@@ -547,6 +648,7 @@ impl Ledger {
             k.capacity()
                 + 64
                 + preview(&a.preview)
+                + a.sections.iter().map(|(p, s)| p.capacity() + preview(s)).sum::<usize>()
                 + a.changes.iter().chain(a.ops.iter().map(|(_, c)| c)).map(|c| c.path.capacity() + 48).sum::<usize>()
         };
         let file = |path: &String, dir: &Arc<str>, name: &Arc<str>| path.capacity() + dir.len() + name.len() + 96;
@@ -554,14 +656,8 @@ impl Ledger {
             + self.files.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
             + self.shell.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
             + (self.shell_calls.len() + self.committed.len() + self.pending.len()) * 64
-            + self
-                .edits
-                .iter()
-                .map(|(p, e)| {
-                    let shown = e.preview.groups.iter().map(|g| g.lines.iter().map(|l| l.text.len() + 32).sum::<usize>() + 48);
-                    p.capacity() + 64 + e.recent.len() * std::mem::size_of::<Edit>() + shown.sum::<usize>()
-                })
-                .sum::<usize>()
+            + self.edit_bytes
+            + self.edits.keys().map(|p| 2 * p.capacity() + 64).sum::<usize>()
     }
 
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
@@ -612,10 +708,16 @@ fn skipped_ops(content: &Value) -> Vec<usize> {
 
 /// The preview, per-file changes and (`multi_edit`) per-op changes of one
 /// tool input.
-fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Change)>) {
+/// A call's preview, its changes, a `multi_edit`'s changes per op, and,
+/// a `multi_edit`, each path's own part of the preview (in the order the
+/// paths first come; its lines kept to [`PREVIEW_LINES`] on their own).
+type Analysis = (Preview, Vec<Change>, Vec<(usize, Change)>, Vec<(String, Preview)>);
+
+fn analyse(name: &str, input: &Value) -> Analysis {
     let mut p = Preview::default();
     let mut changes = Vec::new();
     let mut ops = Vec::new();
+    let mut parts: Vec<(String, Preview)> = Vec::new();
     match name {
         "edit" => {
             let path = str_of(input, "path");
@@ -639,21 +741,37 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
                     push(&mut p, LineKind::Note, path);
                     last_path = path;
                 }
+                // This edit's lines, once: the call's preview takes them,
+                // and so does its file's part, each within its own room.
+                let mut one = Preview::default();
                 let text = str_of(e, "text");
                 let (a, r, approx) = match (str_of(e, "op"), str_of(e, "anchor_mode")) {
-                    ("replace", "" | "exact") => diff_into(&mut p, str_of(e, "anchor"), text),
+                    ("replace", "" | "exact") => diff_into(&mut one, str_of(e, "anchor"), text),
                     // A pattern, not the text it replaces: show it as such.
                     ("replace", mode) => {
-                        push(&mut p, LineKind::Note, &format!("{mode}: {}", str_of(e, "anchor")));
-                        diff_into(&mut p, "", text)
+                        push(&mut one, LineKind::Note, &format!("{mode}: {}", str_of(e, "anchor")));
+                        diff_into(&mut one, "", text)
                     }
                     ("append_jsonl", _) => {
-                        push(&mut p, LineKind::Add, "{…}");
-                        p.added += 1;
+                        push(&mut one, LineKind::Add, "{…}");
+                        one.added += 1;
                         (1, 0, false)
                     }
-                    _ => diff_into(&mut p, "", text),
+                    _ => diff_into(&mut one, "", text),
                 };
+                let part = match parts.iter().position(|(q, _)| q == path) {
+                    Some(k) => &mut parts[k].1,
+                    None => {
+                        parts.push((path.to_string(), Preview::default()));
+                        &mut parts.last_mut().expect("pushed").1
+                    }
+                };
+                for to in [&mut p, part] {
+                    for l in &one.lines {
+                        put(to, l);
+                    }
+                    (to.more, to.added, to.removed) = (to.more + one.more, to.added + one.added, to.removed + one.removed);
+                }
                 match changes.iter_mut().find(|c: &&mut Change| c.path == path) {
                     Some(c) => {
                         c.added += a;
@@ -667,7 +785,17 @@ fn analyse(name: &str, input: &Value) -> (Preview, Vec<Change>, Vec<(usize, Chan
         }
         _ => {}
     }
-    (p, changes, ops)
+    (p, changes, ops, parts)
+}
+
+/// Line `l`, already cut and hung ([`push`]), onto `p`, or counted past
+/// [`PREVIEW_LINES`].
+fn put(p: &mut Preview, l: &DiffLine) {
+    if p.lines.len() >= PREVIEW_LINES {
+        p.more += 1;
+    } else {
+        p.lines.push(l.clone());
+    }
 }
 
 fn push(p: &mut Preview, kind: LineKind, text: &str) {
@@ -826,6 +954,110 @@ mod tests {
     const OK: &str = "Edited the file";
     const DENIED: &str = "Tool call blocked by extension: Tool call confirmation denied: guard wants to check this edit";
     const FAILED: &str = "Tool execution failed: old_string not found in '/w/r/src/a.rs'. Make sure it matches exactly, including whitespace and indentation.";
+
+    /// The lines of a file's edit preview, as drawn.
+    fn shown(l: &Ledger, file: &str) -> Vec<String> {
+        l.edit_preview(file).map_or_else(Vec::new, |p| p.groups.iter().flat_map(|g| g.lines.iter().map(|l| l.text.to_string())).collect())
+    }
+
+    /// Shady #101 R2-2: one successful call edits two files, A with more
+    /// lines than a preview keeps, then B, then A again. Each file's edit
+    /// preview holds its own lines and none of the other's, and A's lines
+    /// never use up B's room; the call's own preview (its tool row's) is
+    /// still the whole call. Through an attach, an append, a replacement of
+    /// the same session's history and another session's, with a relative
+    /// and an absolute name.
+    #[test]
+    fn a_multi_file_calls_preview_is_each_files_own() {
+        let a_lines = (0..PREVIEW_LINES + 40).map(|k| format!("alpha-{k}")).collect::<Vec<_>>().join("\n");
+        let call = |id: &str| {
+            let input = json!({"edits": [
+                {"path": "/w/src/a.rs", "op": "replace", "anchor": "old-a", "text": a_lines},
+                {"path": "src/b.rs", "op": "replace", "anchor": "old-b", "text": "bravo-1\nbravo-2"},
+                {"path": "/w/src/a.rs", "op": "replace", "anchor": "old-a2", "text": "alpha-tail"}]});
+            [tool_use(id, "multi_edit", input), result(id, OK)]
+        };
+        let check = |l: &Ledger, how: &str| {
+            for (file, other) in [("src/b.rs", "/w/src/a.rs"), ("/w/src/b.rs", "src/a.rs")] {
+                let (b, a) = (shown(l, file), shown(l, other));
+                assert!(b.iter().any(|t| t == "bravo-1") && b.iter().any(|t| t == "bravo-2"), "{how}: B's own lines: {b:?}");
+                assert!(!b.iter().any(|t| t.contains("alpha") || t.contains("src/a.rs")), "{how}: none of A's in B's: {b:?}");
+                assert!(a.iter().any(|t| t == "alpha-0"), "{how}: A's own: {a:?}");
+                assert!(!a.iter().any(|t| t.contains("bravo") || t.contains("src/b.rs")), "{how}: none of B's in A's");
+            }
+        };
+        let mut l = Ledger::default();
+        let attach: Vec<Value> = call("m1").into_iter().collect();
+        l.reset(&attach, Some("/w"), false);
+        check(&l, "attach");
+        let whole = l.preview("m1").unwrap();
+        // The call's own preview (its tool row's) is the whole call, clipped:
+        // A's lines fill it before B's come.
+        assert_eq!(whole.lines.first().map(|l| &*l.text), Some("/w/src/a.rs"));
+        assert_eq!(whole.lines.len(), PREVIEW_LINES);
+        assert!(whole.more > 0 && !whole.lines.iter().any(|l| l.text.contains("bravo")));
+        // Appended: A's preview keeps both calls' parts, B's both of its own.
+        l.append(&call("m2"));
+        check(&l, "append");
+        assert_eq!(l.edit_preview("src/b.rs").map(|p| p.groups.len()), Some(2), "B: a group per call");
+        // The same session's history replaced, and another session's.
+        let mut both = attach.clone();
+        both.extend(call("m3"));
+        l.reset(&both, Some("/w"), true);
+        check(&l, "replaced");
+        l.reset(&both, Some("/w"), false);
+        check(&l, "another session");
+    }
+
+    /// Shady #101 R2-1: the edit previews are bounded in all, not per file:
+    /// edits to many more files than [`EDIT_FILES`] keep the newest files'
+    /// previews, within [`EDIT_BYTES`]; an older file's preview went, and
+    /// its block can say so, while a file never edited is not "dropped".
+    #[test]
+    fn the_ledgers_edit_previews_are_bounded_in_all() {
+        let mut l = Ledger::default();
+        l.reset(&[], Some("/w"), false);
+        let n = 2_000;
+        let big = (0..40).map(|k| format!("{k:>3} {}", "x".repeat(150))).collect::<Vec<_>>().join("\n");
+        for k in 0..n {
+            let id = format!("w{k}");
+            l.append(&[tool_use(&id, "write", json!({"path": format!("/w/f{k}.rs"), "content": big})), result(&id, OK)]);
+        }
+        let kept: Vec<usize> = (0..n).filter(|k| l.edits(&format!("f{k}.rs")).is_some()).collect();
+        assert!(kept.len() <= EDIT_FILES, "{} files' previews kept", kept.len());
+        assert!(kept.contains(&(n - 1)), "the newest file's kept");
+        let (files, bytes) = l.edits_kept();
+        assert_eq!(files, kept.len());
+        assert!(bytes <= EDIT_BYTES, "{bytes} bytes of previews");
+        let honest: usize = kept.iter().map(|k| shown(&l, &format!("f{k}.rs")).iter().map(String::len).sum::<usize>()).sum();
+        assert!(bytes >= honest, "the count holds the lines' bytes: {bytes} < {honest}");
+        assert!(l.edits("f0.rs").is_none() && l.edits_dropped("f0.rs"), "the oldest went, and says so");
+        assert!(!l.edits_dropped("never.rs"), "a file never edited");
+        // Edited again: back, the newest.
+        l.append(&[tool_use("again", "write", json!({"path": "/w/f0.rs", "content": "1"})), result("again", OK)]);
+        assert!(l.edits("f0.rs").is_some());
+        assert!(l.edits_kept().0 <= EDIT_FILES);
+    }
+
+    /// Shady #101 R2-1: a reset of the same session reuses the analysed
+    /// calls the new history still holds and lets the others go, so a
+    /// replaced history's calls never stay beside the new one.
+    #[test]
+    fn a_replaced_historys_calls_go() {
+        let edit = |id: &str| [tool_use(id, "edit", json!({"path": "/w/a.rs", "old_string": "a", "new_string": id})), result(id, OK)];
+        let bash = |id: &str| [tool_use(id, "bash", json!({"command": "echo x > /w/out.txt"})), result(id, "")];
+        let mut l = Ledger::default();
+        let old: Vec<Value> = edit("e1").into_iter().chain(edit("e2")).chain(bash("b1")).collect();
+        l.reset(&old, Some("/w"), false);
+        let kept = l.preview("e2").unwrap();
+        assert!(l.preview("e1").is_some());
+        let new: Vec<Value> = edit("e2").into_iter().chain(edit("e3")).collect();
+        l.reset(&new, Some("/w"), true);
+        assert!(Arc::ptr_eq(&kept, &l.preview("e2").unwrap()), "a call the new history holds: reused");
+        assert!(l.preview("e1").is_none(), "one it doesn't: gone");
+        assert!(l.preview("e3").is_some());
+        assert!(l.shell().is_empty(), "the bash call went with its history");
+    }
 
     /// A wrapped code line hangs at its own indent: the indent in columns
     /// (a tab is 4), at most INDENT_MAX, and the rest.
@@ -1065,7 +1297,10 @@ mod tests {
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "call order: {seqs:?}");
         let last: Vec<Option<u32>> = e.recent.iter().rev().take(3).map(|e| e.written).collect();
         assert_eq!(last, [None, Some(2), None], "m, y (a write), x: in call order");
-        assert!(Arc::ptr_eq(&e.recent.back().unwrap().preview, &l.preview("m").unwrap()), "the call's preview, shared");
+        let x_kept = &e.recent.iter().rev().nth(2).unwrap().preview;
+        assert!(Arc::ptr_eq(x_kept, &l.preview("x").unwrap()), "a one-file call's preview, shared");
+        let m_kept = &e.recent.back().unwrap().preview;
+        assert!(!m_kept.lines.iter().any(|l| l.text.contains("b.rs")), "a two-file call: a.rs's part only (R2-2)");
         let p = l.edit_preview("src/a.rs").unwrap();
         assert!(p.groups.len() <= EDIT_CALLS && p.groups.iter().map(|g| g.lines.len()).sum::<usize>() <= EDIT_LINES);
         assert_eq!(p.groups.len() + p.earlier, ok, "every call kept or counted");

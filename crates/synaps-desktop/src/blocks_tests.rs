@@ -1165,6 +1165,45 @@ fn an_edit_preview_is_built_as_edits_commit_not_as_rows_draw(cx: &mut TestAppCon
     assert!(newest, "the newest group is the new edit's");
 }
 
+/// Shady #101 R2-2: a `from: edits` block of file B, after one call that
+/// edited file A (more lines than a preview keeps) and then B: the block
+/// draws B's lines and none of A's.
+#[gpui_kit::test]
+fn an_edits_block_draws_its_files_lines_only(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let file = "crates/relay/src/token_store.rs";
+    let a = (0..80).map(|k| format!("alpha-{k}")).collect::<Vec<_>>().join("\n");
+    let input = json!({"edits": [
+        {"path": "crates/relay/src/other.rs", "op": "replace", "anchor": "x", "text": a},
+        {"path": file, "op": "replace", "anchor": "y", "text": "bravo-only"}]});
+    land(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"role": "user", "content": "both files"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_mm", "name": "multi_edit", "input": input}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_mm", "content": "multi_edit: 2 file(s) written, 2 edit(s) applied"}]}),
+        ],
+    );
+    board(cx, w, &view);
+    let edits = show_block(cx, w, &view, "edits");
+    wait(cx, w, &view, 1000);
+    if folded(cx, &view, edits) {
+        let at = head_at(cx, w, edits);
+        mouse(cx, w, at, "move");
+        mouse(cx, w, at, "down");
+        mouse(cx, w, at, "up");
+        board(cx, w, &view);
+    }
+    assert!(!folded(cx, &view, edits), "open");
+    assert!(has(cx, w, format!("block-text {edits} bravo-only")), "B's own line");
+    for k in [0, 1, 40, 79] {
+        assert!(!has(cx, w, format!("block-text {edits} alpha-{k}")), "A's line {k} in B's block");
+    }
+    assert!(!has(cx, w, format!("block-text {edits} crates/relay/src/other.rs")), "A's name in B's block");
+}
+
 /// Session `sid` in a new tab of the pane acted on, shown.
 fn new_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sid: &str) {
     let client = view.update(cx, |v, cx| {
