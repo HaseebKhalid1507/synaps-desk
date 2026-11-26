@@ -9741,3 +9741,39 @@ fn an_in_flight_ping_is_not_polled_and_its_booking_asks_once(cx: &mut TestAppCon
     deliver(cx, window, &view, vec![digest(1600)]);
     assert_eq!(panel_asks(cx, &view), [], "nothing booked: nothing");
 }
+
+/// Shady #100 F5: every fresh ask has its own `stale` retry, the timers'
+/// too. Attach's ask: `stale`, once more, answered. Then the zero's ask:
+/// `stale` is asked once more (not taken as the attach's second), and a
+/// second `stale` is said. The same for the ask after a suspend.
+#[gpui_kit::test]
+fn each_timer_ask_gets_its_own_stale_retry(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    let drawn =
+        |cx: &mut TestAppContext, what: &str| VisualTestContext::from_window(window, cx).debug_bounds(what.to_string().leak()).is_some();
+    let stale = || cache_reply(seq, json!({"error": {"code": "stale"}}));
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the attach's ask: once more");
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero's ask");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero's ask: once more");
+    assert!(drawn(cx, "right-cache-expires expired?"), "the band stands meanwhile");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [], "not twice");
+    assert!(drawn(cx, "right-cache-expires —"), "said: couldn't check");
+    // Asleep ten minutes: the wake's ask.
+    let status = synaps_client::Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto"}}) };
+    deliver(cx, window, &view, vec![status, cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3000}))]);
+    assert_eq!(panel_asks(cx, &view), []);
+    crate::warm::skew(std::time::Duration::ZERO, std::time::Duration::from_secs(600));
+    // Awake: the countdown's next tick (a minute at most) finds it.
+    pass(cx, window, &view, 60);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "the wake's ask");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the wake's ask: once more");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [], "not twice");
+}

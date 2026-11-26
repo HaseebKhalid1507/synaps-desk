@@ -5048,35 +5048,37 @@ impl AppView {
                 });
                 // Asleep: both asked again. A scheduled ping due: its
                 // status, once (its booking asks both when it is done).
-                let asks = v.model.expiry_query && slept;
+                // Each the model's, a fresh ask: its own `stale` retry.
+                let live = v.panes.cur.live;
+                let mut fx = Vec::new();
                 if (slept || refresh.is_some_and(|r| now.mono >= r))
-                    && let (Some(c), Some(seq)) = (&v.client, seq)
+                    && v.client.is_some()
+                    && let Some(seq) = seq
                 {
-                    let _ = c.on(seq).status();
-                    #[cfg(test)]
-                    v.panel_asks.push((seq, "status"));
-                    let stats = &mut v.model.lives[v.panes.cur.live].stats;
-                    if asks {
-                        let _ = c.on(seq).cache_expiry();
-                        #[cfg(test)]
-                        v.panel_asks.push((seq, "cache_expiry"));
+                    let stats = &mut v.model.lives[live].stats;
+                    if let Some(w) = stats.warm.as_mut() {
+                        w.refresh = false;
+                    }
+                    if slept {
                         // Its answer counts down afresh.
                         if let Some(e) = stats.expiry.as_mut() {
                             e.zero = false;
                         }
-                    }
-                    if let Some(w) = stats.warm.as_mut() {
-                        w.refresh = false;
+                        v.model.ask_panel(live, seq, &mut fx);
+                    } else {
+                        fx.push(Effect::Status(seq));
                     }
                 } else if zero.is_some_and(|z| now.mono >= z)
-                    && let (Some(c), Some(seq)) = (&v.client, seq)
-                    && let Some(e) = v.model.lives[v.panes.cur.live].stats.expiry.as_mut().filter(|e| e.zero)
+                    && v.client.is_some()
+                    && let Some(seq) = seq
+                    && let Some(e) = v.model.lives[live].stats.expiry.as_mut().filter(|e| e.zero)
                 {
                     // The countdown reached zero: the band, and once more.
                     e.zero = false;
-                    let _ = c.on(seq).cache_expiry();
-                    #[cfg(test)]
-                    v.panel_asks.push((seq, "cache_expiry"));
+                    v.model.ask_expiry(live, seq, &mut fx);
+                }
+                for fx in fx {
+                    v.effect(fx);
                 }
                 cx.notify();
             });

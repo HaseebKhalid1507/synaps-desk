@@ -522,14 +522,15 @@ impl Model {
 
     /// Ask store `lid`'s attachment `seq` for the right panel's numbers:
     /// its status, and its cache from a daemon that answers it.
-    fn ask_panel(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+    pub(crate) fn ask_panel(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
         effects.push(Effect::Status(seq));
         self.ask_expiry(lid, seq, effects);
     }
 
-    /// Ask store `lid`'s attachment `seq` for its cache's evidence (a
-    /// `stale` answer is asked once more after it).
-    fn ask_expiry(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
+    /// Ask store `lid`'s attachment `seq` for its cache's evidence: a fresh
+    /// ask, the one way every ask but a retry goes (a `stale` answer is
+    /// asked once more after it, once).
+    pub(crate) fn ask_expiry(&mut self, lid: LiveId, seq: u64, effects: &mut Vec<Effect>) {
         if self.expiry_query {
             self.lives[lid].stats.expiry_retried = false;
             effects.push(Effect::CacheExpiry(seq));
