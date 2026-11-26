@@ -1090,8 +1090,18 @@ fn a_round_let_go_is_destroyed_off_the_frame() {
             _ => None,
         };
         let inputs: Vec<std::sync::Weak<Value>> =
-            d.t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big"))).filter_map(|i| i.kept_allocation()).map(Arc::downgrade).collect();
-        let payload: usize = d.t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big"))).map(|i| i.kept_bytes()).sum();
+            d.t.items()
+                .iter()
+                .filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big")))
+                .filter_map(|i| i.kept_allocation())
+                .map(Arc::downgrade)
+                .collect();
+        let payload: usize =
+            d.t.items()
+                .iter()
+                .filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_big")))
+                .map(|i| i.kept_bytes())
+                .sum();
         assert_eq!(inputs.len(), n, "{boundary}: the round's inputs");
         let gate = dispose::gate();
         let (destroyed, visits) = (dispose::destroyed(), d.t.blocks_live().visits());
@@ -1197,7 +1207,11 @@ fn card_doc(k: usize) -> (cards_spec::CardDoc, bool) {
 /// Card `k`'s result: shown, it binds.
 fn card_shown(k: usize) -> String {
     let (doc, wait) = card_doc(k);
-    format!("{}\nIts answer will come as a user message starting \"[card {}]\".", cards_spec::Envelope::showing(card_id(k), &doc, wait), card_id(k).as_str())
+    format!(
+        "{}\nIts answer will come as a user message starting \"[card {}]\".",
+        cards_spec::Envelope::showing(card_id(k), &doc, wait),
+        card_id(k).as_str()
+    )
 }
 
 /// A user's answer to card `k`.
@@ -1283,8 +1297,11 @@ fn the_card_counts_follow_every_fold_and_pause() {
     let mut h = plain();
     bound_cards(&mut h, &[0, 2, 3]);
     for m in 0..50 {
-        let calls: Vec<Value> = (0..100).map(|k| json!({"type": "tool_use", "id": format!("toolu_r{m}_{k}"), "name": "read", "input": {"path": "a"}})).collect();
-        let results: Vec<Value> = (0..100).map(|k| json!({"type": "tool_result", "tool_use_id": format!("toolu_r{m}_{k}"), "content": "a"})).collect();
+        let calls: Vec<Value> = (0..100)
+            .map(|k| json!({"type": "tool_use", "id": format!("toolu_r{m}_{k}"), "name": "read", "input": {"path": "a"}}))
+            .collect();
+        let results: Vec<Value> =
+            (0..100).map(|k| json!({"type": "tool_result", "tool_use_id": format!("toolu_r{m}_{k}"), "content": "a"})).collect();
         h.push(json!({"role": "assistant", "content": calls}));
         h.push(json!({"role": "user", "content": results}));
     }
@@ -1293,7 +1310,12 @@ fn the_card_counts_follow_every_fold_and_pause() {
     for e in live_start() {
         d.apply(&e);
     }
-    for e in live_pair(0).into_iter().chain([start("toolu_c1"), tool_use("toolu_c1", "cards_ui", card(1)), tool_result("toolu_c1", &card_shown(1)), steer(&card_answer(1, "Yes"))]) {
+    for e in live_pair(0).into_iter().chain([
+        start("toolu_c1"),
+        tool_use("toolu_c1", "cards_ui", card(1)),
+        tool_result("toolu_c1", &card_shown(1)),
+        steer(&card_answer(1, "Yes")),
+    ]) {
         d.apply(&e);
     }
     d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
@@ -1311,7 +1333,11 @@ fn the_card_counts_follow_every_fold_and_pause() {
             wrong.push(format!("paused at {at:?}: {} for {want}", kept.card_bytes));
         }
         assert!(d.t.blocks_bytes() >= kept.bytes, "paused at {at:?}: published as it is");
-        if at.0 < events(&h).len() { history += 1 } else { live += 1 }
+        if at.0 < events(&h).len() {
+            history += 1
+        } else {
+            live += 1
+        }
         assert!(history + live < 100, "it reads on");
     }
     assert!(history >= 1 && live >= 1, "paused in the history {history}, in the live turn {live}");

@@ -378,9 +378,21 @@ pub fn event_bytes(e: &Event) -> usize {
 enum Fact {
     /// `size`: its input's bytes, heap included, as its row counts them
     /// ([`Item::kept_bytes`]): counted with what a reset retires.
-    Call { tool_id: String, name: String, input: Option<Arc<Value>>, row: u64, size: usize },
-    Result { tool_id: String, text: String },
-    User { text: String, row: Option<u64> },
+    Call {
+        tool_id: String,
+        name: String,
+        input: Option<Arc<Value>>,
+        row: u64,
+        size: usize,
+    },
+    Result {
+        tool_id: String,
+        text: String,
+    },
+    User {
+        text: String,
+        row: Option<u64>,
+    },
     End,
 }
 
@@ -823,7 +835,6 @@ impl Store {
     fn calls_at(&self) -> usize {
         self.done_len + usize::from(self.lead)
     }
-
 }
 
 /// A store's facts go off the frame ([`dispose`]): its last owner (a log
@@ -1361,7 +1372,8 @@ impl LiveLog {
                 }
             }
             None => {
-                let k = r.push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: input.clone(), whole: true, answered: false }, row);
+                let k = r
+                    .push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: input.clone(), whole: true, answered: false }, row);
                 r.last_whole = Some(k);
                 if s.results.len > 0 || s.end {
                     s.cut(s.calls_at() + s.calls.len);
