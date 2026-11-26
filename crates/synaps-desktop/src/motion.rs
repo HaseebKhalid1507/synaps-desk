@@ -906,6 +906,11 @@ pub(crate) struct Slide {
 }
 
 impl Slide {
+    /// At rest on `target` (its place), as of `now`.
+    pub(crate) fn rest(target: f32, now: Instant) -> Self {
+        Slide { target, x0: 0., v0: 0., at: now, frame: 0 }
+    }
+
     fn omega() -> f32 {
         std::f32::consts::TAU / SNAP_RESPONSE
     }

@@ -384,7 +384,7 @@ impl AppView {
         let body = (!folded).then(|| self.block_body(s, id, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
         let tag = s.block.tag;
-        div()
+        let el = div()
             .id(("block", id))
             .debug_selector(move || format!("block {id}"))
             .relative()
@@ -401,8 +401,8 @@ impl AppView {
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, id, tag, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, cx)))
-            .into_any_element()
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, cx)));
+        crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]

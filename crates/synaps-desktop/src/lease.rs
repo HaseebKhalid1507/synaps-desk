@@ -32,6 +32,13 @@
 //! - **The pill**: blocks that changed above the view, `2 blocks changed
 //!   above ↑` at the list's top; a click walks to the first, and a block
 //!   painted in view leaves it.
+//! - **A move within view slides** (§6.3, Full): a block row an agent op
+//!   moved starts where it was painted and settles on its new place
+//!   ([`SlideY`]: the desk's row spring, capped at [`motion::SLIDE_CAP`]).
+//!   Only while the list is anchored: following its tail, or scrolled
+//!   since the last frame, a row's place on screen says nothing about a
+//!   move, so it moves at once (decision, listed in the PR). Reduced and
+//!   Off: at once.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -45,6 +52,7 @@ use synaps_client::blocks::{Body, Drawn, Fate, RowBlocks, Shown, Tag};
 
 use crate::app::AppView;
 use crate::live::LiveId;
+use crate::motion;
 use crate::pane::PaneId;
 
 /// The lease lasts this long after the pointer's last move.
@@ -89,6 +97,17 @@ pub(crate) struct Lease {
     pub agent_op: Rc<Cell<Option<Instant>>>,
     /// Block rows changed above the view, oldest first (the pill).
     pub above: Rc<RefCell<Vec<u64>>>,
+    /// Block rows' slides ([`SlideY`]), by row, and the frame each was
+    /// laid out in last.
+    pub slides: Rc<RefCell<HashMap<u64, (motion::Slide, u64)>>>,
+    /// The pane's frames drawn.
+    pub frame: Rc<Cell<u64>>,
+    /// The list neither follows its tail nor scrolled since the last frame
+    /// (set as the pane draws): a row's place on screen moves only with
+    /// the rows.
+    pub anchored: Rc<Cell<bool>>,
+    /// The list's scroll offset as the last frame drew.
+    pub scrolled: Cell<Option<f32>>,
 }
 
 impl Lease {
@@ -374,6 +393,120 @@ impl AppView {
             }
         });
         cx.notify();
+    }
+}
+
+/// Block row `row`, sliding from where it was painted when an agent op
+/// moved it within view (module docs). The offset applies to its paint
+/// and its hit regions alike: what is drawn is what is clicked.
+pub(crate) struct SlideY {
+    child: AnyElement,
+    row: u64,
+    agent: Rc<Cell<Option<Instant>>>,
+    slides: Rc<RefCell<HashMap<u64, (motion::Slide, u64)>>>,
+    anchored: Rc<Cell<bool>>,
+    frame: Rc<Cell<u64>>,
+    fx: Rc<motion::Motion>,
+    off: f32,
+}
+
+impl SlideY {
+    pub(crate) fn new(l: &Lease, fx: &Rc<motion::Motion>, row: u64, child: AnyElement) -> Self {
+        SlideY {
+            child,
+            row,
+            agent: l.agent_op.clone(),
+            slides: l.slides.clone(),
+            anchored: l.anchored.clone(),
+            frame: l.frame.clone(),
+            fx: fx.clone(),
+            off: 0.,
+        }
+    }
+
+    /// Its offset this frame, its layout top at `top`.
+    fn offset(&mut self, top: f32) -> f32 {
+        let now = self.fx.now();
+        let agent = self.agent.get().is_some_and(|t| now.saturating_duration_since(t) < JUST_MOVED);
+        let slide = agent && self.anchored.get() && self.fx.level() == motion::Level::Full;
+        let frame = self.frame.get();
+        let mut slides = self.slides.borrow_mut();
+        let (s, at) = slides.entry(self.row).or_insert_with(|| (motion::Slide::rest(top, now), frame));
+        // Laid out in the pane's last frame: from there; else it comes
+        // from out of view (`appear`, not a slide).
+        let last = *at + 1 == frame || *at == frame;
+        *at = frame;
+        match last && slide {
+            true => s.retarget(top, now),
+            false => *s = motion::Slide::rest(top, now),
+        }
+        if s.settled(now) {
+            *s = motion::Slide::rest(top, now);
+            return 0.;
+        }
+        self.fx.want_frame();
+        s.state(now).0
+    }
+}
+
+impl IntoElement for SlideY {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for SlideY {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.off = self.offset(f32::from(bounds.top()));
+        if self.off != 0. {
+            window.request_animation_frame();
+        }
+        window.with_element_offset(point(px(0.), px(self.off)), |window| self.child.prepaint(window, cx));
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Its bounds were offset as it was prepainted.
+        self.child.paint(window, cx);
     }
 }
 

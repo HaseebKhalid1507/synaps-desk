@@ -457,6 +457,8 @@ fn the_lease_holds_what_would_move_under_the_pointer(cx: &mut TestAppContext) {
     wait(cx, w, &view, 1600);
     board(cx, w, &view);
     assert!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].board.waiting.is_none()), "drawn at the lease's end");
+    // B slides to its new place (§6.3), then is there.
+    wait(cx, w, &view, 1000);
     assert!(y(cx) > y0, "A grew: B moved once the pointer rested");
     assert!(view.read_with(cx, |v, _| v.lease_wake.is_none()), "the wake spent");
     // B replaced while its old view is painted: the click is a no-op
@@ -754,4 +756,58 @@ fn a_panes_block_caches_keep_only_what_the_board_draws(cx: &mut TestAppContext) 
     assert!(left.is_empty(), "kept for blocks not drawn: {left:?}");
     let files = view.read_with(cx, |v, _| v.panes.cur.block_edits.borrow().len());
     assert!(files <= 32, "{files} edit previews");
+}
+
+/// A move within view slides (§6.3): at Full, a block an agent op moved
+/// (here: the block above it moved away) starts where it was painted and
+/// settles on its new place, at most [`crate::motion::SLIDE_CAP`] from
+/// it. Reduced and Off move it at once, and so does a list following its
+/// tail (its place on screen says nothing about a move).
+#[gpui_kit::test]
+fn a_move_within_view_slides_at_full_only(cx: &mut TestAppContext) {
+    use crate::motion::Level;
+    for (level, follow) in [(Level::Full, false), (Level::Reduced, false), (Level::Off, false), (Level::Full, true)] {
+        let (w, view) = blocks(cx, 1500.);
+        motion_level(cx, &view, level);
+        // X at the view's top keeps it (the list's anchor is its top row).
+        let put = json!([
+            {"op":"put","id":"x","kind":"note","body":{"text":"X"}},
+            {"op":"put","id":"a","kind":"note","body":{"text":"A"}},
+            {"op":"put","id":"b","kind":"note","body":{"text":"B"}},
+            {"op":"put","id":"c","kind":"note","body":{"text":"C"}}
+        ]);
+        if follow {
+            turn(cx, w, &view);
+            round(cx, w, &view, &[("toolu_p", put, true)]);
+            view.update(cx, |v, cx| {
+                v.panes.cur.list.scroll_to_end();
+                cx.notify();
+            });
+            wait(cx, w, &view, 1000);
+            assert!(view.read_with(cx, |v, _| v.panes.cur.list.is_following_tail()), "following its tail");
+        } else {
+            put_mid(cx, w, &view, put);
+            assert!(!view.read_with(cx, |v, _| v.panes.cur.list.is_following_tail()), "anchored");
+        }
+        let b = id(cx, &view, "b");
+        let top = |cx: &mut TestAppContext| {
+            let rows = view.read_with(cx, |v, _| v.panes.cur.disp.iter().filter(|d| matches!(d.kind, Kind::Block { .. })).count());
+            f32::from(
+                bounds(cx, w, format!("block {b}")).unwrap_or_else(|| panic!("{level:?} {follow}: B drawn ({rows} block rows)")).top(),
+            )
+        };
+        let y0 = top(cx);
+        round(cx, w, &view, &[("toolu_m", json!([{"op":"move","id":"a"}]), true)]);
+        let mid = top(cx);
+        wait(cx, w, &view, 1000);
+        let y1 = top(cx);
+        assert!(y1 < y0 - 20., "{level:?} {follow}: B moved up ({y0} → {y1})");
+        if level == Level::Full && !follow {
+            assert!(mid > y1 + 0.5 && mid <= y0 + 0.5, "Full: B starts where it was ({y0} → {mid} → {y1})");
+            assert!(mid - y1 <= crate::motion::SLIDE_CAP + 0.5, "at most the cap from its place");
+            assert_eq!(settle(cx, w, 8), 0, "settled: no frames asked");
+        } else {
+            assert!((mid - y1).abs() < 0.5, "{level:?} {follow}: at once ({y0} → {mid} → {y1})");
+        }
+    }
 }

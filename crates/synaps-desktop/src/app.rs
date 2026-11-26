@@ -9136,6 +9136,16 @@ impl AppView {
         if over.is_none() {
             self.panes.cur.over_composer.set(f32::INFINITY);
         }
+        // A block's slide reads whether the list held still since the last
+        // frame (`crate::lease::SlideY`): not following its tail, not
+        // scrolled.
+        {
+            let (l, list) = (&self.panes.cur.lease, &self.panes.cur.list);
+            let off = f32::from(list.scroll_px_offset_for_scrollbar().y);
+            l.anchored.set(!list.is_following_tail() && l.scrolled.get() == Some(off));
+            l.scrolled.set(Some(off));
+            l.frame.set(l.frame.get() + 1);
+        }
         // The list, and right after its layout, reading it as it paints,
         // the top message's label pinned (P15). Revealed, both in the pane
         // as it lands, moved by the reveal's `shift`; the pane clips them.

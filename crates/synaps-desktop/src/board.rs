@@ -61,12 +61,18 @@ pub(crate) struct Work {
     pub(crate) waiting: Option<Arc<Drawn>>,
 }
 
+// The re-fold slot's callers are D7's revision view and D8's outcomes;
+// D5 builds and tests it (guarantee 6), so until then the app build
+// doesn't call it.
+
 /// A re-fold step's budget in visits ([`Refold::step`]): small, so the
 /// 30 ms clock is checked often.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const REFOLD_STEP: usize = 2_048;
 
 /// The re-fold slot (module docs): one running, the next request waiting.
 #[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Refolds {
     running: Option<Running>,
     /// The next request, run once the running one has ended.
@@ -77,6 +83,7 @@ pub(crate) struct Refolds {
     pub(crate) started: u64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct Running {
     live: LiveId,
     target: Target,
@@ -89,6 +96,7 @@ struct Running {
 /// `epoch`. `Ok(None)`: the target never took effect (its call didn't
 /// bind, or it is pending).
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Refolded {
     pub(crate) live: LiveId,
     pub(crate) target: Target,
@@ -100,14 +108,16 @@ pub(crate) struct Refolded {
 
 /// What one turn of a re-fold came to, `budget` of the clock spent.
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Chunk {
-    Done(Result<Option<State>, TooFar>),
+    Done(Result<Option<Box<State>>, TooFar>),
     Paused,
     Stopped,
 }
 
 /// Steps of [`REFOLD_STEP`] visits until it is done, stopped or `budget`
 /// is up (one step at least).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn chunk(rf: &mut Refold, stop: &AtomicBool, budget: Duration) -> Chunk {
     let start = Instant::now();
     loop {
@@ -117,7 +127,7 @@ pub(crate) fn chunk(rf: &mut Refold, stop: &AtomicBool, budget: Duration) -> Chu
         match rf.step(REFOLD_STEP) {
             // Taken out at once: the re-fold is dropped right after, so two
             // boards are kept only for that moment.
-            Ok(true) => return Chunk::Done(Ok(rf.state().cloned())),
+            Ok(true) => return Chunk::Done(Ok(rf.state().cloned().map(Box::new))),
             Err(far) => return Chunk::Done(Err(far)),
             Ok(false) if start.elapsed() >= budget => return Chunk::Paused,
             Ok(false) => {}
@@ -125,14 +135,14 @@ pub(crate) fn chunk(rf: &mut Refold, stop: &AtomicBool, budget: Duration) -> Chu
     }
 }
 
+/// A finished re-fold's board (none: the target never took effect) and
+/// its work in visits; `None` if it was stopped.
+type Folded = (Result<Option<Box<State>>, TooFar>, usize);
+
 /// A re-fold of `events` to `target`, run to its end or its stop, the
 /// executor given a turn each time the clock is up.
-async fn refold(
-    events: Vec<Event>,
-    generation: cards_spec::block::Generation,
-    target: Target,
-    stop: Arc<AtomicBool>,
-) -> Option<(Result<Option<State>, TooFar>, usize)> {
+#[cfg_attr(not(test), allow(dead_code))]
+async fn refold(events: Vec<Event>, generation: cards_spec::block::Generation, target: Target, stop: Arc<AtomicBool>) -> Option<Folded> {
     let mut rf = match Refold::to(generation, &events, target) {
         Ok(rf) => rf,
         Err(far) => return Some((Err(far), 0)),
@@ -238,6 +248,7 @@ impl AppView {
     /// Store `live`'s board at `target` (module docs): a re-fold, run when
     /// the slot is free; the one running for another request is stopped.
     /// Asked again while it runs or once done, nothing new.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refold(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
         let epoch = self.model.lives[live].transcript.blocks_epoch();
         let r = &mut self.refolds;
@@ -259,6 +270,7 @@ impl AppView {
 
     /// The re-fold's request withdrawn (its view closed): stopped, and
     /// nothing kept.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refold_cancel(&mut self) {
         let r = &mut self.refolds;
         r.running.as_ref().inspect(|j| j.stop.store(true, Ordering::Relaxed));
@@ -266,6 +278,7 @@ impl AppView {
         r.done = None;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn refold_start(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
         let t = &self.model.lives[live].transcript;
         let Some(input) = t.blocks_input() else {
@@ -287,19 +300,13 @@ impl AppView {
 
     /// A re-fold ended: kept if it finished and its request and history
     /// still stand; then the request that waited runs.
-    fn refold_ended(
-        &mut self,
-        live: LiveId,
-        target: Target,
-        epoch: u64,
-        out: Option<(Result<Option<State>, TooFar>, usize)>,
-        cx: &mut Context<Self>,
-    ) {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn refold_ended(&mut self, live: LiveId, target: Target, epoch: u64, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
         let now = self.model.lives.get_mut(live).map(|l| l.transcript.blocks_epoch());
         if let (Some((state, visited)), false, Some(true)) = (out, stopped, now.map(|e| e == epoch)) {
-            r.done = Some(Refolded { live, target, epoch, state: state.map(|s| s.map(Arc::new)), visited });
+            r.done = Some(Refolded { live, target, epoch, state: state.map(|s| s.map(|s| Arc::new(*s))), visited });
             cx.notify();
         }
         if let Some((live, target)) = r.next.take() {
@@ -396,7 +403,7 @@ mod tests {
             chunks += 1;
         };
         assert!(chunks >= events.len() / REFOLD_STEP, "{chunks} chunks for {} events", events.len());
-        assert_eq!(state.unwrap().as_ref(), whole.state());
+        assert_eq!(state.unwrap().as_deref(), whole.state());
         assert_eq!(whole.state(), Some(&Board::fold(i.generation, &events).bound(&events)));
         let mut rf = Refold::to(i.generation, &events, at).unwrap();
         assert!(matches!(chunk(&mut rf, &AtomicBool::new(true), Duration::MAX), Chunk::Stopped));
