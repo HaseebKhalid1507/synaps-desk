@@ -17,7 +17,8 @@
 //! after the change (Shady #94 P2-1, rounds 1 and 2). One whose turn
 //! lost it, once a settled history shows another's copy, gives way: the
 //! card is the history's answer, a change from it sends once, and keeping
-//! it sends nothing (Shady #94 round 3). With part B's
+//! it sends nothing (Shady #94 round 3), and every other card's entry
+//! stays as it was. With part B's
 //! memory (#93): a reopened card shows the answer it changes, highlighted
 //! and picked, with no `last time` mark; one whose answer has no pick
 //! starts on the memory, unmarked; a change that reaches the chat is
@@ -1292,6 +1293,99 @@ fn a_change_refused_after_a_lost_answers_copy_gives_way_at_once(cx: &mut TestApp
     cx.run_until_parked();
     settle(cx, w, 8);
     recovers(cx, w, &view, row, tool, id, &a, &b);
+    crate::app::pin_arm_clock(None);
+}
+
+/// The session's history as the view holds it: the demo's, card `tool`'s
+/// ask ([`asked`], the branch question), then `more`, as given.
+fn held(cx: &mut TestAppContext, view: &Entity<AppView>, tool: &str, card_id: &str, more: &[Value]) -> Vec<Value> {
+    let (seq, _) = attachment(cx, view);
+    let mut h = match crate::demo::attach(crate::demo::IDLE_CPU, seq).pop() {
+        Some(synaps_client::Event::Attached { attached, .. }) => attached.conversation.api_messages.clone(),
+        other => panic!("{other:?}"),
+    };
+    h.extend(super::answer_tests::asked_messages(tool, card_id, &branch(), None));
+    let base = h.len();
+    h.extend(more.iter().cloned());
+    let n = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.history_len());
+    assert_eq!(n, h.len(), "the history held: {n}, from {base} and {} more", more.len());
+    h
+}
+
+/// Card `card_id`'s entry of this desk, whole (its state, `seen`, cause,
+/// timers and flags).
+fn entry_of(cx: &mut TestAppContext, view: &Entity<AppView>, card_id: &str) -> cards_spec::memo::Entry {
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        let card = v.model.lives[v.panes.cur.live].transcript.cards().bound(&id(card_id)).unwrap();
+        v.model.memos.entry(&sid, card).cloned().expect("its entry")
+    })
+}
+
+const SHIP_NOW: &str = "Ship the fix now?";
+
+/// Retiring one card's entry leaves every other card's as it was (the
+/// follow-up to Shady #94 round 4: `Memo::forget`). Card 1 is the lost
+/// answer's case: B not confirmed, A, which B expected, lost. Card 2,
+/// asked after it, is answered by a `Steer` the engine takes in, its
+/// history still to come: in the chat by this desk's own record ("Taken
+/// in"), not by the history, the entry a reading of the view without that
+/// record would move. Another desk's copy of A lands, settled: card 1's
+/// entry gives way, and card 2's is exactly as it was, `answered`. Its
+/// history then lands, and it is in the chat as ever.
+#[gpui_kit::test]
+fn retiring_one_cards_entry_leaves_another_cards_as_it_was(cx: &mut TestAppContext) {
+    let (tool, id1) = ("toolu_e8", "ce8mix1");
+    let ((w, view, row, _events), a, _b) = both_lost(cx, tool, id1);
+    let ship = json!({"question": SHIP_NOW, "options": ["Yes", "No"]});
+    let mut more = super::answer_tests::asked_messages("toolu_e9", "ce9mix2", &ship, None);
+    land(cx, w, &view, more.clone());
+    let h = held(cx, &view, tool, id1, &more);
+    heard(cx, w, &view, vec![slot_digest(&h, None)]);
+    play(cx, w, &view);
+    let (row2, _) = card(cx, &view, SHIP_NOW);
+    busy(cx, w, &view);
+    arm(cx, &view, row2, true);
+    click(cx, w, &view, format!("ask-option {row2} 1"));
+    let yes = message("ce9mix2", &ship, json!({"choice": "Yes"}));
+    assert_eq!(sends(cx, &view).last().map(|o| (o.busy, o.text.clone())), Some((true, yes.clone())), "card 2: a Steer");
+    let h = held(cx, &view, tool, id1, &more);
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "steered", "text": yes, "delivered": true}),
+            json!({"ev": "stream", "event": {"kind": "agent", "agent": "steering_delivered", "message": yes}}),
+            slot_digest(&h, None),
+        ],
+    );
+    assert!(has(cx, w, format!("ask-state {row2} answered")), "card 2 taken in, its history to come");
+    assert!(has(cx, w, format!("ask-state {row} not confirmed")), "card 1: B, no copy yet");
+    let before = entry_of(cx, &view, "ce9mix2");
+    assert_eq!(before.state, State::InChat);
+    let n = sends(cx, &view).len();
+    land(cx, w, &view, vec![json!({"role": "user", "content": a})]);
+    more.push(json!({"role": "user", "content": a}));
+    let h = held(cx, &view, tool, id1, &more);
+    heard(cx, w, &view, vec![slot_digest(&h, None)]);
+    play(cx, w, &view);
+    view.read_with(cx, |v, _| {
+        let sid = v.card_session().unwrap();
+        assert!(v.model.lives[v.panes.cur.live].transcript.history_settled(), "settled");
+        assert_eq!(v.model.memos.get_state(&sid, id1), None, "card 1: B's entry gone");
+    });
+    assert!(has(cx, w, format!("ask-state {row} answered")), "card 1: theirs, A");
+    assert_eq!(entry_of(cx, &view, "ce9mix2"), before, "card 2: its entry exactly as it was");
+    assert!(has(cx, w, format!("ask-state {row2} answered")), "card 2: answered");
+    assert_eq!(sends(cx, &view).len(), n, "nothing sent");
+    land(cx, w, &view, vec![json!({"role": "user", "content": yes})]);
+    more.push(json!({"role": "user", "content": yes}));
+    let h = held(cx, &view, tool, id1, &more);
+    heard(cx, w, &view, vec![slot_digest(&h, None)]);
+    play(cx, w, &view);
+    assert_eq!(entry_of(cx, &view, "ce9mix2").state, State::InChat, "card 2's history: in the chat");
+    assert!(has(cx, w, format!("ask-state {row2} answered")));
     crate::app::pin_arm_clock(None);
 }
 
