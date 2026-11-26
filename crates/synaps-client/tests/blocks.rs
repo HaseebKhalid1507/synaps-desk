@@ -1055,15 +1055,17 @@ fn big_round_landed(tag: &str, n: usize) -> Vec<Value> {
 /// delivered steer, at the next response but one (the round before the
 /// one it seals), at a reset, and when the history lands (its log
 /// replaced). Each time its calls and ids (and a reset's facts, a log's
-/// store) are handed to the disposer, gated here: the event finishes
-/// before any of it is dropped (a reset's inputs held: the gate holds
-/// them), the frame destroys O(1) elements (a hand-over is one) and
-/// touches O(1) under the log's lock. A reset's facts are counted with
-/// their inputs (their rows went with the response, the inputs are the
-/// disposer's now); the gate open, the disposer lets every one of them go.
+/// store) are handed to the test's own disposer, its thread held: the
+/// event finishes before any of it is dropped (a reset's inputs alive),
+/// the frame destroys O(1) elements (a hand-over is one) and touches O(1)
+/// under the log's lock. A reset's facts are counted with their inputs
+/// (their rows went with the response, the inputs are the disposer's
+/// now); the hold gone, the disposer lets every one of them go.
 #[test]
 fn a_round_let_go_is_destroyed_off_the_frame() {
     use synaps_client::blocks::dispose;
+    let disposer = dispose::Disposer::start();
+    let _in = disposer.install();
     let n = 3_000;
     // Every boundary checked, the ones that miss listed together.
     let mut wrong = Vec::new();
@@ -1103,14 +1105,15 @@ fn a_round_let_go_is_destroyed_off_the_frame() {
                 .map(|i| i.kept_bytes())
                 .sum();
         assert_eq!(inputs.len(), n, "{boundary}: the round's inputs");
-        let gate = dispose::gate();
-        let (destroyed, visits) = (dispose::destroyed(), d.t.blocks_live().visits());
+        let hold = disposer.hold();
+        let (destroyed, visits, was) = (dispose::destroyed(), d.t.blocks_live().visits(), disposer.backlog());
         match &event {
             Some(e) => d.apply(e),
             None => d.t.apply_update(&HistoryUpdate::Append { base_len: 1, messages: big_round_landed("big", n) }).unwrap(),
         }
         let frame = dispose::destroyed() - destroyed;
-        let (items, elements, bytes) = gate.held();
+        let now = disposer.backlog();
+        let (items, elements, bytes) = (now.items - was.items, now.elements - was.elements, now.bytes - was.bytes);
         if frame > 4 {
             wrong.push(format!("{boundary}: the frame destroyed {frame} elements"));
         }
@@ -1126,13 +1129,13 @@ fn a_round_let_go_is_destroyed_off_the_frame() {
         if boundary == "reset" {
             assert!(d.t.items().iter().all(|i| i.kept_allocation().is_none()), "the response's rows went");
             let alive = inputs.iter().filter(|w| w.strong_count() > 0).count();
-            assert_eq!(alive, n, "the reset's inputs alive, the gate shut: the event finished before any was dropped");
+            assert_eq!(alive, n, "the reset's inputs alive, the disposer held: the event finished before any was dropped");
             if bytes < payload {
                 wrong.push(format!("reset: its facts' {alive} live inputs ({payload} bytes, their rows gone) counted {bytes}"));
             }
         }
-        drop(gate);
-        dispose::flush();
+        drop(hold);
+        disposer.flush();
         if boundary == "reset" {
             let alive = inputs.iter().filter(|w| w.strong_count() > 0).count();
             if alive > 0 {
@@ -1150,7 +1153,8 @@ fn a_round_let_go_is_destroyed_off_the_frame() {
 /// it.
 #[test]
 fn the_same_input_again_is_one_allocation() {
-    use synaps_client::blocks::dispose;
+    let disposer = synaps_client::blocks::dispose::Disposer::start();
+    let _in = disposer.install();
     let mut d = Desk::of(attach(&plain()));
     for e in live_start() {
         d.apply(&e);
@@ -1185,8 +1189,358 @@ fn the_same_input_again_is_one_allocation() {
     assert_eq!(kept, distinct, "the rows count every allocation once");
     drop((rows, alive));
     drop(d);
-    dispose::flush();
+    disposer.flush();
     assert!(seen.iter().all(|w| w.strong_count() == 0), "none outlives the transcript");
+}
+
+/// A response of `n` block calls whose inputs carry `pad` (a note's
+/// text), then their results, every call refused: their inputs outweigh
+/// the round's own bookkeeping. Its tool ids are `toolu_{tag}{k}`.
+fn fat_round(d: &mut Desk, tag: &str, n: usize, pad: &str) {
+    d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+    for k in 0..n {
+        let id = format!("toolu_{tag}{k}");
+        let ops = json!([{"op":"put","id":format!("{tag}{k}"),"kind":"note","body":{"text":pad}}]);
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
+        d.apply(&tool_use(&id, "cards_block", block_input(ops)));
+    }
+    for k in 0..n {
+        d.apply(&tool_result(&format!("toolu_{tag}{k}"), "cards_block: refused (a test)"));
+    }
+}
+
+/// The inputs of the calls whose tool ids start `toolu_{tag}`, as their
+/// rows keep them: each one's allocation and its bytes.
+fn inputs_of(d: &Desk, tag: &str) -> Vec<(std::sync::Weak<Value>, usize)> {
+    let prefix = format!("toolu_{tag}");
+    d.t.items()
+        .iter()
+        .filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with(&prefix)))
+        .filter_map(|i| Some((Arc::downgrade(i.kept_allocation()?), i.kept_bytes())))
+        .collect()
+}
+
+/// Of `inputs`, the bytes of those still alive.
+fn alive_bytes(inputs: &[(std::sync::Weak<Value>, usize)]) -> usize {
+    inputs.iter().filter(|(w, _)| w.strong_count() > 0).map(|(_, b)| b).sum()
+}
+
+fn reset() -> SessionEvent {
+    llm(json!({"kind": "llm", "llm": "response_reset"}))
+}
+
+/// Shady #101 R5-2 A: what the disposer holds stays charged until the last
+/// owner of its payload is dropped, checked between drains (its thread
+/// held, then let drop one item at a time), not only before the first and
+/// after the last. Three ways a large round's inputs (their rows gone)
+/// end up the disposer's: a reset (its round, facts and results), its log
+/// dropped (the tab gone: its rounds and store), and its log dropped while
+/// a job still reads its store (the store stays the job's until it lets
+/// go). At every point the inputs still alive are covered by the charge.
+#[test]
+fn a_retired_input_stays_charged_until_its_last_owner_goes() {
+    use synaps_client::blocks::dispose::Disposer;
+    let (n, pad) = (300, "c".repeat(4_000));
+    let mut wrong = Vec::new();
+    for case in ["reset", "log dropped", "log dropped, a job reading it"] {
+        let disposer = Disposer::start();
+        let _in = disposer.install();
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        fat_round(&mut d, "fat", n, &pad);
+        let inputs = inputs_of(&d, "fat");
+        assert_eq!(inputs.len(), n, "{case}: the round's inputs");
+        let mut job = (case == "log dropped, a job reading it").then(|| d.t.blocks_input().expect("blocks"));
+        let hold = disposer.hold();
+        let desk = match case {
+            "reset" => {
+                d.apply(&reset());
+                assert!(d.t.items().iter().all(|i| i.kept_allocation().is_none()), "the response's rows went");
+                Some(d)
+            }
+            _ => {
+                drop(d);
+                None
+            }
+        };
+        let mut drains = 0;
+        loop {
+            let (alive, b) = (alive_bytes(&inputs), disposer.backlog());
+            if alive > b.bytes {
+                wrong.push(format!(
+                    "{case}: after {drains} drains, {alive} bytes of inputs alive, {} charged ({} items queued)",
+                    b.bytes, b.items
+                ));
+            }
+            if b.items > 0 {
+                hold.step(1);
+                drains += 1;
+            } else if let Some(j) = job.take() {
+                // The job lets go: its store goes to the disposer.
+                drop(j);
+            } else {
+                break;
+            }
+        }
+        drop(hold);
+        disposer.flush();
+        if alive_bytes(&inputs) > 0 {
+            wrong.push(format!("{case}: inputs outlive the disposer's drains"));
+        }
+        let b = disposer.backlog();
+        if (b.items, b.bytes, b.in_place) != (0, 0, 0) {
+            wrong.push(format!("{case}: drained, the disposer still holds {b:?}"));
+        }
+        drop(desk);
+    }
+    assert!(wrong.is_empty(), "a payload alive past its charge: {wrong:#?}");
+}
+
+/// Shady #101 R5-1: the disposer admits a bounded backlog and never makes
+/// the frame wait. Its thread held (nothing it is handed goes), two
+/// sessions reset response after response (1 MiB of inputs each, 96 MiB
+/// in all), then a third's tab is evicted and a fourth's history lands
+/// (its log replaced), then a flood of small resets passes its item cap.
+/// Every event finishes (the thread held throughout); at every point what
+/// it holds stays within `MAX_BYTES` and `MAX_ITEMS`, every retired input
+/// alive is charged, and what it refuses is dropped where it was let go.
+/// The hold gone, everything goes.
+#[test]
+fn the_disposer_admits_a_bounded_backlog_and_drops_the_rest_in_place() {
+    use synaps_client::blocks::dispose::{Disposer, MAX_BYTES, MAX_ITEMS};
+    let disposer = Disposer::start();
+    let _in = disposer.install();
+    let hold = disposer.hold();
+    let pad = "f".repeat(64 * 1024);
+    let mut wrong = Vec::new();
+    let mut retired = Vec::new();
+    let check = |what: &str, retired: &[(std::sync::Weak<Value>, usize)]| {
+        let (b, alive) = (disposer.backlog(), alive_bytes(retired));
+        let mut wrong = Vec::new();
+        if b.bytes > MAX_BYTES || b.items > MAX_ITEMS {
+            wrong.push(format!("{what}: it holds {} items, {} bytes", b.items, b.bytes));
+        }
+        if alive > b.bytes {
+            wrong.push(format!("{what}: {alive} bytes of retired inputs alive, {} charged", b.bytes));
+        }
+        wrong
+    };
+    let mut desks = [Desk::of(attach(&plain())), Desk::of(attach(&plain()))];
+    for d in &mut desks {
+        for e in live_start() {
+            d.apply(&e);
+        }
+    }
+    for r in 0..96 {
+        let d = &mut desks[r % 2];
+        let tag = format!("f{r}_");
+        fat_round(d, &tag, 16, &pad);
+        let inputs = inputs_of(d, &tag);
+        assert_eq!(inputs.len(), 16);
+        d.apply(&reset());
+        retired.extend(inputs);
+        wrong.extend(check(&format!("reset {r}"), &retired));
+    }
+    let refused = disposer.backlog().in_place;
+    if refused == 0 {
+        wrong.push("96 MiB of resets: none refused".into());
+    }
+    // A tab evicted and a history landed while it is full.
+    let mut evicted = Desk::of(attach(&plain()));
+    for e in live_start() {
+        evicted.apply(&e);
+    }
+    fat_round(&mut evicted, "ev", 16, &pad);
+    let gone = inputs_of(&evicted, "ev");
+    drop(evicted);
+    retired.extend(gone);
+    wrong.extend(check("a tab evicted", &retired));
+    let mut landed = Desk::of(attach(&plain()));
+    for e in live_start() {
+        landed.apply(&e);
+    }
+    big_round(&mut landed, "big", 50);
+    landed.t.apply_update(&HistoryUpdate::Append { base_len: 1, messages: big_round_landed("big", 50) }).unwrap();
+    wrong.extend(check("a history landed", &retired));
+    // Items: drained, then small resets past the item cap (their bytes
+    // far below the byte cap).
+    drop(hold);
+    disposer.flush();
+    if alive_bytes(&retired) > 0 {
+        wrong.push("retired inputs outlive the hold".into());
+    }
+    let hold = disposer.hold();
+    let refused = disposer.backlog().in_place;
+    let [a, _] = &mut desks;
+    for k in 0..MAX_ITEMS + 100 {
+        a.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+        for e in live_pair(k) {
+            a.apply(&e);
+        }
+        a.apply(&reset());
+        let b = disposer.backlog();
+        if b.items > MAX_ITEMS || b.bytes > MAX_BYTES {
+            wrong.push(format!("small reset {k}: it holds {} items, {} bytes", b.items, b.bytes));
+            break;
+        }
+    }
+    let b = disposer.backlog();
+    if b.items != MAX_ITEMS || b.in_place < refused + 100 {
+        wrong.push(format!("{} small resets: {} items held, {} refused", MAX_ITEMS + 100, b.items, b.in_place - refused));
+    }
+    drop(hold);
+    disposer.flush();
+    let b = disposer.backlog();
+    if (b.items, b.bytes) != (0, 0) {
+        wrong.push(format!("drained, it still holds {b:?}"));
+    }
+    assert!(wrong.is_empty(), "an unbounded disposer: {wrong:#?}");
+}
+
+/// Shady #101 R5-1: an owned disposer shuts down. With work queued, its
+/// owner's shutdown drains it and joins its thread; a log that outlives
+/// it drops what it lets go in place. Its thread wedged (held), shutdown
+/// waits `JOIN` at most and detaches it, and the thread drops what it
+/// holds once free. A disposer whose thread did not start drops all in
+/// place, counted.
+#[test]
+fn an_owned_disposer_drains_and_joins_at_shutdown() {
+    use std::time::{Duration, Instant};
+    use synaps_client::blocks::dispose::{Disposer, JOIN};
+    let pad = "s".repeat(4_000);
+    let mut wrong = Vec::new();
+    let round = |d: &mut Desk, tag: &str| {
+        fat_round(d, tag, 40, &pad);
+        let inputs = inputs_of(d, tag);
+        assert_eq!(inputs.len(), 40);
+        d.apply(&reset());
+        inputs
+    };
+    let started = || {
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        d
+    };
+    // Work queued, then shut down.
+    {
+        let disposer = Disposer::start();
+        let bin = disposer.bin();
+        let _in = disposer.install();
+        let mut d = started();
+        let hold = disposer.hold();
+        let inputs = round(&mut d, "a");
+        if bin.backlog().items == 0 || alive_bytes(&inputs) == 0 {
+            wrong.push(format!("queued: {:?}", bin.backlog()));
+        }
+        drop(hold);
+        if !disposer.shutdown() {
+            wrong.push("work queued: shutdown did not join".into());
+        }
+        if alive_bytes(&inputs) > 0 || bin.backlog().items > 0 || bin.backlog().bytes > 0 {
+            wrong.push(format!("shut down: not drained ({:?})", bin.backlog()));
+        }
+        let was = bin.backlog().in_place;
+        let after = round(&mut d, "b");
+        if alive_bytes(&after) > 0 || bin.backlog().in_place != was + 1 {
+            wrong.push(format!("after shutdown: not dropped in place ({:?})", bin.backlog()));
+        }
+    }
+    // Its thread wedged: detached within the deadline, done once free.
+    {
+        let disposer = Disposer::start();
+        let bin = disposer.bin();
+        let _in = disposer.install();
+        let mut d = started();
+        let hold = disposer.hold();
+        let inputs = round(&mut d, "w");
+        let t0 = Instant::now();
+        let joined = disposer.shutdown();
+        let took = t0.elapsed();
+        if joined || took > JOIN * 4 {
+            wrong.push(format!("wedged: joined {joined} after {took:?}"));
+        }
+        drop(hold);
+        let t0 = Instant::now();
+        while alive_bytes(&inputs) > 0 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if alive_bytes(&inputs) > 0 || bin.backlog().bytes > 0 {
+            wrong.push(format!("detached: never drained ({:?})", bin.backlog()));
+        }
+    }
+    // Its thread never started.
+    {
+        let disposer = Disposer::failed();
+        let bin = disposer.bin();
+        let _in = disposer.install();
+        let mut d = started();
+        let inputs = round(&mut d, "f");
+        if alive_bytes(&inputs) > 0 || bin.backlog().in_place != 1 {
+            wrong.push(format!("no thread: not dropped in place ({:?})", bin.backlog()));
+        }
+        if !disposer.shutdown() {
+            wrong.push("no thread: shutdown failed".into());
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Shady #101 R5-2 B: a log retired whole (its tab gone) is charged as it
+/// is allocated. Six large rounds, sealed one after another (their calls
+/// whole out of order: their slots and ranks have room to spare), and the
+/// open one: the charge its drop takes, kept as the log grew (O(1) at the
+/// drop), is every allocation the drop moves, walked one by one (the
+/// sealed segments' slots, ranks and room, the segments' vector, the
+/// starts and cuts, the rounds and the head); and it is what the disposer
+/// holds once the log is handed over.
+#[test]
+fn a_log_is_retired_charged_as_it_is_allocated() {
+    use synaps_client::blocks::dispose::Disposer;
+    let disposer = Disposer::start();
+    let _in = disposer.install();
+    let mut d = Desk::of(attach(&plain()));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    let n = 300;
+    for r in 0..7 {
+        d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+        let id = |k: usize| format!("toolu_r{r}_{k}");
+        for k in 0..n {
+            d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id(k)})));
+        }
+        for k in scrambled(n) {
+            let ops = json!([{"op":"put","id":format!("r{r}_{k}"),"kind":"note","body":{"text":format!("note {k}")}}]);
+            d.apply(&tool_use(&id(k), "cards_block", block_input(ops)));
+        }
+        if r < 6 {
+            for k in 0..n {
+                d.apply(&tool_result(&id(k), "cards_block: refused (a test)"));
+            }
+        }
+    }
+    let mut wrong = Vec::new();
+    let (charge, walk) = d.t.blocks_live().retirement();
+    if charge != walk {
+        wrong.push(format!("its charge {charge}, its allocations {walk}"));
+    }
+    let hold = disposer.hold();
+    let was = disposer.backlog();
+    drop(d);
+    let b = disposer.backlog();
+    if (b.items - was.items, b.bytes - was.bytes) != (1, charge) {
+        wrong.push(format!("handed over: {} items, {} bytes; its charge {charge}", b.items - was.items, b.bytes - was.bytes));
+    }
+    drop(hold);
+    disposer.flush();
+    if disposer.backlog().bytes != 0 {
+        wrong.push(format!("drained, still charged: {:?}", disposer.backlog()));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 fn card(k: usize) -> Value {

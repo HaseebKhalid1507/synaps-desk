@@ -1327,12 +1327,13 @@ fn cached_boards_are_counted_and_go_whole_past_the_budget(cx: &mut TestAppContex
 /// Shady #101 R4-2: a reset, and the tab left before any job reads its
 /// log again (cached in the same frame: its board's work cancelled,
 /// nothing drained). The reset's calls' inputs, their rows gone, are the
-/// disposer's, counted there (gated here: all alive, the event done); the
-/// cached transcript keeps none of them: the gate open, none outlives its
-/// row while the tab stays cached.
+/// test's own disposer's, counted there (its thread held: all alive, the
+/// event done); the cached transcript keeps none of them: the hold gone,
+/// none outlives its row while the tab stays cached.
 #[gpui_kit::test]
 fn a_tab_cached_right_after_a_reset_keeps_none_of_its_inputs(cx: &mut TestAppContext) {
-    use synaps_client::blocks::dispose;
+    let disposer = synaps_client::blocks::dispose::Disposer::start();
+    let _in = disposer.install();
     let (w, view) = blocks(cx, 1500.);
     let a = crate::demo::BLOCKS.to_string();
     let (n, pad) = (60, "r".repeat(4_000));
@@ -1354,7 +1355,8 @@ fn a_tab_cached_right_after_a_reset_keeps_none_of_its_inputs(cx: &mut TestAppCon
         calls.filter_map(|i| i.kept_allocation()).map(std::sync::Arc::downgrade).collect()
     });
     assert_eq!(inputs.len(), n, "the live calls' inputs");
-    let gate = dispose::gate();
+    let hold = disposer.hold();
+    let was = disposer.backlog().bytes;
     // The reset, and the tab left in the same frame: no job between.
     let (seq, sid) = attachment(cx, &view);
     let client = view.update(cx, |v, cx| {
@@ -1371,14 +1373,14 @@ fn a_tab_cached_right_after_a_reset_keeps_none_of_its_inputs(cx: &mut TestAppCon
     view.update(cx, |v, _| v.client = client);
     assert!(view.read_with(cx, |v, _| v.tab_cache.contains(&a)), "the tab cached");
     let alive = inputs.iter().filter(|i| i.strong_count() > 0).count();
-    assert_eq!(alive, n, "the gate shut: the reset's inputs held, none dropped before the frame went on");
-    let (_, _, held) = gate.held();
+    assert_eq!(alive, n, "the disposer held: the reset's inputs alive, none dropped before the frame went on");
+    let held = disposer.backlog().bytes - was;
     let mut wrong = Vec::new();
     if held < n * pad.len() {
         wrong.push(format!("the reset's {n} inputs ({} bytes, their rows gone) counted {held}", n * pad.len()));
     }
-    drop(gate);
-    dispose::flush();
+    drop(hold);
+    disposer.flush();
     assert!(view.read_with(cx, |v, _| v.tab_cache.contains(&a)), "still cached");
     let alive = inputs.iter().filter(|i| i.strong_count() > 0).count();
     if alive > 0 {

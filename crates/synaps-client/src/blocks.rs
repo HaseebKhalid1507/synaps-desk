@@ -54,19 +54,30 @@
 //! and `C` the log's cuts; `G` the most one handle's read touches, its
 //! segment found among `S` and its slot's rank-select among the widest
 //! segment's `N` slots, `⌊log₂ S⌋ + ⌊log₂ N⌋ + 4`. That is `HOLD` (1,024)
-//! while the log has fewer than 2³⁰ cuts and 2³² slots, and 4,290 at most
-//! on a 64-bit word, whatever the history. A writer (a fact) touches O(log n) at most.
+//! while the log has fewer than 2³⁰ cuts **and** fewer than 2³² slots, and
+//! 4,290 at most on a 64-bit word, whatever the history; a test's 1,022
+//! is an observed maximum under it, not the bound. These bounds count a
+//! reader's operations under the lock (the tree nodes, slots and handles
+//! it touches), not the mutex's wall-clock hold: allocation, hashing,
+//! scheduling and destructors are not in them, and they are the worker's
+//! and an input's reads, not every method that takes the lock (a log's
+//! copy copies its store). A writer (a fact) touches O(log n) at most.
 //! A reader makes the handles events, cuts what no longer holds (a slice
 //! at a time, `go_on` asked between) and copies the board after letting
 //! go of the lock. A job reads the overlay on from where the last job
 //! stopped while what it read holds.
 //!
-//! **Nothing is destroyed on the frame** ([`dispose`]): what a log lets go
-//! (a round's calls and ids at a seal, a user message or a reset, a
-//! reset's facts, a store when its log is replaced or its last job lets
-//! go) is handed in O(1) to one thread that drops it, counted until then
-//! ([`dispose::pending`]), a reset's facts with their inputs (their rows
-//! went). Everything counted is counted with its heap ([`event_bytes`])
+//! **Nothing is destroyed on the frame while the disposer has room**
+//! ([`dispose`]): what a log lets go (a round's calls, ids and rows at a
+//! seal or a user message; a reset's round, facts and results as one; a
+//! log replaced or gone, its rounds with its store; a store when its last
+//! job lets go) is handed in O(1) to its bin, the app's own disposer's
+//! (one thread, owned, shut down and joined with the app), charged with
+//! its facts' inputs until the disposer has dropped the last of it. Past
+//! the disposer's cap ([`dispose::MAX_ITEMS`] items, [`dispose::MAX_BYTES`]
+//! bytes), closed or never started, whoever lets go drops it in place
+//! (counted): overload costs a rare stall, never unbounded memory, and
+//! nothing waits on the disposer. Everything counted is counted with its heap ([`event_bytes`])
 //! and its room as allocated: staged, journal, the live log, the overlay,
 //! the card folds (the board's and the overlay's, each its own: read again
 //! after whatever can change them, a card call or, with a card in them, a
@@ -569,27 +580,40 @@ impl Seg {
     }
 
     /// Slot `k`'s fact is `f` now: its rank. The one before goes off the
-    /// frame ([`dispose`]).
-    fn set(&mut self, k: usize, f: Handle, t: &Touched) -> usize {
+    /// frame ([`dispose`]), charged with its input.
+    fn set(&mut self, k: usize, f: Handle, t: &Touched, bin: &dispose::Bin) -> usize {
         t.add(1);
         (self.bytes, self.inputs) = (self.bytes + f.bytes(), self.inputs + f.input_bytes());
         let old = self.slots[k].replace(f).expect("a fact");
         let (own, input) = (old.bytes(), old.input_bytes());
         (self.bytes, self.inputs) = (self.bytes - own, self.inputs - input);
-        dispose::retire(old, 1, own + input);
+        bin.retire(old, 1, own + input);
         self.rank(k, t)
     }
 
-    /// What its slots and ranks hold besides the facts (bytes).
+    /// What its slots and ranks hold besides the facts (bytes, as
+    /// allocated).
     fn spare(&self) -> usize {
-        self.slots.capacity() * std::mem::size_of::<Option<Handle>>() + self.ranks.tree.capacity() * 4
+        self.slots.capacity() * std::mem::size_of::<Option<Handle>>() + self.ranks.tree.capacity() * std::mem::size_of::<u32>()
     }
 
-    /// Retired whole ([`dispose`]): its slots, and its bytes with its
-    /// facts' inputs (their rows' no longer, a reset's).
-    fn retire(self) {
-        let (n, bytes) = (self.slots.len(), self.bytes + self.inputs + self.spare());
-        dispose::retire(self, n, bytes);
+    /// What it holds, retired (bytes, heap included, as allocated): its
+    /// facts with their inputs (their rows' no longer), its slots and
+    /// ranks.
+    fn charge(&self) -> usize {
+        self.bytes + self.inputs + self.spare()
+    }
+
+    /// Its allocations, walked one by one (tests: [`LiveLog::retirement`]).
+    fn walk(&self) -> usize {
+        let facts: usize = self.slots.iter().flatten().map(|f| f.bytes() + f.input_bytes()).sum();
+        self.slots.capacity() * std::mem::size_of::<Option<Handle>>() + self.ranks.tree.capacity() * std::mem::size_of::<u32>() + facts
+    }
+
+    /// Retired whole ([`dispose`]), charged as it holds.
+    fn retire(self, bin: &dispose::Bin) {
+        let (n, bytes) = (self.slots.len(), self.charge());
+        bin.retire(self, n, bytes);
     }
 }
 
@@ -653,7 +677,8 @@ impl Cuts {
 /// Nothing under its lock costs more than a fact's events, or a reader's
 /// batch: O(1) amortized, and O(log n) nodes for a call whole out of
 /// order or a cut added ([`Store::touched`] counts them). What it lets go
-/// (a reset's facts, itself) goes off the frame ([`dispose`]).
+/// (a replaced fact, an empty segment, itself) goes off the frame
+/// ([`dispose`]).
 #[derive(Debug, Default)]
 struct Store {
     /// The events before the open round, in segments (a sealed round's
@@ -666,6 +691,8 @@ struct Store {
     done_bytes: usize,
     done_inputs: usize,
     done_slots: usize,
+    /// Their slots' and ranks' room ([`Seg::spare`]), kept as they grow.
+    done_spare: usize,
     widest: usize,
     /// The last segment takes single events (a sealed round's don't).
     loose: bool,
@@ -679,6 +706,10 @@ struct Store {
     touched: Touched,
     visits: usize,
     most: usize,
+    /// Where what it lets go goes (its log's), and, its log gone while a
+    /// job still reads it, its charge there until it goes too.
+    bin: dispose::Bin,
+    charge: Option<dispose::Charge>,
 }
 
 /// A log's store, locked: what it touched counted when it lets go.
@@ -711,6 +742,12 @@ fn hold(store: &Mutex<Store>) -> Held<'_> {
 }
 
 impl Store {
+    fn in_bin(bin: dispose::Bin) -> Store {
+        let mut s = Store::default();
+        s.bin = bin;
+        s
+    }
+
     fn len(&self) -> usize {
         self.done_len + usize::from(self.lead) + self.calls.len + self.results.len + usize::from(self.end)
     }
@@ -772,16 +809,35 @@ impl Store {
     }
 
     /// What it keeps (bytes, heap included; the calls' inputs are their
-    /// rows'): its facts, and its slots, ranks and cuts as allocated.
+    /// rows'): its facts, and its slots, ranks and cuts as allocated. O(1):
+    /// the sealed segments' room is kept as they grow.
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Store>()
-            + self.fact_bytes()
-            + self.done.iter().map(Seg::spare).sum::<usize>()
-            + self.calls.spare()
-            + self.results.spare()
-            + self.done.capacity() * std::mem::size_of::<Seg>()
+        std::mem::size_of::<Store>() + self.fact_bytes() + self.done_spare + self.calls.spare() + self.results.spare() + self.rooms()
+    }
+
+    /// Its vectors' own room: the segments', the starts' and the cuts'.
+    fn rooms(&self) -> usize {
+        self.done.capacity() * std::mem::size_of::<Seg>()
             + self.starts.capacity() * std::mem::size_of::<usize>()
             + (self.cuts.at.capacity() + self.cuts.low.capacity()) * std::mem::size_of::<usize>()
+    }
+
+    /// What its retirement moves ([`Store`]'s drop), charged (bytes, heap
+    /// included, as allocated): every segment with its facts' inputs
+    /// (their rows' no longer), slots and ranks, and its vectors' room.
+    /// O(1).
+    fn moved(&self) -> usize {
+        self.done_bytes + self.done_inputs + self.done_spare + self.calls.charge() + self.results.charge() + self.rooms()
+    }
+
+    /// The same, its allocations walked one by one (tests).
+    fn walk(&self) -> usize {
+        self.done.iter().map(Seg::walk).sum::<usize>() + self.calls.walk() + self.results.walk() + self.rooms()
+    }
+
+    /// The elements its retirement destroys: segments and slots.
+    fn elements(&self) -> usize {
+        self.done.len() + self.done_slots + self.calls.slots.len() + self.results.slots.len()
     }
 
     /// The most one handle's read ([`Store::get`]) touches: its segment
@@ -803,7 +859,9 @@ impl Store {
         let f = Arc::new(f);
         (self.done_bytes, self.done_inputs) = (self.done_bytes + f.bytes(), self.done_inputs + f.input_bytes());
         let last = self.done.last_mut().expect("a loose segment");
+        let room = last.spare();
         last.push(Some(f), &self.touched);
+        self.done_spare = self.done_spare + last.spare() - room;
         self.widest = self.widest.max(last.slots.len());
         self.done_len += 1;
         self.done_slots += 1;
@@ -813,10 +871,11 @@ impl Store {
     /// whole (with no event, its empty slots go off the frame).
     fn append_done(&mut self, s: Seg) {
         if s.len == 0 {
-            s.retire();
+            s.retire(&self.bin);
             return;
         }
         self.touched.add(1);
+        self.done_spare += s.spare();
         self.starts.push(self.done_len);
         self.done_len += s.len;
         (self.done_bytes, self.done_inputs) = (self.done_bytes + s.bytes, self.done_inputs + s.inputs);
@@ -837,18 +896,24 @@ impl Store {
     }
 }
 
-/// A store's facts go off the frame ([`dispose`]): its last owner (a log
-/// replaced, a job's input) lets go of it in O(1), and the disposer
-/// destroys its segments, counted with their facts' inputs.
+/// A store's facts go off the frame ([`dispose`]): its last owner lets go
+/// of it in O(1), and the disposer destroys all it moves, charged as
+/// [`Store::moved`] counts it (a store its log left to a job, by the charge
+/// its log took for it then).
 impl Drop for Store {
     fn drop(&mut self) {
-        let elements = self.done.len() + self.done_slots + self.calls.slots.len() + self.results.slots.len();
-        let bytes = self.done_bytes
-            + self.done_inputs
-            + self.done_slots * std::mem::size_of::<Option<Handle>>()
-            + [&self.calls, &self.results].iter().map(|s| s.bytes + s.inputs + s.spare()).sum::<usize>();
-        let parts = (std::mem::take(&mut self.done), std::mem::take(&mut self.calls), std::mem::take(&mut self.results));
-        dispose::retire(parts, elements, bytes);
+        let (elements, bytes) = (self.elements(), self.moved());
+        let parts = (
+            std::mem::take(&mut self.done),
+            std::mem::take(&mut self.starts),
+            std::mem::take(&mut self.calls),
+            std::mem::take(&mut self.results),
+            std::mem::take(&mut self.cuts),
+        );
+        match self.charge.take() {
+            Some(held) => self.bin.retire_charged(parts, elements, held),
+            None => self.bin.retire(parts, elements, bytes),
+        }
     }
 }
 
@@ -861,8 +926,9 @@ impl Drop for Store {
 /// besides is two rounds' calls (the open one's, and the one before it,
 /// which a reset of the open one makes the batch again) and the ids of
 /// the history's last message's calls that reported. What it lets go (a
-/// round, a reset's facts, its store) goes off the frame ([`dispose`]): no
-/// event destroys a round's calls, nor a log replaced its turn's.
+/// round; a reset's round, facts and results as one; itself, with its
+/// store) goes to its bin ([`dispose`]): no event destroys a round's
+/// calls, nor a log replaced its turn's, while the disposer has room.
 #[derive(Debug)]
 pub struct LiveLog {
     store: Arc<Mutex<Store>>,
@@ -895,6 +961,9 @@ pub struct LiveLog {
     /// Facts written to its store, and moved within it (tests: the
     /// frame's work).
     work: usize,
+    /// Where what it lets go goes ([`dispose`]): the bin its thread had
+    /// when it was made, or its predecessor's ([`LiveLog::renewed`]).
+    bin: dispose::Bin,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -917,12 +986,56 @@ struct Round {
     done: usize,
     /// Its last whole call.
     last_whole: Option<usize>,
-    /// What it keeps (bytes, heap included; an input is its row's), kept
-    /// as it grows.
-    bytes: usize,
+    /// Its strings' room (its calls' tool ids and names, its ids' keys),
+    /// kept as they come.
+    strs: usize,
+    /// Where it goes ([`dispose`]): its log's.
+    bin: dispose::Bin,
+}
+
+/// A hash table's allocation for `capacity` entries of `(K, V)` (bytes, as
+/// allocated: hashbrown's buckets, `capacity` 7/8 of them past 8, each an
+/// entry and a control byte, and a group's 16 control bytes more).
+fn table<K, V>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 { (capacity + 1).next_power_of_two() } else { (capacity * 8 / 7).next_power_of_two() };
+    buckets * (std::mem::size_of::<(K, V)>() + 1) + 16
 }
 
 impl Round {
+    fn new(bin: dispose::Bin) -> Round {
+        let mut r = Round::default();
+        r.bin = bin;
+        r
+    }
+
+    /// What it keeps (bytes, heap included, as allocated; an input is its
+    /// row's): its calls' vector and strings, its two tables and their
+    /// keys. O(1).
+    fn bytes(&self) -> usize {
+        self.calls.capacity() * std::mem::size_of::<LiveCall>()
+            + self.strs
+            + table::<String, usize>(self.ids.capacity())
+            + table::<u64, usize>(self.rows.capacity())
+    }
+
+    /// The same, its strings walked one by one (tests).
+    fn walk(&self) -> usize {
+        let strs: usize = self.calls.iter().map(|c| c.tool_id.capacity() + c.name.capacity()).sum::<usize>()
+            + self.ids.keys().map(String::capacity).sum::<usize>();
+        self.calls.capacity() * std::mem::size_of::<LiveCall>()
+            + strs
+            + table::<String, usize>(self.ids.capacity())
+            + table::<u64, usize>(self.rows.capacity())
+    }
+
+    /// The elements its drop destroys.
+    fn elements(&self) -> usize {
+        self.calls.len() + self.ids.len() + self.rows.len()
+    }
+
     fn complete(&self) -> bool {
         !self.calls.is_empty() && self.done == self.calls.len()
     }
@@ -930,11 +1043,9 @@ impl Round {
     /// Call `c` at its end, row `row`'s: its index.
     fn push(&mut self, c: LiveCall, row: u64) -> usize {
         let k = self.calls.len();
-        self.bytes += std::mem::size_of::<LiveCall>() + c.tool_id.capacity() + c.name.capacity();
+        self.strs += c.tool_id.capacity() + c.name.capacity();
         self.id(c.tool_id.clone(), k);
-        if self.rows.insert(row, k).is_none() {
-            self.bytes += 32;
-        }
+        self.rows.insert(row, k);
         self.calls.push(c);
         k
     }
@@ -943,7 +1054,7 @@ impl Round {
     fn id(&mut self, id: String, k: usize) {
         let cap = id.capacity();
         if self.ids.insert(id, k).is_none() {
-            self.bytes += cap + 48;
+            self.strs += cap;
         }
     }
 
@@ -951,40 +1062,49 @@ impl Round {
     fn rename(&mut self, k: usize, tool_id: &str, name: &str) {
         if self.calls[k].tool_id != tool_id {
             let old = std::mem::replace(&mut self.calls[k].tool_id, tool_id.to_string());
-            self.bytes = self.bytes + self.calls[k].tool_id.capacity() - old.capacity();
+            self.strs = self.strs + self.calls[k].tool_id.capacity() - old.capacity();
             self.id(tool_id.to_string(), k);
         }
         if self.calls[k].name != name {
             let old = std::mem::replace(&mut self.calls[k].name, name.to_string());
-            self.bytes = self.bytes + self.calls[k].name.capacity() - old.capacity();
+            self.strs = self.strs + self.calls[k].name.capacity() - old.capacity();
         }
     }
 }
 
-/// A round's calls and ids go off the frame ([`dispose`]): whatever lets
-/// go of a round (a seal, a user message, a reset, its log) does in O(1).
+/// A round's calls, ids and rows go off the frame ([`dispose`]): whatever
+/// lets go of a round alone (a seal, a user message) does in O(1). A
+/// reset's round goes with its facts, a log's with its log ([`LiveLog`]).
 impl Drop for Round {
     fn drop(&mut self) {
-        let elements = self.calls.len() + self.ids.len();
-        let parts = (std::mem::take(&mut self.calls), std::mem::take(&mut self.ids));
-        dispose::retire(parts, elements, self.bytes);
+        let (elements, bytes) = (self.elements(), self.bytes());
+        let parts = (std::mem::take(&mut self.calls), std::mem::take(&mut self.ids), std::mem::take(&mut self.rows));
+        self.bin.retire(parts, elements, bytes);
     }
 }
 
-/// The ids of the history's last message's calls that reported, and their
-/// bytes (heap included): let go off the frame ([`dispose`]).
+/// The ids of the history's last message's calls that reported: let go off
+/// the frame ([`dispose`]).
 #[derive(Clone, Debug, Default)]
 struct Ids {
     set: HashSet<String>,
-    bytes: usize,
+    /// Their room, kept as they come.
+    keys: usize,
+    bin: dispose::Bin,
 }
 
 impl Ids {
+    fn new(bin: dispose::Bin) -> Ids {
+        Ids { set: HashSet::new(), keys: 0, bin }
+    }
+
     /// `id` reported: `false` if it had.
     fn insert(&mut self, id: &str) -> bool {
-        let new = self.set.insert(id.to_string());
+        let id = id.to_string();
+        let cap = id.capacity();
+        let new = self.set.insert(id);
         if new {
-            self.bytes += id.len() + 48;
+            self.keys += cap;
         }
         new
     }
@@ -992,12 +1112,22 @@ impl Ids {
     fn len(&self) -> usize {
         self.set.len()
     }
+
+    /// What it keeps (bytes, heap included, as allocated). O(1).
+    fn bytes(&self) -> usize {
+        self.keys + table::<String, ()>(self.set.capacity())
+    }
+
+    /// The same, walked (tests).
+    fn walk(&self) -> usize {
+        self.set.iter().map(String::capacity).sum::<usize>() + table::<String, ()>(self.set.capacity())
+    }
 }
 
 impl Drop for Ids {
     fn drop(&mut self) {
-        let n = self.set.len();
-        dispose::retire(std::mem::take(&mut self.set), n, self.bytes);
+        let (n, bytes) = (self.set.len(), self.bytes());
+        self.bin.retire(std::mem::take(&mut self.set), n, bytes);
     }
 }
 
@@ -1013,15 +1143,22 @@ struct LiveCall {
     answered: bool,
 }
 
+/// A log made on a thread takes its bin ([`dispose::current`]).
 impl Default for LiveLog {
     fn default() -> Self {
+        LiveLog::in_bin(dispose::current())
+    }
+}
+
+impl LiveLog {
+    fn in_bin(bin: dispose::Bin) -> LiveLog {
         static IDS: AtomicU64 = AtomicU64::new(1);
         LiveLog {
-            store: Arc::default(),
+            store: Arc::new(Mutex::new(Store::in_bin(bin.clone()))),
             id: IDS.fetch_add(1, Ordering::Relaxed),
             version: 0,
             head: None,
-            head_answered: Ids::default(),
+            head_answered: Ids::new(bin.clone()),
             head_ended: false,
             after: false,
             open: None,
@@ -1032,44 +1169,79 @@ impl Default for LiveLog {
             blocks: false,
             first: None,
             work: 0,
+            bin,
         }
+    }
+
+    /// A new log in its bin (one replacing it).
+    pub fn renewed(&self) -> LiveLog {
+        LiveLog::in_bin(self.bin.clone())
     }
 }
 
-/// A copy is another log, of the same facts.
+/// A copy is another log, of the same facts, in the same bin.
 impl Clone for LiveLog {
     fn clone(&self) -> Self {
         let s = hold(&self.store);
-        let mut store = Store::default();
+        let mut store = Store::in_bin(self.bin.clone());
         (store.done, store.starts, store.calls, store.results) = (s.done.clone(), s.starts.clone(), s.calls.clone(), s.results.clone());
         (store.done_len, store.done_bytes, store.done_inputs, store.done_slots) = (s.done_len, s.done_bytes, s.done_inputs, s.done_slots);
         (store.widest, store.loose, store.lead, store.end) = (s.widest, s.loose, s.lead, s.end);
-        LiveLog {
-            store: Arc::new(Mutex::new(store)),
-            head_answered: self.head_answered.clone(),
-            open: self.open.clone(),
-            sealed: self.sealed.clone(),
-            first: self.first,
-            ..*self.fresh()
-        }
+        // A copy's room is its own (a vector copied has no room to spare).
+        store.done_spare = store.done.iter().map(Seg::spare).sum();
+        let mut l = self.renewed();
+        (l.version, l.head, l.head_ended, l.after, l.target, l.before) =
+            (self.version, self.head, self.head_ended, self.after, self.target, self.before);
+        (l.empty, l.blocks, l.work, l.first) = (self.empty, self.blocks, self.work, self.first);
+        l.store = Arc::new(Mutex::new(store));
+        l.head_answered = self.head_answered.clone();
+        (l.open, l.sealed) = (self.open.clone(), self.sealed.clone());
+        l
     }
 }
 
+/// A log goes as one unit ([`dispose`]): its rounds and the head's ids,
+/// with its store when no job reads it (none can start now), so no owner
+/// of a call's input outlives the charge that covers it. A store a job
+/// still reads stays the job's, charged from now on ([`dispose::Bin::charge`],
+/// what [`Store::moved`] counts) until its last reader lets go of it.
+impl Drop for LiveLog {
+    fn drop(&mut self) {
+        let (open, sealed, head) = (self.open.take(), self.sealed.take(), std::mem::take(&mut self.head_answered));
+        let (mut elements, mut bytes) = (head.len(), head.bytes());
+        for r in [&open, &sealed].into_iter().flatten() {
+            (elements, bytes) = (elements + r.elements(), bytes + r.bytes());
+        }
+        let store = if Arc::strong_count(&self.store) == 1 {
+            let s = self.lock();
+            (elements, bytes) = (elements + s.elements(), bytes + s.moved());
+            drop(s);
+            Some(self.store.clone())
+        } else {
+            let mut s = self.lock();
+            if s.charge.is_none() {
+                s.charge = Some(self.bin.charge(s.moved()));
+            }
+            None
+        };
+        self.bin.retire((store, open, sealed, head), elements, bytes);
+    }
+}
+
+/// What a log's drop hands over, with its store (tests).
+type LogUnit = (Option<Arc<Mutex<Store>>>, Option<Round>, Option<Round>, Ids);
+
 impl LiveLog {
-    /// Its scalars, under a new identity (for [`Clone`]).
-    fn fresh(&self) -> Box<LiveLog> {
-        Box::new(LiveLog {
-            version: self.version,
-            head: self.head,
-            head_ended: self.head_ended,
-            after: self.after,
-            target: self.target,
-            before: self.before,
-            empty: self.empty,
-            blocks: self.blocks,
-            work: self.work,
-            ..LiveLog::default()
-        })
+    /// Tests: what its drop hands over now, its store with it (no job
+    /// reading it): the charge it takes (O(1), kept as the log grows), and
+    /// the bytes of every allocation it moves, walked one by one.
+    pub fn retirement(&self) -> (usize, usize) {
+        let s = self.lock();
+        let unit = std::mem::size_of::<LogUnit>();
+        let rounds = || [&self.open, &self.sealed].into_iter().flatten();
+        let charge = unit + s.moved() + rounds().map(Round::bytes).sum::<usize>() + self.head_answered.bytes();
+        let walk = unit + s.walk() + rounds().map(Round::walk).sum::<usize>() + self.head_answered.walk();
+        (charge, walk)
     }
 
     /// A block call among its calls.
@@ -1129,7 +1301,7 @@ impl LiveLog {
     /// rows').
     pub fn bytes(&self) -> usize {
         let s = self.lock();
-        s.bytes() + self.open.as_ref().map_or(0, |r| r.bytes) + self.sealed.as_ref().map_or(0, |r| r.bytes) + self.head_answered.bytes
+        s.bytes() + self.open.as_ref().map_or(0, Round::bytes) + self.sealed.as_ref().map_or(0, Round::bytes) + self.head_answered.bytes()
     }
 
     /// Its events (tests), [`COPY`] in one hold of its lock at most.
@@ -1195,7 +1367,7 @@ impl LiveLog {
         } else if before != Target::Sealed {
             self.sealed = None;
         }
-        self.open = Some(Round::default());
+        self.open = Some(Round::new(self.bin.clone()));
         (self.target, self.before, self.empty) = (Target::Open, before, false);
         if self.after {
             s.lead = true;
@@ -1263,14 +1435,17 @@ impl LiveLog {
             s.cut(at);
         }
         drop(s);
-        // Its facts and its round go off the frame ([`dispose`]), counted
-        // with their inputs (their rows went with the response).
-        calls.retire();
-        results.retire();
+        // Its round, its facts and their results go off the frame as one
+        // ([`dispose`]), charged with the facts' inputs (their rows went
+        // with the response) until the last of them is dropped.
+        let open = self.open.take();
+        let (re, rb) = open.as_ref().map_or((0, 0), |r| (r.elements(), r.bytes()));
+        let elements = re + calls.slots.len() + results.slots.len();
+        let bytes = rb + calls.charge() + results.charge();
+        self.bin.retire((open, calls, results), elements, bytes);
         if had {
             self.changed();
         }
-        self.open = None;
         (self.target, self.empty) = (self.before, true);
     }
 
@@ -1365,7 +1540,7 @@ impl LiveLog {
                     moved = true;
                 } else if !same {
                     // Its input again, another: in its place (a cut).
-                    let at = s.calls.set(k, Arc::new(fact(&input)), &s.touched);
+                    let at = s.calls.set(k, Arc::new(fact(&input)), &s.touched, &s.bin);
                     s.cut(s.calls_at() + at);
                     self.work += 1;
                     moved = true;

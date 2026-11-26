@@ -1255,6 +1255,8 @@ impl Transcript {
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
             drawn,
+            // Its log's bin carries over ([`crate::blocks::dispose`]).
+            live_log: self.live_log.renewed(),
             ..Transcript::default()
         };
         self.dirty_from = Some(0);
@@ -1352,7 +1354,7 @@ impl Transcript {
         self.push_pending(pending);
         self.response_start = None;
         // The live turn it took is the history's now.
-        self.live_log = crate::blocks::LiveLog::default();
+        self.live_log = self.live_log.renewed();
         if !self.busy {
             self.settle();
         }
@@ -1397,7 +1399,7 @@ impl Transcript {
         self.after_summary = false;
         self.cards = crate::cards::HistoryCards::default();
         self.blocks = crate::blocks::HistoryBlocks::default();
-        self.live_log = crate::blocks::LiveLog::default();
+        self.live_log = self.live_log.renewed();
         self.cards_dirty = true;
         self.recount = true;
         let notes = self.hold_events(notes, messages);
@@ -1890,7 +1892,7 @@ impl Transcript {
         self.items.drain(..n);
         // No history: no board reads the turn (a worker's), and its facts
         // would outgrow the rows they left.
-        self.live_log = crate::blocks::LiveLog::default();
+        self.live_log = self.live_log.renewed();
         self.tools.retain(|_, ix| *ix >= n);
         for ix in self.tools.values_mut() {
             *ix -= n;
