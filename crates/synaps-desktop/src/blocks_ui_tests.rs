@@ -1,8 +1,9 @@
 //! D5's desk side after Shady's review of #101 (`review-pr-desk101-shady.md`):
-//! the lease's geometry as the renderer draws it (P2-5), the edit preview's
-//! text drawn as D1 draws agent text (P2-9), a file's header (P2-10), a metric
-//! at 320 px (P2-11), the `op skipped` chip, and the lease's note readable at
-//! 320 px and every text size (decision #5). Each fails on `653c30c`.
+//! the lease's geometry as the renderer draws it (P2-5), one painted-target
+//! rule for every action (P2-6), the edit preview's text drawn as D1 draws
+//! agent text (P2-9), a file's header (P2-10), a metric at 320 px (P2-11), the
+//! `op skipped` chip, and the lease's note readable at 320 px and every text
+//! size (decision #5). Each fails on `653c30c`.
 
 use gpui_kit::{
     AnyWindowHandle, Entity, ListOffset, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext,
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use synaps_client::synthetic::{block_input, block_receipt};
 
 use super::answer_tests::{has, heard, llm};
-use super::{open_at, settle, wait};
+use super::{motion_level, open_at, settle, wait};
 use crate::app::AppView;
 use crate::turns::Kind;
 
@@ -68,6 +69,14 @@ fn row(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(u
 
 fn id(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> u64 {
     row(cx, view, name).unwrap_or_else(|| panic!("block {name} drawn")).0
+}
+
+/// A group member's row id.
+fn member(cx: &mut TestAppContext, view: &Entity<AppView>, group: u64, k: usize) -> u64 {
+    view.read_with(cx, |v, _| {
+        let (_, s) = v.block_shown(group).expect("the group drawn");
+        crate::blocks::row_id(&s.members[k].block.id)
+    })
 }
 
 fn show_block(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, name: &str) -> u64 {
@@ -143,6 +152,31 @@ fn head_at(cx: &mut TestAppContext, w: AnyWindowHandle, id: u64) -> gpui_kit::Po
     drawn(cx, w, format!("block-head {id}")).center()
 }
 
+/// Whether block row `id` (a top-level block or a member) draws folded
+/// in the pane acted on.
+fn folded(cx: &mut TestAppContext, view: &Entity<AppView>, id: u64) -> bool {
+    view.read_with(cx, |v, _| {
+        let items = v.model.lives[v.panes.cur.live].shown().items();
+        let s = v
+            .panes
+            .cur
+            .disp
+            .iter()
+            .filter_map(|d| {
+                let Kind::Block { at } = d.kind else { return None };
+                items.get(d.item)?.blocks.as_ref()?.blocks.get(at as usize).cloned()
+            })
+            .find_map(|s| {
+                if crate::blocks::row_id(&s.block.id) == id {
+                    return Some(s);
+                }
+                s.members.iter().find(|m| crate::blocks::row_id(&m.block.id) == id).cloned()
+            })
+            .expect("drawn");
+        v.panes.cur.block_folds.folded(id, &s)
+    })
+}
+
 fn note(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<(u64, &'static str)> {
     view.read_with(cx, |v, _| v.panes.cur.lease.note)
 }
@@ -205,6 +239,80 @@ fn a_wrap_only_change_above_the_pointer_waits_at_320(cx: &mut TestAppContext) {
         wait(cx, w, &view, 1000);
         assert!(!waiting(cx, &view));
     }
+}
+
+/// P2-6: `more` is an action like any other: replaced between down and
+/// up, it does nothing and says so; moved just now, it does nothing once.
+#[gpui_kit::test]
+fn more_obeys_the_painted_target(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let long = (0..200).map(|k| format!("w{k}")).collect::<Vec<_>>().join(" ");
+    let put = json!([
+        {"op":"put","id":"a","kind":"plan","body":{"steps":[{"id":"s1","label":"One","state":"todo"}]}},
+        {"op":"put","id":"n","kind":"note","body":{"text":long}}
+    ]);
+    put_mid(cx, w, &view, put);
+    let n = id(cx, &view, "n");
+    let opened = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.panes.cur.block_more.contains(&n));
+    // Replaced between down and up.
+    let at = drawn(cx, w, format!("block-more {n}")).center();
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    round(cx, w, &view, &[("toolu_r", json!([{"op":"replace","id":"n","kind":"note","body":{"text":long.clone()}}]), true)]);
+    mouse(cx, w, at, "up");
+    assert!(!opened(cx), "replaced under the press: `more` did nothing");
+    assert_eq!(note(cx, &view), Some((n, crate::lease::CHANGED)));
+    mouse(cx, w, point(px(2.), px(500.)), "move");
+    board(cx, w, &view);
+    wait(cx, w, &view, 1000);
+    // Moved just now by an agent op (the plan above it grew): nothing, once.
+    motion_level(cx, &view, crate::motion::Level::Off);
+    round(
+        cx,
+        w,
+        &view,
+        &[("toolu_g", json!([{"op":"patch","id":"a","append":{"steps":[{"id":"s2","label":"Two","state":"todo"}]}}]), true)],
+    );
+    wait(cx, w, &view, 300);
+    let at = drawn(cx, w, format!("block-more {n}")).center();
+    click(cx, w, at);
+    assert!(!opened(cx), "300 ms after it moved: nothing");
+    assert_eq!(note(cx, &view), Some((n, crate::lease::MOVED)));
+    click(cx, w, at);
+    assert!(opened(cx), "once: the next click opens it");
+}
+
+/// P2-6: a group member's header is its own target: a click folds the
+/// member, never its group; the member replaced under a held press, the
+/// release does nothing and the member says so.
+#[gpui_kit::test]
+fn a_member_is_its_own_target(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let why = show_block(cx, w, &view, "why");
+    let at_ = head_at(cx, w, why);
+    click(cx, w, at_);
+    assert!(!folded(cx, &view, why), "the group open");
+    wait(cx, w, &view, 1000);
+    let rot = member(cx, &view, why, 1);
+    let was = folded(cx, &view, rot);
+    let at_ = head_at(cx, w, rot);
+    click(cx, w, at_);
+    assert!(!folded(cx, &view, why), "the group stays open");
+    assert_ne!(folded(cx, &view, rot), was, "the member folded");
+    let at_ = head_at(cx, w, rot);
+    click(cx, w, at_);
+    assert_eq!(folded(cx, &view, rot), was);
+    // Replaced under a held press.
+    let at = head_at(cx, w, rot);
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    turn(cx, w, &view);
+    let metric = json!({"label":"rotations per 32 refreshes","value":"1.0","state":"ok"});
+    round(cx, w, &view, &[("toolu_r", json!([{"op":"replace","id":"rot","kind":"metric","body":metric}]), true)]);
+    mouse(cx, w, at, "up");
+    assert!(!folded(cx, &view, why), "the group untouched");
+    assert_eq!(folded(cx, &view, rot), was, "the replaced member untouched");
+    assert_eq!(note(cx, &view), Some((rot, crate::lease::CHANGED)), "the member says so");
 }
 
 /// P2-9: an edit preview's lines are drawn as D1 draws agent text: a

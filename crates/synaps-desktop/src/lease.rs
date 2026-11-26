@@ -16,13 +16,17 @@
 //! - **Release**: the lease's end (one timer wake, armed only while a
 //!   board waits), the pointer leaving the list, or a key. What waited
 //!   draws at once; what it moved or replaced counts as just moved.
-//! - **Painted targets**: a block's hit region is painted as its block row
-//!   and its incarnation's tag. Pointer-down takes the target, and the
-//!   press holds the lease; pointer-up acts on that same target only if
-//!   the board drawn still holds it (the same tag), else it does nothing
-//!   and the block says `this block changed · look again` until the next
-//!   input. It never redirects to whatever holds the name now.
-//! - **Just moved**: a pointer-down on a block an agent op moved (its
+//! - **Painted targets**: every action's hit region is painted as its
+//!   block row and its incarnation's tag ([`Press`]): a block's fold, a
+//!   group member's fold (the member's own row and tag, and the group it
+//!   was painted in), a note's `more`. Pointer-down takes the innermost
+//!   target, and the press holds the lease; pointer-up acts on that same
+//!   target only if the bound board still holds it (the same tag, a member
+//!   in the same group), else it does nothing and the block says `this
+//!   block changed · look again` until the next input. It never redirects
+//!   to whatever holds the name now. A release anywhere else (another
+//!   to whatever holds the name now.
+//! - **Just moved**: a pointer-down on a target an agent op moved (its
 //!   painted rect) or replaced (its tag) in the last [`JUST_MOVED`] does
 //!   nothing, once, and says `this moved just now`. "An agent op" is a
 //!   frame within [`JUST_MOVED`] of a board drawn; a slide's frames each
@@ -70,6 +74,25 @@ pub(crate) struct Target {
     pub tag: Tag,
 }
 
+/// What a press acts on (§6.2: one rule for every action).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Act {
+    /// The block's local fold.
+    Fold,
+    /// A note's `more` / `less`.
+    More,
+}
+
+/// A press's painted target: the block row it was painted as (a group's
+/// member is its own row), its action, and for a member the group it was
+/// painted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Press {
+    pub at: Target,
+    pub act: Act,
+    pub group: Option<Target>,
+}
+
 /// A block row's last paint: its rect and tag, and when an agent op last
 /// moved or replaced it.
 #[derive(Clone, Copy, Debug)]
@@ -88,7 +111,7 @@ pub(crate) struct Lease {
     /// A press taken on a block, held.
     pub pressed: bool,
     pub hover: Option<Target>,
-    pub down: Option<Target>,
+    pub down: Option<Press>,
     /// A block's note until the next input.
     pub note: Option<(u64, &'static str)>,
     pub painted: Rc<RefCell<HashMap<u64, Painted>>>,
@@ -169,6 +192,17 @@ fn shapes(r: Option<&Arc<RowBlocks>>, g: &Geom) -> u64 {
 fn find(d: &Drawn, row: u64) -> Option<(u64, usize, &Shown)> {
     d.rows.iter().find_map(|(item, rb)| {
         rb.blocks.iter().enumerate().find(|(_, s)| crate::blocks::row_id(&s.block.id) == row).map(|(j, s)| (*item, j, s))
+    })
+}
+
+/// Block row `row` on board `d`, a top-level block or a group's member,
+/// and for a member its group.
+pub(crate) fn find_any(d: &Drawn, row: u64) -> Option<(&Shown, Option<&Shown>)> {
+    d.rows.values().flat_map(|rb| rb.blocks.iter()).find_map(|s| {
+        if crate::blocks::row_id(&s.block.id) == row {
+            return Some((s, None));
+        }
+        s.members.iter().find(|m| crate::blocks::row_id(&m.block.id) == row).map(|m| (m, Some(s)))
     })
 }
 
@@ -354,10 +388,11 @@ impl AppView {
         });
     }
 
-    /// Pointer-down on block row `row` painted as `tag`: the target taken
-    /// and the lease held, or, just moved, nothing (once).
-    pub(crate) fn block_down(&mut self, pane: PaneId, row: u64, tag: Tag, cx: &mut Context<Self>) {
+    /// Pointer-down on press target `press`: the target taken and the
+    /// lease held, or, just moved, nothing (once).
+    pub(crate) fn block_down(&mut self, pane: PaneId, press: Press, cx: &mut Context<Self>) {
         let now = self.fx.now();
+        let row = press.at.row;
         self.in_pane(pane, |this| {
             let l = &mut this.panes.cur.lease;
             l.note = None;
@@ -370,29 +405,42 @@ impl AppView {
                 l.note = Some((row, MOVED));
                 return;
             }
-            l.down = Some(Target { row, tag });
+            l.down = Some(press);
             l.pressed = true;
             l.moved = Some(now);
         });
         cx.notify();
     }
 
-    /// Pointer-up on block row `row`: the press's target, if it is this one
-    /// and the board drawn still holds it, folds or unfolds (§3.5: local);
-    /// else nothing, and the note.
-    pub(crate) fn block_up(&mut self, pane: PaneId, row: u64, cx: &mut Context<Self>) {
+    /// Pointer-up on block row `row`'s `act`: the press's target, if it is
+    /// this one and the bound board still holds it (a member in the same
+    /// group), acts (§3.5: local); else nothing, and the note.
+    pub(crate) fn block_up(&mut self, pane: PaneId, row: u64, act: Act, cx: &mut Context<Self>) {
         self.in_pane(pane, |this| {
             let l = &mut this.panes.cur.lease;
             l.pressed = false;
-            let Some(down) = l.down.take().filter(|d| d.row == row) else { return };
+            let Some(down) = l.down.take().filter(|d| d.at.row == row && d.act == act) else { return };
             // The bound board now: the newest, drawn or waiting.
-            let bound = match &this.model.lives[this.panes.cur.live].board.waiting {
-                Some(d) => find(d, row).and_then(|(_, _, s)| s.bound.as_ref().map(|b| b.tag)),
-                None => this.block_shown(row).and_then(|(_, s)| s.bound.as_ref().map(|b| b.tag)),
-            };
-            match this.block_shown(row) {
-                Some((ix, s)) if bound == Some(down.tag) => {
-                    this.panes.cur.block_folds.toggle(row, &s);
+            let live = &this.model.lives[this.panes.cur.live];
+            let board = live.board.waiting.clone().or_else(|| live.transcript.drawn().cloned());
+            let found = board.as_deref().and_then(|d| find_any(d, row)).map(|(s, g)| {
+                let tag = |s: &Shown| s.bound.as_ref().map(|b| b.tag);
+                let group = g.map(|g| (crate::blocks::row_id(&g.block.id), tag(g)));
+                (tag(s), group)
+            });
+            let held = found.is_some_and(|(tag, group)| tag == Some(down.at.tag) && group == down.group.map(|g| (g.row, Some(g.tag))));
+            // Drawn now in this pane: its list row (a member's is its group's).
+            let shown = this.block_drawn(row);
+            match shown {
+                Some((ix, s)) if held => {
+                    match act {
+                        Act::Fold => this.panes.cur.block_folds.toggle(row, &s),
+                        Act::More => {
+                            if !this.panes.cur.block_more.remove(&row) {
+                                this.panes.cur.block_more.insert(row);
+                            }
+                        }
+                    }
                     this.panes.cur.list.remeasure_items(ix..ix + 1);
                 }
                 _ => this.panes.cur.lease.note = Some((row, CHANGED)),

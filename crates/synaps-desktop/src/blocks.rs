@@ -411,9 +411,10 @@ impl AppView {
         let folded = self.panes.cur.block_folds.folded(id, s);
         let streaming = self.model.lives[self.panes.cur.live].shown().busy();
         let head = self.block_head(s, id, p.card_d, folded, streaming, fit, &g, p, m, cx);
-        let body = (!folded).then(|| self.block_body(s, id, streaming, fit, &g, p, m, cx));
+        let body = (!folded).then(|| self.block_body(s, id, None, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
         let tag = s.block.tag;
+        let press = crate::lease::Press { at: crate::lease::Target { row: id, tag }, act: crate::lease::Act::Fold, group: None };
         let el = div()
             .id(("block", id))
             .debug_selector(move || format!("block {id}"))
@@ -430,8 +431,8 @@ impl AppView {
             .children(body)
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, id, tag, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, cx)));
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
         crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element()
     }
 
@@ -680,6 +681,7 @@ impl AppView {
         &self,
         s: &Shown,
         id: u64,
+        group: Option<crate::lease::Target>,
         streaming: bool,
         fit: Fit,
         g: &Geo,
@@ -824,6 +826,10 @@ impl AppView {
                     .text_color(text_c)
                     .children(crate::detail::lines(&shown).into_iter().map(|l| crate::ask::detail_line(l, p, m)));
                 let pane = self.panes.cur.id;
+                // `more` is an action like any other (§6.2): its painted
+                // target, taken at down, checked at up.
+                let press =
+                    crate::lease::Press { at: crate::lease::Target { row: id, tag: s.block.tag }, act: crate::lease::Act::More, group };
                 v_flex()
                     .w_full()
                     .pb(pb)
@@ -840,7 +846,20 @@ impl AppView {
                                 .cursor_pointer()
                                 .debug_selector(move || format!("block-more {id}"))
                                 .child(if cut { "more" } else { "less" })
-                                .on_click(cx.listener(move |this, _, _, cx| this.block_more(pane, id, cx))),
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.block_down(pane, press, cx);
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.block_up(pane, id, press.act, cx);
+                                    }),
+                                ),
                         )
                     })
                     .into_any_element()
@@ -905,17 +924,43 @@ impl AppView {
             }
             Body::Group(_) => {
                 let mut col = v_flex().w_full().pb(pb).gap(px(4.)).debug_selector(move || format!("block-members {id}"));
+                let pane = self.panes.cur.id;
+                let group = crate::lease::Target { row: id, tag: s.block.tag };
                 for mshown in &s.members {
                     let mid = row_id(&mshown.block.id);
                     let folded = self.panes.cur.block_folds.folded(mid, mshown);
+                    // A member is its own target (§6.2): its fold, never
+                    // its group's; its group the one it was painted in.
+                    let mtag = mshown.block.tag;
+                    let press = crate::lease::Press {
+                        at: crate::lease::Target { row: mid, tag: mtag },
+                        act: crate::lease::Act::Fold,
+                        group: Some(group),
+                    };
                     col = col.child(
                         v_flex()
+                            .relative()
                             .w_full()
                             .pl(px(g.pad))
                             .bg(p.well_d)
                             .debug_selector(move || format!("block-member {id} {mid}"))
                             .child(self.block_head(mshown, mid, p.well_d, folded, streaming, fit, g, p, m, cx))
-                            .children((!folded).then(|| self.block_body(mshown, mid, streaming, fit, g, p, m, cx))),
+                            .children((!folded).then(|| self.block_body(mshown, mid, Some(group), streaming, fit, g, p, m, cx)))
+                            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.block_down(pane, press, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.block_up(pane, mid, press.act, cx);
+                                }),
+                            ),
                     );
                 }
                 col.into_any_element()
@@ -1055,16 +1100,18 @@ impl AppView {
         Some((ix, s))
     }
 
-    /// `more` or `less` on a note.
-    pub(crate) fn block_more(&mut self, pane: crate::pane::PaneId, id: u64, cx: &mut Context<Self>) {
-        self.in_pane(pane, |this| {
-            if !this.panes.cur.block_more.remove(&id) {
-                this.panes.cur.block_more.insert(id);
-            }
-            if let Some(ix) = this.panes.cur.disp.iter().position(|d| d.id == id) {
-                this.panes.cur.list.remeasure_items(ix..ix + 1);
-            }
-        });
-        cx.notify();
+    /// Block row `id` as drawn in this pane now, a top-level block or a
+    /// group's member, and the list index of its row (a member's: its
+    /// group's).
+    pub(crate) fn block_drawn(&self, id: u64) -> Option<(usize, Shown)> {
+        if let Some(found) = self.block_shown(id) {
+            return Some(found);
+        }
+        let items = self.model.lives[self.panes.cur.live].shown().items();
+        self.panes.cur.disp.iter().enumerate().find_map(|(ix, d)| {
+            let Kind::Block { at } = d.kind else { return None };
+            let s = items.get(d.item)?.blocks.as_deref()?.blocks.get(at as usize)?;
+            s.members.iter().find(|m| row_id(&m.block.id) == id).map(|m| (ix, m.clone()))
+        })
     }
 }
