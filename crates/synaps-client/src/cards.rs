@@ -197,38 +197,144 @@ fn result_text(content: &Value) -> Option<String> {
     }
 }
 
-/// What each row draws: the history's fold, then the live rows (`live`,
-/// the rows after the history's) read on top, in the order their events
-/// came. By row id; and that fold.
-pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> (HashMap<u64, CardRow>, Fold) {
-    // The live events, each with its place in the stream: a call once its
-    // input is whole (the history never holds a call that is still
-    // streaming), a card call's result (no other binds: it is nothing to
-    // the fold), the user message that started a turn.
-    let mut events: Vec<(u64, Event, Option<u64>)> = Vec::new();
-    for it in live.iter().filter(|i| !i.is_note()) {
-        let [came, reported] = it.seq();
-        match it.kind {
-            ItemKind::Tool => {
-                let Some(t) = it.tool.as_ref().filter(|t| !t.tool_id.is_empty() && t.status != Some(ToolStatus::Streaming)) else {
-                    continue;
-                };
-                let card = is_card_tool(&t.name);
-                let input = if card { it.card_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
-                events.push((came, Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input }, Some(it.id)));
-                if card && t.status.is_some_and(ToolStatus::is_terminal) {
-                    events.push((reported, Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() }, None));
-                }
+/// A live row's events, each with its place in the stream: a call once
+/// its input is whole (the history never holds a call that is still
+/// streaming), a card call's result (no other binds: it is nothing to the
+/// fold), the user message that started a turn.
+fn row_events(it: &Item) -> Vec<(u64, Event)> {
+    let mut out = Vec::new();
+    if it.is_note() {
+        return out;
+    }
+    let [came, reported] = it.seq();
+    match it.kind {
+        ItemKind::Tool => {
+            let Some(t) = it.tool.as_ref().filter(|t| !t.tool_id.is_empty() && t.status != Some(ToolStatus::Streaming)) else {
+                return out;
+            };
+            let card = is_card_tool(&t.name);
+            let input = if card { it.card_input().cloned().unwrap_or(Value::Null) } else { Value::Null };
+            out.push((came, Event::Call { tool_id: t.tool_id.clone(), name: t.name.clone(), input }));
+            if card && t.status.is_some_and(ToolStatus::is_terminal) {
+                out.push((reported, Event::Result { tool_id: t.tool_id.clone(), text: t.result.clone() }));
             }
-            ItemKind::User => events.push((came, Event::User { text: it.text.clone() }, Some(it.id))),
-            _ => {}
         }
+        ItemKind::User => out.push((came, Event::User { text: it.text.clone() })),
+        _ => {}
     }
-    events.sort_by_key(|(at, ..)| *at);
-    let mut read = history.clone();
-    for (_, e, row) in &events {
-        read.push(e, *row);
+    out
+}
+
+/// The row an event of row `id` is drawn on: a result's, none.
+fn drawn_on(e: &Event, id: u64) -> Option<u64> {
+    (!matches!(e, Event::Result { .. })).then_some(id)
+}
+
+/// The cards the rows draw: the history's fold, then the live rows read on
+/// top, in the order their events came. Kept between syncs, it reads only
+/// the rows that changed ([`LiveCards::step`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LiveCards {
+    read: HistoryCards,
+    /// Each live row's events read, by row id.
+    seen: HashMap<u64, Vec<(u64, Event)>>,
+    /// The place of the last live event read (0: none).
+    last: u64,
+    /// What each row draws, by row id.
+    pub(crate) want: HashMap<u64, CardRow>,
+    /// Where each row that draws a card was when it was drawn (it may have
+    /// moved since: the caller checks).
+    pub(crate) at: HashMap<u64, usize>,
+}
+
+/// What a [`LiveCards::step`] changed.
+pub(crate) struct Step {
+    /// The fold's cards.
+    pub(crate) cards: bool,
+    /// The rows whose card changed, by id.
+    pub(crate) rows: Vec<u64>,
+}
+
+impl LiveCards {
+    /// The history's fold, then the live rows (`live`, the rows after the
+    /// history's).
+    pub(crate) fn of(history: &HistoryCards, live: &[Item]) -> Self {
+        let mut events: Vec<(u64, Event, Option<u64>)> = Vec::new();
+        let mut seen = HashMap::new();
+        for it in live {
+            let e = row_events(it);
+            if !e.is_empty() {
+                events.extend(e.iter().map(|(at, e)| (*at, e.clone(), drawn_on(e, it.id))));
+                seen.insert(it.id, e);
+            }
+        }
+        events.sort_by_key(|(at, ..)| *at);
+        let mut read = history.clone();
+        for (_, e, row) in &events {
+            read.push(e, *row);
+        }
+        let last = events.last().map_or(0, |(at, ..)| *at);
+        let want = want(&read);
+        LiveCards { read, seen, last, want, at: HashMap::new() }
     }
+
+    /// The fold the rows draw.
+    pub(crate) fn fold(&self) -> &Fold {
+        &self.read.fold
+    }
+
+    /// Read what `rows` (live rows that may have changed since) have new:
+    /// events that came after every one read, read on top. `None` if a row
+    /// changed otherwise (an event read is gone or different, or a new one
+    /// came before one read): read them all again ([`LiveCards::of`]).
+    pub(crate) fn step<'a>(&mut self, rows: impl IntoIterator<Item = &'a Item>) -> Option<Step> {
+        let mut new: Vec<(u64, Event, Option<u64>)> = Vec::new();
+        for it in rows {
+            let now = row_events(it);
+            let had = self.seen.get(&it.id).map_or(0, Vec::len);
+            if now.len() < had || self.seen.get(&it.id).is_some_and(|h| h[..] != now[..had]) {
+                return None;
+            }
+            for (at, e) in &now[had..] {
+                if *at <= self.last {
+                    return None;
+                }
+                new.push((*at, e.clone(), drawn_on(e, it.id)));
+            }
+            if now.len() > had {
+                self.seen.insert(it.id, now);
+            }
+        }
+        new.sort_by_key(|(at, ..)| *at);
+        // Another tool's call changes no card (it takes its tool id over:
+        // a card still pending there turns plain, the one case it does).
+        let mut before = None;
+        for (at, e, row) in &new {
+            let inert = match e {
+                Event::Call { tool_id, name, .. } => {
+                    !is_card_tool(name) && !self.read.fold.card(tool_id).is_some_and(|c| c.state == State::Pending)
+                }
+                _ => false,
+            };
+            if !inert && before.is_none() {
+                before = Some(self.read.fold.cards().to_vec());
+            }
+            self.read.push(e, *row);
+            self.last = *at;
+        }
+        let Some(before) = before else {
+            return Some(Step { cards: false, rows: Vec::new() });
+        };
+        let want = want(&self.read);
+        let mut rows: Vec<u64> = want.iter().filter(|(id, c)| self.want.get(id) != Some(c)).map(|(id, _)| *id).collect();
+        rows.extend(self.want.keys().filter(|id| !want.contains_key(id)));
+        self.want = want;
+        Some(Step { cards: before != self.read.fold.cards(), rows })
+    }
+}
+
+/// What each row draws of `read`'s fold, by row id.
+fn want(read: &HistoryCards) -> HashMap<u64, CardRow> {
     let row = |at: usize| read.rows.get(at).copied().flatten();
     let mut out = HashMap::new();
     for c in read.fold.cards() {
@@ -253,7 +359,7 @@ pub(crate) fn rows(history: &HistoryCards, live: &[Item]) -> (HashMap<u64, CardR
     for (r, doc) in &read.closes {
         out.insert(*r, CardRow::Close(Closed { doc: doc.clone() }));
     }
-    (out, read.fold)
+    out
 }
 
 #[cfg(test)]
