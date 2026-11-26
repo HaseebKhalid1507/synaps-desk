@@ -1206,10 +1206,11 @@ fn an_edits_block_draws_its_files_lines_only(cx: &mut TestAppContext) {
 
 /// Shady #101 R2-1: a tab's cached bytes hold its block calls' inputs as
 /// its rows and its board's journal keep them, heap included, so the tab
-/// cache's budget holds. 160 block calls with inputs near the 8 KiB limit:
-/// under a 1 MiB budget the tab goes from the cache when it is left; under
-/// one that holds it, it stays, counted at least twice its inputs (the
-/// rows' copy and the journal's).
+/// cache's budget holds. 160 block calls with inputs near the 8 KiB limit
+/// are held three times at least: the tool row's preview of each (4 KiB
+/// at most), the row's whole input, and the board journal's. Under a
+/// 3 MiB budget the tab goes from the cache when it is left; under one
+/// that holds it, it stays, counted at least three times its inputs.
 #[gpui_kit::test]
 fn a_tabs_block_inputs_count_against_the_cache_budget(cx: &mut TestAppContext) {
     let pad = "q".repeat(6_000);
@@ -1227,7 +1228,7 @@ fn a_tabs_block_inputs_count_against_the_cache_budget(cx: &mut TestAppContext) {
     }
     let payload = n * pad.len();
     let sid = crate::demo::BLOCKS.to_string();
-    for (budget, kept) in [(1usize << 20, false), (64 << 20, true)] {
+    for (budget, kept) in [(3usize << 20, false), (64 << 20, true)] {
         let (w, view) = blocks(cx, 1500.);
         land(cx, w, &view, msgs.clone());
         board(cx, w, &view);
@@ -1236,7 +1237,7 @@ fn a_tabs_block_inputs_count_against_the_cache_budget(cx: &mut TestAppContext) {
         let (has, bytes) = view.read_with(cx, |v, _| (v.tab_cache.contains(&sid), v.tab_cache.bytes()));
         assert_eq!(has, kept, "a {budget}-byte budget: {bytes} bytes cached");
         if kept {
-            assert!(bytes >= 2 * payload, "{bytes} bytes counted for {payload} of inputs");
+            assert!(bytes >= 3 * payload, "{bytes} bytes counted for {payload} of inputs");
         }
     }
 }
