@@ -12,7 +12,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 use synaps_client::synthetic::{block_input, block_receipt};
 
-use super::answer_tests::{has, heard, land, llm};
+use super::answer_tests::{attachment, has, heard, land, llm};
 use super::{motion_level, open_at, settle, wait};
 use crate::app::AppView;
 use crate::turns::Kind;
@@ -1322,6 +1322,69 @@ fn cached_boards_are_counted_and_go_whole_past_the_budget(cx: &mut TestAppContex
     assert!(!has_a && has_b, "past the budget the oldest goes: A {has_a}, B {has_b}, {bytes} bytes");
     wait(cx, w, &view, 200);
     assert!(worker.upgrade().is_none() && drawn.upgrade().is_none(), "A's worker and board let go with it");
+}
+
+/// Shady #101 R4-2: a reset, and the tab left before any job reads its
+/// log again (cached in the same frame: its board's work cancelled,
+/// nothing drained). The reset's calls' inputs, their rows gone, are the
+/// disposer's, counted there (gated here: all alive, the event done); the
+/// cached transcript keeps none of them: the gate open, none outlives its
+/// row while the tab stays cached.
+#[gpui_kit::test]
+fn a_tab_cached_right_after_a_reset_keeps_none_of_its_inputs(cx: &mut TestAppContext) {
+    use synaps_client::blocks::dispose;
+    let (w, view) = blocks(cx, 1500.);
+    let a = crate::demo::BLOCKS.to_string();
+    let (n, pad) = (60, "r".repeat(4_000));
+    let mut events = vec![
+        json!({"ev": "turn_started", "turn_baseline": 40, "trigger": "user", "user_text": "go"}),
+        llm(json!({"kind": "llm", "llm": "response_start"})),
+    ];
+    for k in 0..n {
+        let id = format!("toolu_z{k}");
+        let ops = json!([{"op":"put","id":format!("z{k}"),"kind":"note","body":{"text":pad}}]);
+        events.push(llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
+        events.push(llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": id, "input": block_input(ops)})));
+    }
+    heard(cx, w, &view, events);
+    board(cx, w, &view);
+    let inputs: Vec<std::sync::Weak<Value>> = view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        let calls = t.items().iter().filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id.starts_with("toolu_z")));
+        calls.filter_map(|i| i.kept_allocation()).map(std::sync::Arc::downgrade).collect()
+    });
+    assert_eq!(inputs.len(), n, "the live calls' inputs");
+    let gate = dispose::gate();
+    // The reset, and the tab left in the same frame: no job between.
+    let (seq, sid) = attachment(cx, &view);
+    let client = view.update(cx, |v, cx| {
+        let e = llm(json!({"kind": "llm", "llm": "response_reset"}));
+        let ev = synaps_client::protocol::decode_event(&e).expect("a reset");
+        v.apply_batch(vec![synaps_client::Event::session(seq, sid, 0, ev, std::sync::Arc::new(e))], cx);
+        let c = v.client.take();
+        v.open_tab(crate::app::Open::Attach { session_id: crate::demo::SID.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    assert!(view.read_with(cx, |v, _| v.tab_cache.contains(&a)), "the tab cached");
+    let alive = inputs.iter().filter(|i| i.strong_count() > 0).count();
+    assert_eq!(alive, n, "the gate shut: the reset's inputs held, none dropped before the frame went on");
+    let (_, _, held) = gate.held();
+    let mut wrong = Vec::new();
+    if held < n * pad.len() {
+        wrong.push(format!("the reset's {n} inputs ({} bytes, their rows gone) counted {held}", n * pad.len()));
+    }
+    drop(gate);
+    dispose::flush();
+    assert!(view.read_with(cx, |v, _| v.tab_cache.contains(&a)), "still cached");
+    let alive = inputs.iter().filter(|i| i.strong_count() > 0).count();
+    if alive > 0 {
+        wrong.push(format!("the cached tab keeps {alive} of the reset's inputs"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Session `sid` in a new tab of the pane acted on, shown.
