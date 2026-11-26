@@ -7,8 +7,9 @@
 //!   (SynapsCLI #462): what its own requests show about the prompt cache,
 //!   evidence and not provider state. `warm` counts down from receipt,
 //!   "about", in a neutral colour; at zero it reads as the amber band (may
-//!   have expired) and the daemon is asked once more. Also asked on any
-//!   setting change, and once more on `stale`. A daemon that can't answer
+//!   have expired) and the daemon is asked once more: once per countdown
+//!   (a `warm` of zero seconds starts none). Also asked on any setting
+//!   change, and once more on `stale`. A daemon that can't answer
 //!   it shows `—`, never `cold`.
 //! - **Keep-warm** ([`Warm`]): the session's `Status` (`keepwarm`,
 //!   `pinned`): mode, pin, pings, spend and next ping.
@@ -192,13 +193,19 @@ impl Warm {
 pub(crate) struct Expiry {
     pub at: Age,
     pub answer: Result<CacheExpiry, QueryError>,
-    /// The `warm` countdown reached zero and the daemon was asked once more.
-    pub asked_at_zero: bool,
+    /// The daemon is asked once more when the `warm` countdown reaches zero
+    /// ([`Expiry::zero_at`]): a countdown of its own (`warm_for_secs` above
+    /// zero), not asked yet. Spent by that ask, and never set again by an
+    /// answer with nothing left to count: SynapsCLI says `warm` with `0`
+    /// through the last second, and asking at each of those is a loop
+    /// (Shady #100 F1).
+    pub zero: bool,
 }
 
 impl Expiry {
     pub fn new(answer: Result<CacheExpiry, QueryError>, at: Moment) -> Expiry {
-        Expiry { at: Age::new(at), answer, asked_at_zero: false }
+        let zero = answer.as_ref().is_ok_and(|c| c.state == CacheState::Warm && c.warm_for_secs.is_some_and(|s| s > 0));
+        Expiry { at: Age::new(at), answer, zero }
     }
 
     /// `warm`: what is left of `warm_for_secs` now (zero: the band).
@@ -237,12 +244,9 @@ impl Expiry {
     }
 
     /// When the `warm` countdown reaches zero (the daemon is asked once
-    /// more then); `None` once it was.
+    /// more then); `None`: no countdown of its own, or asked already.
     pub fn zero_at(&self, now: Moment) -> Option<Instant> {
-        if self.asked_at_zero {
-            return None;
-        }
-        self.warm_left(now).map(|d| now.mono + d)
+        self.warm_left(now).filter(|_| self.zero).map(|d| now.mono + d)
     }
 }
 
@@ -468,8 +472,12 @@ mod tests {
         assert_eq!(e.next_change(zero), None, "nothing ticks at zero");
         let mut e = expiry(json!({"state": "warm", "warm_for_secs": 222}), t0);
         assert_eq!(e.zero_at(t0), Some(t0.mono + Duration::from_secs(222)));
-        e.asked_at_zero = true;
+        e.zero = false;
         assert_eq!(e.zero_at(t0), None, "asked once");
+        // A `warm` with nothing left to count (its last second): no zero of
+        // its own to ask at.
+        let e = expiry(json!({"state": "warm", "warm_for_secs": 0}), t0);
+        assert_eq!((says(&expires(Some(&e), true, t0)), e.zero_at(t0)), (("expired?", Tone::Warn), None));
         // Never extended: the answer's lapse is no timer.
         let band = expiry(json!({"state": "unknown", "reason": "may_have_expired", "lapse_by_secs": 2400}), t0);
         assert_eq!((band.next_change(t0), band.zero_at(t0)), (None, None));

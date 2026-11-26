@@ -5061,7 +5061,7 @@ impl AppView {
                         v.panel_asks.push((seq, "cache_expiry"));
                         // Its answer counts down afresh.
                         if let Some(e) = stats.expiry.as_mut() {
-                            e.asked_at_zero = true;
+                            e.zero = false;
                         }
                     }
                     if let Some(w) = stats.warm.as_mut() {
@@ -5069,10 +5069,10 @@ impl AppView {
                     }
                 } else if zero.is_some_and(|z| now.mono >= z)
                     && let (Some(c), Some(seq)) = (&v.client, seq)
-                    && let Some(e) = v.model.lives[v.panes.cur.live].stats.expiry.as_mut().filter(|e| !e.asked_at_zero)
+                    && let Some(e) = v.model.lives[v.panes.cur.live].stats.expiry.as_mut().filter(|e| e.zero)
                 {
                     // The countdown reached zero: the band, and once more.
-                    e.asked_at_zero = true;
+                    e.zero = false;
                     let _ = c.on(seq).cache_expiry();
                     #[cfg(test)]
                     v.panel_asks.push((seq, "cache_expiry"));

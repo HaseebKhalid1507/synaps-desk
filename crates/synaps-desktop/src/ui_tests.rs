@@ -9571,3 +9571,72 @@ fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
     show(cx, false, None, true);
     assert!(VisualTestContext::from_window(window, cx).debug_bounds("right-cache").is_none());
 }
+
+/// The right panel's cache tests' window (Shady #100): the demo session
+/// attached, its daemon answering `cache_expiry`, nothing asked yet. The
+/// window, its view, its client's events (kept) and the attachment.
+fn cache_panel(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>, u64) {
+    let (window, view, events) = open(cx);
+    let seq = view.update(cx, |v, cx| {
+        v.model.cache_expiry = true;
+        v.model.expiry_query = true;
+        cx.notify();
+        v.model.lives[v.panes.cur.live].attachment().expect("the demo session attached")
+    });
+    settle(cx, window, 8);
+    view.update(cx, |v, _| v.panel_asks.clear());
+    (window, view, events, seq)
+}
+
+/// `evs` from the client, as its pump hands them over, and drawn.
+fn deliver(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, evs: Vec<synaps_client::Event>) {
+    view.update(cx, |v, cx| v.apply_batch(evs, cx));
+    settle(cx, w, 8);
+}
+
+/// The daemon's `cache_expiry` reply `v` to attachment `seq`.
+fn cache_reply(seq: u64, v: serde_json::Value) -> synaps_client::Event {
+    let reply = match synaps_client::decode_query_reply(&v) {
+        Ok(c) => synaps_client::CacheExpiryReply::Answer(c),
+        Err(e) => synaps_client::CacheExpiryReply::Error(e),
+    };
+    synaps_client::Event::CacheExpiry { attach_seq: seq, reply }
+}
+
+/// `secs` go by on this machine's clocks, a second at a time: the right
+/// panel's ([`crate::warm::skew`]) and the test's ([`wait`]), what fell
+/// due each second fired and drawn.
+fn pass(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, secs: u64) {
+    for _ in 0..secs {
+        crate::warm::skew(std::time::Duration::from_secs(1), std::time::Duration::from_secs(1));
+        wait(cx, w, view, 1000);
+    }
+}
+
+/// The right panel's asks since the last look, and none kept.
+fn panel_asks(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<(u64, &'static str)> {
+    view.update(cx, |v, _| std::mem::take(&mut v.panel_asks))
+}
+
+/// Shady #100 F1: the countdown's zero asks once. A `warm` answer whose
+/// last second is under way (`warm_for_secs: 0`, a valid answer of
+/// SynapsCLI #462's) starts no countdown of its own: however many come,
+/// nothing more is asked until a positive one does.
+#[gpui_kit::test]
+fn a_warm_zero_answer_does_not_ask_again(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    assert_eq!(panel_asks(cx, &view), []);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero: once");
+    for k in 0..4 {
+        deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 0}))]);
+        pass(cx, window, &view, 1);
+        assert_eq!(panel_asks(cx, &view), [], "warm-zero answer {k}: nothing more");
+    }
+    // A positive answer (a ping moved the anchor): its own zero, once.
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")]);
+}
