@@ -17,8 +17,9 @@
 //! `bash` calls wrote, as far as their command text says ([`crate::shell`]),
 //! without line counts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use synaps_client::transcript::{ToolOutcome, tool_result_outcome};
@@ -164,6 +165,8 @@ struct Change {
 /// One file tool call, analysed once.
 #[derive(Debug)]
 struct Analysed {
+    /// When it was first seen: the calls' order.
+    seq: u64,
     preview: Arc<Preview>,
     /// Per file.
     changes: Vec<Change>,
@@ -185,8 +188,91 @@ pub struct CallDelta {
     pub written: u32,
 }
 
+/// An edit preview (blocks.md §1.5) keeps this many calls of a file, at
+/// most this many lines in all, a line at most this many characters.
+pub const EDIT_CALLS: usize = 12;
+pub const EDIT_LINES: usize = 120;
+pub const EDIT_LINE_CHARS: usize = 160;
+
+/// A file's successful file tool calls, for its edit preview: the newest
+/// [`EDIT_CALLS`] in call order, how many earlier ones there were, and the
+/// preview they make. Kept as each call commits ([`Ledger::edits`]): no
+/// preview reads the history, and a draw only takes the finished one.
+#[derive(Clone, Debug, Default)]
+pub struct Edits {
+    pub recent: VecDeque<Edit>,
+    pub earlier: usize,
+    pub preview: Arc<EditPreview>,
+}
+
+/// One call's part of an edit preview: its diff preview (the call's, shared)
+/// and, a `write`, the lines it wrote.
+#[derive(Clone, Debug)]
+pub struct Edit {
+    seq: u64,
+    pub preview: Arc<Preview>,
+    pub written: Option<u32>,
+}
+
+/// An edit preview as drawn (§1.5): a group per call in call order, and
+/// how many earlier calls folded away.
+#[derive(Clone, Debug, Default)]
+pub struct EditPreview {
+    pub groups: Vec<EditGroup>,
+    pub earlier: usize,
+}
+
+/// One call's group of an edit preview: its lines as requested.
+#[derive(Clone, Debug)]
+pub struct EditGroup {
+    pub lines: Vec<DiffLine>,
+    /// A `write`: "N lines written", no old side.
+    pub written: Option<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Edit previews built ([`Edits::preview`]; tests: when they are).
+    pub static EDIT_PREVIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Edits {
+    /// The preview of its calls: the newest of them, at most
+    /// [`EDIT_LINES`] lines in all, the oldest kept ones folding first.
+    fn project(&self) -> EditPreview {
+        #[cfg(test)]
+        EDIT_PREVIEWS.with(|n| n.set(n.get() + 1));
+        let mut earlier = self.earlier;
+        let mut kept: Vec<&Edit> = self.recent.iter().collect();
+        while kept.len() > 1 && kept.iter().map(|e| e.preview.lines.len()).sum::<usize>() > EDIT_LINES {
+            kept.remove(0);
+            earlier += 1;
+        }
+        let groups = kept
+            .iter()
+            .map(|e| {
+                let lines = e
+                    .preview
+                    .lines
+                    .iter()
+                    .take(EDIT_LINES)
+                    .map(|l| match l.text.chars().count() > EDIT_LINE_CHARS {
+                        true => DiffLine { text: l.text.chars().take(EDIT_LINE_CHARS).collect::<String>().into(), ..l.clone() },
+                        false => l.clone(),
+                    })
+                    .collect();
+                EditGroup { lines, written: e.written }
+            })
+            .collect();
+        EditPreview { groups, earlier }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
+    /// This session's ledger: another for every other session (a cache
+    /// keyed by `(id, generation)` is never another session's).
+    id: u64,
     files: Vec<FileStat>,
     index: HashMap<String, usize>,
     /// Tool calls waiting for their result.
@@ -205,6 +291,10 @@ pub struct Ledger {
     committed: HashMap<String, CallDelta>,
     /// Bumped whenever `committed` changes (a reset included).
     generation: u64,
+    /// Calls seen so far: the next call's `seq`.
+    seq: u64,
+    /// Each file's edits ([`Edits`]), by path.
+    edits: HashMap<String, Edits>,
     cwd: Option<String>,
     added: u32,
     removed: u32,
@@ -220,13 +310,16 @@ impl Ledger {
     /// Start over from a whole history (attach, replacement). `same`: the
     /// same session as before, whose analysed calls are reused.
     pub fn reset(&mut self, messages: &[Value], cwd: Option<&str>, same: bool) {
+        static IDS: AtomicU64 = AtomicU64::new(1);
         let (calls, shell_calls) =
             if same { (std::mem::take(&mut self.calls), std::mem::take(&mut self.shell_calls)) } else { Default::default() };
         *self = Ledger {
+            id: if same && self.id != 0 { self.id } else { IDS.fetch_add(1, Ordering::Relaxed) },
             cwd: cwd.map(|c| c.trim_end_matches(['/', '\\']).to_string()).filter(|c| !c.is_empty()),
             calls,
             shell_calls,
             generation: self.generation + 1,
+            seq: self.seq,
             ..Ledger::default()
         };
         self.append(messages);
@@ -259,14 +352,19 @@ impl Ledger {
                             let skipped =
                                 if call.ops.is_empty() { Vec::new() } else { skipped_ops(b.get("content").unwrap_or(&Value::Null)) };
                             let mut delta = CallDelta::default();
-                            if skipped.is_empty() {
-                                for c in &call.changes {
-                                    self.commit(c, &mut delta);
-                                }
+                            let changes: Vec<&Change> = if skipped.is_empty() {
+                                call.changes.iter().collect()
                             } else {
-                                for (_, c) in call.ops.iter().filter(|(i, _)| !skipped.contains(i)) {
-                                    self.commit(c, &mut delta);
-                                }
+                                call.ops.iter().filter(|(i, _)| !skipped.contains(i)).map(|(_, c)| c).collect()
+                            };
+                            for c in &changes {
+                                self.commit(c, &mut delta);
+                            }
+                            let written = changes.iter().all(|c| c.kind == FileKind::Written).then_some(call.preview.added);
+                            let mut paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+                            paths.dedup();
+                            for p in paths {
+                                self.record(p, Edit { seq: call.seq, preview: call.preview.clone(), written });
                             }
                             self.committed.insert(id.to_string(), delta);
                             self.generation += 1;
@@ -304,9 +402,48 @@ impl Ledger {
                 [one] => one.path.clone(),
                 [first, rest @ ..] => format!("{} +{} files", first.path, rest.len()),
             };
-            self.calls.insert(id.to_string(), Arc::new(Analysed { preview: Arc::new(preview), changes, ops }));
+            self.seq += 1;
+            self.calls.insert(id.to_string(), Arc::new(Analysed { seq: self.seq, preview: Arc::new(preview), changes, ops }));
         }
         self.pending.insert(id.to_string());
+    }
+
+    /// A call that succeeded on `path`: its file's edits, the newest
+    /// [`EDIT_CALLS`] in call order kept.
+    fn record(&mut self, path: &str, e: Edit) {
+        let f = self.edits.entry(path.to_string()).or_default();
+        if f.recent.len() == EDIT_CALLS && f.recent.front().is_some_and(|o| o.seq > e.seq) {
+            f.earlier += 1;
+        } else {
+            let at = f.recent.partition_point(|o| o.seq < e.seq);
+            f.recent.insert(at, e);
+            if f.recent.len() > EDIT_CALLS {
+                f.recent.pop_front();
+                f.earlier += 1;
+            }
+        }
+        f.preview = Arc::new(f.project());
+    }
+
+    /// File `file`'s edits ([`Edits`]): its path as the ledger keeps it
+    /// (relative to the session's folder), or one naming the same file
+    /// (one the other's tail at a `/`).
+    pub fn edits(&self, file: &str) -> Option<&Edits> {
+        let rel = self.relative(file);
+        self.edits.get(&rel).or_else(|| self.edits.iter().find(|(p, _)| same_file(p, &rel)).map(|(_, e)| e))
+    }
+
+    /// File `file`'s edit preview ([`Edits::preview`]), as it was built
+    /// when its last call committed.
+    pub fn edit_preview(&self, file: &str) -> Option<Arc<EditPreview>> {
+        self.edits(file).map(|e| e.preview.clone())
+    }
+
+    /// Its identity (another for every other session's ledger, kept by a
+    /// reset of the same session) and generation.
+    #[cfg(test)]
+    pub fn version(&self) -> (u64, u64) {
+        (self.id, self.generation)
     }
 
     fn relative(&self, path: &str) -> String {
@@ -410,6 +547,14 @@ impl Ledger {
             + self.files.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
             + self.shell.iter().map(|f| file(&f.path, &f.dir, &f.name)).sum::<usize>()
             + (self.shell_calls.len() + self.committed.len() + self.pending.len()) * 64
+            + self
+                .edits
+                .iter()
+                .map(|(p, e)| {
+                    let shown = e.preview.groups.iter().map(|g| g.lines.iter().map(|l| l.text.len() + 32).sum::<usize>() + 48);
+                    p.capacity() + 64 + e.recent.len() * std::mem::size_of::<Edit>() + shown.sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     pub fn preview(&self, tool_id: &str) -> Option<Arc<Preview>> {
@@ -425,6 +570,12 @@ impl Ledger {
     pub fn totals(&self) -> (u32, u32) {
         (self.added, self.removed)
     }
+}
+
+/// Two names of one file: equal, or one the other's tail at a `/`.
+pub fn same_file(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim_start_matches("./"), b.trim_start_matches("./"));
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -863,6 +1014,65 @@ mod tests {
         let mut p = Preview::default();
         // No line in common: the multiset count is exact.
         assert_eq!(diff_into(&mut p, &old, &new), (3000, 3000, false));
+    }
+
+    /// A file's edits for its preview (blocks.md §1.5, Shady #101 P2-3):
+    /// kept as each call commits, the newest [`EDIT_CALLS`] in call order
+    /// (results out of order in one message included) and a count of the
+    /// earlier ones, whatever the history's length; a failed call is none;
+    /// a `multi_edit` counts for each file it changed; a name of the same
+    /// file (absolute, `./`) finds them; another session's ledger is
+    /// another identity.
+    #[test]
+    fn a_files_edits_keep_the_newest_calls_in_call_order() {
+        let call = |id: &str, name: &str, input: Value| json!({"type": "tool_use", "id": id, "name": name, "input": input});
+        let res = |id: &str, text: &str| json!({"type": "tool_result", "tool_use_id": id, "content": text});
+        let mut l = Ledger::default();
+        l.reset(&[], Some("/w"), false);
+        let n = 500;
+        for k in 0..n {
+            let id = format!("e{k}");
+            let input = json!({"path": "/w/src/a.rs", "old_string": format!("a{k}"), "new_string": format!("b{k}")});
+            l.append(&[tool_use(&id, "edit", input), result(&id, if k % 7 == 3 { FAILED } else { OK })]);
+        }
+        // Two calls in one message, their results the other way round; and
+        // a multi_edit of two files.
+        let x = call("x", "edit", json!({"path": "src/a.rs", "old_string": "p", "new_string": "q"}));
+        let y = call("y", "write", json!({"path": "src/a.rs", "content": "1\n2\n"}));
+        let m = call(
+            "m",
+            "multi_edit",
+            json!({"edits": [
+            {"path": "src/a.rs", "op": "replace", "anchor": "r", "text": "s"},
+            {"path": "src/b.rs", "op": "replace", "anchor": "t", "text": "u"}]}),
+        );
+        l.append(&[
+            json!({"role": "assistant", "content": [x, y, m]}),
+            json!({"role": "user", "content": [res("y", OK), res("x", OK), res("m", OK)]}),
+        ]);
+        let ok = (0..n).filter(|k| k % 7 != 3).count() + 3;
+        let e = l.edits("src/a.rs").expect("a.rs");
+        assert_eq!(e.recent.len(), EDIT_CALLS);
+        assert_eq!(e.earlier + e.recent.len(), ok);
+        let seqs: Vec<u64> = e.recent.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "call order: {seqs:?}");
+        let last: Vec<Option<u32>> = e.recent.iter().rev().take(3).map(|e| e.written).collect();
+        assert_eq!(last, [None, Some(2), None], "m, y (a write), x: in call order");
+        assert!(Arc::ptr_eq(&e.recent.back().unwrap().preview, &l.preview("m").unwrap()), "the call's preview, shared");
+        let p = l.edit_preview("src/a.rs").unwrap();
+        assert!(p.groups.len() <= EDIT_CALLS && p.groups.iter().map(|g| g.lines.len()).sum::<usize>() <= EDIT_LINES);
+        assert_eq!(p.groups.len() + p.earlier, ok, "every call kept or counted");
+        assert_eq!(p.groups.last().map(|g| g.written), Some(None), "the newest last");
+        assert_eq!(l.edits("/w/src/a.rs").map(|e| e.earlier), Some(e.earlier), "an absolute name");
+        assert_eq!(l.edits("./src/b.rs").map(|e| e.recent.len()), Some(1), "the multi_edit's other file");
+        assert!(l.edits("src/c.rs").is_none());
+        let mut other = Ledger::default();
+        other.reset(&[], Some("/w"), false);
+        assert_ne!(other.version().0, l.version().0, "another session's ledger");
+        let v = l.version();
+        l.reset(&[], Some("/w"), true);
+        assert_eq!(l.version().0, v.0, "the same session's, reset");
+        assert!(l.version().1 > v.1);
     }
 
     /// N1: an edit past the preview's alignment cap still counts what changed,

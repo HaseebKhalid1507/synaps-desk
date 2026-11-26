@@ -60,13 +60,6 @@ const GLOW_KEYS: u64 = 0x7B10 << 48;
 pub(crate) const DIFF_LINES: usize = 12;
 pub(crate) const NOTE_LINES: usize = 6;
 
-/// An edit preview keeps this many calls' groups, and lines in all (§1.5).
-const EDIT_GROUPS: usize = 12;
-const EDIT_LINES: usize = 120;
-const EDIT_LINE_CHARS: usize = 160;
-/// Edit previews kept per pane (a board holds at most 32 blocks).
-const EDIT_FILES: usize = 32;
-
 fn hash(v: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
@@ -254,70 +247,6 @@ pub(crate) fn note_lines(text: &str, cpl: f32) -> usize {
     text.lines().map(|l| l.chars().count().div_ceil(cpl).max(1)).sum::<usize>().max(1)
 }
 
-/// An edit preview: its groups, and how many earlier ones folded away.
-pub(crate) type Preview = (Vec<EditGroup>, usize);
-
-/// One call's group of an edit preview: its file's lines as requested.
-#[derive(Clone, Debug)]
-pub(crate) struct EditGroup {
-    pub lines: Vec<crate::files::DiffLine>,
-    /// A `write`: "N lines written", no old side.
-    pub written: Option<u32>,
-}
-
-/// The edit preview of `file` (§1.5): this session's successful `edit`,
-/// `write` and `multi_edit` calls on it, a group per call in call order,
-/// the newest [`EDIT_GROUPS`] and at most [`EDIT_LINES`] lines (a line at
-/// most [`EDIT_LINE_CHARS`]); how many earlier ones folded away.
-pub(crate) fn edit_preview(items: &[Item], ledger: &crate::files::Ledger, file: &str) -> (Vec<EditGroup>, usize) {
-    let mut groups: Vec<EditGroup> = Vec::new();
-    for it in items {
-        let Some(t) = it.tool.as_ref().filter(|t| crate::files::is_file_tool(&t.name)) else { continue };
-        if ledger.delta(&t.tool_id).is_none() {
-            continue;
-        }
-        let input: serde_json::Value = serde_json::from_str(&t.input).unwrap_or_default();
-        let path = input.get("path").or_else(|| input.get("file_path")).and_then(|v| v.as_str()).unwrap_or_default();
-        if !same_file(path, file) {
-            continue;
-        }
-        let Some(pv) = ledger.preview(&t.tool_id) else { continue };
-        let written = (t.name == "write").then_some(pv.added);
-        let lines = pv
-            .lines
-            .iter()
-            .map(|l| {
-                let mut l = l.clone();
-                if l.text.chars().count() > EDIT_LINE_CHARS {
-                    l.text = l.text.chars().take(EDIT_LINE_CHARS).collect::<String>().into();
-                }
-                l
-            })
-            .collect();
-        groups.push(EditGroup { lines, written });
-    }
-    let mut earlier = groups.len().saturating_sub(EDIT_GROUPS);
-    let mut kept: Vec<EditGroup> = groups.split_off(earlier);
-    // At most EDIT_LINES in all: the oldest kept groups fold first.
-    while kept.len() > 1 && kept.iter().map(|g| g.lines.len()).sum::<usize>() > EDIT_LINES {
-        kept.remove(0);
-        earlier += 1;
-    }
-    if let Some(g) = kept.first_mut() {
-        let total: usize = g.lines.len();
-        if total > EDIT_LINES {
-            g.lines.truncate(EDIT_LINES);
-        }
-    }
-    (kept, earlier)
-}
-
-/// Two names of one file: equal, or one the other's tail at a `/`.
-fn same_file(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim_start_matches("./"), b.trim_start_matches("./"));
-    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
-}
-
 /// The user's own folds (§3.5: presentation, local), by block row: open
 /// or folded, and the agent's `collapse` it overrode. The agent's next one
 /// wins again.
@@ -351,27 +280,6 @@ impl Folds {
 }
 
 impl AppView {
-    /// The edit preview's groups for `file` ([`edit_preview`]), kept while
-    /// the transcript's rows and the ledger stay as they were.
-    fn edit_groups(&self, file: &str) -> (Vec<EditGroup>, usize) {
-        let l = &self.model.lives[self.panes.cur.live];
-        let t = l.shown();
-        let key = hash((t.items().len(), t.items().last().map(|i| (i.id, i.rev)), l.shown_files().generation(), file));
-        if let Some((k, v)) = self.panes.cur.block_edits.borrow().get(file)
-            && *k == key
-        {
-            return v.clone();
-        }
-        let v = edit_preview(t.items(), l.shown_files(), file);
-        let mut kept = self.panes.cur.block_edits.borrow_mut();
-        // A preview per file the board draws: at most [`EDIT_FILES`] kept.
-        if kept.len() >= EDIT_FILES && !kept.contains_key(file) {
-            kept.clear();
-        }
-        kept.insert(file.to_string(), (key, v.clone()));
-        v
-    }
-
     /// Block row `d` (`at`, its item's `at`th block): its card (module docs).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_block(&self, item: &Item, at: u16, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
@@ -768,11 +676,14 @@ impl AppView {
         let cw = m.mono * 0.6;
         let mut lines: Vec<(Option<crate::files::LineKind>, SharedString)> = Vec::new();
         let foot = if d.from.is_some() {
-            let (groups, earlier) = self.edit_groups(&d.file);
+            // Built as the file's last call committed (`files::Edits`):
+            // a draw only takes it.
+            let preview = l.shown_files().edit_preview(&d.file).unwrap_or_default();
+            let (groups, earlier) = (&preview.groups, preview.earlier);
             if earlier > 0 {
                 lines.push((None, format!("+{earlier} earlier edit{}", if earlier == 1 { "" } else { "s" }).into()));
             }
-            for gr in &groups {
+            for gr in groups {
                 if let Some(n) = gr.written {
                     lines.push((None, format!("{n} lines written").into()));
                 }
@@ -781,7 +692,7 @@ impl AppView {
                     lines.push((Some(dl.kind), format!("{indent}{}", dl.text).into()));
                 }
             }
-            if groups.is_empty() && l.shown_files().shell().iter().any(|f| same_file(&f.path, &d.file)) {
+            if groups.is_empty() && l.shown_files().shell().iter().any(|f| crate::files::same_file(&f.path, &d.file)) {
                 lines.push((None, "changed by a shell command · no preview".into()));
             }
             "as requested · not read from disk"

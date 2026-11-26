@@ -791,6 +791,60 @@ fn a_refold_holds_for_the_input_it_read(cx: &mut TestAppContext) {
     assert_eq!((started(cx), state(cx)), (n, kept), "kept: nothing ran");
 }
 
+/// An edit preview is built as its file's calls commit, never as rows
+/// draw (Shady #101 P2-3): a history of 40 more edits of the file keeps
+/// its groups bounded, the newest kept and the rest counted; text
+/// streaming in (the rows change, the files don't) builds none while the
+/// preview draws open, and the draws take the one built; the next edit of
+/// the file landing builds it once, its group the newest.
+#[gpui_kit::test]
+fn an_edit_preview_is_built_as_edits_commit_not_as_rows_draw(cx: &mut TestAppContext) {
+    let (w, view) = blocks(cx, 1500.);
+    let file = "crates/relay/src/token_store.rs";
+    let edit = |k: usize| {
+        let id = format!("toolu_pe{k}");
+        vec![
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "edit", "input": {"path": file, "old_string": format!("a{k}"), "new_string": format!("b{k}")}}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": format!("Edited {file}")}]}),
+        ]
+    };
+    let mut msgs = vec![json!({"role": "user", "content": "more edits"})];
+    msgs.extend((0..40).flat_map(edit));
+    land(cx, w, &view, msgs);
+    board(cx, w, &view);
+    // The agent folded its edits: open them (once nothing just moved).
+    let edits = show_block(cx, w, &view, "edits");
+    wait(cx, w, &view, 1000);
+    let at = head_at(cx, w, edits);
+    mouse(cx, w, at, "move");
+    mouse(cx, w, at, "down");
+    mouse(cx, w, at, "up");
+    board(cx, w, &view);
+    assert!(!folded(cx, &view, edits), "open");
+    let built = || crate::files::EDIT_PREVIEWS.with(std::cell::Cell::get);
+    let preview = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].shown_files().edit_preview(file));
+    let before = preview(cx).expect("the file's");
+    assert!(before.groups.len() <= 12 && before.earlier >= 41 - 12, "{} groups, {} earlier", before.groups.len(), before.earlier);
+    let n = built();
+    // Text streams: rows change, frames draw, the files stay.
+    turn(cx, w, &view);
+    heard(cx, w, &view, vec![llm(json!({"kind": "llm", "llm": "response_start"}))]);
+    for k in 0..20 {
+        heard(cx, w, &view, vec![llm(json!({"kind": "llm", "llm": "text", "text": format!("streaming {k} ")}))]);
+        board(cx, w, &view);
+    }
+    assert!(!folded(cx, &view, edits) && row(cx, &view, "edits").is_some(), "still drawn open");
+    assert_eq!(built(), n, "no preview built while text streams");
+    assert!(std::sync::Arc::ptr_eq(&before, &preview(cx).unwrap()), "the one built");
+    heard(cx, w, &view, vec![json!({"ev": "idle"})]);
+    land(cx, w, &view, edit(99));
+    board(cx, w, &view);
+    assert!(built() > n, "the next edit builds it");
+    let after = preview(cx).unwrap();
+    let newest = after.groups.last().unwrap().lines.iter().any(|l| l.text.contains("b99"));
+    assert!(newest, "the newest group is the new edit's");
+}
+
 /// Bounded caches (§1.8: renderer caches per pane): a pane's state per
 /// block (its fold, a well's scroll, `more`, its painted target) keeps
 /// only the blocks the board draws, and its edit previews one per file
@@ -830,8 +884,6 @@ fn a_panes_block_caches_keep_only_what_the_board_draws(cx: &mut TestAppContext) 
     });
     let left: Vec<u64> = kept(cx).into_iter().filter(|r| !drawn.contains(r)).collect();
     assert!(left.is_empty(), "kept for blocks not drawn: {left:?}");
-    let files = view.read_with(cx, |v, _| v.panes.cur.block_edits.borrow().len());
-    assert!(files <= 32, "{files} edit previews");
 }
 
 /// A move within view slides (§6.3): at Full, a block an agent op moved
