@@ -134,10 +134,6 @@ pub(crate) enum RailAct {
     More,
     /// A slot's `+N` row: its leftovers' headers listed, or not.
     List,
-    /// A section header's `×` (D6b): dismissed.
-    Dismiss,
-    /// A section header's `⇅` (D6b): to the other slot, or the agent's.
-    Slot,
     /// A soft tombstone's `u` (D6b), its token as drawn: it ends.
     Unsoft(u64),
     /// The footer's `show` (D6b): what the rail hides, shown.
@@ -1163,24 +1159,12 @@ impl AppView {
         let rev_max = (self.rail_text_w() - fixed - TITLE_MIN).max(REV_MIN);
         // Its hover actions (D7): over its right end, never reflowing it,
         // unless the lease's note is there or a past revision is in view.
-        // D6b's `⇅` and `×` among them, the rail's own presses
-        // ([`AppView::rail_up`]) until D7's seam is wired (its follow-up).
+        // D6b's `rail`, `⇅` and `×` among them, through D7's seam.
         let hovered = self.agent_rail.lease.head.filter(|h| h.0 == row && past.is_none() && says.is_none());
         let acts = hovered.map(|(_, since)| {
-            use crate::walk::Hover;
-            let mut offers = self.hover_offers(s, true);
-            if !self.desires.wired() {
-                let fold = offers.iter().position(|o| o.0 == Hover::Fold).unwrap_or(offers.len());
-                offers.insert(fold, (Hover::Slot, "⇅"));
-                offers.push((Hover::Dismiss, "×"));
-            }
-            let wired = self.desires.wired();
+            let offers = self.hover_offers(s, true);
             self.hover_actions(row, since, &offers, p.card_d, p, |act, el| {
-                let act = match act {
-                    Hover::Slot if !wired => RailAct::Slot,
-                    Hover::Dismiss if !wired => RailAct::Dismiss,
-                    a => RailAct::Hover(a),
-                };
+                let act = RailAct::Hover(act);
                 let press = RailPress { at: Target { row, tag }, act };
                 el.on_mouse_down(
                     MouseButton::Left,
@@ -1619,7 +1603,7 @@ impl AppView {
                 let k = (row & !MORE_ROW) as usize;
                 b.more.get(k).and_then(Option::as_ref).is_some_and(|m| more_tag(m) == down.at.tag)
             }
-            RailAct::Fold | RailAct::More | RailAct::Dismiss | RailAct::Slot | RailAct::Hover(_) => b
+            RailAct::Fold | RailAct::More | RailAct::Hover(_) => b
                 .sections()
                 .any(|s| crate::blocks::row_id(&s.s.block.id) == row && s.s.bound.as_ref().is_some_and(|x| x.tag == down.at.tag)),
             RailAct::Unsoft(token) => tomb_of(b, row, token, down.at.tag).is_some(),
@@ -1663,16 +1647,6 @@ impl AppView {
                     let k = (row & !MORE_ROW) as usize;
                     let listed = &mut self.agent_rail.local_mut(&session).listed[k];
                     *listed = !*listed;
-                }
-                RailAct::Dismiss | RailAct::Slot => {
-                    let Some(b) = lay.sections().find(|s| crate::blocks::row_id(&s.s.block.id) == row).map(|s| s.s.block.clone()) else {
-                        return;
-                    };
-                    if act == RailAct::Dismiss {
-                        self.dismiss_block(live, &b, cx);
-                    } else {
-                        self.slot_block(live, &b, cx);
-                    }
                 }
                 RailAct::Unsoft(token) => {
                     if let Some(id) = tomb_of(&lay, row, token, down.at.tag) {

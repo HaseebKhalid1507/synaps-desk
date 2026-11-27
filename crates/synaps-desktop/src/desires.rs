@@ -171,7 +171,6 @@ impl Desire {
         if self.dismissed { Seen::Dismissed } else { Seen::Shown }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "the tests' view of a carrier"))]
     pub(crate) fn in_flight(&self) -> bool {
         self.carrier.is_some()
     }
@@ -794,6 +793,12 @@ impl Desires {
             Some(a) => a.before.as_ref(),
             None => self.book.get(conv, &generation_key(generation), id),
         }
+    }
+
+    /// `id`'s last wish in `conv` (of `generation`'s history), written or
+    /// not: memory's.
+    pub(crate) fn wish(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<&Desire> {
+        self.book.get(conv, &generation_key(generation), id)
     }
 
     /// Whether `id` has a wish not written yet: it draws as before

@@ -90,6 +90,20 @@ enum Entry {
     Soft(BlockId),
 }
 
+impl Entry {
+    /// Whether it is `r`'s.
+    fn of(&self, r: &Ref) -> bool {
+        match self {
+            Entry::Placed { r: x, .. } => x == r,
+            Entry::Soft(id) => matches!(r, Ref::Block(b) if b == id),
+        }
+    }
+}
+
+/// What the user set for one block in one conversation ([`Presentation::mark`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mark(Vec<Kept>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Kept {
     entry: Entry,
@@ -524,8 +538,22 @@ impl Presentation {
         v.into_iter().map(|(_, r, s)| (r, s)).collect()
     }
 
+    /// What the user set for `r` in `conv`: its pin or slot move and its
+    /// soft dismissal, each as kept (an undo's before and after, D7).
+    pub(crate) fn mark(&self, conv: &str, r: &Ref) -> Mark {
+        Mark(self.book.conversations.get(conv).map(|c| c.entries.iter().filter(|k| k.entry.of(r)).cloned().collect()).unwrap_or_default())
+    }
+
+    /// `r`'s entries in `conv` put back to `was` (D7's undo: only while
+    /// they are still what the action left, [`Presentation::mark`]).
+    pub(crate) fn put_back(&mut self, conv: &str, r: &Ref, was: &Mark) {
+        let c = self.book.conversations.entry(conv.to_string()).or_default();
+        c.entries.retain(|k| !k.entry.of(r));
+        c.entries.extend(was.0.iter().cloned());
+        self.touch(conv);
+    }
+
     /// `p` on `b` (module docs): what it does now.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D7's `p`"))]
     pub(crate) fn pin(&mut self, conv: &str, b: &Block) -> Result<Placed, String> {
         Self::movable(conv, b)?;
         let on_rail = matches!(self.placed(conv, b).place, Place::Rail(_));

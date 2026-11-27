@@ -47,12 +47,19 @@
 //!   says `loading r2…`, and `r2 unavailable` if it can't be had
 //!   ([`PastBody`]). `x` dismisses, `u` shows again, `p` pins, `m`
 //!   moves a rail section to the other slot: D6b's desires and stores
-//!   (#103), through [`BlockDesires`], whose default does nothing until
-//!   D6b wires it. `e` (take) and `R` (restore) are D8's: nothing yet.
+//!   (#103), through [`BlockDesires`] (`crate::rail_wishes::Stores`
+//!   answers it), where this desk draws what they do: `x` and `u` on the
+//!   agent's rail sections, `p` on a transcript block (into the rail, and
+//!   back), `m` on a rail section. The transcript's own tombstone and pin
+//!   stub aren't drawn yet: `x` and `u` on a transcript block, and `p` on
+//!   an agent's rail section, do nothing, and the hover doesn't offer
+//!   them ([`BlockDesires::offers`]). `e` (take) and `R` (restore) are
+//!   D8's: nothing yet.
 //! - **Undo** (§3.5): Ctrl+Z (Cmd+Z) in the walk undoes the last local
 //!   action, one level per block: a fold (a key's or a click's, in the
 //!   transcript or the rail), and through [`BlockDesires::undo`] a pin, a
-//!   slot move or a dismissal not yet sent, with D6b's token for it. It
+//!   slot move or a dismissal not yet sent, with D6b's token for it (its
+//!   block found on the board wherever it is, a dismissed one hidden). It
 //!   is the inverse of what the action set, never a toggle: it puts back
 //!   what was there before (an expansion the rail's cap folded back for
 //!   it too), only while the block still shows what the action set, and
@@ -244,14 +251,16 @@ impl WalkMode {
 // ── the seam for D6b ──────────────────────────────────────────────────
 
 /// The block a shared or stored key acts on, as the walk found it on the
-/// bound board ([`Found`]): its session and board, the block, where it
-/// paints on this desk (its effective placement: a section's slot as the
-/// rail lays it out, the user's pin or slot move included; a transcript
-/// block's, [`BlockDesires::placed`]), and the token of the tombstone it
-/// was painted as (D6b's soft dismissal), if it was.
-#[cfg_attr(not(test), expect(dead_code, reason = "D6b's side reads it (#103); D7's default doesn't"))]
+/// bound board ([`Found`]): its session, conversation (the transcript's
+/// journal, D6b's key) and board, the block, where it paints on this desk
+/// (its effective placement: a section's slot as the rail lays it out,
+/// the user's pin or slot move included; a transcript block's,
+/// [`BlockDesires::placed`]), and the token of the tombstone it was
+/// painted as (D6b's soft dismissal), if it was.
 pub(crate) struct Aim<'a> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's tests' stand-in reads it"))]
     pub session: &'a str,
+    pub conv: &'a str,
     pub drawn: &'a Drawn,
     pub block: &'a Shown,
     pub place: Place,
@@ -260,9 +269,9 @@ pub(crate) struct Aim<'a> {
 
 /// How D6b answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "D6b's side answers them (#103); D7's default is Off"))]
 pub(crate) enum Asked {
-    /// Not wired (D7's default): nothing happened.
+    /// Not wired (D7's default), or not where this desk draws it
+    /// ([`BlockDesires::offers`]): nothing happened.
     Off,
     /// Accepted (D6b draws it), with D6b's token for what it did: its
     /// undo names it ([`BlockDesires::undo`]).
@@ -274,20 +283,27 @@ pub(crate) enum Asked {
 
 /// The walk's `x`, `u`, `p` and `m`, the hover's `×`, `rail` and `⇅`, and
 /// their undo: D6b's dismiss and show desires and its pins and slot moves
-/// (#103). D7 routes the keys here; the default does nothing, and the
-/// status line and the hover don't offer them until [`BlockDesires::wired`].
-/// And the effective placement ([`BlockDesires::placed`]): where a block
-/// paints on this desk after the user's pins and slot moves.
+/// (#103), answered by `crate::rail_wishes::Stores`. D7 routes the keys
+/// here; the default (tests' `NoDesires`) does nothing, and the status line
+/// and the hover don't offer them until [`BlockDesires::wired`]. And the
+/// effective placement ([`BlockDesires::placed`]): where a block paints on
+/// this desk after the user's pins and slot moves.
 pub(crate) trait BlockDesires {
     /// The keys act: their hints and buttons show.
     fn wired(&self) -> bool {
         false
     }
-    /// Where block `b` of `session` paints on this desk: the user's pin or
-    /// slot move (D6b's presentation), else the agent's placement (the
-    /// default). The rail draws the same through D6a's `RailVisibility`,
-    /// which D6b answers from the same store.
-    fn placed(&self, _session: &str, b: &Block) -> Place {
+    /// Whether the hover offers `wish` on block `b` (a rail section's
+    /// header, `rail`, or a transcript block's): where this desk draws what
+    /// it does. Wired, everywhere (the default).
+    fn offers(&self, _wish: Wish, _b: &Block, _rail: bool) -> bool {
+        self.wired()
+    }
+    /// Where block `b` of conversation `conv` paints on this desk: the
+    /// user's pin or slot move (D6b's presentation), else the agent's
+    /// placement (the default). The rail draws the same through D6a's
+    /// `RailVisibility`, which D6b answers from the same store.
+    fn placed(&self, _conv: &str, b: &Block) -> Place {
         b.place
     }
     fn dismiss(&mut self, _: &Aim) -> Asked {
@@ -310,14 +326,33 @@ pub(crate) trait BlockDesires {
     }
 }
 
-/// D7's: nothing wired.
+/// D7's default, nothing wired (tests: the app has D6b's stores).
+#[cfg(test)]
 pub(crate) struct NoDesires;
 
+#[cfg(test)]
 impl BlockDesires for NoDesires {}
 
 // ── the walk ──────────────────────────────────────────────────────────
 
 impl AppView {
+    /// D6b's side of the seam: its stores (tests: a stand-in, if set).
+    pub(crate) fn block_desires(&self) -> &dyn BlockDesires {
+        #[cfg(test)]
+        if let Some(d) = self.desires.as_deref() {
+            return d;
+        }
+        &self.wishes
+    }
+
+    pub(crate) fn block_desires_mut(&mut self) -> &mut dyn BlockDesires {
+        #[cfg(test)]
+        if let Some(d) = self.desires.as_deref_mut() {
+            return d;
+        }
+        &mut self.wishes
+    }
+
     /// The walk's order in the pane acted on (module docs): its block rows
     /// in reading order, then the rail's sections as drawn, upper first
     /// (a tombstone too: `u` shows it again), if the rail is this pane's
@@ -586,8 +621,9 @@ impl AppView {
         match at {
             At::Block(row) => {
                 let s = crate::lease::find_any(d, row).filter(|(_, g)| g.is_none())?.0.clone();
-                let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str())?;
-                Some(Found { place: self.desires.placed(session, &s.block), s, tomb: None })
+                self.model.lives[self.panes.cur.live].active.as_ref()?;
+                let conv = self.conversation(self.panes.cur.live);
+                Some(Found { place: self.block_desires().placed(&conv, &s.block), s, tomb: None })
             }
             At::Rail(row) => {
                 let lay = self.rail_of(self.panes.cur.live, d);
@@ -707,16 +743,21 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone())?;
-        let aim = Aim { session: &session, drawn: board, block: &f.s, place: f.place, tomb: f.tomb };
+        let conv = self.conversation(self.panes.cur.live);
+        let aim = Aim { session: &session, conv: &conv, drawn: board, block: &f.s, place: f.place, tomb: f.tomb };
+        let d = self.block_desires_mut();
         let asked = match wish {
-            Wish::Dismiss => self.desires.dismiss(&aim),
-            Wish::Show => self.desires.show(&aim),
-            Wish::Pin => self.desires.pin(&aim),
-            Wish::Slot => self.desires.slot(&aim),
+            Wish::Dismiss => d.dismiss(&aim),
+            Wish::Show => d.show(&aim),
+            Wish::Pin => d.pin(&aim),
+            Wish::Slot => d.slot(&aim),
         };
         log::info!(target: "synaps_desktop::walk", "walk: {wish:?} {}: {asked:?}", f.s.block.id);
         match asked {
             Asked::Done(token) => {
+                // D6b's stores: what changed written (a dismissal draws
+                // once it is).
+                self.pump_wishes(cx);
                 cx.notify();
                 Some(token)
             }
@@ -737,7 +778,12 @@ impl AppView {
     fn walk_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(u) = self.panes.cur.walk.undo.pop() else { return };
         let board = self.bound_board();
-        let found = board.as_deref().and_then(|d| self.find_on(d, u.at)).filter(|f| f.s.bound.as_ref().is_some_and(|b| b.tag == u.tag));
+        // A wish's block wherever the board has it: a dismissed section is
+        // hidden, a pin taken out of the rail is gone from it.
+        let found = board
+            .as_deref()
+            .and_then(|d| self.find_on(d, u.at).or_else(|| matches!(u.act, Undid::Wish(..)).then(|| on_board(d, u.at.row())).flatten()))
+            .filter(|f| f.s.bound.as_ref().is_some_and(|b| b.tag == u.tag));
         let (Some(board), Some(f)) = (board, found) else {
             self.walk_says(u.at, CHANGED, window, cx);
             return;
@@ -788,14 +834,18 @@ impl AppView {
             }
             Undid::Wish(wish, token) => {
                 let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
-                let aim = Aim { session: &session, drawn: &board, block: &f.s, place: f.place, tomb: f.tomb };
-                match self.desires.undo(&aim, *wish, *token) {
+                let conv = self.conversation(self.panes.cur.live);
+                let aim = Aim { session: &session, conv: &conv, drawn: &board, block: &f.s, place: f.place, tomb: f.tomb };
+                match self.block_desires_mut().undo(&aim, *wish, *token) {
                     Asked::Refused(why) => {
                         log::info!(target: "synaps_desktop::walk", "walk: undo {wish:?} {} refused: {why}", f.s.block.id);
                         self.walk_says(u.at, REFUSED, window, cx);
                         true
                     }
-                    _ => true,
+                    _ => {
+                        self.pump_wishes(cx);
+                        true
+                    }
                 }
             }
         };
@@ -1022,7 +1072,7 @@ impl AppView {
                 let label = self.walk_past(w.at.row()).map(|pv| pv.label).unwrap_or_default();
                 format!("{label} · [ older · ] newer · esc latest")
             }
-            None => status_keys(self.desires.wired(), cfg!(target_os = "macos")),
+            None => status_keys(self.block_desires().wired(), cfg!(target_os = "macos")),
         };
         let t = text.clone();
         Some(
@@ -1138,21 +1188,22 @@ impl AppView {
     }
 
     /// The hover actions block `s` offers (module docs): `rev` if it has a
-    /// past revision, D6b's when wired (`rail` a transcript block, `⇅` a
-    /// rail section, `×`), `fold`.
+    /// past revision, D6b's where it offers them (`rail`, `⇅` a rail
+    /// section's, `×`: [`BlockDesires::offers`]), `fold`.
     pub(crate) fn hover_offers(&self, s: &Shown, rail: bool) -> Vec<(Hover, &'static str)> {
+        let d = self.block_desires();
         let mut v = Vec::new();
         if !s.block.pending && (s.block.rev > 1 || s.block.replaced.is_some()) {
             v.push((Hover::Rev, "rev"));
         }
-        if self.desires.wired() {
+        if d.offers(Wish::Pin, &s.block, rail) {
             v.push((Hover::Pin, "rail"));
-            if rail {
-                v.push((Hover::Slot, "⇅"));
-            }
+        }
+        if rail && d.offers(Wish::Slot, &s.block, rail) {
+            v.push((Hover::Slot, "⇅"));
         }
         v.push((Hover::Fold, "fold"));
-        if self.desires.wired() {
+        if d.offers(Wish::Dismiss, &s.block, rail) {
             v.push((Hover::Dismiss, "×"));
         }
         v
@@ -1376,6 +1427,14 @@ pub(crate) struct Found {
     pub s: Shown,
     pub place: Place,
     pub tomb: Option<u64>,
+}
+
+/// Top-level block row `row` wherever board `d` has it (a rail slot, a
+/// transcript row), drawn or not: the agent's placement, no tombstone.
+fn on_board(d: &Drawn, row: u64) -> Option<Found> {
+    let s =
+        d.rail.iter().flatten().chain(d.rows.values().flat_map(|r| r.blocks.iter())).find(|s| crate::blocks::row_id(&s.block.id) == row)?;
+    Some(Found { s: s.clone(), place: s.block.place, tomb: None })
 }
 
 /// Block `id` of incarnation `tag` on past board `st`, as a row draws it

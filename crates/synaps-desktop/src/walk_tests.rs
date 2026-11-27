@@ -76,7 +76,7 @@ fn status(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
         v.panes.cur.walk.walk.as_ref()?;
         Some(match v.panes.cur.walk.walk.as_ref().and_then(|w| w.rev.as_ref()) {
             Some(_) => "rev".into(),
-            None => crate::walk::status_keys(v.desires.wired(), cfg!(target_os = "macos")),
+            None => crate::walk::status_keys(v.block_desires().wired(), cfg!(target_os = "macos")),
         })
     })
 }
@@ -146,7 +146,7 @@ fn ctrl_g_walks_from_the_newest_block_in_view_and_esc_returns_to_the_composer(cx
     assert_eq!(keys_at(cx, w, &view), (false, false), "neither the composer's nor the window's");
     let s = status(cx, &view).expect("the status line");
     assert!(has(cx, w, format!("walk-status {s}")), "the status line drawn: {s}");
-    assert!(s.contains("j k walk") && s.contains("esc composer") && !s.contains("dismiss"), "{s}");
+    assert!(s.contains("j k walk") && s.contains("esc composer") && s.contains("x dismiss · u show · p pin · m slot"), "D6b's, wired: {s}");
     press(cx, w, "k");
     assert_eq!(at(cx, &view), Some(At::Block(row("b"))));
     wait(cx, w, &view, 300);
@@ -464,7 +464,10 @@ fn hover_actions_draw_over_the_header_and_nothing_reflows(cx: &mut TestAppContex
     let h = drawn(cx, w, format!("block-head {b}"));
     assert!(acts.right() <= h.right() + px(0.5) && acts.top() >= h.top() && acts.bottom() <= h.bottom(), "over the header's end");
     assert!(has(cx, w, format!("hover-act {b} rev")) && has(cx, w, format!("hover-act {b} fold")));
-    assert!(!has(cx, w, format!("hover-act {b} ×")) && !has(cx, w, format!("hover-act {b} rail")), "D6b's not wired");
+    assert!(
+        !has(cx, w, format!("hover-act {b} ×")) && has(cx, w, format!("hover-act {b} rail")),
+        "D6b's: a transcript block's pin, no × (its tombstone isn't drawn yet)"
+    );
     // c has one revision: no rev.
     let at_ = head(cx, w, "c");
     mouse(cx, w, at_, "move");
@@ -680,6 +683,7 @@ impl Asks {
 #[gpui_kit::test]
 fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     let (w, view) = walked(cx);
+    view.update(cx, |v, _| v.desires = Some(Box::new(crate::walk::NoDesires)));
     enter(cx, w, &view);
     for k in ["x", "u", "p", "m"] {
         press(cx, w, k);
@@ -687,7 +691,7 @@ fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     assert!(walking(cx, w, &view) && !folded(cx, &view, "c") && note(cx, &view).is_none(), "not wired: nothing");
     press(cx, w, "escape");
     let asks = Asks::default();
-    view.update(cx, |v, _| v.desires = Box::new(asks.clone()));
+    view.update(cx, |v, _| v.desires = Some(Box::new(asks.clone())));
     enter(cx, w, &view);
     assert!(status(cx, &view).is_some_and(|s| s.contains("x dismiss · u show · p pin · m slot")));
     let sid = attachment(cx, &view).1;
@@ -709,6 +713,243 @@ fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     *asks.1.borrow_mut() = Some("a write failed".into());
     press(cx, w, "u");
     assert_eq!(note(cx, &view), Some((row("c"), crate::walk::REFUSED)), "refused: the note");
+}
+
+// ── D6b's stores behind the seam ──────────────────────────────────────
+
+/// Two agent sections, `r1` and `r2`, in the rail's upper slot.
+fn rail_blocks(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    ops(
+        cx,
+        w,
+        view,
+        "toolu_rb",
+        json!([
+            {"op":"put","id":"r1","kind":"note","target":"rail","slot":"upper","body":{"text":"R one"}},
+            {"op":"put","id":"r2","kind":"note","target":"rail","slot":"upper","body":{"text":"R two"}}
+        ]),
+    );
+    wait(cx, w, view, 1000);
+}
+
+/// Section `name` as the rail lays it out now: its slot, whether the user
+/// placed it, whether it draws as a tombstone.
+fn sec(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(Slot, bool, bool)> {
+    let id = Ref::parse(name).expect("an id");
+    view.read_with(cx, |v, _| {
+        let (_, l) = v.rail_layout()?;
+        l.section(&id).map(|s| (s.slot, s.user, matches!(s.state, crate::agent_rail::State::Tombstone(_))))
+    })
+}
+
+/// D6b's writes landed (a dismissal draws once it is written), and the
+/// frames after.
+fn landed(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    super::rail_wishes_ui_tests::written(cx, view);
+    wait(cx, w, view, 300);
+    super::rail_wishes_ui_tests::written(cx, view);
+}
+
+fn desires(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
+    view.read_with(cx, |v, _| v.wishes.desires.len())
+}
+
+/// The desk restarts on the same files (the old one's locks let go): what
+/// it draws is what they kept.
+fn restart(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    landed(cx, w, view);
+    let (d, p) = view.read_with(cx, |v, _| (v.wishes.desires.path().map(Into::into), v.wishes.pres.path().map(Into::into)));
+    view.update(cx, |v, _| v.wishes = crate::rail_wishes::Stores::at_launch());
+    let home = crate::rail_wishes::Home::take(d, p);
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    landed(cx, w, view);
+    assert!(view.read_with(cx, |v, _| v.wishes.desires.owns_file() && v.wishes.pres.owns_file()), "the files are its own");
+}
+
+/// `x` on an agent's rail section is D6b's dismissal: the section goes
+/// once it is written, the zone counts it, and a restart keeps it; Ctrl+Z
+/// cancels one no notice of which went, and the section comes back.
+#[gpui_kit::test]
+fn x_dismisses_a_rail_section_and_ctrl_z_cancels_it_unsent(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "dismissed: the section goes");
+    assert_eq!(view.read_with(cx, |v, _| v.rail_layout().map(|(_, l)| l.dismissed)), Some(1), "the zone counts it");
+    assert_eq!(desires(cx, &view), 1, "a desire, written");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "undone: back");
+    assert_eq!(desires(cx, &view), 0, "never sent: cancelled");
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "a restart keeps it");
+    assert_eq!(desires(cx, &view), 1);
+}
+
+/// A dismissal whose notice went isn't undone by Ctrl+Z (`u` shows it
+/// again): the section stays dismissed, and the rail says why.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_dismissal_whose_notice_went_isnt_undone(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    view.update(cx, |v, cx| assert!(v.enter("go on".into(), cx)));
+    landed(cx, w, &view);
+    let sent = view.read_with(cx, |v, _| v.wishes.outbox.clone());
+    assert!(sent.last().is_some_and(|m| m.starts_with("go on\n[block r1 v") && m.ends_with(" dismissed]")), "it rode: {sent:?}");
+    enter(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "still dismissed");
+    let said = view.read_with(cx, |v, _| v.wishes.said.clone()).unwrap_or_default();
+    assert!(said.contains("its notice went"), "{said}");
+}
+
+/// `m` moves a rail section to the other slot, written to the file (a
+/// restart keeps it); Ctrl+Z puts back the agent's placement.
+#[gpui_kit::test]
+fn m_moves_a_rail_section_and_ctrl_z_puts_it_back(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::End, true, false)), "the end slot, the user's");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "undone: the agent's");
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "m");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::End, true, false)), "a restart keeps it");
+}
+
+/// `p` on a transcript block pins it into the rail's upper slot (a
+/// restart keeps it); `p` on its rail section takes it out again, and
+/// Ctrl+Z puts the pin back (its section found wherever the board has it).
+#[gpui_kit::test]
+fn p_pins_a_transcript_block_into_the_rail_and_back(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    walk_on(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "undone: pinned again");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "a restart keeps it");
+}
+
+/// The walk finds a transcript block where this desk draws it (D6b's
+/// placement, `BlockDesires::placed`): pinned into the rail, its
+/// transcript row is placed in the rail's upper slot, and `m` on it moves
+/// its rail section.
+#[gpui_kit::test]
+fn a_pinned_blocks_row_is_placed_where_its_pin_is(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let (_, s) = v.block_shown(row("c")).expect("drawn");
+        assert!(v.wishes.pres.pin(&conv, &s.block).is_ok());
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    let place = view.read_with(cx, |v, _| v.bound_board().and_then(|d| v.find_on(&d, At::Block(row("c")))).map(|f| f.place));
+    assert_eq!(place, Some(Place::Rail(Slot::Upper)), "its row, placed where its pin is");
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::End, true, false)), "its pin, moved");
+}
+
+/// `u` on a soft tombstone ends it, and Ctrl+Z puts it back; `x` on one
+/// sends a real notice of the new generation, and the tombstone ends.
+#[gpui_kit::test]
+fn u_ends_a_soft_tombstone_and_x_dismisses_it(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let ids = ["r1", "r2"].map(|i| cards_spec::block::BlockId::parse(i).expect("an id"));
+        v.wishes.pres.compacted("before-compaction", &conv, &ids);
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "a soft tombstone");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "u");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "it ends");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "undone: the tombstone again");
+    walk_on(cx, w, &view, At::Rail(row("r2")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r2"), None, "dismissed");
+    assert_eq!(desires(cx, &view), 1, "a real notice's desire");
+    let soft = view.read_with(cx, |v, _| {
+        let conv = v.conversation(v.panes.cur.live);
+        v.wishes.pres.soft(&conv, &cards_spec::block::BlockId::parse("r2").expect("an id"))
+    });
+    assert!(!soft, "its tombstone ended");
+}
+
+/// The hover offers D6b's actions where this desk draws them: a transcript
+/// block `rail` (a pin), never `×`; an agent's rail section `⇅` and `×`,
+/// never `rail`; a pinned one's section `rail` (out again). They act.
+#[gpui_kit::test]
+fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let c = row("c");
+    let at_ = head(cx, w, "c");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-act {c} rail")) && !has(cx, w, format!("hover-act {c} ×")));
+    let pin = drawn(cx, w, format!("hover-act {c} rail")).center();
+    click(cx, w, pin);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    let rail_head = |cx: &mut TestAppContext, name: &str| {
+        let at_ = drawn(cx, w, format!("agent-head {}", row(name))).center();
+        mouse(cx, w, at_, "move");
+        wait(cx, w, &view, 300);
+    };
+    let r1 = row("r1");
+    rail_head(cx, "r1");
+    assert!(has(cx, w, format!("hover-act {r1} ⇅")) && has(cx, w, format!("hover-act {r1} ×")));
+    assert!(!has(cx, w, format!("hover-act {r1} rail")), "an agent's section: no pin");
+    rail_head(cx, "c");
+    assert!(has(cx, w, format!("hover-act {c} rail")), "a pinned one's: out again");
+    let unpin = drawn(cx, w, format!("hover-act {c} rail")).center();
+    click(cx, w, unpin);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
 }
 
 // ── the op log ────────────────────────────────────────────────────────
@@ -1119,7 +1360,7 @@ fn the_walk_finds_its_targets_where_this_desk_draws_them(cx: &mut TestAppContext
     let asks = Asks::default();
     view.update(cx, |v, cx| {
         v.agent_rail.vis = Some(Rc::new(Placed { placed: vec![(id("a"), Slot::Upper), (id("r1"), Slot::End)], tomb: id("r2") }));
-        v.desires = Box::new(asks.clone());
+        v.desires = Some(Box::new(asks.clone()));
         cx.notify();
     });
     wait(cx, w, &view, 1000);

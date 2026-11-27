@@ -15,6 +15,16 @@
 //!   (again: the agent's), `show` shows every section this rail hides, and
 //!   a tombstone's click ends it (`u`). Each is checked against the bound
 //!   board first, as D6a's targets are.
+//! - **D7's keys** (`x u p m`, the hover's `×` `rail` `⇅`, and their undo)
+//!   are D7's seam, answered here ([`Stores`]'s `BlockDesires`) where this
+//!   desk draws what they do: `x` and `u` on the agent's rail sections
+//!   (`u` on a soft tombstone ends it), `p` on a transcript block (into
+//!   the rail's upper slot, and `p` again back), `m` on a rail section.
+//!   Elsewhere nothing, and the hover doesn't offer it: the transcript's
+//!   tombstone and pin stub aren't drawn yet. Ctrl+Z puts back what one
+//!   did, all of it or nothing, only while it holds: a dismissal (or a
+//!   show) no notice of which may have gone, a pin, a slot move, a soft
+//!   tombstone ended. A key's token names its undo ([`UNDO_KEPT`] kept).
 //! - **Riding** ([`AppView::ride_notices`]): the composer's `Submit` (idle)
 //!   or `Steer` (a turn runs) carries what [`Desires::ride`] attaches; one
 //!   whose marks aren't written yet goes once they are ([`Landed::Send`]),
@@ -39,22 +49,23 @@
 //!   for as long as this desk doesn't own its files, that it keeps its
 //!   changes in memory only ([`Stores::memory_only`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use cards_spec::block::message::Visibility as Notice;
 use cards_spec::block::{BlockId, Generation, Slot};
-use cards_spec::board::{Block, Visibility};
+use cards_spec::board::{Block, Place, Visibility};
 use gpui_kit::*;
 use synaps_client::blocks::{Drawn, Ref, Shown};
 
 use crate::agent_rail::{RailVisibility, Seen, Tomb};
 use crate::app::AppView;
 use crate::blockfiles::{NotOwned, Owned, Writer};
-use crate::desires::{Carry, Desires, Landed, Refused, Ride, Riding};
+use crate::desires::{Ask, Carry, Desire, Desires, Landed, Refused, Ride, Riding};
 use crate::live::LiveId;
-use crate::presentation::Presentation;
+use crate::presentation::{Mark, Presentation};
+use crate::walk::{Aim, Asked, BlockDesires, Wish};
 
 /// A soft dismissal's tombstone (§3.5).
 pub(crate) const SOFT: &str = "dismissed before compaction · u show";
@@ -151,9 +162,30 @@ pub(crate) struct Stores {
     track: HashMap<String, Track>,
     /// What the rail's footer says last: a refusal, or a settle's why.
     pub(crate) said: Option<String>,
+    /// D7's undo of each key's change, by its token, oldest first.
+    undos: VecDeque<(u64, Undo)>,
+    next_undo: u64,
     /// Tests: every message sent to a session, as it went.
     #[cfg(test)]
     pub(crate) outbox: Vec<String>,
+}
+
+/// An undo refused: what the key did doesn't hold now.
+pub(crate) const CHANGED_SINCE: &str = "it changed since";
+/// An undo refused: its notice may have gone (`u` undoes a dismissal then).
+pub(crate) const NOTICE_WENT: &str = "its notice went · u shows it again";
+
+/// Undos kept at most: every pane's walk keeps `crate::walk::UNDO_MAX`.
+pub(crate) const UNDO_KEPT: usize = 4 * crate::walk::UNDO_MAX;
+
+/// What a key changed, to put back: block `r`'s presentation in `conv`
+/// as it was and as the key left it, and its desire (in `generation`) as
+/// the key left it, if the key made one.
+struct Undo {
+    conv: String,
+    r: Ref,
+    pres: (Mark, Mark),
+    desire: Option<(Generation, BlockId, Option<Desire>)>,
 }
 
 /// A message waiting for its marks: its attachment, and whether a turn
@@ -209,6 +241,8 @@ impl Stores {
             sent: Vec::new(),
             track: HashMap::new(),
             said: None,
+            undos: VecDeque::new(),
+            next_undo: 0,
             #[cfg(test)]
             outbox: Vec::new(),
         }
@@ -287,6 +321,150 @@ impl Stores {
             h.finish()
         };
         out
+    }
+}
+
+impl Stores {
+    /// `aim`'s change made by `f` (it says what happened), kept to undo:
+    /// its presentation before and after, and its desire after, if `f`
+    /// made one (its generation, its id).
+    fn keep(&mut self, aim: &Aim, desire: Option<(Generation, BlockId)>, f: impl FnOnce(&mut Self) -> Result<bool, String>) -> Asked {
+        let r = &aim.block.block.id;
+        let before = self.pres.mark(aim.conv, r);
+        match f(self) {
+            Ok(wished) => {
+                let after = self.pres.mark(aim.conv, r);
+                let desire = desire.filter(|_| wished).map(|(g, id)| {
+                    let d = self.desires.wish(aim.conv, &g, &id).cloned();
+                    (g, id, d)
+                });
+                self.next_undo += 1;
+                self.undos.push_back((self.next_undo, Undo { conv: aim.conv.to_string(), r: r.clone(), pres: (before, after), desire }));
+                if self.undos.len() > UNDO_KEPT {
+                    self.undos.pop_front();
+                }
+                Asked::Done(self.next_undo)
+            }
+            Err(why) => {
+                self.said = Some(format!("{r}: {why}"));
+                Asked::Refused(why)
+            }
+        }
+    }
+
+    /// `x` or `u` on `aim`: the desire (on a soft tombstone, `x` a real
+    /// notice of the new generation, and the tombstone ends; `u` ends it).
+    fn want(&mut self, aim: &Aim, dismiss: bool) -> Asked {
+        let wish = if dismiss { Wish::Dismiss } else { Wish::Show };
+        let (Ref::Block(id), Some(g)) = (&aim.block.block.id, aim.drawn.generation) else { return Asked::Off };
+        if !self.offers(wish, &aim.block.block, matches!(aim.place, Place::Rail(_))) {
+            return Asked::Off;
+        }
+        self.said = None;
+        if !dismiss && aim.tomb.is_some() {
+            return self.keep(aim, None, |s| Ok(s.pres.unsoft(aim.conv, id)));
+        }
+        let shared = aim.drawn.visibility.clone();
+        self.keep(aim, Some((g, id.clone())), |s| {
+            let asked = if dismiss { s.desires.dismiss(aim.conv, &g, id, &shared) } else { s.desires.show(aim.conv, &g, id, &shared) };
+            match asked {
+                Ok(a) => {
+                    if dismiss {
+                        s.pres.unsoft(aim.conv, id);
+                    }
+                    Ok(a == Ask::Saving)
+                }
+                Err(Refused(why)) => Err(why),
+            }
+        })
+    }
+}
+
+/// D7's keys on D6b's stores (module docs).
+impl BlockDesires for Stores {
+    fn wired(&self) -> bool {
+        true
+    }
+
+    fn offers(&self, wish: Wish, b: &Block, rail: bool) -> bool {
+        match wish {
+            // The rail draws a dismissal; the transcript's tombstone isn't
+            // drawn yet.
+            Wish::Dismiss | Wish::Show => matches!(b.place, Place::Rail(_)),
+            // A transcript block into the rail, and back; nothing draws an
+            // agent's rail section in the transcript yet.
+            Wish::Pin => matches!(b.place, Place::Transcript(_)),
+            Wish::Slot => rail,
+        }
+    }
+
+    fn placed(&self, conv: &str, b: &Block) -> Place {
+        self.pres.placed(conv, b).place
+    }
+
+    fn dismiss(&mut self, aim: &Aim) -> Asked {
+        self.want(aim, true)
+    }
+
+    fn show(&mut self, aim: &Aim) -> Asked {
+        self.want(aim, false)
+    }
+
+    fn pin(&mut self, aim: &Aim) -> Asked {
+        if !self.offers(Wish::Pin, &aim.block.block, false) {
+            return Asked::Off;
+        }
+        self.said = None;
+        self.keep(aim, None, |s| s.pres.pin(aim.conv, &aim.block.block).map(|_| false))
+    }
+
+    fn slot(&mut self, aim: &Aim) -> Asked {
+        if !matches!(aim.place, Place::Rail(_)) {
+            return Asked::Off;
+        }
+        self.said = None;
+        self.keep(aim, None, |s| s.pres.slot(aim.conv, &aim.block.block).map(|_| false))
+    }
+
+    /// All of it put back, or nothing: only while its presentation and its
+    /// desire are what the key left, and no notice of that desire may have
+    /// gone (a delivered dismissal is undone with Show).
+    fn undo(&mut self, aim: &Aim, wish: Wish, token: u64) -> Asked {
+        let Some(k) = self.undos.iter().position(|(t, _)| *t == token) else {
+            return Asked::Refused("too long ago to undo".into());
+        };
+        let u = &self.undos[k].1;
+        let mut why = (self.pres.mark(&u.conv, &u.r) != u.pres.1).then_some(CHANGED_SINCE);
+        if let Some((g, id, after)) = &u.desire {
+            match (self.desires.wish(&u.conv, g, id), after) {
+                (None, None) => {}
+                (Some(now), Some(then)) if (now.dismissed, now.version) == (then.dismissed, then.version) => {
+                    if now.sent || now.in_flight() {
+                        why = why.or(Some(NOTICE_WENT));
+                    }
+                }
+                _ => why = Some(CHANGED_SINCE),
+            }
+        }
+        if let Some(why) = why {
+            self.said = Some(format!("{}: {why}", u.r));
+            return Asked::Refused(why.into());
+        }
+        let (_, u) = self.undos.remove(k).expect("found");
+        if let Some((g, id, _)) = &u.desire {
+            let shared = &aim.drawn.visibility;
+            // The opposite wish: over one no notice went for, a cancel.
+            let undone = match wish {
+                Wish::Dismiss => self.desires.show(&u.conv, g, id, shared),
+                _ => self.desires.dismiss(&u.conv, g, id, shared),
+            };
+            if let Err(Refused(why)) = undone {
+                self.said = Some(format!("{id}: {why}"));
+                return Asked::Refused(why);
+            }
+        }
+        self.pres.put_back(&u.conv, &u.r, &u.pres.0);
+        Asked::Done(token)
     }
 }
 
@@ -597,27 +775,6 @@ impl AppView {
         }
         self.pump_wishes(cx);
         cx.notify();
-    }
-
-    /// `×` on block `b` of store `live`'s rail.
-    pub(crate) fn dismiss_block(&mut self, live: LiveId, b: &Block, cx: &mut Context<Self>) {
-        let (Ref::Block(id), Some((conv, g, shared))) = (&b.id, self.wish_board(live)) else { return };
-        self.wishes.said = None;
-        match self.wishes.desires.dismiss(&conv, &g, id, &shared) {
-            Ok(_) => {
-                // A soft one: the real notice now, the tombstone ends.
-                self.wishes.pres.unsoft(&conv, id);
-            }
-            Err(Refused(why)) => self.wishes.said = Some(format!("{id}: {why}")),
-        }
-        self.pump_wishes(cx);
-    }
-
-    /// `⇅` on block `b` of store `live`'s rail.
-    pub(crate) fn slot_block(&mut self, live: LiveId, b: &Block, cx: &mut Context<Self>) {
-        let conv = self.conversation(live);
-        self.wishes.said = self.wishes.pres.slot(&conv, b).err();
-        self.pump_wishes(cx);
     }
 
     /// A soft tombstone's `u`: it ends.
