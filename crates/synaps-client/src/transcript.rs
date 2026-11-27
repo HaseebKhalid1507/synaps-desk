@@ -300,6 +300,11 @@ pub struct ToolCall {
     /// note the engine ends with), not from the preview's slice.
     pub tail: String,
     pub status: Option<ToolStatus>,
+    /// Its place among the calls this transcript heard start
+    /// (`ToolStarted`, 1 for the first; 0: none heard). The rail's NOW
+    /// names the earliest-started call still running (synaps-cards
+    /// `docs/blocks.md` §4), so parallel calls never trade the label.
+    pub started: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -564,6 +569,8 @@ pub struct Transcript {
     /// The steer the engine holds, by the latest word (the snapshot's or
     /// a digest's `queued_message`).
     queued: Option<String>,
+    /// The calls heard start (`ToolStarted`): [`ToolCall::started`]'s count.
+    started: u64,
     /// A compaction this attachment heard start has not ended.
     compacting: bool,
     /// The conversation was swapped (a compaction applied, a resume): the
@@ -1920,6 +1927,7 @@ impl Transcript {
                                 result: String::new(),
                                 tail: String::new(),
                                 status: Some(ToolStatus::Running),
+                                started: 0,
                             };
                             let kept = crate::blocks::keeps_input(&tool.name)
                                 .then(|| Arc::new(crate::blocks::canonical(b.get("input").unwrap_or(&Value::Null))));
@@ -2318,6 +2326,10 @@ impl Transcript {
                     if let Some(ix) = self.tool_mut(tool_id) {
                         if let Some(t) = self.items[ix].tool.as_mut() {
                             t.status = Some(if queued { ToolStatus::Queued } else { ToolStatus::Running });
+                            if !queued && t.started == 0 {
+                                self.started += 1;
+                                t.started = self.started;
+                            }
                         }
                         self.came(ix, false);
                         self.touch(ix);

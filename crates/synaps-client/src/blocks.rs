@@ -2080,13 +2080,7 @@ impl RowBlocks {
     /// shown blocks' entries and its run's title, not the blocks (the
     /// board's copies, counted with it: [`Drawn::bytes`]).
     pub fn own_bytes(&self) -> usize {
-        fn shown(s: &Shown) -> usize {
-            s.members.capacity() * std::mem::size_of::<Shown>() + s.members.iter().map(shown).sum::<usize>()
-        }
-        ARC + std::mem::size_of::<RowBlocks>()
-            + self.blocks.capacity() * std::mem::size_of::<Shown>()
-            + self.blocks.iter().map(shown).sum::<usize>()
-            + self.run.as_ref().map_or(0, |r| ARC + r.len())
+        ARC + std::mem::size_of::<RowBlocks>() + Shown::list_bytes(&self.blocks) + self.run.as_ref().map_or(0, |r| ARC + r.len())
     }
 
     /// One of the rows every committed call shares ([`RowBlocks::committed`]):
@@ -2129,6 +2123,15 @@ pub struct Shown {
     pub members: Vec<Shown>,
 }
 
+impl Shown {
+    /// What a list of them keeps of its own (bytes): its entries and its
+    /// groups' member lists, not the blocks (the board's copies, counted
+    /// with it: [`Drawn::bytes`]).
+    pub fn list_bytes(list: &Vec<Shown>) -> usize {
+        list.capacity() * std::mem::size_of::<Shown>() + list.iter().map(|s| Shown::list_bytes(&s.members)).sum::<usize>()
+    }
+}
+
 /// One finished board ([`Worker::run`]): what the rows draw of it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Drawn {
@@ -2143,6 +2146,10 @@ pub struct Drawn {
     /// What rows draw of it, by row id (module docs): the live turn's and
     /// the open batch's calls' fates, blocks, runs' titles.
     pub rows: HashMap<u64, Arc<RowBlocks>>,
+    /// The rail's two slots (§4), `upper` then `end`: each slot's blocks
+    /// that aren't group members, in its list's order (the agent's
+    /// placement order), a group with its members.
+    pub rail: [Vec<Shown>; 2],
     /// The history's block calls that committed since the rows last took
     /// them, their rows and fates: each row keeps its fate once taken
     /// ([`HistoryBlocks::took`] with `committed_to`, how many so far).
@@ -2582,11 +2589,14 @@ impl Worker {
                 rows.entry(r).or_default().run = Some(Arc::from(&*run.summary));
             }
         }
+        let rail =
+            [block::Slot::Upper, block::Slot::End].map(|slot| view.list(Place::Rail(slot)).iter().filter_map(shown).collect::<Vec<_>>());
         // Its blocks are copies of the boards' (each block once at most):
         // B2's count of their blocks bounds them, heap included (its
         // own: a block's item ids and last writers are B2's to read).
         let (mut shown_n, mut bound_n) = (0, 0);
-        for s in rows.values().flat_map(|r| &r.blocks).flat_map(|s| std::iter::once(s).chain(&s.members)) {
+        let tops = rows.values().flat_map(|r| &r.blocks).chain(rail.iter().flatten());
+        for s in tops.flat_map(|s| std::iter::once(s).chain(&s.members)) {
             shown_n += 1;
             bound_n += usize::from(s.bound.is_some());
         }
@@ -2598,6 +2608,7 @@ impl Worker {
         let bytes = std::mem::size_of::<Drawn>()
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
+            + rail.iter().map(Shown::list_bytes).sum::<usize>()
             + blocks
             + ARC
             + committed.len() * std::mem::size_of::<(u64, Fate)>();
@@ -2607,6 +2618,7 @@ impl Worker {
             history: input.history_len,
             events: self.journal.len(),
             rows,
+            rail,
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),

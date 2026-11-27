@@ -1474,6 +1474,9 @@ impl AppView {
         }
         let pct: SharedString = ratio.map(|r| format!("{:.0}", r * 100.0)).unwrap_or_else(|| "—".into()).into();
         let fits = crate::app::toggled(self.width, self.panels, false).is_some();
+        // The agent's sections the panel holds (blocks.md §4): `◆3` under
+        // the gauge; the strip's click opens the panel.
+        let agent = self.rail_count();
         v_flex()
             .id("right-strip")
             .w(px(STRIP))
@@ -1492,7 +1495,10 @@ impl AppView {
                     .items_center()
                     .gap(px(14.))
                     .child(v_flex().items_center().child(display(pct, 13., q.prose_ch)).child(mono("%", size::META, q.dim_ch)))
-                    .child(gauge),
+                    .child(gauge)
+                    .when(agent > 0, |d| {
+                        d.child(mono(format!("◆{agent}"), size::META, q.acc).debug_selector(move || format!("strip-agent {agent}")))
+                    }),
             )
             .tooltip(move |window, cx| {
                 let tip = match (detached, fits) {
@@ -2631,7 +2637,10 @@ impl AppView {
                 files = files.child(mono(format!("+{} more", shell.len() - FILES_SHOWN), size::META, p.dim_ch).mt(px(6.)));
             }
         }
-        v_flex()
+        self.rail_frame();
+        let upper = self.render_agent(cards_spec::block::Slot::Upper, width, p, cx);
+        let end = self.render_agent(cards_spec::block::Slot::End, width, p, cx);
+        let panel = v_flex()
             .id("right")
             .w(px(width))
             .h_full()
@@ -2660,7 +2669,12 @@ impl AppView {
             .child(context)
             .child(tokens)
             .children(cache)
+            // The agent's sections (blocks.md §4, decision 1): `upper`
+            // between Prompt cache and Files, `end` after Files.
+            .children(upper)
             .child(files)
+            .children(end);
+        crate::agent_rail_view::KeepY::new(panel.into_any_element(), &self.agent_rail, &self.bars.right.scroll, self.fx.now())
     }
 
     /// The theme picker: SYNAPS CONFIG (follow the TUI's `theme =`, the

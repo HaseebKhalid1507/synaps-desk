@@ -357,7 +357,7 @@ impl AppView {
     /// them: bound, the latest call of their tool id, and no answer of
     /// this desk's on its way (its receipt is drawn instead). With their
     /// age (the fold's order).
-    fn open_cards(&self, live: crate::live::LiveId) -> Vec<(Painted, u64)> {
+    pub(crate) fn open_cards(&self, live: crate::live::LiveId) -> Vec<(Painted, u64)> {
         let l = &self.model.lives[live];
         if l.watch.focused().is_some() {
             return Vec::new();

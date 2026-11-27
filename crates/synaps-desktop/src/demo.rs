@@ -40,6 +40,11 @@ pub(crate) const ASK_OPEN: &str = "20261124-101700-cd03";
 /// `--offline --session 20261126-093000-bk01`; listed with
 /// `SYNAPS_DEMO_BLOCKS=1` (stills).
 pub(crate) const BLOCKS: &str = "20261126-093000-bk01";
+/// A session whose agent molds the rail (synaps-cards `docs/blocks.md` §4,
+/// D6): sections in both slots, more than the cap wants, every kind, a
+/// group ([`synaps_client::synthetic::rail_history`]): `--offline
+/// --session 20261127-090000-rl01`; listed with `SYNAPS_DEMO_BLOCKS=1`.
+pub(crate) const RAIL: &str = "20261127-090000-rl01";
 /// Tests: another session of [`BLOCKS`]' shape, its block ids and files the
 /// same, its edit's text not (what one session's pane state must never
 /// show for another's).
@@ -146,6 +151,8 @@ fn sessions(now: i64, settled: bool) -> Vec<SessionMeta> {
     if std::env::var("SYNAPS_DEMO_BLOCKS").as_deref() == Ok("1") {
         rows.push(json!({"id": BLOCKS, "name": "relay-refresh", "title": "Close the refresh race", "model": opus, "cwd": CWD,
             "lifecycle": "live", "messages": 13, "cost_usd": 2.31, "state_since": ago(3), "created_at": ago(25)}));
+        rows.push(json!({"id": RAIL, "name": "relay-rail", "title": "Keep the plan in the rail", "model": opus, "cwd": CWD,
+            "lifecycle": "live", "messages": 6, "cost_usd": 0.84, "state_since": ago(2), "created_at": ago(12)}));
     }
     rows.into_iter().filter_map(|r| serde_json::from_value(r).ok()).collect()
 }
@@ -576,6 +583,9 @@ pub fn attach(id: &str, attach_seq: u64) -> Vec<Event> {
     }
     if id == BLOCKS {
         return attach_asks(attach_seq, BLOCKS, synaps_client::synthetic::blocks_history(), "Close the refresh race");
+    }
+    if id == RAIL {
+        return attach_asks(attach_seq, RAIL, synaps_client::synthetic::rail_history(), "Keep the plan in the rail");
     }
     #[cfg(test)]
     if id == BLOCKS_TWIN {

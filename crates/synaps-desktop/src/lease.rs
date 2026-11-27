@@ -329,7 +329,10 @@ impl AppView {
     pub(crate) fn board_ready(&mut self, live: LiveId, drawn: Arc<Drawn>, cx: &mut Context<Self>) {
         let old = self.model.lives[live].transcript.drawn().cloned();
         let panes: Vec<PaneId> = self.panes.iter().filter(|p| p.live == live).map(|p| p.id).collect();
-        let held = panes.iter().any(|&p| self.in_pane(p, |this| this.disturbs(old.as_deref(), &drawn)).unwrap_or(false));
+        // The rail's lease too (D6a, §4): the panel draws the focused
+        // pane's session's rail from the same board.
+        let held = panes.iter().any(|&p| self.in_pane(p, |this| this.disturbs(old.as_deref(), &drawn)).unwrap_or(false))
+            || self.rail_disturbs(live, old.as_deref(), &drawn);
         if held {
             self.model.lives[live].board.waiting = Some(drawn);
             self.arm_lease_wake(cx);
@@ -363,6 +366,7 @@ impl AppView {
         }
         self.model.lives[live].transcript.set_drawn(Some(drawn.clone()));
         self.model.lives[live].board.published += 1;
+        self.rail_landed(live, &drawn);
         // The panes' caches keep only the blocks this board draws (§1.8:
         // renderer caches are bounded, per pane).
         let rows: std::collections::HashSet<u64> = drawn
@@ -394,12 +398,15 @@ impl AppView {
         }
     }
 
-    /// One wake, at the lease's end, while a board waits (§6.2 "Frames").
-    fn arm_lease_wake(&mut self, cx: &mut Context<Self>) {
+    /// One wake, at the lease's end, while a board waits (§6.2 "Frames"):
+    /// the panes' leases and the rail's.
+    pub(crate) fn arm_lease_wake(&mut self, cx: &mut Context<Self>) {
         let now = self.fx.now();
-        let due = self.panes.iter().filter(|p| !p.lease.pressed).filter_map(|p| p.lease.moved).map(|t| t + LEASE).max();
+        let rail = &self.agent_rail.lease;
+        let leases = self.panes.iter().map(|p| &p.lease).chain(std::iter::once(rail));
+        let due = leases.filter(|l| !l.pressed).filter_map(|l| l.moved).map(|t| t + LEASE).max();
         let Some(due) = due.filter(|d| *d > now) else {
-            if !self.panes.iter().any(|p| p.lease.pressed) {
+            if !self.panes.iter().any(|p| p.lease.pressed) && !self.agent_rail.lease.pressed {
                 self.lease_release(cx);
             }
             return;
@@ -449,6 +456,7 @@ impl AppView {
             p.lease.note = None;
             p.lease.moved = None;
         }
+        (self.agent_rail.lease.note, self.agent_rail.lease.moved) = (None, None);
         self.lease_release(cx);
     }
 
@@ -460,6 +468,7 @@ impl AppView {
         for p in self.panes.iter_mut() {
             ended |= std::mem::take(&mut p.lease.pressed) | p.lease.down.take().is_some();
         }
+        ended |= std::mem::take(&mut self.agent_rail.lease.pressed) | self.agent_rail.down.take().is_some();
         if !ended {
             return;
         }
