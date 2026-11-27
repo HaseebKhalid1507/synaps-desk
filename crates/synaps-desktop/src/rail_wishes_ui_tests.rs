@@ -848,6 +848,7 @@ fn a_writer_that_takes_nothing_runs_no_disk_job_here(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
     board(cx, w, &view);
     assert_eq!(outbox(cx, &view), ["one\n[block plan v1 dismissed]"], "it rode at once");
+    echoed_then_detached(cx, w, &view, "one\n[block plan v1 dismissed]");
     view.update(cx, |v, _| {
         v.flush_wishes();
     });
@@ -878,6 +879,7 @@ fn a_writer_that_didnt_start_takes_no_lock_and_keeps_the_rail_in_memory(cx: &mut
     view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
     board(cx, w, &view);
     assert_eq!(outbox(cx, &view), ["one\n[block plan v1 dismissed]"], "it rode at once");
+    refused(cx, &view, "one");
     assert_eq!(crate::blockfiles::on_this_thread(), before, "no disk job ran here");
     assert!(!path.exists() && !ppath.exists(), "nor anywhere");
     let t = std::time::Instant::now();
@@ -914,6 +916,95 @@ fn a_writer_that_stops_with_a_write_out_leaves_the_rail_in_memory(cx: &mut TestA
     assert!(!has_sec(cx, &view, "cause"), "and after");
     assert_eq!(crate::blockfiles::on_this_thread(), before, "no disk job ran here");
     assert_eq!(std::fs::read(&path).expect("the file"), written, "nor anywhere: the file as it was");
+    echoed_then_detached(cx, w, &view, "one\n[block plan v1 dismissed]");
+}
+
+// Shady's review of #103, round 5 (41f117d).
+
+/// The message in flight, `wire` as sent: its echo confirms it, and a
+/// detach after gives the composer nothing back.
+#[cfg(unix)]
+fn echoed_then_detached(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, wire: &str) {
+    assert_eq!(in_flight(cx, view).len(), 1, "in flight");
+    heard(cx, w, view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": wire})]);
+    assert!(in_flight(cx, view).is_empty(), "its echo, the text as sent, confirmed it");
+    detached(cx, view);
+    assert_eq!(drafts(cx, view), "", "it went and was confirmed: nothing back");
+}
+
+/// The message in flight (`body` typed) refused: its body goes back to the
+/// composer, and it is no longer in flight.
+#[cfg(unix)]
+fn refused(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) {
+    assert_eq!(in_flight(cx, view), [body], "in flight");
+    let (seq, _) = attachment(cx, view);
+    let error = synaps_client::Error::Refused { command: Some("submit".into()), reason: "input is owned by client #1".into() };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::Error { attach_seq: Some(seq), error }], cx));
+    cx.run_until_parked();
+    assert_eq!(drafts(cx, view), body, "refused: back to its composer");
+    assert!(in_flight(cx, view).is_empty());
+}
+
+#[cfg(unix)]
+fn detached(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    let (seq, sid) = attachment(cx, view);
+    view.update(cx, |v, cx| {
+        v.apply_batch(vec![synaps_client::Event::Detached { attach_seq: seq, session_id: Some(sid), reason: "gone".into() }], cx)
+    });
+    cx.run_until_parked();
+}
+
+/// R5-P2: the desk owns its files, its dismissal written, and the writer
+/// stops with nothing out. A message its notice rides waits for its mark,
+/// the writer takes no write, and it goes at once (memory only from then),
+/// before `enter` returns: it was in flight first, so it is in flight now
+/// as sent.
+#[cfg(unix)]
+fn sent_as_its_writer_is_lost(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>, &'static str) {
+    let (w, view) = rail(cx);
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.wishes.desires.owns_file()));
+    let writer = view.read_with(cx, |v, _| v.wishes.home.writer.clone());
+    writer.stop();
+    let wire = "one\n[block plan v1 dismissed]";
+    view.update(cx, |v, cx| {
+        assert!(v.enter("one".into(), cx));
+        assert_eq!(v.wishes.outbox, [wire], "it went before enter returned");
+    });
+    let said = view.read_with(cx, |v, _| v.wishes.memory_only()).expect("memory only, said");
+    assert!(said.contains("its writer stopped"), "{said}");
+    assert_eq!(in_flight(cx, &view), ["one"]);
+    (w, view, wire)
+}
+
+/// R5-P2: sent as its writer is lost, its echo confirms it.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_message_sent_as_its_writer_is_lost_is_confirmed_by_its_echo(cx: &mut TestAppContext) {
+    let (w, view, wire) = sent_as_its_writer_is_lost(cx);
+    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": wire})]);
+    assert!(in_flight(cx, &view).is_empty(), "its echo, the text as sent, confirmed it");
+}
+
+/// R5-P2: sent as its writer is lost, a refusal is about it: its body goes
+/// back to the composer.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_message_sent_as_its_writer_is_lost_is_given_back_when_refused(cx: &mut TestAppContext) {
+    let (_, view, _) = sent_as_its_writer_is_lost(cx);
+    refused(cx, &view, "one");
+}
+
+/// R5-P2: sent as its writer is lost and confirmed, a detach gives the
+/// composer nothing back.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_message_sent_as_its_writer_is_lost_isnt_given_back_by_a_detach(cx: &mut TestAppContext) {
+    let (w, view, wire) = sent_as_its_writer_is_lost(cx);
+    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": wire})]);
+    detached(cx, &view);
+    assert_eq!(drafts(cx, &view), "", "it went: nothing back");
 }
 
 /// The view's last change, made and its window closed at once (no frame

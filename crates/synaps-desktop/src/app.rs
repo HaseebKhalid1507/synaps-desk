@@ -4904,11 +4904,11 @@ impl AppView {
         // or it goes once their marks are written (out of the composer
         // already); refused, it stays.
         let body = text;
-        let ride = match self.ride_notices(self.panes.cur.live, seq, busy, body.clone(), cx) {
+        let ride = match self.ride_notices(self.panes.cur.live, self.panes.cur.id, seq, busy, body.clone(), cx) {
             Ok(crate::desires::Riding::Go(r)) => r,
-            // In flight once it goes: its echo is the text as it goes then.
-            Ok(crate::desires::Riding::Wait(ticket)) => {
-                self.model.lives[self.panes.cur.live].waiting(self.panes.cur.id, body, ticket);
+            // In flight already (it may have gone): its echo is the text as
+            // it goes.
+            Ok(crate::desires::Riding::Wait(_)) => {
                 self.panes.cur.draft_note = None;
                 self.panes.cur.watch_note = None;
                 self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));

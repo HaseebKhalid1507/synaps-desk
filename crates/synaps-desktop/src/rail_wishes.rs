@@ -548,14 +548,19 @@ impl AppView {
         }
     }
 
-    /// The composer's `text` for store `live` (attachment `seq`), as it
+    /// Pane `pane`'s `text` for store `live` (attachment `seq`), as it
     /// goes `busy` or not, with the notices that ride it: `Go` to send now
     /// ([`AppView::ride_went`] after), `Wait` sent once its marks are
-    /// written (its ticket: [`crate::live::InFlight::went`]), `Err` kept
-    /// in the composer, why.
+    /// written, `Err` kept in the composer, why.
+    ///
+    /// Waiting, it is in flight (on its ticket, [`crate::live::InFlight::went`])
+    /// before anything can send it: the writer may take no write now (memory
+    /// only from then), and then it goes before this returns (Shady #103
+    /// R5-P2).
     pub(crate) fn ride_notices(
         &mut self,
         live: LiveId,
+        pane: crate::pane::PaneId,
         seq: u64,
         busy: bool,
         text: String,
@@ -567,6 +572,7 @@ impl AppView {
         let how = if busy { Carry::Steer } else { Carry::Submit };
         match self.wishes.desires.ride(&conv, &g, &shared, &text, how) {
             Ok(Riding::Wait(ticket)) => {
+                self.model.lives[live].waiting(pane, text, ticket);
                 self.wishes.waiting.insert(ticket, Waiting { seq, busy });
                 self.pump_wishes(cx);
                 Ok(Riding::Wait(ticket))
