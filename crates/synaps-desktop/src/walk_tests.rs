@@ -1333,6 +1333,36 @@ fn undoing_a_fifth_expansion_refuses_if_the_displaced_one_was_made_again(cx: &mu
     the_displaced_one_changed(cx, "removed and made again", vec![json!([{"op":"remove","id":"file"}]), again]);
 }
 
+/// Shady #105 R3: the expansion a fifth folded back, replaced by the agent
+/// while the rail's lease holds (its board waiting, the old one still
+/// drawn): the undo checks both sections on that newest bound board,
+/// never the one drawn. Nothing undone, and once the board lands the
+/// replacement stays folded.
+#[gpui_kit::test]
+fn undoing_a_fifth_expansion_refuses_if_the_displaced_one_was_replaced_under_the_lease(cx: &mut TestAppContext) {
+    let (w, view) = fifth_folded_back(cx, "file");
+    let file = Ref::parse("file").expect("an id");
+    let laid =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail_layout().and_then(|(_, l)| l.section(&file).map(|s| s.s.block.tag)));
+    let was = laid(cx).expect("file laid out");
+    turn(cx, w, &view);
+    // The pointer over the rail: its lease holds the replacement back.
+    let over = drawn(cx, w, format!("agent-head {}", row("plan"))).center();
+    mouse(cx, w, over, "move");
+    let replace = json!([{"op":"replace","id":"file","kind":"file","body":{"path":"crates/relay/src/lock.rs","state":"editing"}}]);
+    round(cx, w, &view, &[("toolu_dl", replace, true)]);
+    assert!(waiting(cx, &view), "the replacement waits under the rail's lease");
+    assert_eq!(laid(cx), Some(was), "the old file still drawn");
+    assert!(rail_open(cx, w, "plan") && !rail_open(cx, w, "file"), "as the fifth left them");
+    press(cx, w, "ctrl-z");
+    assert!(!waiting(cx, &view), "the key released the lease");
+    assert!(laid(cx).is_some_and(|t| t != was), "the replacement drawn");
+    wait(cx, w, &view, 1000);
+    assert!(!rail_open(cx, w, "file"), "the old choice never opens the replacement");
+    assert!(rail_open(cx, w, "plan"), "nothing undone, the fifth still open");
+    assert_eq!(view.read_with(cx, |v, _| v.agent_rail.lease.note), Some((row("plan"), crate::walk::STALE)), "and says so");
+}
+
 /// The successor's history (`successor`) after a compaction into
 /// `journal`, in one batch with it, as a daemon can send them: the
 /// capture begins with the predecessor's input, then the transcript lets

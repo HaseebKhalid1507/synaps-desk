@@ -56,7 +56,8 @@
 //!   is the inverse of what the action set, never a toggle: it puts back
 //!   what was there before (an expansion the rail's cap folded back for
 //!   it too), only while the block still shows what the action set, and
-//!   all or nothing: it checks every section it writes. An agent
+//!   all or nothing: it checks every section it writes, all on the
+//!   newest bound board (one waiting under the lease included). An agent
 //!   `collapse` since, the rail's cap since, or the expansion it folded
 //!   back replaced, made again or collapsed by the agent since, makes it
 //!   a no-op that says so ([`STALE`]); another incarnation of the block
@@ -767,17 +768,19 @@ impl AppView {
                 _ => false,
             },
             Undid::RailFold { toggled, open } => {
-                let session = self.rail_sid().map(str::to_string);
-                let laid = self.rail_layout();
-                match (session, laid) {
+                // Both sections it writes checked on one rail: the newest
+                // bound board's (the one `f` was found on, a board waiting
+                // under the lease included), never the one drawn while a
+                // newer one waits (Shady #105 R3).
+                let lay = self.rail_of(self.panes.cur.live, &board);
+                let laid_open = lay.section(&toggled.id).is_some_and(|x| x.state == crate::agent_rail::State::Open);
+                match self.rail_sid().map(str::to_string) {
                     // Still what it set: its choice as made (no agent
                     // `collapse` since), the expansion it folded back
                     // still folded back, the same incarnation, its own
                     // choice holding (`Local::undo`), and it draws as it
                     // did then (no change of the cap's since).
-                    (Some(session), Some((d, lay)))
-                        if f.s.block.folded_at == toggled.after.at && self.rail_open(&d, &toggled.id) == *open =>
-                    {
+                    Some(session) if f.s.block.folded_at == toggled.after.at && laid_open == *open => {
                         self.agent_rail.local_mut(&session).undo(toggled, &lay)
                     }
                     _ => false,
