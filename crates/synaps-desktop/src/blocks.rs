@@ -60,7 +60,7 @@ use crate::turns::{Disp, Gap, Kind, Who};
 pub(crate) const BLOCK_ID: u64 = 1 << 59;
 
 /// The afterglows' key space ([`motion::key`]).
-const GLOW_KEYS: u64 = 0x7B10 << 48;
+pub(crate) const GLOW_KEYS: u64 = 0x7B10 << 48;
 
 /// A diff's well shows this many lines at most; a note this many.
 pub(crate) const DIFF_LINES: usize = 12;
@@ -145,7 +145,7 @@ impl Fit {
 }
 
 /// The block's state, as its header's glyph and word.
-fn life_of(b: &Body, streaming: bool) -> (Life, Option<&'static str>) {
+pub(crate) fn life_of(b: &Body, streaming: bool) -> (Life, Option<&'static str>) {
     let run = if streaming { Life::Run } else { Life::Seen };
     match b {
         Body::Plan(p) => {
@@ -191,7 +191,7 @@ fn life_of(b: &Body, streaming: bool) -> (Life, Option<&'static str>) {
 /// A state word's colour: work going on in the accent, a good end `ok`,
 /// a bad one `err`, the rest `dim` (never the authorize card's warning
 /// colours, §6.1).
-fn word_color(l: Life, p: &Palette) -> Hsla {
+pub(crate) fn word_color(l: Life, p: &Palette) -> Hsla {
     match l {
         Life::Run | Life::Stream | Life::Wait => p.acc,
         Life::Failed | Life::Denied => p.err,
@@ -201,7 +201,7 @@ fn word_color(l: Life, p: &Palette) -> Hsla {
 }
 
 /// The header's title: the block's, else its kind's word (a file's path).
-fn title_of(s: &Shown) -> String {
+pub(crate) fn title_of(s: &Shown) -> String {
     let b = &s.block;
     if let Some(t) = b.title.as_deref().filter(|t| !t.is_empty()) {
         return crate::ask::shown(t, cards_spec::Lines::Single);
@@ -219,12 +219,12 @@ fn title_of(s: &Shown) -> String {
 
 /// A value's hash, for its afterglow: of the bound board's block (a pending
 /// change never glows; it glows when it binds, §6.1).
-fn bound_value<T: Hash>(s: &Shown, f: impl Fn(&Body) -> Option<T>) -> u64 {
+pub(crate) fn bound_value<T: Hash>(s: &Shown, f: impl Fn(&Body) -> Option<T>) -> u64 {
     s.bound.as_ref().map_or(0, |b| hash(f(&b.body)))
 }
 
 /// A plan step's text in its state.
-fn step_word(st: StepState, streaming: bool) -> &'static str {
+pub(crate) fn step_word(st: StepState, streaming: bool) -> &'static str {
     match st {
         StepState::Todo => "",
         StepState::Doing if streaming => "doing",
@@ -235,7 +235,7 @@ fn step_word(st: StepState, streaming: bool) -> &'static str {
     }
 }
 
-fn step_life(st: StepState, streaming: bool) -> Life {
+pub(crate) fn step_life(st: StepState, streaming: bool) -> Life {
     match st {
         StepState::Todo => Life::Queued,
         StepState::Doing if streaming => Life::Run,
@@ -981,19 +981,16 @@ impl AppView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn diff_body(
+    /// A diff's lines as a block draws them (in the transcript and the
+    /// rail): an edit preview's from its session's edits, built as the
+    /// file's last call committed ([`crate::files::Edits`]); a diff's hunks,
+    /// each its `@@` line and its lines. And its foot, if it has one.
+    pub(crate) fn diff_rows(
         &self,
-        s: &Shown,
+        live: crate::live::LiveId,
         d: &cards_spec::block::DiffBody,
-        id: u64,
-        g: &Geo,
-        p: &Palette,
-        m: &Metrics,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let l = &self.model.lives[self.panes.cur.live];
-        let cw = m.mono * 0.6;
+    ) -> (Vec<(Option<crate::files::LineKind>, SharedString)>, &'static str) {
+        let l = &self.model.lives[live];
         let mut lines: Vec<(Option<crate::files::LineKind>, SharedString)> = Vec::new();
         let foot = if d.from.is_some() {
             // Built as the file's last call committed (`files::Edits`):
@@ -1039,6 +1036,22 @@ impl AppView {
             }
             if d.state == DiffState::Proposed { "PROPOSED · not applied" } else { "" }
         };
+        (lines, foot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn diff_body(
+        &self,
+        s: &Shown,
+        d: &cards_spec::block::DiffBody,
+        id: u64,
+        g: &Geo,
+        p: &Palette,
+        m: &Metrics,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cw = m.mono * 0.6;
+        let (lines, foot) = self.diff_rows(self.panes.cur.live, d);
         let n = lines.len();
         let shown = n.clamp(1, DIFF_LINES);
         let v = bound_value(s, |b| if let Body::Diff(x) = b { Some(x.hunks.iter().map(|h| h.lines.len()).sum::<usize>()) } else { None });
@@ -1108,7 +1121,7 @@ fn text_w_max(cw: f32) -> f32 {
 
 /// A metric's series (≤ 32): square bars, `series` px tall, the newest
 /// right, in the accent.
-fn spark(series: &[cards_spec::block::Num], h: f32, p: &Palette) -> Div {
+pub(crate) fn spark(series: &[cards_spec::block::Num], h: f32, p: &Palette) -> Div {
     let (lo, hi) = series.iter().map(|n| n.get()).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(x), b.max(x)));
     let span = (hi - lo).max(f64::EPSILON);
     h_flex().h(px(h)).items_end().gap(px(2.)).children(series.iter().map(|n| {

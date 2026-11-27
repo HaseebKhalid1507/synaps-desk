@@ -31,6 +31,8 @@
 // every test module builds, stays the authority on dead code.
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
+mod agent_rail;
+mod agent_rail_view;
 mod agent_surface;
 mod answer;
 mod app;

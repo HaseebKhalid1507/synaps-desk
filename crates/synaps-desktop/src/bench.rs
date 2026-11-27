@@ -711,6 +711,48 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     let _ = cx.update(|_, cx| cx.quit());
                     return;
                 }
+                // `SYNAPS_BENCH_RAIL=N` (D6a, synaps-cards `docs/blocks.md`
+                // §4): the rail session's history, its sections in both slots
+                // of the right panel; 10 s at rest (presents and app frames:
+                // none expected); then after N s a live turn that puts a
+                // section in the upper slot (it glides in, file gives way),
+                // patches the status, runs a read (NOW on the beat), removes
+                // the section and ends; then 3 s at rest past the last glide.
+                if let Some(after) = std::env::var("SYNAPS_BENCH_RAIL").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let _ = upd(cx, &|v, _| {
+                        v.model.local_session(v.panes.cur.live, "bench");
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::rail_history()));
+                        v.sync_list();
+                        v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                        v.panes.cur.list.scroll_to_end();
+                    });
+                    sleep(2.).await;
+                    let mut out = json!({"bench": "rail"});
+                    out["rail_sections"] = json!(view.update(cx, |v, _| v.rail_count()).unwrap_or(0));
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    sleep(10.).await;
+                    out["idle_10s"] = stats(cx, t0, Instant::now(), c0, f0);
+                    sleep(after).await;
+                    for round in crate::bench::rail_turn() {
+                        apply(cx, round);
+                        sleep(1.2).await;
+                    }
+                    out["rail_sections_after"] = json!(view.update(cx, |v, _| v.rail_count()).unwrap_or(0));
+                    sleep(0.6).await;
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    sleep(3.).await;
+                    out["after_last_glide_3s"] = stats(cx, t0, Instant::now(), c0, f0);
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
                 // N s, a scripted turn on the bench's session, the scene a
                 // capture records: a bash call runs (the spinner, its clock,
@@ -2158,6 +2200,43 @@ pub(crate) fn blocks_turn() -> Vec<Vec<Value>> {
         call("toolu_live3", &tick(6, json!({"bisect":"done","fix":"doing"}), "1 commit left: 4e1c0de")),
         call("toolu_live4", &tick(7, json!({"fix":"done","verify":"done"}), "found at 4e1c0de")),
         end,
+    ]
+}
+
+/// The rail scene's live turn (`SYNAPS_BENCH_RAIL`), round by round: a
+/// section put second in the upper slot, the status patched, a read run
+/// and done, the section removed, the turn's end.
+pub(crate) fn rail_turn() -> Vec<Vec<Value>> {
+    use synaps_client::synthetic::{block_input, block_receipt};
+    let s = |e: Value| json!({"ev": "stream", "event": e});
+    let call = |id: &str, ops: &Value| {
+        vec![
+            s(json!({"kind": "llm", "llm": "response_start"})),
+            s(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})),
+            s(json!({"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": id, "input": block_input(ops.clone())})),
+            s(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": block_receipt(ops)})),
+        ]
+    };
+    let put = json!([{"op":"put","id":"lockwait","kind":"metric","title":"Lock wait p95","target":"rail","slot":"upper",
+        "at":{"after":"plan"},"body":{"label":"ms under the 1.5 s cutoff","value":"880","was":"1410","state":"ok"}}]);
+    let mut start = vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": "Run it again."})];
+    start.extend(call("toolu_rail1", &put));
+    let read = vec![
+        s(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "read", "tool_id": "toolu_rail3"})),
+        s(
+            json!({"kind": "llm", "llm": "tool_use", "tool_name": "read", "tool_id": "toolu_rail3", "input": {"path": "crates/relay/src/token_store.rs"}}),
+        ),
+        s(json!({"kind": "llm", "llm": "tool_started", "tool_id": "toolu_rail3"})),
+    ];
+    let mut done = vec![s(json!({"kind": "llm", "llm": "tool_result", "tool_id": "toolu_rail3", "result": "pub struct TokenStore {"}))];
+    done.extend(call("toolu_rail4", &json!([{"op":"remove","id":"lockwait"}])));
+    done.push(s(json!({"kind": "session", "session": "done"})));
+    done.push(json!({"ev": "idle"}));
+    vec![
+        start,
+        call("toolu_rail2", &json!([{"op":"patch","id":"now","set":{"text":"Rerunning the regression test","progress":{"n":32,"of":32}}}])),
+        read,
+        done,
     ]
 }
 
