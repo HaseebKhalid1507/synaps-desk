@@ -21,9 +21,9 @@ anyhow = "1"
 # the answer message and the fold, the same code the `cards` extension runs;
 # and blocks (docs/blocks.md v1.3: the ops, the kinds, the board's fold, B1
 # and B2), from bb7b698 on; the board's `Visibility::records()` (soft
-# dismissals, D6b) from 3d0b979, synaps-cards #12's head until it merges.
-# Pinned to a revision: a new catalog version is a new pin.
-cards-spec = { git = "https://github.com/HaseebKhalid1507/synaps-cards", rev = "3d0b97980a9c35a0f330ccbb7d830445a7c181c4" }
+# dismissals, D6b) from fb72358 (#12). Pinned to a revision: a new catalog
+# version is a new pin.
+cards-spec = { git = "https://github.com/HaseebKhalid1507/synaps-cards", rev = "fb723587c849f82ff8ca2cbf0b5161291e6245aa" }
 
 [profile.release]
 opt-level = 3
