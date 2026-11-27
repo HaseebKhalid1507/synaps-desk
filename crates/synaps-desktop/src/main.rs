@@ -39,6 +39,10 @@ mod ask_keys;
 mod authorize;
 mod beat;
 mod bench;
+// D6b's stores (blocks.md §3.5): built and tested ahead of the rail's
+// seam (D6a's `RailVisibility`), which wires them.
+#[cfg_attr(not(test), allow(dead_code))]
+mod blockfiles;
 mod blocks;
 mod board;
 mod cards;
@@ -48,6 +52,8 @@ mod chrome;
 mod dash;
 mod deliver;
 mod demo;
+#[cfg_attr(not(test), allow(dead_code))]
+mod desires;
 mod detail;
 mod diag;
 mod dnd;
@@ -72,6 +78,8 @@ mod palette;
 mod palettes;
 mod pane;
 mod presence;
+#[cfg_attr(not(test), allow(dead_code))]
+mod presentation;
 mod rail;
 mod recall;
 #[cfg(test)]

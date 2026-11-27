@@ -2217,7 +2217,7 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 /// Windows' `ERROR_LOCK_VIOLATION` only). `Err`: why it isn't held, at once
 /// for a lock file that can't be opened or locked at all (the caller writes
 /// unlocked and says so on stderr). Never a blocking lock.
-fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
