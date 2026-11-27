@@ -312,10 +312,113 @@ pub fn blocks_history() -> Vec<Value> {
     ]
 }
 
+/// The plan [`rail_history`] keeps: 20 steps, the first 6 done, the 7th
+/// doing (blocks.md §6.2's "a full 20-step plan at rail width").
+fn rail_plan() -> Value {
+    let labels = [
+        "Trace issuance and verification paths",
+        "Find every caller of rotate()",
+        "Reproduce the race with 32 refreshes",
+        "Read the upstream's rotation contract",
+        "Measure p95 of a rotation",
+        "Pick a lock wait under the upstream's cutoff",
+        "Serialize rotate() per session",
+        "Regression test: 32 concurrent refreshes",
+        "Drop the retry band-aid",
+        "Check the cutoff belongs to the session",
+        "Audit the token cache's eviction",
+        "Load test at 10× staging traffic",
+        "Update the relay runbook",
+        "Note the lock in the design doc",
+        "Review with the relay owners",
+        "Deploy to staging",
+        "Watch staging for a day",
+        "Deploy to production",
+        "Watch production for a day",
+        "Close the incident",
+    ];
+    let steps: Vec<Value> = labels
+        .iter()
+        .enumerate()
+        .map(|(k, l)| {
+            let state = match k {
+                0..6 => "done",
+                6 => "doing",
+                _ => "todo",
+            };
+            json!({"id": format!("s{:02}", k + 1), "label": l, "state": state})
+        })
+        .collect();
+    json!({"steps": steps})
+}
+
+/// A session whose agent molds the rail (blocks.md §4, D6): sections in
+/// both slots, more than the cap of 4 expanded wants, every kind, and a
+/// group. `upper`: a 20-step plan, a status, a long note, a file; `end`:
+/// a metric with a series, a proposed diff of 14 lines, and a group of two
+/// notes (created folded). In drawing order the four places go to the
+/// plan, the status, the note and the file; the metric and the diff are
+/// the end slot's `+2 more`. Deterministic: tests, the demo and the
+/// bench read the same.
+pub fn rail_history() -> Vec<Value> {
+    let note = "Two refreshes read the same token before either rotates it. The second rotation invalidates the first one's token, \
+        so the client that won the race gets a dead token back.\n\nThe retry band-aid hid it: a retry reads the new token, so the \
+        failure only showed as a slow refresh. Under load the retries stacked up behind the upstream's limiter and some \
+        refreshes gave up at the 1.5 s cutoff.\n\nThe fix serializes rotate() per session id. A refresh that finds the lock \
+        held waits for it, then reads the token the holder wrote, so it never rotates again. The lock wait has to stay \
+        under the upstream's cutoff: p95 of a rotation is 1.1 s, so 900 ms leaves room for the read after it.\n\nThe \
+        regression test runs 32 refreshes at once and counts the upstream rotations: one, every time.";
+    let o1 = json!([
+        {"op":"put","id":"plan","kind":"plan","title":"Close the refresh race","target":"rail","slot":"upper","body":rail_plan()},
+        {"op":"put","id":"now","kind":"status","title":"Working on","target":"rail","slot":"upper","body":{"text":"Running the regression test","detail":"32 concurrent refreshes","progress":{"n":31,"of":32},"state":"working"}},
+        {"op":"put","id":"cause","kind":"note","title":"Root cause","target":"rail","slot":"upper","body":{"text":note}},
+        {"op":"put","id":"file","kind":"file","target":"rail","slot":"upper","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}}
+    ]);
+    let o2 = json!([
+        {"op":"put","id":"rot","kind":"metric","title":"Upstream rotations per burst","target":"rail","slot":"end","body":{"label":"rotations per 32 refreshes","value":"1.0","was":"2.0","series":[2,2,2,2,1.5,2,1.5,1,1,1,1,1],"state":"ok"}},
+        {"op":"put","id":"retry","kind":"diff","title":"Drop the band-aid","target":"rail","slot":"end","body":{"file":"crates/relay/src/session.rs","state":"proposed","hunks":[
+            {"id":"h1","at":"Session::refresh()","lines":["-        match self.relay.refresh(&self.token).await {","-            Err(Error::Stale) => {","-                tracing::warn!(\"stale token, retrying\");","-                self.relay.refresh(&self.token).await","-            }","-            r => r,","-        }","+        self.relay.refresh(&self.token).await"],"state":"open"},
+            {"id":"h2","at":"mod retry;","lines":["-mod retry;","-pub use retry::Retry;"],"state":"open"},
+            {"id":"h3","at":"Session::new()","lines":["-            retry: Retry::default(),"],"state":"open"}]}},
+        {"op":"put","id":"n1","kind":"note","title":"Trace","target":"rail","slot":"end","body":{"text":"Both refreshes load generation 41, both rotate: 42 and 43."}},
+        {"op":"put","id":"n2","kind":"note","title":"Upstream","target":"rail","slot":"end","body":{"text":"The upstream revokes 42 as 43 is issued."}},
+        {"op":"merge","into":"findings","title":"What the trace showed","ids":["n1","n2"]}
+    ]);
+    vec![
+        json!({"role": "user", "content": "The refresh race is back on staging. Fix it properly, and keep the plan where I can see it."}),
+        said(vec![text("Putting the plan in the rail."), ops("toolu_rl01", o1.clone())]),
+        results(vec![("toolu_rl01", block_receipt(&o1))]),
+        said(vec![tool("toolu_rl02", "read", json!({"path": "crates/relay/src/session.rs"})), ops("toolu_rl03", o2.clone())]),
+        results(vec![
+            ("toolu_rl02", "impl Session {\n    pub async fn refresh(&self) -> Result<Token> {".into()),
+            ("toolu_rl03", block_receipt(&o2)),
+        ]),
+        said(vec![text("The lock is in. Running the regression test next.")]),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transcript::{ItemKind, Transcript};
+
+    /// Every block call of [`rail_history`] binds (its result a receipt,
+    /// never a refusal), and its board places its sections as the doc says.
+    #[test]
+    fn the_rail_history_binds_and_places_both_slots() {
+        let h = rail_history();
+        for m in &h {
+            for r in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                let text = r["content"].as_str().unwrap_or_default();
+                assert!(!text.starts_with("cards_block:"), "refused: {text}");
+            }
+        }
+        let (board, _) = cards_spec::board::Board::of_history(&h);
+        let names = |slot| board.committed().list(cards_spec::board::Place::Rail(slot)).iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(names(cards_spec::block::Slot::Upper), ["plan", "now", "cause", "file"]);
+        assert_eq!(names(cards_spec::block::Slot::End), ["rot", "retry", "findings"]);
+        assert_eq!(rail_history(), h, "deterministic");
+    }
 
     #[test]
     fn history_is_deterministic_and_folds() {

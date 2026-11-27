@@ -22,7 +22,7 @@ use crate::turns::Kind;
 type W = (AnyWindowHandle, Entity<AppView>);
 
 /// Session `id` opened in `place`, attached by the demo's transport.
-fn open_session(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: &str, place: crate::tabs::Place) {
+pub(super) fn open_session(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: &str, place: crate::tabs::Place) {
     let client = view.update(cx, |v, cx| {
         let c = v.client.take();
         v.open_tab(crate::app::Open::Attach { session_id: id.into(), fallback: None, open: false }, place);
@@ -49,7 +49,7 @@ fn blocks(cx: &mut TestAppContext, w: f32) -> W {
 }
 
 /// The board's job runs and lands, and what it drew settles.
-fn board(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn board(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     for _ in 0..4 {
         view.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
@@ -92,16 +92,16 @@ fn show_block(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView
     id
 }
 
-fn bounds(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+pub(super) fn bounds(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
     VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel))
 }
 
-fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+pub(super) fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) -> gpui_kit::Bounds<gpui_kit::Pixels> {
     bounds(cx, w, sel.clone()).unwrap_or_else(|| panic!("{sel} drawn"))
 }
 
 /// A live round of block calls (`(tool, ops, bound)`); the board lands.
-fn round(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, calls: &[(&str, Value, bool)]) {
+pub(super) fn round(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, calls: &[(&str, Value, bool)]) {
     let mut evs = vec![llm(json!({"kind": "llm", "llm": "response_start"}))];
     for (tool, ops, _) in calls {
         evs.push(llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": tool})));
@@ -118,11 +118,11 @@ fn round(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ca
     board(cx, w, view);
 }
 
-fn turn(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn turn(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     heard(cx, w, view, vec![json!({"ev": "turn_started", "turn_baseline": 13, "trigger": "user", "user_text": "go on"})]);
 }
 
-fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>, ev: &str) {
+pub(super) fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>, ev: &str) {
     let mut vcx = VisualTestContext::from_window(w, cx);
     match ev {
         "move" => vcx.simulate_event(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }),
@@ -144,7 +144,7 @@ fn mouse(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_k
 
 /// A click at `at`: the pointer there (the window's hit test is the
 /// pointer's), down and up.
-fn click(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
+pub(super) fn click(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<gpui_kit::Pixels>) {
     mouse(cx, w, at, "move");
     mouse(cx, w, at, "down");
     mouse(cx, w, at, "up");
@@ -201,7 +201,7 @@ fn put_mid(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
 
 /// Split panes on, and the pane acted on split: a second pane on its
 /// session (its store).
-fn split(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn split(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     view.update(cx, |v, cx| {
         v.app_settings.split = true;
         cx.notify();

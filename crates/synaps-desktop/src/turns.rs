@@ -2774,7 +2774,7 @@ impl AppView {
 /// `dim`. The path and the range are the row's (its target and facts).
 /// A body as it opens or closes ([`Motion::reveal`]): clipped to `shown`
 /// of its height (none: all of it), measured into `sink`.
-fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::Cell<f32>>) -> Div {
+pub(crate) fn revealed(body: AnyElement, shown: Option<f32>, sink: std::rc::Rc<std::cell::Cell<f32>>) -> Div {
     let h = sink.get();
     div()
         .w_full()
@@ -3481,6 +3481,7 @@ mod tests {
             result: result.into(),
             tail: String::new(),
             status: Some(ToolStatus::Done),
+            started: 0,
         };
         let card = |t: &ToolCall, arg: &str| Card::of(t, None, arg, crate::app::input_of(&t.input).as_ref());
         // A read of 2 lines, the file going on for 9 more.

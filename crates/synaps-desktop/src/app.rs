@@ -1879,7 +1879,7 @@ pub(crate) fn input_of(input: &str) -> Option<serde_json::Value> {
     input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(input).ok()).flatten()
 }
 
-fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
     match input?.get("command")? {
         serde_json::Value::String(c) => Some(c.clone()),
         _ => None,
@@ -2232,6 +2232,9 @@ pub struct AppView {
     pub(crate) attach_source: Option<AttachSource>,
     /// The pointer lease's one wake, while a board waits ([`crate::lease`]).
     pub(crate) lease_wake: Option<Task<()>>,
+    /// The agent's sections in the right panel: each session's local
+    /// state, the rail's lease and painted targets ([`crate::agent_rail_view`]).
+    pub(crate) agent_rail: crate::agent_rail_view::RailState,
     /// The re-fold slot (`crate::board::Refolds`): one at a time, app-wide.
     pub(crate) refolds: crate::board::Refolds,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
@@ -2944,6 +2947,7 @@ impl AppView {
             once: None,
             attach_source: None,
             lease_wake: None,
+            agent_rail: Default::default(),
             refolds: crate::board::Refolds::default(),
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
@@ -9899,6 +9903,10 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        // The rail lays its notes out as the window's text system does.
+        if self.agent_rail.text.as_ref().is_none_or(|t| !Rc::ptr_eq(t, window.text_system())) {
+            self.agent_rail.text = Some(window.text_system().clone());
+        }
         self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);
@@ -10310,7 +10318,7 @@ impl Render for AppView {
         self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
-        h_flex()
+        let root = h_flex()
             .id("root")
             .track_focus(&self.focus)
             // A divider dragged: its resize cursor wherever the pointer
@@ -10361,14 +10369,14 @@ impl Render for AppView {
             // outside it, ends the press after the target's own up has
             // acted (§6.2 "Down and up"; Shady #101 P2-7).
             .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
-                if this.panes.iter().any(|p| p.lease.pressed) {
+                if this.panes.iter().any(|p| p.lease.pressed) || this.agent_rail.lease.pressed {
                     cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
                 }
             }))
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, window, cx| {
-                    if this.panes.iter().any(|p| p.lease.pressed) {
+                    if this.panes.iter().any(|p| p.lease.pressed) || this.agent_rail.lease.pressed {
                         cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
                     }
                 }),
@@ -10729,7 +10737,10 @@ impl Render for AppView {
                 .absolute()
                 .size_0()
             })
-            .children(self.draw_probe(cx))
+            .children(self.draw_probe(cx));
+        // A rail this frame did not draw keeps nothing (D6a).
+        self.rail_unseen();
+        root
     }
 }
 

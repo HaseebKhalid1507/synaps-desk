@@ -145,6 +145,9 @@ pub(crate) struct Lease {
     pub above: Rc<RefCell<Vec<u64>>>,
     /// Block rows' slides ([`SlideY`]), by row.
     pub slides: Rc<RefCell<HashMap<u64, Sliding>>>,
+    /// The rail's: rows an agent op's glide moved, by the frame it moved
+    /// them in (`AppView::rail_retire`).
+    pub glided: Rc<RefCell<HashMap<u64, u64>>>,
     /// The pane's frames drawn.
     pub frame: Rc<Cell<u64>>,
     /// The list neither follows its tail nor scrolled since the last frame
@@ -169,13 +172,23 @@ impl Lease {
         self.agent_frame.set(None);
         self.above.borrow_mut().clear();
         self.slides.borrow_mut().clear();
+        self.glided.borrow_mut().clear();
     }
 
     /// Whether the pane's frame `frame` draws an agent op for row `slid`
     /// (the top-level block row it slides with): the frame that draws a
-    /// board published, or one of a slide an agent op started.
-    fn agent_in(agent: &Cell<Option<u64>>, slides: &RefCell<HashMap<u64, Sliding>>, frame: u64, slid: u64) -> bool {
-        agent.get() == Some(frame) || slides.borrow().get(&slid).is_some_and(|s| s.moved == frame)
+    /// board published, or one of a slide an agent op started (in the
+    /// rail, of a glide that moved it).
+    fn agent_in(
+        agent: &Cell<Option<u64>>,
+        slides: &RefCell<HashMap<u64, Sliding>>,
+        glided: &RefCell<HashMap<u64, u64>>,
+        frame: u64,
+        slid: u64,
+    ) -> bool {
+        agent.get() == Some(frame)
+            || slides.borrow().get(&slid).is_some_and(|s| s.moved == frame)
+            || glided.borrow().get(&slid) == Some(&frame)
     }
 }
 
@@ -329,7 +342,10 @@ impl AppView {
     pub(crate) fn board_ready(&mut self, live: LiveId, drawn: Arc<Drawn>, cx: &mut Context<Self>) {
         let old = self.model.lives[live].transcript.drawn().cloned();
         let panes: Vec<PaneId> = self.panes.iter().filter(|p| p.live == live).map(|p| p.id).collect();
-        let held = panes.iter().any(|&p| self.in_pane(p, |this| this.disturbs(old.as_deref(), &drawn)).unwrap_or(false));
+        // The rail's lease too (D6a, §4): the panel draws the focused
+        // pane's session's rail from the same board.
+        let held = panes.iter().any(|&p| self.in_pane(p, |this| this.disturbs(old.as_deref(), &drawn)).unwrap_or(false))
+            || self.rail_disturbs(live, old.as_deref(), &drawn);
         if held {
             self.model.lives[live].board.waiting = Some(drawn);
             self.arm_lease_wake(cx);
@@ -363,6 +379,7 @@ impl AppView {
         }
         self.model.lives[live].transcript.set_drawn(Some(drawn.clone()));
         self.model.lives[live].board.published += 1;
+        self.rail_landed(live, &drawn);
         // The panes' caches keep only the blocks this board draws (§1.8:
         // renderer caches are bounded, per pane).
         let rows: std::collections::HashSet<u64> = drawn
@@ -385,6 +402,10 @@ impl AppView {
     /// The lease's end, the pointer gone or a key: a board that waited
     /// draws, unless a lease still holds it.
     pub(crate) fn lease_release(&mut self, cx: &mut Context<Self>) {
+        // The rail's glides held under its lease go on.
+        if self.rail_gliding() {
+            cx.notify();
+        }
         for live in self.model.lives.ids() {
             if let Some(d) = self.model.lives[live].board.waiting.take()
                 && d.epoch == self.model.lives[live].transcript.blocks_epoch()
@@ -394,12 +415,15 @@ impl AppView {
         }
     }
 
-    /// One wake, at the lease's end, while a board waits (§6.2 "Frames").
-    fn arm_lease_wake(&mut self, cx: &mut Context<Self>) {
+    /// One wake, at the lease's end, while a board waits (§6.2 "Frames"):
+    /// the panes' leases and the rail's.
+    pub(crate) fn arm_lease_wake(&mut self, cx: &mut Context<Self>) {
         let now = self.fx.now();
-        let due = self.panes.iter().filter(|p| !p.lease.pressed).filter_map(|p| p.lease.moved).map(|t| t + LEASE).max();
+        let rail = &self.agent_rail.lease;
+        let leases = self.panes.iter().map(|p| &p.lease).chain(std::iter::once(rail));
+        let due = leases.filter(|l| !l.pressed).filter_map(|l| l.moved).map(|t| t + LEASE).max();
         let Some(due) = due.filter(|d| *d > now) else {
-            if !self.panes.iter().any(|p| p.lease.pressed) {
+            if !self.panes.iter().any(|p| p.lease.pressed) && !self.agent_rail.lease.pressed {
                 self.lease_release(cx);
             }
             return;
@@ -449,6 +473,7 @@ impl AppView {
             p.lease.note = None;
             p.lease.moved = None;
         }
+        (self.agent_rail.lease.note, self.agent_rail.lease.moved) = (None, None);
         self.lease_release(cx);
     }
 
@@ -460,6 +485,7 @@ impl AppView {
         for p in self.panes.iter_mut() {
             ended |= std::mem::take(&mut p.lease.pressed) | p.lease.down.take().is_some();
         }
+        ended |= std::mem::take(&mut self.agent_rail.lease.pressed) | self.agent_rail.down.take().is_some();
         if !ended {
             return;
         }
@@ -706,13 +732,13 @@ impl Element for SlideY {
 /// that draws an agent op (for row `slid`, the top-level block row it
 /// slides with) marks it just moved; painted in view, it leaves the pill.
 pub(crate) fn probe(l: &Lease, fx: &Rc<crate::motion::Motion>, row: u64, tag: Tag, slid: u64) -> impl IntoElement + use<> {
-    let (painted, agent, slides, frame, above, fx) =
-        (l.painted.clone(), l.agent_frame.clone(), l.slides.clone(), l.frame.clone(), l.above.clone(), fx.clone());
+    let (painted, agent, slides, glided, frame, above, fx) =
+        (l.painted.clone(), l.agent_frame.clone(), l.slides.clone(), l.glided.clone(), l.frame.clone(), l.above.clone(), fx.clone());
     canvas(
         |_, _, _| {},
         move |bounds, (), window, _| {
             let now = fx.now();
-            let agent = Lease::agent_in(&agent, &slides, frame.get(), slid);
+            let agent = Lease::agent_in(&agent, &slides, &glided, frame.get(), slid);
             let mut map = painted.borrow_mut();
             match map.get_mut(&row) {
                 Some(p) if p.bounds != bounds || p.tag != tag => {
