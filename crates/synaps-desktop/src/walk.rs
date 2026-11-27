@@ -320,7 +320,8 @@ pub(crate) trait BlockDesires {
     }
     /// Undo `wish` on `aim`, its token as D6b gave it (§3.5: a pin, a slot
     /// move, a dismissal not yet sent; a delivered one is undone with
-    /// Show): D6b refuses one that no longer holds.
+    /// Show): D6b refuses one that no longer holds, and one `wish` isn't
+    /// offered for now ([`BlockDesires::offers`]: the block moved since).
     fn undo(&mut self, _: &Aim, _: Wish, _token: u64) -> Asked {
         Asked::Off
     }

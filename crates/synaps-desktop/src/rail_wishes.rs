@@ -24,7 +24,9 @@
 //!   tombstone and pin stub aren't drawn yet. Ctrl+Z puts back what one
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
-//!   tombstone ended. A key's token names its undo ([`UNDO_KEPT`] kept).
+//!   tombstone ended; and only where its key is offered now (a block the
+//!   agent moved since is refused, [`MOVED_SINCE`]). A key's token names
+//!   its undo ([`UNDO_KEPT`] kept).
 //! - **Riding** ([`AppView::ride_notices`]): the composer's `Submit` (idle)
 //!   or `Steer` (a turn runs) carries what [`Desires::ride`] attaches; one
 //!   whose marks aren't written yet goes once they are ([`Landed::Send`]),
@@ -172,6 +174,10 @@ pub(crate) struct Stores {
 
 /// An undo refused: what the key did doesn't hold now.
 pub(crate) const CHANGED_SINCE: &str = "it changed since";
+/// An undo refused: the block is where this desk doesn't draw what it
+/// would put back (the agent moved it since), as its key isn't offered
+/// there.
+pub(crate) const MOVED_SINCE: &str = "it moved where this desk doesn't draw that";
 /// An undo refused: its notice may have gone (`u` undoes a dismissal then).
 pub(crate) const NOTICE_WENT: &str = "its notice went · u shows it again";
 
@@ -426,15 +432,22 @@ impl BlockDesires for Stores {
         self.keep(aim, None, |s| s.pres.slot(aim.conv, &aim.block.block).map(|_| false))
     }
 
-    /// All of it put back, or nothing: only while its presentation and its
-    /// desire are what the key left, and no notice of that desire may have
-    /// gone (a delivered dismissal is undone with Show).
+    /// All of it put back, or nothing: only where its key is offered now
+    /// (the block as bound, where it draws), while its presentation and
+    /// its desire are what the key left, and no notice of that desire may
+    /// have gone (a delivered dismissal is undone with Show).
     fn undo(&mut self, aim: &Aim, wish: Wish, token: u64) -> Asked {
         let Some(k) = self.undos.iter().position(|(t, _)| *t == token) else {
             return Asked::Refused("too long ago to undo".into());
         };
         let u = &self.undos[k].1;
-        let mut why = (self.pres.mark(&u.conv, &u.r) != u.pres.1).then_some(CHANGED_SINCE);
+        // The inverse is the same key's (`x` and `u`, `p`, `m`): refused
+        // where that key is, the scope it was offered in.
+        let offered = self.offers(wish, &aim.block.block, matches!(aim.place, Place::Rail(_)));
+        let mut why = (!offered).then_some(MOVED_SINCE);
+        if self.pres.mark(&u.conv, &u.r) != u.pres.1 {
+            why = why.or(Some(CHANGED_SINCE));
+        }
         if let Some((g, id, after)) = &u.desire {
             match (self.desires.wish(&u.conv, g, id), after) {
                 (None, None) => {}
@@ -443,7 +456,7 @@ impl BlockDesires for Stores {
                         why = why.or(Some(NOTICE_WENT));
                     }
                 }
-                _ => why = Some(CHANGED_SINCE),
+                _ => why = why.or(Some(CHANGED_SINCE)),
             }
         }
         if let Some(why) = why {

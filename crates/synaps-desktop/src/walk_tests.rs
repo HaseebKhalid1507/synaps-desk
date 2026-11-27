@@ -952,6 +952,94 @@ fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
     assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
 }
 
+// ── D6b's undo: its scope, its two stores, the caps, the order ────────
+
+/// The walk to `to`, back (`k`) or on (`j`).
+fn walk_to(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
+    for _ in 0..16 {
+        if at(cx, view) == Some(to) {
+            break;
+        }
+        press(cx, w, "k");
+    }
+    walk_on(cx, w, view, to);
+}
+
+/// The walk has the keys (entered again if it ended).
+fn walk_again(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    if !walking(cx, w, view) {
+        enter(cx, w, view);
+    }
+}
+
+/// What the user set for `name` in the pane's conversation (its marks).
+fn mark(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> crate::presentation::Mark {
+    view.read_with(cx, |v, _| v.wishes.pres.mark(&v.conversation(v.panes.cur.live), &Ref::parse(name).expect("an id")))
+}
+
+/// The writer let go: what it held runs, and lands.
+fn release(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hold: crate::blockfiles::Hold) {
+    drop(hold);
+    view.read_with(cx, |v, _| v.wishes.home.writer.clone()).drain();
+    landed(cx, w, view);
+}
+
+/// What the rail's footer says last.
+fn said(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, _| v.wishes.said.clone()).unwrap_or_default()
+}
+
+/// Shady #106 P2-1: Ctrl+Z is refused where its key isn't offered. A
+/// dismissal asked and cancelled before it was written (`x`, `u`, the
+/// writer held), the section then moved by the agent into the transcript
+/// (the same incarnation): undoing that `u` would dismiss a transcript
+/// block, which this desk doesn't draw dismissed. Nothing changes, no
+/// notice rides the next message; there `x` and `u` do nothing, and the
+/// hover doesn't offer `×`.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn ctrl_z_is_refused_where_its_key_isnt_offered(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    let writer = view.read_with(cx, |v, _| v.wishes.home.writer.clone());
+    let hold = writer.hold();
+    press(cx, w, "x");
+    wait(cx, w, &view, 300);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "not written yet: it still draws");
+    press(cx, w, "u");
+    release(cx, w, &view, hold);
+    assert_eq!(desires(cx, &view), 0, "cancelled before it was written");
+    ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
+    wait(cx, w, &view, 1000);
+    assert_eq!(sec(cx, &view, "r1"), None, "the agent moved it into the transcript");
+    let before = mark(cx, &view, "r1");
+    walk_again(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "no dismissal of a transcript block");
+    assert_eq!(mark(cx, &view, "r1"), before, "its presentation as it was");
+    assert!(said(cx, &view).contains("moved where this desk doesn't draw that"), "refused: {}", said(cx, &view));
+    // There its own keys do nothing, and the hover doesn't offer them.
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("r1")));
+    press(cx, w, "x");
+    press(cx, w, "u");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "x and u: nothing");
+    let r1 = row("r1");
+    let at_ = head(cx, w, "r1");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-acts {r1}")) && !has(cx, w, format!("hover-act {r1} ×")), "no ×");
+    press(cx, w, "escape");
+    view.update(cx, |v, cx| assert!(v.enter("go on".into(), cx)));
+    landed(cx, w, &view);
+    let sent = view.read_with(cx, |v, _| v.wishes.outbox.clone());
+    assert_eq!(sent.last().map(String::as_str), Some("go on"), "no notice rode: {sent:?}");
+}
+
 // ── the op log ────────────────────────────────────────────────────────
 
 fn oplog_lines(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
