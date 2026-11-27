@@ -195,24 +195,49 @@ impl Local {
     /// open folds it, anything else expands it (§4). An expansion past the
     /// cap with all four places the user's folds the oldest one back to
     /// the agent's default; an agent-expanded one gives way by the layout.
-    pub(crate) fn toggle(&mut self, l: &Layout, id: &Ref) {
-        let Some(sec) = l.section(id) else { return };
+    /// What it changed, for its undo (D7); `None`: not laid out.
+    pub(crate) fn toggle(&mut self, l: &Layout, id: &Ref) -> Option<Toggled> {
+        let sec = l.section(id)?;
         self.next += 1;
         let n = self.next;
+        let before = self.user.get(id).copied();
         if sec.state == State::Open {
-            self.user.insert(id.clone(), Choice { open: false, at: sec.s.block.folded_at, n });
-            return;
+            let after = Choice { open: false, at: sec.s.block.folded_at, n };
+            self.user.insert(id.clone(), after);
+            return Some(Toggled { id: id.clone(), before, after, displaced: None });
         }
-        self.user.insert(id.clone(), Choice { open: true, at: sec.s.block.folded_at, n });
+        let after = Choice { open: true, at: sec.s.block.folded_at, n };
+        self.user.insert(id.clone(), after);
         let mut theirs: Vec<(u64, Ref)> = l
             .sections()
             .filter(|x| &x.s.block.id != id)
             .filter_map(|x| self.choice(&x.s).filter(|c| c.open).map(|c| (c.n, x.s.block.id.clone())))
             .collect();
+        let mut displaced = None;
         if theirs.len() >= CAP {
             theirs.sort();
-            self.user.remove(&theirs[0].1);
+            displaced = self.user.remove(&theirs[0].1).map(|c| (theirs[0].1.clone(), c));
         }
+        Some(Toggled { id: id.clone(), before, after, displaced })
+    }
+
+    /// Toggle `t` undone (D7, §3.5), if what it set still holds: its
+    /// choice as it made it (the caller checks the agent's `collapse` and
+    /// the cap), and the expansion it folded back still folded back (no
+    /// choice of the user's on it since). Then the section's choice before
+    /// it is back, and the expansion too. `false`: nothing changed.
+    pub(crate) fn undo(&mut self, t: &Toggled) -> bool {
+        if self.user.get(&t.id) != Some(&t.after) || t.displaced.as_ref().is_some_and(|(r, _)| self.user.contains_key(r)) {
+            return false;
+        }
+        match t.before {
+            Some(c) => self.user.insert(t.id.clone(), c),
+            None => self.user.remove(&t.id),
+        };
+        if let Some((r, c)) = &t.displaced {
+            self.user.insert(r.clone(), *c);
+        }
+        true
     }
 
     /// The user's expansions held, oldest first (tests).
@@ -222,6 +247,17 @@ impl Local {
         v.sort();
         v.into_iter().map(|(_, r)| r).collect()
     }
+}
+
+/// What one user fold changed (D7's undo, §3.5): section `id`'s choice
+/// before it (none: the agent's) and the one it made, and an expansion of
+/// the user's the cap folded back for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Toggled {
+    pub id: Ref,
+    pub before: Option<Choice>,
+    pub after: Choice,
+    pub displaced: Option<(Ref, Choice)>,
 }
 
 // ---------------------------------------------------------------------------

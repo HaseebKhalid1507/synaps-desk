@@ -20,26 +20,45 @@
 //!   was painted ends the walk, and a printable one is typed into the
 //!   composer.
 //! - **Every key acts on the painted target** (§6.2): the walked block's
-//!   row and incarnation as the ring last painted them ([`Walk::painted`]),
-//!   checked against the bound board, the newest drawn or waiting under
-//!   the lease, *before* the lease releases (the root's capture defers
-//!   the release to after the key). A block whose incarnation differs now,
-//!   or gone, does nothing and says `this block changed · look again`;
-//!   the release then shows why. A key names its target by identity,
+//!   row and incarnation (and a tombstone's token) as the ring last
+//!   painted them ([`Walk::painted`]), checked against the bound board,
+//!   the newest drawn or waiting under the lease, *before* the lease
+//!   releases (the root's capture defers the release to after the key):
+//!   folds, revisions (`[` and `]`, an open view's too) and D6b's keys
+//!   alike. A block whose incarnation differs now, or gone, does nothing
+//!   and says `this block changed · look again`; the release then shows
+//!   why. A key just after `j`/`k`, before the ring was painted on the
+//!   block reached, does nothing. A key names its target by identity,
 //!   never by position, so the just-moved rule never blocks one.
+//! - **Targets are found where this desk draws them** ([`Found`]): a
+//!   transcript row's block, or a rail section of the rail's layout,
+//!   after the user's pins and slot moves and as a tombstone (D6a's
+//!   `RailVisibility`, D6b's to answer), on the bound board. What D6b is
+//!   asked carries the effective placement ([`BlockDesires::placed`]:
+//!   the user's, else the agent's) and the tombstone's token as painted.
+//!   A tombstone is walked to; only `x` and `u` act on it.
 //! - **Acting.** `z` or `c` folds the block (local, §3.5); `[` and `]`
 //!   walk its revisions (§3.6: [`crate::revisions`], the past body drawn
 //!   from the re-fold scratch, one at a time; `]` or Esc back to the
 //!   latest, and no yanking: an agent op landing meanwhile moves nothing,
-//!   a dot says `r6 new`). `x` dismisses, `u` shows again, `p` pins, `m`
+//!   a dot says `r6 new`; an open view steps on through its own
+//!   incarnation's revisions, history whatever replaced it since). A past
+//!   label never wears the live body: until the scratch has it the block
+//!   says `loading r2…`, and `r2 unavailable` if it can't be had
+//!   ([`PastBody`]). `x` dismisses, `u` shows again, `p` pins, `m`
 //!   moves a rail section to the other slot: D6b's desires and stores
 //!   (#103), through [`BlockDesires`], whose default does nothing until
 //!   D6b wires it. `e` (take) and `R` (restore) are D8's: nothing yet.
 //! - **Undo** (§3.5): Ctrl+Z (Cmd+Z) in the walk undoes the last local
 //!   action, one level per block: a fold (a key's or a click's, in the
 //!   transcript or the rail), and through [`BlockDesires::undo`] a pin, a
-//!   slot move or a dismissal not yet sent. The block must still be the
-//!   incarnation acted on; the walk goes to it.
+//!   slot move or a dismissal not yet sent, with D6b's token for it. It
+//!   is the inverse of what the action set, never a toggle: it puts back
+//!   what was there before (an expansion the rail's cap folded back for
+//!   it too), only while the block still shows what the action set. An
+//!   agent `collapse` since, or the rail's cap since, makes it a no-op
+//!   that says so ([`STALE`]); another incarnation says
+//!   `this block changed`. The walk goes to it.
 //! - **Leaving.** Esc returns to the composer, never to the window, so a
 //!   second Esc can't deny a prompt (design §5.1): the composer's Esc with
 //!   a prompt up only hands the prompt its keys, after their wait. Any
@@ -63,11 +82,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use cards_spec::block::Ref;
-use cards_spec::board::{State, Target as Refold};
+use cards_spec::board::{Block, Place, State, Target as Refold};
 use gpui_kit::component::h_flex;
 use gpui_kit::*;
 use synaps_client::blocks::{Drawn, Shown, Tag};
 
+use crate::agent_rail::Toggled;
 use crate::app::{AppView, mono};
 use crate::fonts::{self, TextPx as _, size};
 use crate::lease::CHANGED;
@@ -110,14 +130,26 @@ impl At {
 }
 
 /// A past revision in view (§3.6): which, where it is in the block's
-/// revisions ([`revisions::revisions`], newest first), and the block's
-/// revision and incarnation when the view opened (a later one: `rN new`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// revisions ([`revisions::revisions`], newest first), the block's
+/// revision and incarnation when the view opened (a later one: `rN new`),
+/// the block it is of (by identity, never looked for again), and its
+/// row's time, read once as it opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RevView {
     pub rev: Rev,
     pub ix: usize,
     pub latest: u32,
     pub tag: Tag,
+    pub id: Ref,
+    pub time: Option<String>,
+}
+
+/// The ring's last paint of the walked block (§6.2): its incarnation, and
+/// the token of the tombstone it was drawn as, if it was (D6b's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Painted {
+    pub tag: Tag,
+    pub tomb: Option<u64>,
 }
 
 /// The walk in a pane.
@@ -128,8 +160,9 @@ pub(crate) struct Walk {
     pub ix: usize,
     /// The session it walks.
     pub session: String,
-    /// The ring's last paint: the walked block's incarnation (§6.2).
-    pub painted: Rc<Cell<Option<Tag>>>,
+    /// The ring's last paint ([`Painted`], §6.2): none since it came to
+    /// `at`, no key acts on it.
+    pub painted: Rc<Cell<Option<Painted>>>,
     /// Its ring was painted in view since the walk began: keys act.
     pub shown: Rc<Cell<bool>>,
     /// Its ring was painted in view since this frame began.
@@ -143,11 +176,20 @@ pub(crate) struct Walk {
     pub reveal: u8,
 }
 
-/// What a local action was, for its undo.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a local action set, for its undo (§3.5): enough to put back what
+/// was there, and to know it still holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Undid {
-    Fold,
-    Wish(Wish),
+    /// A transcript block's fold: the pane's fold of it before (none: the
+    /// agent's), and the one it set (with the agent's `collapse` it was
+    /// made against).
+    Fold { before: Option<crate::blocks::Fold>, after: crate::blocks::Fold },
+    /// A rail section's fold: what it changed of the user's folds (an
+    /// expansion the cap folded back for it included), and whether the
+    /// section drew open after it.
+    RailFold { toggled: Toggled, open: bool },
+    /// D6b's: the wish, and D6b's token for what it did.
+    Wish(Wish, u64),
 }
 
 /// D6b's actions ([`BlockDesires`]).
@@ -160,7 +202,7 @@ pub(crate) enum Wish {
 }
 
 /// A block's last local action (§3.5's undo): its row and incarnation then.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Undo {
     pub at: At,
     pub tag: Tag,
@@ -199,14 +241,18 @@ impl WalkMode {
 // ── the seam for D6b ──────────────────────────────────────────────────
 
 /// The block a shared or stored key acts on, as the walk found it on the
-/// bound board: its session and board, the block, and for a rail section
-/// its slot.
+/// bound board ([`Found`]): its session and board, the block, where it
+/// paints on this desk (its effective placement: a section's slot as the
+/// rail lays it out, the user's pin or slot move included; a transcript
+/// block's, [`BlockDesires::placed`]), and the token of the tombstone it
+/// was painted as (D6b's soft dismissal), if it was.
 #[cfg_attr(not(test), expect(dead_code, reason = "D6b's side reads it (#103); D7's default doesn't"))]
 pub(crate) struct Aim<'a> {
     pub session: &'a str,
     pub drawn: &'a Drawn,
     pub block: &'a Shown,
-    pub rail: Option<cards_spec::block::Slot>,
+    pub place: Place,
+    pub tomb: Option<u64>,
 }
 
 /// How D6b answered.
@@ -215,8 +261,9 @@ pub(crate) struct Aim<'a> {
 pub(crate) enum Asked {
     /// Not wired (D7's default): nothing happened.
     Off,
-    /// Accepted (D6b draws it).
-    Done,
+    /// Accepted (D6b draws it), with D6b's token for what it did: its
+    /// undo names it ([`BlockDesires::undo`]).
+    Done(u64),
     /// Refused, with why (a cap, a write that failed): the block says
     /// `not done · try again`, the log why.
     Refused(String),
@@ -226,10 +273,19 @@ pub(crate) enum Asked {
 /// their undo: D6b's dismiss and show desires and its pins and slot moves
 /// (#103). D7 routes the keys here; the default does nothing, and the
 /// status line and the hover don't offer them until [`BlockDesires::wired`].
+/// And the effective placement ([`BlockDesires::placed`]): where a block
+/// paints on this desk after the user's pins and slot moves.
 pub(crate) trait BlockDesires {
     /// The keys act: their hints and buttons show.
     fn wired(&self) -> bool {
         false
+    }
+    /// Where block `b` of `session` paints on this desk: the user's pin or
+    /// slot move (D6b's presentation), else the agent's placement (the
+    /// default). The rail draws the same through D6a's `RailVisibility`,
+    /// which D6b answers from the same store.
+    fn placed(&self, _session: &str, b: &Block) -> Place {
+        b.place
     }
     fn dismiss(&mut self, _: &Aim) -> Asked {
         Asked::Off
@@ -243,9 +299,10 @@ pub(crate) trait BlockDesires {
     fn slot(&mut self, _: &Aim) -> Asked {
         Asked::Off
     }
-    /// Undo `wish` on `aim` (§3.5: a pin, a slot move, a dismissal not yet
-    /// sent; a delivered one is undone with Show).
-    fn undo(&mut self, _: &Aim, _: Wish) -> Asked {
+    /// Undo `wish` on `aim`, its token as D6b gave it (§3.5: a pin, a slot
+    /// move, a dismissal not yet sent; a delivered one is undone with
+    /// Show): D6b refuses one that no longer holds.
+    fn undo(&mut self, _: &Aim, _: Wish, _token: u64) -> Asked {
         Asked::Off
     }
 }
@@ -259,8 +316,9 @@ impl BlockDesires for NoDesires {}
 
 impl AppView {
     /// The walk's order in the pane acted on (module docs): its block rows
-    /// in reading order, then the rail's sections as drawn, upper first,
-    /// if the rail is this pane's and can be drawn.
+    /// in reading order, then the rail's sections as drawn, upper first
+    /// (a tombstone too: `u` shows it again), if the rail is this pane's
+    /// and can be drawn.
     pub(crate) fn walk_order(&self) -> Vec<At> {
         let mut out: Vec<At> =
             self.panes.cur.disp.iter().filter(|d| matches!(d.kind, Kind::Block { .. })).map(|d| At::Block(d.id)).collect();
@@ -270,7 +328,7 @@ impl AppView {
             use crate::agent_rail::State as S;
             out.extend(
                 lay.sections()
-                    .filter(|s| matches!(s.state, S::Open | S::Summary | S::Listed))
+                    .filter(|s| matches!(s.state, S::Open | S::Summary | S::Listed | S::Tombstone(_)))
                     .map(|s| At::Rail(crate::blocks::row_id(&s.s.block.id))),
             );
         }
@@ -388,10 +446,10 @@ impl AppView {
             self.walk_reveal(true, cx);
         }
         let Some(w) = self.panes.cur.walk.walk.as_ref() else { return };
-        match w.rev {
-            Some(rv) => {
+        match w.rev.as_ref().map(|rv| rv.rev.at) {
+            Some(at) => {
                 self.panes.cur.walk.refolding = true;
-                self.refold(self.panes.cur.live, Refold::Revision(rv.rev.at), cx);
+                self.refold(self.panes.cur.live, Refold::Revision(at), cx);
             }
             None if self.panes.cur.walk.refolding => self.walk_scratch_drop(),
             None => {}
@@ -510,27 +568,52 @@ impl AppView {
         self.walk_reveal(false, cx);
     }
 
-    /// The walked block's painted target, if the bound board (the newest,
-    /// drawn or waiting under the lease) still holds it: its board, the
-    /// block, and for a rail section its slot. `None`: not painted yet, or
-    /// changed.
-    fn walk_target(&self) -> Option<(std::sync::Arc<Drawn>, Shown, Option<cards_spec::block::Slot>)> {
-        let w = self.panes.cur.walk.walk.as_ref()?;
-        let tag = w.painted.get()?;
+    /// The board keys are checked against (§6.2): the newest, drawn or
+    /// waiting under the lease.
+    pub(crate) fn bound_board(&self) -> Option<std::sync::Arc<Drawn>> {
         let live = &self.model.lives[self.panes.cur.live];
-        let board = live.board.waiting.clone().or_else(|| live.transcript.drawn().cloned())?;
-        let bound = |s: &Shown| s.bound.as_ref().is_some_and(|b| b.tag == tag);
-        let found = match w.at {
-            At::Block(row) => crate::lease::find_any(&board, row).filter(|(_, g)| g.is_none()).map(|(s, _)| (s.clone(), None)),
-            At::Rail(row) => [cards_spec::block::Slot::Upper, cards_spec::block::Slot::End].into_iter().find_map(|slot| {
-                board.rail[crate::agent_rail::slot_ix(slot)]
-                    .iter()
-                    .find(|s| crate::blocks::row_id(&s.block.id) == row)
-                    .map(|s| (s.clone(), Some(slot)))
-            }),
+        live.board.waiting.clone().or_else(|| live.transcript.drawn().cloned())
+    }
+
+    /// Walk target `at` on board `d` as this desk draws it (module docs):
+    /// a transcript row's top-level block, its placement D6b's to say
+    /// ([`BlockDesires::placed`]); a rail section as the rail lays `d` out
+    /// (the user's pins and slot moves, tombstones), in its slot then.
+    pub(crate) fn find_on(&self, d: &Drawn, at: At) -> Option<Found> {
+        match at {
+            At::Block(row) => {
+                let s = crate::lease::find_any(d, row).filter(|(_, g)| g.is_none())?.0.clone();
+                let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.as_str())?;
+                Some(Found { place: self.desires.placed(session, &s.block), s, tomb: None })
+            }
+            At::Rail(row) => {
+                let lay = self.rail_of(self.panes.cur.live, d);
+                let sec = lay.sections().find(|x| crate::blocks::row_id(&x.s.block.id) == row)?;
+                let tomb = match &sec.state {
+                    crate::agent_rail::State::Tombstone(t) => Some(t.token),
+                    _ => None,
+                };
+                Some(Found { s: sec.s.clone(), place: Place::Rail(sec.slot), tomb })
+            }
         }
-        .filter(|(s, _)| bound(s))?;
-        Some((board, found.0, found.1))
+    }
+
+    /// The walked block's painted target, if the bound board still holds
+    /// it as painted (its incarnation, its tombstone's token): the board,
+    /// and the block as found there. `None`: not painted since it came
+    /// there, or changed.
+    fn walk_target(&self) -> Option<(std::sync::Arc<Drawn>, Found)> {
+        let w = self.panes.cur.walk.walk.as_ref()?;
+        let painted = w.painted.get()?;
+        let board = self.bound_board()?;
+        let f = self.find_on(&board, w.at)?;
+        (f.s.bound.as_ref().is_some_and(|b| b.tag == painted.tag) && f.tomb == painted.tomb).then_some((board, f))
+    }
+
+    /// The walked block, if its ring was painted on it since it came there
+    /// (else no key acts on it).
+    fn walk_painted_at(&self) -> Option<At> {
+        self.panes.cur.walk.walk.as_ref().filter(|w| w.painted.get().is_some()).map(|w| w.at)
     }
 
     /// The note on the walked block, after the key's release (§6.2: the
@@ -548,107 +631,111 @@ impl AppView {
         });
     }
 
-    /// `z`/`c`: the walked block's local fold (§3.5), on its painted target.
+    /// `z`/`c`: the walked block's local fold (§3.5), on its painted target
+    /// (a tombstone has none).
     fn walk_fold(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Its ring not painted yet since it came there: nothing to act on.
-        let Some(at) = self.panes.cur.walk.walk.as_ref().filter(|w| w.painted.get().is_some()).map(|w| w.at) else { return };
-        let Some((_, s, _)) = self.walk_target() else {
+        let Some(at) = self.walk_painted_at() else { return };
+        let Some((_, f)) = self.walk_target() else {
             self.walk_says(at, CHANGED, window, cx);
             return;
         };
-        if self.fold_now(at, &s, cx) {
-            self.panes.cur.walk.push(Undo { at, tag: s.block.tag, act: Undid::Fold });
+        if f.tomb.is_none() {
+            self.fold_now(at, &f.s, cx);
         }
     }
 
     /// Block `s` (at `at`) folded or unfolded, locally: in this pane's
-    /// transcript, or in the rail. `false`: not drawn here now.
+    /// transcript, or in the rail; its undo kept, what it set and what it
+    /// was before (§3.5). `false`: not drawn here now.
     pub(crate) fn fold_now(&mut self, at: At, s: &Shown, cx: &mut Context<Self>) -> bool {
-        match at {
+        let act = match at {
             At::Block(row) => {
                 let Some((ix, drawn)) = self.block_shown(row) else { return false };
-                self.panes.cur.block_folds.toggle(row, &drawn);
+                let (before, after) = self.panes.cur.block_folds.toggle(row, &drawn);
                 self.panes.cur.list.remeasure_items(ix..ix + 1);
+                Undid::Fold { before, after }
             }
             At::Rail(_) => {
                 let Some(session) = self.rail_sid().map(str::to_string) else { return false };
-                let Some((_, lay)) = self.rail_layout() else { return false };
-                if lay.section(&s.block.id).is_none() {
-                    return false;
-                }
-                self.agent_rail.local_mut(&session).toggle(&lay, &s.block.id);
+                let Some((d, lay)) = self.rail_layout() else { return false };
+                let Some(toggled) = self.agent_rail.local_mut(&session).toggle(&lay, &s.block.id) else { return false };
+                let open = self.rail_open(&d, &s.block.id);
+                Undid::RailFold { toggled, open }
             }
-        }
+        };
+        self.panes.cur.walk.push(Undo { at, tag: s.block.tag, act });
         cx.notify();
         true
     }
 
+    /// Whether section `id` draws open in the rail of board `d` (the
+    /// focused pane's session's), as laid out now.
+    pub(crate) fn rail_open(&self, d: &Drawn, id: &Ref) -> bool {
+        self.rail_of(self.panes.cur.live, d).section(id).is_some_and(|x| x.state == crate::agent_rail::State::Open)
+    }
+
     /// `x`, `u`, `p`, `m` (and the hover's `×`, `rail`, `⇅`): D6b's, on the
-    /// walked block's painted target ([`BlockDesires`]).
+    /// walked block's painted target ([`BlockDesires`]); on a tombstone,
+    /// `x` and `u` only.
     fn walk_wish(&mut self, wish: Wish, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(at) = self.panes.cur.walk.walk.as_ref().filter(|w| w.painted.get().is_some()).map(|w| w.at) else { return };
-        let Some((board, s, slot)) = self.walk_target() else {
+        let Some(at) = self.walk_painted_at() else { return };
+        let Some((board, f)) = self.walk_target() else {
             self.walk_says(at, CHANGED, window, cx);
             return;
         };
-        if self.wish_now(at, wish, &board, &s, slot, window, cx) {
-            self.panes.cur.walk.push(Undo { at, tag: s.block.tag, act: Undid::Wish(wish) });
+        if f.tomb.is_some() && !matches!(wish, Wish::Dismiss | Wish::Show) {
+            return;
+        }
+        if let Some(token) = self.wish_now(at, wish, &board, &f, window, cx) {
+            self.panes.cur.walk.push(Undo { at, tag: f.s.block.tag, act: Undid::Wish(wish, token) });
         }
     }
 
-    /// `wish` on block `s` (at `at`) of board `board`, asked of D6b;
-    /// `true`: it took it.
-    #[allow(clippy::too_many_arguments)]
+    /// `wish` on block `f` (at `at`) of board `board`, asked of D6b; its
+    /// token if it took it.
     pub(crate) fn wish_now(
         &mut self,
         at: At,
         wish: Wish,
         board: &Drawn,
-        s: &Shown,
-        slot: Option<cards_spec::block::Slot>,
+        f: &Found,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return false };
-        let aim = Aim { session: &session, drawn: board, block: s, rail: slot };
+    ) -> Option<u64> {
+        let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone())?;
+        let aim = Aim { session: &session, drawn: board, block: &f.s, place: f.place, tomb: f.tomb };
         let asked = match wish {
             Wish::Dismiss => self.desires.dismiss(&aim),
             Wish::Show => self.desires.show(&aim),
             Wish::Pin => self.desires.pin(&aim),
             Wish::Slot => self.desires.slot(&aim),
         };
-        log::info!(target: "synaps_desktop::walk", "walk: {wish:?} {}: {asked:?}", s.block.id);
+        log::info!(target: "synaps_desktop::walk", "walk: {wish:?} {}: {asked:?}", f.s.block.id);
         match asked {
-            Asked::Done => {
+            Asked::Done(token) => {
                 cx.notify();
-                true
+                Some(token)
             }
-            Asked::Off => false,
+            Asked::Off => None,
             Asked::Refused(why) => {
-                log::info!(target: "synaps_desktop::walk", "walk: {wish:?} {} refused: {why}", s.block.id);
+                log::info!(target: "synaps_desktop::walk", "walk: {wish:?} {} refused: {why}", f.s.block.id);
                 self.walk_says(at, REFUSED, window, cx);
-                false
+                None
             }
         }
     }
 
     /// Ctrl+Z (Cmd+Z) in the walk: the last local action undone, one level
-    /// per block (§3.5), if its block is still the incarnation acted on;
-    /// the walk goes to it.
+    /// per block (§3.5): what it set put back as it was, if the block is
+    /// still the incarnation acted on (else `this block changed`) and
+    /// still shows what it set (else nothing, and [`STALE`]); the walk
+    /// goes to it.
     fn walk_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(u) = self.panes.cur.walk.undo.pop() else { return };
-        let live = &self.model.lives[self.panes.cur.live];
-        let board = live.board.waiting.clone().or_else(|| live.transcript.drawn().cloned());
-        let found = board.as_deref().and_then(|d| match u.at {
-            At::Block(row) => crate::lease::find_any(d, row).filter(|(_, g)| g.is_none()).map(|(s, _)| (s.clone(), None)),
-            At::Rail(row) => [cards_spec::block::Slot::Upper, cards_spec::block::Slot::End].into_iter().find_map(|slot| {
-                d.rail[crate::agent_rail::slot_ix(slot)]
-                    .iter()
-                    .find(|s| crate::blocks::row_id(&s.block.id) == row)
-                    .map(|s| (s.clone(), Some(slot)))
-            }),
-        });
-        let Some((s, slot)) = found.filter(|(s, _)| s.bound.as_ref().is_some_and(|b| b.tag == u.tag)) else {
+        let board = self.bound_board();
+        let found = board.as_deref().and_then(|d| self.find_on(d, u.at)).filter(|f| f.s.bound.as_ref().is_some_and(|b| b.tag == u.tag));
+        let (Some(board), Some(f)) = (board, found) else {
             self.walk_says(u.at, CHANGED, window, cx);
             return;
         };
@@ -656,69 +743,132 @@ impl AppView {
         let order = self.walk_order();
         if let Some(k) = order.iter().position(|a| *a == u.at) {
             let now = self.fx.now();
+            let had_rev = self.panes.cur.walk.walk.as_ref().is_some_and(|w| w.at != u.at && w.rev.is_some());
             if let Some(w) = self.panes.cur.walk.walk.as_mut().filter(|w| w.at != u.at) {
                 (w.at, w.ix, w.since, w.rev) = (u.at, k, now, None);
                 w.painted.set(None);
             }
-        }
-        match u.act {
-            Undid::Fold => {
-                self.fold_now(u.at, &s, cx);
+            if had_rev {
+                self.walk_scratch_drop();
             }
-            Undid::Wish(wish) => {
-                let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
-                let Some(board) = board else { return };
-                let aim = Aim { session: &session, drawn: &board, block: &s, rail: slot };
-                if let Asked::Refused(why) = self.desires.undo(&aim, wish) {
-                    log::info!(target: "synaps_desktop::walk", "walk: undo {wish:?} {} refused: {why}", s.block.id);
-                    self.walk_says(u.at, REFUSED, window, cx);
+        }
+        let undone = match &u.act {
+            Undid::Fold { before, after } => match (u.at, self.block_shown(u.at.row())) {
+                // Still what the fold set: no agent `collapse` since.
+                (At::Block(row), Some((ix, s)))
+                    if self.panes.cur.block_folds.entry(row) == Some(*after) && s.block.folded_at == after.1 =>
+                {
+                    self.panes.cur.block_folds.set(row, *before);
+                    self.panes.cur.list.remeasure_items(ix..ix + 1);
+                    true
+                }
+                _ => false,
+            },
+            Undid::RailFold { toggled, open } => {
+                let session = self.rail_sid().map(str::to_string);
+                let drawn = self.rail_layout().map(|(d, _)| d);
+                match (session, drawn) {
+                    // Still what it set: its choice as made (no agent
+                    // `collapse` since), the expansion it folded back
+                    // still folded back, and it draws as it did then (no
+                    // change of the cap's since).
+                    (Some(session), Some(d)) if f.s.block.folded_at == toggled.after.at && self.rail_open(&d, &toggled.id) == *open => {
+                        self.agent_rail.local_mut(&session).undo(toggled)
+                    }
+                    _ => false,
                 }
             }
+            Undid::Wish(wish, token) => {
+                let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
+                let aim = Aim { session: &session, drawn: &board, block: &f.s, place: f.place, tomb: f.tomb };
+                match self.desires.undo(&aim, *wish, *token) {
+                    Asked::Refused(why) => {
+                        log::info!(target: "synaps_desktop::walk", "walk: undo {wish:?} {} refused: {why}", f.s.block.id);
+                        self.walk_says(u.at, REFUSED, window, cx);
+                        true
+                    }
+                    _ => true,
+                }
+            }
+        };
+        if undone {
+            log::info!(target: "synaps_desktop::walk", "walk: undid {:?} on {:?}", u.act, u.at);
+        } else {
+            log::info!(target: "synaps_desktop::walk", "walk: {:?} on {:?} no longer holds: not undone", u.act, u.at);
+            self.walk_says(u.at, STALE, window, cx);
         }
-        log::info!(target: "synaps_desktop::walk", "walk: undid {:?} on {:?}", u.act, u.at);
+        cx.notify();
         self.walk_reveal(false, cx);
     }
 
-    /// `[` (`back`) and `]`: the walked block's revisions (§3.6), newest
-    /// first; `]` from the newest past one, the latest (the view closes).
-    fn walk_rev(&mut self, back: bool, cx: &mut Context<Self>) {
-        let Some(w) = self.panes.cur.walk.walk.as_ref() else { return };
-        let (at, cur) = (w.at, w.rev);
-        let Some(d) = self.model.lives[self.panes.cur.live].transcript.drawn().cloned() else { return };
-        let s = match at {
-            At::Block(row) => crate::lease::find_any(&d, row).filter(|(_, g)| g.is_none()).map(|(s, _)| s.clone()),
-            At::Rail(row) => d.rail.iter().flatten().find(|s| crate::blocks::row_id(&s.block.id) == row).cloned(),
+    /// `[` (`back`) and `]` on the walked block's painted target (§3.6,
+    /// §6.2): checked as every key is, before the lease releases; a
+    /// tombstone has none.
+    fn walk_rev_key(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.walk_painted_at() else { return };
+        let Some((board, f)) = self.walk_target() else {
+            self.walk_says(at, CHANGED, window, cx);
+            return;
         };
-        let Some(s) = s.filter(|s| !s.block.pending) else { return };
-        // Of the incarnation the view opened on (no yanking), else the
-        // current one; the one in view found by identity (a revision
-        // landed since is newer, never in its place).
-        let tag = cur.map_or(s.block.tag, |v| v.tag);
-        let latest = cur.map_or(s.block.rev, |v| v.latest);
-        let revs = revisions::revisions(&d, &s.block.id, tag);
-        let ix =
-            cur.and_then(|v| revs.iter().position(|r| r.tag == v.rev.tag && r.rev == v.rev.rev && r.earlier == v.rev.earlier)).unwrap_or(0);
-        let next = if back { (ix + 1).min(revs.len().saturating_sub(1)) } else { ix.saturating_sub(1) };
+        if f.tomb.is_none() {
+            self.walk_rev(at, &board, &f.s, back, cx);
+        }
+    }
+
+    /// `[` (`back`) and `]` on block `s` (at `at`) of the bound board `d`,
+    /// its target checked: its revisions, newest first; `]` from the
+    /// newest past one, the latest (the view closes). An open view steps
+    /// through its own incarnation's (no yanking: the board's records of
+    /// it are history, whatever replaced it since).
+    fn walk_rev(&mut self, at: At, d: &Drawn, s: &Shown, back: bool, cx: &mut Context<Self>) {
+        if s.block.pending {
+            return;
+        }
+        let cur = self.panes.cur.walk.walk.as_ref().filter(|w| w.at == at).and_then(|w| w.rev.clone());
+        // Of the incarnation the view opened on, else the current one; the
+        // one in view found by identity (a revision landed since is
+        // newer, never in its place).
+        let tag = cur.as_ref().map_or(s.block.tag, |v| v.tag);
+        let latest = cur.as_ref().map_or(s.block.rev, |v| v.latest);
+        let revs = revisions::revisions(d, &s.block.id, tag);
+        if revs.is_empty() {
+            return;
+        }
+        let ix = cur
+            .as_ref()
+            .and_then(|v| revs.iter().position(|r| r.tag == v.rev.tag && r.rev == v.rev.rev && r.earlier == v.rev.earlier))
+            .unwrap_or(0);
+        let next = if back { (ix + 1).min(revs.len() - 1) } else { ix.saturating_sub(1) };
         // Forward to the view's latest (or past it): the latest, the view
         // closed.
         let past = next > 0 && !(revs[next].tag == tag && !revs[next].earlier && revs[next].rev >= latest);
         if next == ix && cur.is_some() == past {
             return;
         }
-        let view = past.then(|| RevView { rev: revs[next], ix: next, latest, tag });
+        let view = past.then(|| {
+            let time = revs[next].call.as_deref().and_then(|c| self.call_time(c));
+            RevView { rev: revs[next].clone(), ix: next, latest, tag, id: s.block.id.clone(), time }
+        });
+        let target = view.as_ref().map(|v| Refold::Revision(v.rev.at));
         if let Some(w) = self.panes.cur.walk.walk.as_mut() {
             w.rev = view;
         }
-        match view {
-            Some(v) => {
+        match target {
+            Some(target) => {
                 self.panes.cur.walk.refolding = true;
-                self.refold(self.panes.cur.live, Refold::Revision(v.rev.at), cx);
+                self.refold(self.panes.cur.live, target, cx);
             }
             None => {
                 self.walk_scratch_drop();
             }
         }
         cx.notify();
+    }
+
+    /// Call `tool_id`'s row's time in the pane acted on, `HH:MM` (a lookup
+    /// by its call: [`synaps_client::Transcript::call_at`]).
+    pub(crate) fn call_time(&self, tool_id: &str) -> Option<String> {
+        crate::oplog::time_of(&self.model.lives[self.panes.cur.live].transcript, Some(tool_id))
     }
 
     /// A key down on the pane's walk focus: see the module.
@@ -783,8 +933,8 @@ impl AppView {
             "j" | "down" => self.walk_step(1, cx),
             "k" | "up" => self.walk_step(-1, cx),
             "z" | "c" => self.walk_fold(window, cx),
-            "[" => self.walk_rev(true, cx),
-            "]" => self.walk_rev(false, cx),
+            "[" => self.walk_rev_key(true, window, cx),
+            "]" => self.walk_rev_key(false, window, cx),
             "x" => self.walk_wish(Wish::Dismiss, window, cx),
             "u" => self.walk_wish(Wish::Show, window, cx),
             "p" => self.walk_wish(Wish::Pin, window, cx),
@@ -811,12 +961,13 @@ impl AppView {
 
     // ── drawn ─────────────────────────────────────────────────────────
 
-    /// The walk ring on block or section row `row` (painted as `tag`), if
-    /// the walk of the pane acted on is there: a 1 px accent outline over
-    /// the block (its spine stays), fading in; painted in view, its fade
-    /// begun (as an entered card's growth: a frame of the motion clock),
-    /// its keys act ([`Walk::shown`]).
-    pub(crate) fn walk_ring(&self, at: At, tag: Tag, p: &Palette) -> Option<AnyElement> {
+    /// The walk ring on block or section row `row` (painted as `tag`, and
+    /// as the tombstone of token `tomb` if it draws as one), if the walk of
+    /// the pane acted on is there: a 1 px accent outline over the block
+    /// (its spine stays), fading in; painted in view, its fade begun (as
+    /// an entered card's growth: a frame of the motion clock), its keys act
+    /// ([`Walk::shown`]).
+    pub(crate) fn walk_ring(&self, at: At, tag: Tag, tomb: Option<u64>, p: &Palette) -> Option<AnyElement> {
         let w = self.panes.cur.walk.walk.as_ref().filter(|w| w.at == at)?;
         let t = self.fx.shot(Some(w.since), Duration::ZERO, motion::QUICK, &motion::ease::OUT, motion::Kind::Fade);
         // Its fade begun: a frame of the motion clock since it came (or no
@@ -841,7 +992,7 @@ impl AppView {
                             // (a frame of the motion clock since it came).
                             let in_view = bounds.intersect(&window.content_mask().bounds);
                             if begun && in_view.size.width > px(0.) && in_view.size.height > px(0.) {
-                                painted.set(Some(tag));
+                                painted.set(Some(Painted { tag, tomb }));
                                 shown.set(true);
                                 seen.set(true);
                             }
@@ -858,7 +1009,7 @@ impl AppView {
     /// pane walking: its keys, or the revision in view.
     pub(crate) fn walk_status(&self, p: &Palette) -> Option<AnyElement> {
         let w = self.panes.cur.walk.walk.as_ref()?;
-        let text = match w.rev {
+        let text = match &w.rev {
             Some(_) => {
                 let label = self.walk_past(w.at.row()).map(|pv| pv.label).unwrap_or_default();
                 format!("{label} · [ older · ] newer · esc latest")
@@ -888,46 +1039,33 @@ impl AppView {
     }
 
     /// The past revision drawn for row `row` in the pane acted on, if its
-    /// walk shows one (module docs, §3.6).
+    /// walk shows one (module docs, §3.6): its label, a later revision
+    /// landed since, and its body from the re-fold scratch, or why there
+    /// is none yet, or none at all: never the live block's.
     pub(crate) fn walk_past(&self, row: u64) -> Option<Past> {
         let w = self.panes.cur.walk.walk.as_ref().filter(|w| w.at.row() == row)?;
-        let v = w.rev?;
+        let v = w.rev.as_ref()?;
         let live = self.panes.cur.live;
         let l = &self.model.lives[live];
-        let time = v
-            .rev
-            .row
-            .and_then(|r| l.transcript.items().iter().find(|i| i.id == r))
-            .and_then(|i| i.at.as_deref())
-            .and_then(crate::times::Stamp::local);
-        let mut label = revisions::label(&v.rev, v.latest, time.as_ref().map(|t| t.hhmm.as_ref()));
-        let now = l.transcript.drawn().and_then(|d| match w.at {
-            At::Block(r) => crate::lease::find_any(d, r).map(|(s, _)| (s.block.tag, s.block.rev)),
-            At::Rail(r) => d.rail.iter().flatten().find(|s| crate::blocks::row_id(&s.block.id) == r).map(|s| (s.block.tag, s.block.rev)),
-        });
+        let label = revisions::label(&v.rev, v.latest, v.time.as_deref());
+        let now = l.transcript.drawn().and_then(|d| self.find_on(d, w.at)).map(|f| (f.s.block.tag, f.s.block.rev));
         // No yanking: a later revision landed meanwhile says so.
         let newer = now.filter(|(tag, rev)| *tag != v.tag || *rev > v.latest).map(|(_, rev)| rev);
         let done = self.refolds.done.as_ref().filter(|d| d.live == live && d.target == Refold::Revision(v.rev.at));
-        let shown = match done.map(|d| &d.state) {
-            Some(Ok(Some(st))) => past_shown(st, &row_ref(l.transcript.drawn().map(|d| &**d), w.at)?, v.rev.tag),
-            Some(Ok(None)) => {
-                label.push_str(" · not shown");
-                None
-            }
-            Some(Err(_)) => {
-                label = format!("r{} · too far back to show", v.rev.rev);
-                None
-            }
-            None => None,
+        let body = match done.map(|d| &d.state) {
+            Some(Ok(Some(st))) => past_shown(st, &v.id, v.rev.tag).map_or(PastBody::Unavailable("not on its board"), PastBody::Ready),
+            Some(Ok(None)) => PastBody::Unavailable("not shown"),
+            Some(Err(_)) => PastBody::Unavailable("too far back to show"),
+            None => PastBody::Loading,
         };
-        Some(Past { label, newer, shown })
+        Some(Past { label, newer, rev: v.rev.rev, body })
     }
 
     /// The motion keys' salt for row `row` in the pane acted on: a past
     /// revision's own (0: the block's).
     pub(crate) fn past_salt(&self, row: u64) -> u64 {
         let Some(w) = self.panes.cur.walk.walk.as_ref().filter(|w| w.at.row() == row) else { return 0 };
-        w.rev.map_or(0, |v| past_salt(row, &v.rev))
+        w.rev.as_ref().map_or(0, |v| past_salt(row, &v.rev))
     }
 
     /// The pointer over block row `row`'s header in pane `pane`, or off it:
@@ -1018,13 +1156,14 @@ impl AppView {
     pub(crate) fn hover_act(&mut self, at: At, act: Hover, s: &Shown, window: &mut Window, cx: &mut Context<Self>) {
         match act {
             Hover::Fold => {
-                if self.fold_now(at, s, cx) {
-                    self.panes.cur.walk.push(Undo { at, tag: s.block.tag, act: Undid::Fold });
-                }
+                self.fold_now(at, s, cx);
             }
             Hover::Rev => {
-                if self.walk_to(at, window, cx) {
-                    self.walk_rev(true, cx);
+                if self.walk_to(at, window, cx)
+                    && let Some(board) = self.bound_board()
+                    && let Some(f) = self.find_on(&board, at)
+                {
+                    self.walk_rev(at, &board, &f.s, true, cx);
                 }
             }
             Hover::Pin | Hover::Slot | Hover::Dismiss => {
@@ -1033,18 +1172,10 @@ impl AppView {
                     Hover::Slot => Wish::Slot,
                     _ => Wish::Dismiss,
                 };
-                let live = &self.model.lives[self.panes.cur.live];
-                let Some(board) = live.board.waiting.clone().or_else(|| live.transcript.drawn().cloned()) else { return };
-                let slot = match at {
-                    At::Rail(_) => board
-                        .rail
-                        .iter()
-                        .position(|l| l.iter().any(|x| x.block.id == s.block.id))
-                        .map(|k| if k == 0 { cards_spec::block::Slot::Upper } else { cards_spec::block::Slot::End }),
-                    At::Block(_) => None,
-                };
-                if self.wish_now(at, wish, &board, s, slot, window, cx) {
-                    self.panes.cur.walk.push(Undo { at, tag: s.block.tag, act: Undid::Wish(wish) });
+                let Some(board) = self.bound_board() else { return };
+                let Some(f) = self.find_on(&board, at) else { return };
+                if let Some(token) = self.wish_now(at, wish, &board, &f, window, cx) {
+                    self.panes.cur.walk.push(Undo { at, tag: f.s.block.tag, act: Undid::Wish(wish, token) });
                 }
             }
         }
@@ -1171,12 +1302,56 @@ pub(crate) enum Hover {
 }
 
 /// A past revision as drawn (§3.6): its label, a later revision landed
-/// meanwhile (`rN new`), and its block from the re-fold scratch once there.
+/// meanwhile (`rN new`), its revision, and its body.
 pub(crate) struct Past {
     pub label: String,
     pub newer: Option<u32>,
-    pub shown: Option<Shown>,
+    pub rev: u32,
+    pub body: PastBody,
 }
+
+/// A past revision's body (§3.6): never the live block's under its label.
+#[derive(Clone, Debug)]
+pub(crate) enum PastBody {
+    /// Its block then, from the re-fold scratch.
+    Ready(Shown),
+    /// The scratch is folding it: `loading r2…`.
+    Loading,
+    /// It can't be had, and why: `r2 unavailable · too far back to show`.
+    Unavailable(&'static str),
+}
+
+impl Past {
+    /// Its label as the header draws it: `rN new` after it.
+    pub(crate) fn head(&self) -> String {
+        match self.newer {
+            Some(n) => format!("{} · r{n} new", self.label),
+            None => self.label.clone(),
+        }
+    }
+
+    /// Its block then, once the scratch has it.
+    pub(crate) fn ready(&self) -> Option<&Shown> {
+        match &self.body {
+            PastBody::Ready(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// What its frame says in place of a body not drawn: `loading r2…`, or
+    /// `r2 unavailable · why`.
+    pub(crate) fn wait(&self) -> Option<String> {
+        match self.body {
+            PastBody::Ready(_) => None,
+            PastBody::Loading => Some(format!("loading r{}…", self.rev)),
+            PastBody::Unavailable(why) => Some(format!("r{} unavailable · {why}", self.rev)),
+        }
+    }
+}
+
+/// A local undo that no longer holds (§3.5): the block shows something
+/// else now than what the action set.
+pub(crate) const STALE: &str = "changed since · not undone";
 
 fn past_salt(row: u64, r: &Rev) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1185,13 +1360,14 @@ fn past_salt(row: u64, r: &Rev) -> u64 {
     (h.finish() | 1) & (crate::blocks::BLOCK_ID - 1)
 }
 
-/// Row `at`'s block id on board `d`.
-fn row_ref(d: Option<&Drawn>, at: At) -> Option<Ref> {
-    let d = d?;
-    match at {
-        At::Block(r) => crate::lease::find_any(d, r).map(|(s, _)| s.block.id.clone()),
-        At::Rail(r) => d.rail.iter().flatten().find(|s| crate::blocks::row_id(&s.block.id) == r).map(|s| s.block.id.clone()),
-    }
+/// A walk target as this desk draws it on a board ([`AppView::find_on`]):
+/// the block, where it paints (its effective placement), and the token of
+/// the tombstone it draws as, if it does.
+#[derive(Clone, Debug)]
+pub(crate) struct Found {
+    pub s: Shown,
+    pub place: Place,
+    pub tomb: Option<u64>,
 }
 
 /// Block `id` of incarnation `tag` on past board `st`, as a row draws it
@@ -1236,16 +1412,17 @@ mod tests {
     #[test]
     fn undo_keeps_one_level_per_block() {
         let tag = Tag::parse("00000000000000000000000000000001").expect("a tag");
+        let fold = Undid::Fold { before: None, after: (false, None) };
         let mut w = WalkMode::default();
-        w.push(Undo { at: At::Block(1), tag, act: Undid::Fold });
-        w.push(Undo { at: At::Block(2), tag, act: Undid::Fold });
-        w.push(Undo { at: At::Block(1), tag, act: Undid::Wish(Wish::Pin) });
+        w.push(Undo { at: At::Block(1), tag, act: fold.clone() });
+        w.push(Undo { at: At::Block(2), tag, act: fold.clone() });
+        w.push(Undo { at: At::Block(1), tag, act: Undid::Wish(Wish::Pin, 7) });
         assert_eq!(
-            w.undo.iter().map(|u| (u.at, u.act)).collect::<Vec<_>>(),
-            [(At::Block(2), Undid::Fold), (At::Block(1), Undid::Wish(Wish::Pin))]
+            w.undo.iter().map(|u| (u.at, u.act.clone())).collect::<Vec<_>>(),
+            [(At::Block(2), fold.clone()), (At::Block(1), Undid::Wish(Wish::Pin, 7))]
         );
         for r in 0..100 {
-            w.push(Undo { at: At::Rail(r), tag, act: Undid::Fold });
+            w.push(Undo { at: At::Rail(r), tag, act: fold.clone() });
         }
         assert_eq!(w.undo.len(), UNDO_MAX);
         assert_eq!(w.undo.last().map(|u| u.at), Some(At::Rail(99)));
@@ -1257,10 +1434,17 @@ mod tests {
         assert!(status_keys(true, true).contains("x dismiss · u show · p pin · m slot") && status_keys(true, true).contains("⌘Z"));
     }
 
-    /// D7's default answers nothing.
+    /// D7's default answers nothing, and places a block where the agent
+    /// placed it.
     #[test]
-    fn no_desires_does_nothing() {
+    fn no_desires_does_nothing_and_places_as_the_agent_did() {
         let d = NoDesires;
         assert!(!d.wired());
+        let (b, events) = cards_spec::board::Board::of_history(&synaps_client::synthetic::rail_history());
+        let v = b.view(&events);
+        for id in ["plan", "rot"] {
+            let blk = v.block(&cards_spec::block::Ref::parse(id).expect("an id")).expect("on the board");
+            assert_eq!(d.placed("s", blk), blk.place, "{id}: the agent's placement");
+        }
     }
 }

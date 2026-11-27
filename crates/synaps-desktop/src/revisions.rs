@@ -21,14 +21,14 @@ use cards_spec::board::Pos;
 use synaps_client::blocks::Drawn;
 
 /// One revision the board holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Rev {
     pub tag: Tag,
     pub rev: u32,
     pub at: Pos,
     pub author: Author,
-    /// The row of the event it is at: its time.
-    pub row: Option<u64>,
+    /// The call of the event it is at: its row's time is found by it.
+    pub call: Option<std::sync::Arc<str>>,
     /// Of an earlier incarnation of the id (behind `— replaced —`).
     pub earlier: bool,
 }
@@ -41,7 +41,7 @@ pub(crate) fn revisions(d: &Drawn, id: &Ref, tag: Tag) -> Vec<Rev> {
             .records
             .iter()
             .filter(|(r, _)| r.tag == tag)
-            .map(|(r, row)| Rev { tag, rev: r.rev, at: r.at, author: r.author, row: *row, earlier })
+            .map(|(r, m)| Rev { tag, rev: r.rev, at: r.at, author: r.author, call: m.call.clone(), earlier })
             .collect();
         v.sort_by_key(|r| std::cmp::Reverse(r.rev));
         v
@@ -91,7 +91,11 @@ mod tests {
         let (b, events) = Board::of_history(&synaps_client::synthetic::blocks_history());
         let v = b.view(&events);
         Drawn {
-            records: v.records().map(|r| (r.clone(), Some(r.at.event as u64))).collect::<Vec<_>>().into(),
+            records: v
+                .records()
+                .map(|r| (r.clone(), synaps_client::blocks::Mark { row: Some(r.at.event as u64), call: None }))
+                .collect::<Vec<_>>()
+                .into(),
             tombstones: v.tombstones().cloned().collect::<Vec<_>>().into(),
             log: Arc::from(Vec::new()),
             ..Default::default()
@@ -127,12 +131,12 @@ mod tests {
             rev: 3,
             at: Pos::event(4),
             author: Author::Agent,
-            row: None,
+            call: None,
             earlier: false,
         };
         assert_eq!(label(&r, 5, Some("07:41")), "r3 of 5 · agent · 07:41");
         assert_eq!(label(&r, 5, None), "r3 of 5 · agent", "no time recorded: none, never now");
-        let e = Rev { earlier: true, author: Author::User, rev: 2, ..r };
+        let e = Rev { earlier: true, author: Author::User, rev: 2, ..r.clone() };
         assert_eq!(label(&e, 1, Some("07:39")), "— replaced — r2 · you · 07:39");
     }
 }

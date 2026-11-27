@@ -6,27 +6,43 @@
 //!   the keys go back where they were. Tab flips its two tabs.
 //! - **Ops** lists the board's latest 256 lines ([`Drawn::log`], the board
 //!   drawn, the live turn's included), newest first: the time (its row's,
-//!   never "now"), who, the op, the id, and how it went (applied, placed
+//!   found by the line's call, a lookup each: never "now", and never a
+//!   walk of the history to find it), who, the op, the id, and how it
+//!   went (applied, placed
 //!   here, no change, exists, skipped and why, a path skipped, unbound,
 //!   a stale notice). A pending line says so. It is where an agent's
 //!   skipped op, which the agent never learns of, becomes visible.
 //!   Clicking a line whose block is live jumps to it: the walk entered on
 //!   it ([`crate::walk`]).
 //! - **Before compaction** is the archive (§5.2): the predecessor's final
-//!   blocks and op log, read-only, as text (≤ [`ARCHIVE_MAX`]), one per
-//!   session; the next compaction replaces it, and a desk restart loses
-//!   it. Never a revision of a new block, never matched by id: its lines
-//!   don't jump. Its text can be copied whole.
+//!   blocks, whole (each block's contents as canonical JSON, every kind,
+//!   a group's members after it, sanitized for the screen), and its op
+//!   log, read-only, as text (≤ [`ARCHIVE_MAX`]: past it, the oldest log
+//!   lines and then the last blocks' lines go, and a line says what was
+//!   cut). Its text can be copied whole. Never a revision of a new block,
+//!   never matched by id: its lines don't jump.
+//! - **Whose it is** ([`Archives`]): the session's, and the conversation
+//!   its last compaction began. It is captured at the compaction, from the
+//!   predecessor's final board: its history folded to its end off the
+//!   frame by the adapter's own steps (`crate::board::step`), not the
+//!   board last painted (one waiting under the lease, a fold in flight).
+//!   Every compaction replaces it, an empty predecessor with an empty
+//!   archive. Another session, or another conversation of this one (a
+//!   clear, a resume), shows none; switching tabs, splitting panes or
+//!   reattaching changes nothing of it. At most [`ARCHIVES_MAX`]
+//!   sessions' are held; a desk restart loses them.
 //! - **Derived and read-only**: nothing here changes the board.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use cards_spec::board::{Did, Logged, Outcome, PathWhy, Why};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use synaps_client::blocks::{Drawn, Ref};
+use synaps_client::Transcript;
+use synaps_client::blocks::{Drawn, Input, Ref, Shown};
 
 use crate::app::{AppView, display, mono};
 use crate::fonts::{self, TextPx as _, size};
@@ -34,6 +50,12 @@ use crate::theme::Palette;
 
 /// The archive's text holds at most this many bytes (§1.8).
 pub(crate) const ARCHIVE_MAX: usize = 256 * 1024;
+
+/// Sessions whose archive this desk holds at most.
+pub(crate) const ARCHIVES_MAX: usize = 8;
+
+/// A cut line's bytes at most.
+const CUT_MAX: usize = 160;
 
 /// The log's key context.
 pub(crate) const LOG_CTX: &str = "OpLog";
@@ -50,12 +72,14 @@ pub(crate) enum Tab {
     Archive,
 }
 
-/// The op log open: its tab, its focus, where the keys were, its scroll.
+/// The op log open: its tab, its focus, where the keys were, its scroll
+/// (the archive's, a list drawn a line at a time).
 pub(crate) struct OpLog {
     pub tab: Tab,
     pub focus: FocusHandle,
     pub back: Option<FocusHandle>,
     pub scroll: ScrollHandle,
+    pub archive_scroll: UniformListScrollHandle,
 }
 
 /// One line as drawn.
@@ -158,51 +182,126 @@ pub(crate) fn text(l: &Line) -> String {
     format!("{:<5}  {:<5}  {:<8}  {:<12}  {}{pending}", l.time, l.who, l.did, l.id, l.outcome)
 }
 
+/// A line's time, `HH:MM`: its row's, found by its call (`call`, a
+/// lookup: [`Transcript::call_at`]); none without one.
+pub(crate) fn time_of(t: &Transcript, call: Option<&str>) -> Option<String> {
+    #[cfg(test)]
+    VISITS.with(|n| n.set(n.get() + 1));
+    let at = t.call_at(call?)?;
+    crate::times::Stamp::local(at).map(|s| s.hhmm.to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rows the op log looked up for its times (tests: bounded by its
+    /// lines, whatever the history).
+    pub(crate) static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The archive (§5.2, module docs): the predecessor's final blocks and op
-/// log, as text lines.
+/// log, as text lines: each block's head and its contents, a group's
+/// members after it, indented; the log newest first. Past the cap, the
+/// last line of what was cut says so (`cut`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Archive {
     pub blocks: Vec<String>,
     pub log: Vec<String>,
+    pub cut: bool,
+}
+
+/// Block `s`'s lines in the archive, after `indent`: its id, kind, title
+/// and revision, then its contents, canonical JSON, a line each, every
+/// line sanitized for the screen (an agent's string drawn as text).
+fn block_lines(s: &Shown, indent: &str, out: &mut Vec<String>) {
+    let b = &s.block;
+    let mut head = format!("{indent}{} · {} · {} · r{}", b.id, b.body.kind().as_str(), crate::blocks::title_of(s), b.rev);
+    if b.replaced.is_some() {
+        head.push_str(" · replaced");
+    }
+    out.push(clean(&head));
+    let v = synaps_client::blocks::canonical(&serde_json::to_value(&b.body).unwrap_or_default());
+    let json = serde_json::to_string_pretty(&v).unwrap_or_default();
+    out.extend(json.lines().map(|l| clean(&format!("{indent}  {l}"))));
+}
+
+fn clean(s: &str) -> String {
+    crate::ask::shown(s, cards_spec::Lines::Single)
 }
 
 impl Archive {
-    /// Board `d`'s, its rows' times read by `time`: its live blocks (the
-    /// transcript's in reading order, then the rail's), its log newest
-    /// first, the oldest lines dropped past [`ARCHIVE_MAX`].
-    pub(crate) fn of(d: &Drawn, time: impl Fn(Option<u64>) -> Option<String>) -> Self {
-        let mut blocks: Vec<String> = Vec::new();
+    /// Board `d`'s (module docs), its log's times `times` (one a line, in
+    /// its order): its live blocks whole (the transcript's in reading
+    /// order, then the rail's), its log newest first, within
+    /// [`ARCHIVE_MAX`]: past it, the log's oldest lines, then the blocks'
+    /// last lines go, and a line says so. Off the frame.
+    pub(crate) fn of(d: &Drawn, times: &[Option<String>]) -> Self {
+        let log: Vec<String> =
+            d.log.iter().enumerate().rev().map(|(k, (l, _))| text(&line(l, times.get(k).and_then(|t| t.as_deref()), false))).collect();
         let mut rows: Vec<(&u64, &Arc<synaps_client::blocks::RowBlocks>)> = d.rows.iter().collect();
         rows.sort_by_key(|(k, _)| **k);
-        let mut one = |s: &synaps_client::blocks::Shown| {
-            let b = &s.block;
-            let text = match &b.body {
-                synaps_client::blocks::Body::Note(n) => format!(" · {}", n.text.lines().next().unwrap_or("")),
-                _ => String::new(),
-            };
-            blocks.push(
-                format!("{} · {} · {} · r{}{text}", b.id, b.body.kind().as_str(), crate::blocks::title_of(s), b.rev).replace('\n', " "),
-            );
-        };
-        for (_, r) in rows {
-            r.blocks.iter().for_each(&mut one);
+        let mut blocks = Vec::new();
+        for s in rows.iter().flat_map(|(_, r)| r.blocks.iter()).chain(d.rail.iter().flatten()) {
+            block_lines(s, "", &mut blocks);
+            for m in &s.members {
+                block_lines(m, "    ", &mut blocks);
+            }
         }
-        d.rail.iter().flatten().for_each(&mut one);
-        let log: Vec<String> = d.log.iter().rev().map(|(l, row)| text(&line(l, time(*row).as_deref(), false))).collect();
-        let mut a = Archive { blocks, log };
-        while a.bytes() > ARCHIVE_MAX && a.log.pop().is_some() {}
-        while a.bytes() > ARCHIVE_MAX && a.blocks.pop().is_some() {}
+        Self::capped(blocks, log)
+    }
+
+    /// `blocks` and `log` within [`ARCHIVE_MAX`] (module docs): the log
+    /// first (≤ 256 lines), the blocks in the room left, in order; what
+    /// doesn't fit goes from there on, and a line says how much.
+    pub(crate) fn capped(blocks: Vec<String>, log: Vec<String>) -> Self {
+        let line = std::mem::size_of::<String>();
+        let cost = |l: &String| line + l.len();
+        let room = ARCHIVE_MAX - std::mem::size_of::<Self>() - 2 * (line + CUT_MAX);
+        let mut a = Archive::default();
+        let mut used = 0;
+        let (mut log_cut, mut block_cut) = (0usize, 0usize);
+        for l in log {
+            if log_cut == 0 && used + cost(&l) <= room {
+                used += cost(&l);
+                a.log.push(l);
+            } else {
+                log_cut += 1;
+            }
+        }
+        for l in blocks {
+            if block_cut == 0 && used + cost(&l) <= room {
+                used += cost(&l);
+                a.blocks.push(l);
+            } else {
+                block_cut += 1;
+            }
+        }
+        let kib = ARCHIVE_MAX / 1024;
+        if block_cut > 0 {
+            a.blocks.push(format!("✂ cut here: the archive keeps {kib} KiB · {block_cut} more lines of blocks not kept"));
+        }
+        if log_cut > 0 {
+            a.log.push(format!("✂ cut here: the archive keeps {kib} KiB · {log_cut} older lines not kept"));
+        }
+        a.cut = block_cut + log_cut > 0;
+        for l in a.blocks.iter_mut().chain(a.log.iter_mut()) {
+            l.shrink_to_fit();
+        }
+        a.blocks.shrink_to_fit();
+        a.log.shrink_to_fit();
         a
     }
 
-    /// What it keeps, heap included (bytes).
+    /// What it keeps, heap included (bytes: tests, the cap's measure).
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         let v = |l: &Vec<String>| l.capacity() * std::mem::size_of::<String>() + l.iter().map(String::capacity).sum::<usize>();
         std::mem::size_of::<Self>() + v(&self.blocks) + v(&self.log)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.log.is_empty()
+    /// Its lines as the tab lists them: a head, the blocks', a head, the
+    /// log's.
+    pub(crate) fn rows(&self) -> usize {
+        2 + self.blocks.len() + self.log.len()
     }
 
     /// Its text whole, for the clipboard.
@@ -221,6 +320,104 @@ impl Archive {
     }
 }
 
+/// One session's archive ([`Archives`]): the conversation its compaction
+/// began (shown only while the session holds it), and the archive once
+/// captured.
+pub(crate) struct Held {
+    pub session: String,
+    pub journal: String,
+    pub archive: Option<Arc<Archive>>,
+    capture: u64,
+    _task: Option<Task<()>>,
+}
+
+/// The archives this desk holds (module docs): one per session, of its
+/// last compaction, at most [`ARCHIVES_MAX`] (the least recently captured
+/// goes first).
+#[derive(Default)]
+pub(crate) struct Archives {
+    held: Vec<Held>,
+    next: u64,
+}
+
+impl Archives {
+    /// Session `session`'s archive, if it holds one of conversation
+    /// `journal` (another conversation's is not shown).
+    pub(crate) fn of(&self, session: &str, journal: &str) -> Option<&Held> {
+        self.held.iter().find(|h| h.session == session && h.journal == journal)
+    }
+
+    /// A compaction of `session` began conversation `journal`: its archive
+    /// replaced by the one this capture makes (the one before is gone).
+    fn begin(&mut self, session: &str, journal: &str) -> u64 {
+        self.next += 1;
+        self.held.retain(|h| h.session != session);
+        if self.held.len() >= ARCHIVES_MAX {
+            self.held.remove(0);
+        }
+        self.held.push(Held { session: session.into(), journal: journal.into(), archive: None, capture: self.next, _task: None });
+        self.next
+    }
+
+    fn task(&mut self, session: &str, capture: u64, task: Task<()>) {
+        if let Some(h) = self.held.iter_mut().find(|h| h.session == session && h.capture == capture) {
+            h._task = Some(task);
+        }
+    }
+
+    /// Capture `capture` of `session` made `a`: held if it is still the
+    /// one asked for.
+    fn landed(&mut self, session: &str, capture: u64, a: Archive) -> bool {
+        let Some(h) = self.held.iter_mut().find(|h| h.session == session && h.capture == capture) else { return false };
+        h.archive = Some(Arc::new(a));
+        h._task = None;
+        true
+    }
+}
+
+/// A capture asked for at a compaction (module docs), as the boundary
+/// left it: the predecessor's input, its board last bound and those lines'
+/// times (its rows are the predecessor's until its history is replaced),
+/// its history's epoch.
+pub(crate) struct Capture {
+    session: String,
+    capture: u64,
+    input: Option<Input>,
+    bound: Option<Arc<Drawn>>,
+    times: HashMap<Arc<str>, String>,
+    epoch: u64,
+}
+
+/// Archive `a`'s row `k` as the tab lists it ([`Archive::rows`]).
+fn archive_row(a: &Archive, k: usize, dim: Hsla, ink: Hsla) -> AnyElement {
+    let nb = a.blocks.len();
+    let (text, ink, sel) = if k == 0 {
+        ("blocks".to_string(), dim, "oplog-archive-head blocks".to_string())
+    } else if k <= nb {
+        let b = &a.blocks[k - 1];
+        (b.clone(), ink, format!("oplog-archive-block {} {b}", k - 1))
+    } else if k == nb + 1 {
+        ("op log".to_string(), dim, "oplog-archive-head log".to_string())
+    } else {
+        let l = &a.log[k - nb - 2];
+        (l.clone(), ink, format!("oplog-archive-line {} {l}", k - nb - 2))
+    };
+    div()
+        .h(px(ROW_H))
+        .px(px(16.))
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .text_ellipsis()
+        .font_family(fonts::MONO)
+        .text_px(size::META)
+        .text_color(ink)
+        .debug_selector(move || sel.clone())
+        .child(text)
+        .into_any_element()
+}
+
 impl AppView {
     /// Ctrl+O (Cmd+O): the op log opened over the focused pane, or closed.
     pub(crate) fn oplog_toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -234,7 +431,8 @@ impl AppView {
         let focus = cx.focus_handle();
         let back = window.focused(cx);
         window.focus(&focus, cx);
-        self.oplog = Some(OpLog { tab: Tab::Ops, focus, back, scroll: ScrollHandle::new() });
+        self.oplog =
+            Some(OpLog { tab: Tab::Ops, focus, back, scroll: ScrollHandle::new(), archive_scroll: UniformListScrollHandle::new() });
         log::info!(target: "synaps_desktop::oplog", "op log: opened");
         cx.notify();
     }
@@ -275,6 +473,7 @@ impl AppView {
                 if let Some(o) = self.oplog.as_mut() {
                     o.tab = if o.tab == Tab::Ops { Tab::Archive } else { Tab::Ops };
                     o.scroll.set_offset(Point::default());
+                    o.archive_scroll = UniformListScrollHandle::new();
                 }
                 cx.notify();
             }
@@ -292,17 +491,106 @@ impl AppView {
         }
     }
 
-    /// The focused pane's session's log lines, newest first.
+    /// The focused pane's session's log lines, newest first: at most 256,
+    /// each one's time looked up by its call (never an index of the
+    /// history: module docs).
     pub(crate) fn oplog_lines(&self) -> Vec<Line> {
         let l = &self.model.lives[self.panes.cur.live];
         let Some(d) = l.transcript.drawn() else { return Vec::new() };
-        let items: HashMap<u64, &synaps_client::transcript::Item> = l.transcript.items().iter().map(|i| (i.id, i)).collect();
-        let time = |row: Option<u64>| {
-            row.and_then(|r| items.get(&r)).and_then(|i| i.at.as_deref()).and_then(crate::times::Stamp::local).map(|t| t.hhmm.to_string())
-        };
-        let live: std::collections::HashSet<Ref> =
-            d.rows.values().flat_map(|r| r.blocks.iter()).chain(d.rail.iter().flatten()).map(|s| s.block.id.clone()).collect();
-        d.log.iter().rev().map(|(lg, row)| line(lg, time(*row).as_deref(), lg.id.as_ref().is_some_and(|i| live.contains(i)))).collect()
+        let live: std::collections::HashSet<&Ref> =
+            d.rows.values().flat_map(|r| r.blocks.iter()).chain(d.rail.iter().flatten()).map(|s| &s.block.id).collect();
+        d.log
+            .iter()
+            .rev()
+            .map(|(lg, m)| line(lg, time_of(&l.transcript, m.call.as_deref()).as_deref(), lg.id.as_ref().is_some_and(|i| live.contains(i))))
+            .collect()
+    }
+
+    /// The focused pane's session's archive, if it holds one of the
+    /// conversation the session holds now.
+    pub(crate) fn archive_shown(&self) -> Option<&Held> {
+        let l = &self.model.lives[self.panes.cur.live];
+        let session = l.active.as_ref().map(|a| a.session_id.as_str())?;
+        self.archives.of(session, l.transcript.journal())
+    }
+
+    /// A compaction of store `live`'s session began conversation `journal`
+    /// (module docs): its archive is replaced by a capture of the
+    /// predecessor as this boundary leaves it (its input, its board bound
+    /// now and those lines' times: a lookup each), run once the batch is
+    /// applied ([`AppView::archive_run`]).
+    pub(crate) fn archive_boundary(&mut self, live: crate::live::LiveId, journal: &str) {
+        let l = &self.model.lives[live];
+        let Some(session) = l.active.as_ref().map(|a| a.session_id.clone()) else { return };
+        let t = &l.transcript;
+        let input = t.blocks_input();
+        let bound = l.board.waiting.clone().or_else(|| t.drawn().cloned()).filter(|d| d.epoch == t.blocks_epoch());
+        let mut times = HashMap::new();
+        for (_, m) in bound.iter().flat_map(|d| d.log.iter()) {
+            if let Some(c) = m.call.as_ref()
+                && let Some(at) = time_of(t, Some(c))
+            {
+                times.insert(c.clone(), at);
+            }
+        }
+        let epoch = t.blocks_epoch();
+        let capture = self.archives.begin(&session, journal);
+        log::info!(target: "synaps_desktop::oplog", "archive: {session} compacted into {journal}: capture {capture}");
+        self.captures.push(Capture { session, capture, input, bound, times, epoch });
+    }
+
+    /// The captures asked for in the batch, run (module docs): the
+    /// predecessor's history folded to its end off the frame, a step at a
+    /// time as a board job's; its lines' times; its archive written off
+    /// the frame, and held if it is still the one asked for. A live turn
+    /// changed under the fold (its log reset) leaves the board bound at
+    /// the boundary.
+    pub(crate) fn archive_run(&mut self, cx: &mut Context<Self>) {
+        for c in std::mem::take(&mut self.captures) {
+            let Capture { session, capture, input, bound, times, epoch } = c;
+            let s = session.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let drawn = match input {
+                    None => None,
+                    Some(input) => {
+                        let (input, stop) = (Arc::new(input), Arc::new(AtomicBool::new(false)));
+                        let worker = input.worker.clone();
+                        loop {
+                            let (w, i, s) = (worker.clone(), input.clone(), stop.clone());
+                            match cx.background_spawn(async move { crate::board::step(&w, &i, &s, crate::board::STEP) }).await {
+                                crate::board::Step::Done(d) => break Some(d),
+                                crate::board::Step::Paused => {}
+                                crate::board::Step::Stopped => break bound,
+                            }
+                        }
+                    }
+                };
+                let Ok(times) = this.update(cx, |v, _| v.archive_times(drawn.as_deref(), &times, epoch)) else { return };
+                let a = cx.background_spawn(async move { drawn.map_or_else(Archive::default, |d| Archive::of(&d, &times)) }).await;
+                let _ = this.update(cx, |v, cx| {
+                    if v.archives.landed(&s, capture, a) {
+                        log::info!(target: "synaps_desktop::oplog", "archive: {s}'s capture {capture} held");
+                        cx.notify();
+                    }
+                });
+            });
+            self.archives.task(&session, capture, task);
+        }
+    }
+
+    /// The times of board `d`'s log lines (a capture's): the boundary's,
+    /// else looked up in the predecessor's rows while a store still holds
+    /// its history (`epoch`); a lookup a line.
+    fn archive_times(&self, d: Option<&Drawn>, snap: &HashMap<Arc<str>, String>, epoch: u64) -> Vec<Option<String>> {
+        let Some(d) = d else { return Vec::new() };
+        let t = self.model.lives.ids().into_iter().map(|l| &self.model.lives[l].transcript).find(|t| t.blocks_epoch() == epoch);
+        d.log
+            .iter()
+            .map(|(_, m)| {
+                let c = m.call.as_deref()?;
+                snap.get(c).cloned().or_else(|| t.and_then(|t| time_of(t, Some(c))))
+            })
+            .collect()
     }
 
     /// The op log over the pane at `left` (`pane` wide), its foot above
@@ -328,6 +616,9 @@ impl AppView {
                 .child(text)
         };
         let mut list = div().id("oplog-list").overflow_y_scroll().track_scroll(&o.scroll).max_h(px(max)).w_full();
+        let held = self.archive_shown();
+        let archive = held.and_then(|h| h.archive.clone());
+        let mut lines_el = None;
         match o.tab {
             Tab::Ops => {
                 let lines = self.oplog_lines();
@@ -352,20 +643,26 @@ impl AppView {
                     });
                 }
             }
-            Tab::Archive => match self.model.lives[self.panes.cur.live].archive.as_ref().filter(|a| !a.is_empty()) {
-                None => list = list.child(row("Nothing before a compaction yet".into(), p.dim_k, "oplog-archive-empty".into())),
-                Some(a) => {
-                    list = list.child(row("blocks".into(), p.dim_k, "oplog-archive-head blocks".into()));
-                    for (k, b) in a.blocks.iter().enumerate() {
-                        list = list.child(row(b.clone(), p.prose_k, format!("oplog-archive-block {k} {b}")));
-                    }
-                    list = list.child(row("op log".into(), p.dim_k, "oplog-archive-head log".into()));
-                    for (k, l) in a.log.iter().enumerate() {
-                        list = list.child(row(l.clone(), p.prose_k, format!("oplog-archive-line {k} {l}")));
-                    }
+            Tab::Archive => match (held, archive.clone()) {
+                (None, _) => list = list.child(row("Nothing before a compaction yet".into(), p.dim_k, "oplog-archive-empty".into())),
+                (Some(_), None) => list = list.child(row("Capturing what was before…".into(), p.dim_k, "oplog-archive-capturing".into())),
+                // Drawn a line at a time as it scrolls: ≤ 256 KiB of lines.
+                (Some(_), Some(a)) => {
+                    let n = a.rows();
+                    let (dim, ink) = (p.dim_k, p.prose_k);
+                    lines_el = Some(
+                        uniform_list("oplog-archive", n, move |range, _, _| {
+                            range.map(|k| archive_row(&a, k, dim, ink)).collect::<Vec<_>>()
+                        })
+                        .track_scroll(&o.archive_scroll)
+                        .w_full()
+                        .h(px(max.min(n as f32 * ROW_H)))
+                        .into_any_element(),
+                    );
                 }
             },
         }
+        let list = lines_el.unwrap_or_else(|| list.into_any_element());
         let seg = |tab: Tab, text: &'static str| {
             let on = o.tab == tab;
             div()
@@ -384,11 +681,11 @@ impl AppView {
                     if let Some(o) = this.oplog.as_mut() {
                         o.tab = tab;
                         o.scroll.set_offset(Point::default());
+                        o.archive_scroll = UniformListScrollHandle::new();
                     }
                     cx.notify();
                 }))
         };
-        let archive = self.model.lives[self.panes.cur.live].archive.clone().filter(|a| !a.is_empty());
         let copy = (o.tab == Tab::Archive).then_some(archive).flatten().map(|a| {
             div()
                 .id("oplog-copy")
@@ -445,6 +742,10 @@ mod tests {
     use cards_spec::board::Board;
     use synaps_client::blocks::Drawn;
 
+    use std::sync::Arc;
+
+    use synaps_client::blocks::{Mark, Shown};
+
     use super::{ARCHIVE_MAX, Archive, Line, line, text};
 
     /// §3.8: every line names who, the op, the id and how it went; a
@@ -465,21 +766,81 @@ mod tests {
         assert_eq!(text(&lines[0]).split_whitespace().collect::<Vec<_>>(), ["—", "agent", "put", "now", "applied"]);
     }
 
-    /// §5.2: the archive is the board's blocks and its log, newest first,
-    /// bounded.
-    #[test]
-    fn the_archive_is_the_final_blocks_and_log_bounded() {
+    /// The blocks demo's board as a drawn board carries it: its live
+    /// top-level blocks (a group with its members), its log.
+    fn demo() -> Drawn {
         let (b, events) = Board::of_history(&synaps_client::synthetic::blocks_history());
         let v = b.view(&events);
-        let d = Drawn { log: v.log().map(|l| (l.clone(), None)).collect::<Vec<_>>().into(), ..Default::default() };
-        let a = Archive::of(&d, |_| None);
-        assert_eq!(a.log.len(), v.log().count());
+        let shown = |r: &cards_spec::block::Ref| {
+            let blk = v.block(r)?;
+            let members = blk
+                .members()
+                .iter()
+                .filter_map(|m| v.block(&cards_spec::block::Ref::Block(m.clone())))
+                .map(|m| Shown { block: Arc::new(m.clone()), bound: None, members: Vec::new() })
+                .collect();
+            Some(Shown { block: Arc::new(blk.clone()), bound: None, members })
+        };
+        let tops: Vec<Shown> = v.lists().flat_map(|(_, refs)| refs.iter().filter_map(shown).collect::<Vec<_>>()).collect();
+        Drawn {
+            rail: [tops, Vec::new()],
+            log: v.log().map(|l| (l.clone(), Mark::default())).collect::<Vec<_>>().into(),
+            ..Default::default()
+        }
+    }
+
+    /// §5.2: the archive is the predecessor's final blocks whole (every
+    /// kind's contents, a group's members after it, multiline text) and its
+    /// log newest first; nothing cut, nothing said cut.
+    #[test]
+    fn the_archive_keeps_every_blocks_contents_whole() {
+        let d = demo();
+        let a = Archive::of(&d, &[]);
+        let all = a.text();
+        assert!(!a.cut && !all.contains("✂"), "nothing cut");
+        for want in [
+            // A plan's steps and their states.
+            "Trace issuance and verification paths",
+            "Regression test: 32 concurrent refreshes",
+            "\"state\": \"done\"",
+            // A status's text and detail.
+            "Running the regression test",
+            "32 concurrent refreshes",
+            // A diff's hunks.
+            "self.relay.refresh(&self.token).await",
+            // A file's path and note.
+            "TokenStore::rotate",
+            // A metric's value and series.
+            "\"value\": \"1.0\"",
+            // A note's text past its first line.
+            "The retry band-aid hid it",
+            // A group's members, after it.
+            "why · group",
+        ] {
+            assert!(all.contains(want), "{want:?} kept: {all}");
+        }
+        let g = a.blocks.iter().position(|l| l.starts_with("why · group")).expect("the group");
+        assert!(a.blocks[g..].iter().any(|l| l.starts_with("    cause · note")), "its members after it, indented");
+        assert_eq!(a.log.len(), d.log.len(), "every line");
         assert!(a.log[0].contains("call") && a.log[0].contains("unbound"), "newest first: {:?}", a.log[0]);
         assert!(a.text().starts_with("before compaction: blocks\n") && a.text().contains("before compaction: op log"));
-        // Past the cap, the oldest lines go.
-        let big = Archive { blocks: Vec::new(), log: (0..4000).map(|k| format!("{k:0>100}")).collect() };
-        let mut cut = big.clone();
-        while cut.bytes() > ARCHIVE_MAX && cut.log.pop().is_some() {}
-        assert!(cut.bytes() <= ARCHIVE_MAX && cut.log.len() < big.log.len() && cut.log[0] == big.log[0]);
+        assert!(a.bytes() <= ARCHIVE_MAX);
+    }
+
+    /// §1.8: past 256 KiB the archive is cut, and says so where it is cut;
+    /// the log comes first, the blocks' last lines go.
+    #[test]
+    fn the_archive_is_cut_at_its_cap_and_says_so() {
+        let d = demo();
+        let one = Archive::of(&d, &[]);
+        let many: Vec<Shown> = (0..400).flat_map(|_| d.rail[0].iter().cloned()).collect();
+        let big = Drawn { rail: [many, Vec::new()], ..d.clone() };
+        let a = Archive::of(&big, &[]);
+        assert!(a.bytes() <= ARCHIVE_MAX, "{} bytes", a.bytes());
+        assert!(a.cut, "cut");
+        let last = a.blocks.last().expect("lines");
+        assert!(last.starts_with("✂ cut here: the archive keeps 256 KiB") && last.contains("more lines of blocks not kept"), "{last}");
+        assert_eq!(a.log, one.log, "the log whole");
+        assert_eq!(a.blocks[..one.blocks.len()], one.blocks[..], "the blocks in order, whole up to the cut");
     }
 }

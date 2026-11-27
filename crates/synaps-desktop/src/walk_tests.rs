@@ -12,11 +12,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use cards_spec::block::Ref;
+use cards_spec::block::{Ref, Slot};
+use cards_spec::board::Place;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, point, px};
 use serde_json::{Value, json};
 
-use super::answer_tests::{ask_live, attachment, has, heard};
+use super::answer_tests::{ask_live, attachment, has, heard, llm};
 use super::blocks_ui_tests::{click, drawn, mouse, open_session, round, split, turn};
 use super::keys_tests::{composer_text, down, entered, keys_at, press, prompt, prompt_pending, repeat};
 use super::{open_at, settle, wait};
@@ -73,7 +74,7 @@ fn ring(cx: &mut TestAppContext, w: AnyWindowHandle, row: u64) -> bool {
 fn status(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
     view.read_with(cx, |v, _| {
         v.panes.cur.walk.walk.as_ref()?;
-        Some(match v.panes.cur.walk.walk.as_ref().and_then(|w| w.rev) {
+        Some(match v.panes.cur.walk.walk.as_ref().and_then(|w| w.rev.as_ref()) {
             Some(_) => "rev".into(),
             None => crate::walk::status_keys(v.desires.wired(), cfg!(target_os = "macos")),
         })
@@ -518,7 +519,7 @@ fn revisions_step_back_and_an_op_meanwhile_never_yanks_the_view(cx: &mut TestApp
     let past = |cx: &mut TestAppContext| {
         view.read_with(cx, |v, _| {
             v.walk_past(b).map(|p| {
-                let text = p.shown.as_ref().and_then(|s| match &s.block.body {
+                let text = p.ready().and_then(|s| match &s.block.body {
                     synaps_client::blocks::Body::Note(n) => Some(n.text.to_string()),
                     _ => None,
                 });
@@ -621,9 +622,13 @@ fn undo_reverses_the_last_local_action_per_block(cx: &mut TestAppContext) {
 /// What D6b was asked: the wish, the block, the session, a rail section.
 type Ask = (Wish, String, String, bool);
 
-/// A stand-in for D6b's side: what it was asked, and its answer.
+/// An ask's placement and tombstone token.
+type Aimed = Rc<RefCell<Vec<(Place, Option<u64>)>>>;
+
+/// A stand-in for D6b's side: what it was asked, its answer, and each
+/// ask's placement and tombstone token.
 #[derive(Clone, Default)]
-struct Asks(Rc<RefCell<Vec<Ask>>>, Rc<RefCell<Option<String>>>);
+struct Asks(Rc<RefCell<Vec<Ask>>>, Rc<RefCell<Option<String>>>, Aimed);
 
 impl BlockDesires for Asks {
     fn wired(&self) -> bool {
@@ -641,19 +646,30 @@ impl BlockDesires for Asks {
     fn slot(&mut self, a: &Aim) -> Asked {
         self.ask(Wish::Slot, a)
     }
-    fn undo(&mut self, a: &Aim, wish: Wish) -> Asked {
-        self.0.borrow_mut().push((wish, format!("undo {}", a.block.block.id), a.session.to_string(), a.rail.is_some()));
-        Asked::Done
+    fn undo(&mut self, a: &Aim, wish: Wish, token: u64) -> Asked {
+        assert_eq!(token, self.token(wish, a), "its own token back");
+        self.0.borrow_mut().push((wish, format!("undo {}", a.block.block.id), a.session.to_string(), on_rail(a)));
+        Asked::Done(0)
     }
 }
 
+/// The aim is a rail section's.
+fn on_rail(a: &Aim) -> bool {
+    matches!(a.place, cards_spec::board::Place::Rail(_))
+}
+
 impl Asks {
+    fn token(&self, wish: Wish, a: &Aim) -> u64 {
+        crate::blocks::row_id(&a.block.block.id) ^ wish as u64
+    }
+
     fn ask(&self, wish: Wish, a: &Aim) -> Asked {
-        assert!(a.drawn.rows.values().any(|r| r.blocks.iter().any(|s| s.block.id == a.block.block.id)) || a.rail.is_some());
-        self.0.borrow_mut().push((wish, a.block.block.id.to_string(), a.session.to_string(), a.rail.is_some()));
+        assert!(a.drawn.rows.values().any(|r| r.blocks.iter().any(|s| s.block.id == a.block.block.id)) || on_rail(a));
+        self.0.borrow_mut().push((wish, a.block.block.id.to_string(), a.session.to_string(), on_rail(a)));
+        self.2.borrow_mut().push((a.place, a.tomb));
         match self.1.borrow().clone() {
             Some(why) => Asked::Refused(why),
-            None => Asked::Done,
+            None => Asked::Done(self.token(wish, a)),
         }
     }
 }
@@ -744,35 +760,65 @@ fn click_over(cx: &mut TestAppContext, w: AnyWindowHandle, at_: gpui_kit::Point<
 }
 
 /// The archive tab (§5.2): empty until a compaction; then the
-/// predecessor's final blocks and op log, read-only, its text copied
-/// whole. Its lines don't jump.
+/// predecessor's final blocks, whole, and its op log, read-only, its text
+/// copied whole. Its lines don't jump.
 #[gpui_kit::test]
 fn the_archive_tab_keeps_the_predecessors_blocks_and_log(cx: &mut TestAppContext) {
     let (w, view) = walked(cx);
+    ops(cx, w, &view, "toolu_ml", json!([{"op":"put","id":"m","kind":"note","body":{"text":"first line\nimportant second line"}}]));
     press(cx, w, "ctrl-o");
     press(cx, w, "tab");
     assert!(has(cx, w, "oplog-archive-empty".into()), "nothing before a compaction yet");
     press(cx, w, "escape");
-    let sid = attachment(cx, &view).1;
+    compact(cx, w, &view);
+    let all = copied(cx, w, &view);
+    assert!(all.contains("b · note · ") && all.contains("\"text\": \"B first\""), "{all}");
+    assert!(all.contains("important second line"), "a note whole: {all}");
+    assert!(all.split('\n').any(|l| l.split_whitespace().collect::<Vec<_>>().join(" ").contains("agent put c applied")), "{all}");
+    let a = view.read_with(cx, |v, _| v.archive_shown().and_then(|h| h.archive.clone())).expect("the archive");
+    assert!(a.bytes() <= crate::oplog::ARCHIVE_MAX && !a.cut);
+    press(cx, w, "ctrl-o");
+    press(cx, w, "tab");
+    assert!(has(cx, w, format!("oplog-archive-block 0 {}", a.blocks[0])), "drawn, a line at a time");
+}
+
+/// The session's compaction, as the daemon says it: the conversation it
+/// begins is `journal` (none: the one the session holds, as an attach of
+/// it says).
+fn compact_into(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, journal: Option<&str>) {
+    let sid = attachment(cx, view).1;
+    let j =
+        journal.map_or_else(|| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string()), str::to_string);
     heard(
         cx,
         w,
-        &view,
-        vec![
-            json!({"ev": "compaction_applied", "previous_session_id": sid, "session_id": "j2walk", "chains_advanced": [], "msg_count": 4}),
-        ],
+        view,
+        vec![json!({"ev": "compaction_applied", "previous_session_id": sid, "session_id": j, "chains_advanced": [], "msg_count": 4})],
     );
-    let a = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].archive.clone()).expect("the archive");
-    assert!(a.blocks.iter().any(|l| l.starts_with("b · note · ") && l.ends_with("· B first")), "{:#?}", a.blocks);
-    assert!(a.log.iter().any(|l| l.split_whitespace().collect::<Vec<_>>().join(" ").contains("agent put c applied")), "{:#?}", a.log);
-    assert!(a.bytes() <= crate::oplog::ARCHIVE_MAX);
+    wait(cx, w, view, 300);
+}
+
+fn compact(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    compact_into(cx, w, view, None);
+}
+
+/// The archive tab's text as its copy gives it (none drawn: `None`).
+fn copied_now(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> Option<String> {
     press(cx, w, "ctrl-o");
     press(cx, w, "tab");
-    let b0 = a.blocks.iter().position(|l| l.starts_with("b · note")).expect("b");
-    assert!(has(cx, w, format!("oplog-archive-block {b0} {}", a.blocks[b0])));
-    let copy = drawn(cx, w, "oplog-copy".into()).center();
-    click(cx, w, copy);
-    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some(a.text()), "copied whole");
+    let copy = super::blocks_ui_tests::bounds(cx, w, "oplog-copy".into()).map(|b| b.center());
+    let text = copy.map(|c| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()));
+        click(cx, w, c);
+        cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default()
+    });
+    press(cx, w, "escape");
+    wait(cx, w, view, 100);
+    text
+}
+
+fn copied(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> String {
+    copied_now(cx, w, view).expect("an archive to copy")
 }
 
 // ── the rail ──────────────────────────────────────────────────────────
@@ -834,4 +880,366 @@ fn the_walk_its_hover_and_the_op_log_ask_no_frame_at_rest(cx: &mut TestAppContex
     wait(cx, w, &view, 1000);
     assert!(has(cx, w, "oplog".into()));
     assert_eq!(settle(cx, w, 8), 0, "the op log, at rest");
+}
+
+// ── Shady #105 ────────────────────────────────────────────────────────
+
+/// A past revision is in view in the pane acted on.
+fn rev_open(cx: &mut TestAppContext, view: &Entity<AppView>) -> bool {
+    view.read_with(cx, |v, _| v.panes.cur.walk.walk.as_ref().is_some_and(|w| w.rev.is_some()))
+}
+
+/// Re-folds started.
+fn started(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
+    view.read_with(cx, |v, _| v.refolds.started)
+}
+
+/// `j` until the walk is on `to`, painted.
+fn walk_on(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
+    for _ in 0..16 {
+        if at(cx, view) == Some(to) {
+            break;
+        }
+        press(cx, w, "j");
+    }
+    wait(cx, w, view, 300);
+    assert_eq!(at(cx, view), Some(to), "walked to it");
+}
+
+/// P2-1: `[` and `]` act on the painted target as `z` does (§6.2): a block
+/// just reached, its ring not painted on it yet, gets nothing; a
+/// replacement waiting under the lease refuses them, an open view's `]`
+/// too, with why, before the lease releases; painted again, they act.
+#[gpui_kit::test]
+fn revision_keys_act_on_the_painted_target_checked_before_the_lease_releases(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    ops(cx, w, &view, "toolu_r2", json!([{"op":"patch","id":"b","set":{"text":"B second"}}]));
+    tail(cx, w, &view);
+    enter(cx, w, &view);
+    // Just reached: no ring painted on b yet.
+    super::keys_tests::down(cx, w, "k");
+    super::keys_tests::up(cx, w, "k");
+    crate::app::next_press();
+    assert_eq!(at(cx, &view), Some(At::Block(row("b"))));
+    assert!(view.read_with(cx, |v, _| v.panes.cur.walk.walk.as_ref().is_some_and(|w| w.painted.get().is_none())), "not painted on b yet");
+    let n0 = started(cx, &view);
+    super::keys_tests::down(cx, w, "[");
+    super::keys_tests::up(cx, w, "[");
+    crate::app::next_press();
+    assert!(!rev_open(cx, &view) && started(cx, &view) == n0, "nothing asked of a target not painted");
+    // Painted: `[` opens r1.
+    wait(cx, w, &view, 300);
+    press(cx, w, "[");
+    wait(cx, w, &view, 300);
+    assert!(rev_open(cx, &view), "painted: r1 in view");
+    // A replacement waiting under the pointer: `]` refuses, the view as it
+    // was, and why; the key releases the lease.
+    let at_ = head(cx, w, "b");
+    mouse(cx, w, at_, "move");
+    ops(cx, w, &view, "toolu_rr", json!([{"op":"replace","id":"b","kind":"note","body":{"text":"B again"}}]));
+    assert!(waiting(cx, &view), "the board waits under the pointer");
+    let n1 = started(cx, &view);
+    press(cx, w, "]");
+    assert!(rev_open(cx, &view) && started(cx, &view) == n1, "the view as it was");
+    assert_eq!(note(cx, &view), Some((row("b"), crate::lease::CHANGED)), "and why");
+    assert!(!waiting(cx, &view), "the key released the lease");
+    // Painted again, the new incarnation's ring: `]` acts, the latest.
+    away(cx, w);
+    wait(cx, w, &view, 300);
+    press(cx, w, "]");
+    assert!(!rev_open(cx, &view), "painted again: the latest");
+    // And with no view: a replacement waiting refuses `[`.
+    ops(cx, w, &view, "toolu_r3", json!([{"op":"patch","id":"b","set":{"text":"B again, twice"}}]));
+    wait(cx, w, &view, 300);
+    let at_ = head(cx, w, "b");
+    mouse(cx, w, at_, "move");
+    ops(cx, w, &view, "toolu_r4", json!([{"op":"replace","id":"b","kind":"note","body":{"text":"B thrice"}}]));
+    assert!(waiting(cx, &view));
+    let n2 = started(cx, &view);
+    press(cx, w, "[");
+    assert!(!rev_open(cx, &view) && started(cx, &view) == n2, "no revision asked of a block replaced");
+    assert_eq!(note(cx, &view), Some((row("b"), crate::lease::CHANGED)));
+}
+
+/// P2-2: a past label never wears the live body (§3.6): until the scratch
+/// has r2 the block says `loading r2…`, its live title and body not
+/// drawn; one that can't be had says `r2 unavailable`; a folded rail
+/// section's summary is its revision's.
+#[gpui_kit::test]
+fn a_past_revision_never_wears_the_live_body(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    ops(cx, w, &view, "toolu_l2", json!([{"op":"patch","id":"b","set":{"text":"B second"}}]));
+    ops(cx, w, &view, "toolu_l3", json!([{"op":"patch","id":"b","set":{"text":"B third"}}]));
+    tail(cx, w, &view);
+    let b = row("b");
+    enter(cx, w, &view);
+    press(cx, w, "k");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("block-note {b}")) && has(cx, w, format!("block-title {b}")), "the latest drawn");
+    // `[`, the frame drawn as the key's update flushes: the scratch hasn't
+    // folded r2 yet.
+    let ks = super::keys_tests::keystroke(cx, "[");
+    cx.update_window(w, |_, window, cx| window.dispatch_keystroke(ks, cx)).expect("the window");
+    assert!(has(cx, w, format!("block-past-wait {b} loading r2…")), "loading");
+    assert!(!has(cx, w, format!("block-note {b}")) && !has(cx, w, format!("block-title {b}")), "nothing of the live block");
+    super::keys_tests::up(cx, w, "[");
+    wait(cx, w, &view, 300);
+    crate::app::next_press();
+    assert!(!has(cx, w, format!("block-past-wait {b} loading r2…")));
+    assert!(has(cx, w, format!("block-note {b}")), "r2's body, once the scratch has it");
+    // One the scratch can't have: unavailable, never the live block.
+    view.update(cx, |v, cx| {
+        if let Some(d) = v.refolds.done.as_mut() {
+            d.state = Err(cards_spec::board::TooFar);
+        }
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    assert!(has(cx, w, format!("block-past-wait {b} r2 unavailable · too far back to show")), "unavailable");
+    assert!(!has(cx, w, format!("block-note {b}")) && !has(cx, w, format!("block-title {b}")), "never the live block");
+    press(cx, w, "escape");
+    wait(cx, w, &view, 300);
+    // A rail section folded, then its r1: the summary is r1's.
+    ops(cx, w, &view, "toolu_rn", json!([{"op":"put","id":"rn","kind":"note","target":"rail","slot":"upper","body":{"text":"R first"}}]));
+    ops(cx, w, &view, "toolu_rp", json!([{"op":"patch","id":"rn","set":{"text":"R second"}}]));
+    let rn = row("rn");
+    walk_on(cx, w, &view, At::Rail(rn));
+    if !has(cx, w, format!("agent-summary {rn} R second")) {
+        press(cx, w, "z");
+        wait(cx, w, &view, 1000);
+    }
+    assert!(has(cx, w, format!("agent-summary {rn} R second")), "folded: the latest's summary");
+    press(cx, w, "[");
+    wait(cx, w, &view, 1000);
+    assert!(has(cx, w, format!("agent-summary {rn} R first")), "r1's own summary");
+    assert!(!has(cx, w, format!("agent-summary {rn} R second")));
+}
+
+/// P2-4: the archive is its session's (§5.2): another session in the same
+/// tab (its store reused) shows its own or none, and the first's comes
+/// back with it.
+#[gpui_kit::test]
+fn the_archive_is_its_sessions_whatever_the_tab_shows(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    ops(cx, w, &view, "toolu_oa", json!([{"op":"put","id":"onlya","kind":"note","body":{"text":"A's own"}}]));
+    compact(cx, w, &view);
+    assert!(copied(cx, w, &view).contains("A's own"));
+    // Session B in the same tab: none yet.
+    open_session(cx, w, &view, crate::demo::BLOCKS_TWIN, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    assert_eq!(copied_now(cx, w, &view), None, "B has none");
+    press(cx, w, "ctrl-o");
+    press(cx, w, "tab");
+    assert!(has(cx, w, "oplog-archive-empty".into()));
+    press(cx, w, "escape");
+    // B compacted: its own.
+    compact(cx, w, &view);
+    let b = copied(cx, w, &view);
+    assert!(b.contains(" · plan · ") && !b.contains("A's own"), "{b}");
+    // A again: A's.
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    assert!(copied(cx, w, &view).contains("A's own"), "A's archive, back with A");
+}
+
+/// P2-4: every compaction replaces the archive, an empty predecessor with
+/// an empty one.
+#[gpui_kit::test]
+fn every_compaction_replaces_the_archive_an_empty_predecessor_too(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    compact(cx, w, &view);
+    assert!(copied(cx, w, &view).contains(" · plan · "), "the demo's blocks");
+    // The successor's history: no block call, no board.
+    let (seq, sid) = attachment(cx, &view);
+    let update = synaps_client::HistoryUpdate::Replace { messages: vec![json!({"role": "user", "content": "after the compaction"})] };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx));
+    cx.run_until_parked();
+    wait(cx, w, &view, 300);
+    assert!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.drawn().is_none()), "no board");
+    compact(cx, w, &view);
+    assert_eq!(copied(cx, w, &view), "before compaction: blocks\n\nbefore compaction: op log\n", "replaced: empty");
+}
+
+/// P2-4: the archive is the predecessor's final board, folded to its end:
+/// not the board painted while a newer one waits under the lease.
+#[gpui_kit::test]
+fn the_archive_is_the_final_predecessor_not_the_board_painted(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    let at_ = head(cx, w, "b");
+    mouse(cx, w, at_, "move");
+    ops(cx, w, &view, "toolu_aw", json!([{"op":"replace","id":"b","kind":"note","body":{"text":"B again"}}]));
+    assert!(waiting(cx, &view), "the board waits under the pointer");
+    compact(cx, w, &view);
+    away(cx, w);
+    let all = copied(cx, w, &view);
+    assert!(all.contains("B again") && !all.contains("B first"), "{all}");
+}
+
+/// D6a's visibility as D6b will answer it: a transcript block pinned into
+/// the rail, a section moved to the other slot, one a tombstone.
+struct Placed {
+    placed: Vec<(Ref, Slot)>,
+    tomb: Ref,
+}
+
+impl crate::agent_rail::RailVisibility for Placed {
+    fn seen(&self, id: &Ref) -> crate::agent_rail::Seen {
+        if *id == self.tomb {
+            crate::agent_rail::Seen::Tombstone(crate::agent_rail::Tomb { text: "dismissed before compaction · u show".into(), token: 7 })
+        } else {
+            crate::agent_rail::Seen::Shown
+        }
+    }
+
+    fn placed(&self) -> &[(Ref, Slot)] {
+        &self.placed
+    }
+}
+
+/// P2-5: the walk finds its targets where this desk draws them: a block
+/// pinned into the rail folds there and D6b is asked of its slot as
+/// drawn; a section moved to the end slot is asked of the end; a
+/// tombstone is walked to, `u` names its token as painted, `z` nothing.
+#[gpui_kit::test]
+fn the_walk_finds_its_targets_where_this_desk_draws_them(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    ops(
+        cx,
+        w,
+        &view,
+        "toolu_rl",
+        json!([
+            {"op":"put","id":"r1","kind":"note","target":"rail","slot":"upper","body":{"text":"R one"}},
+            {"op":"put","id":"r2","kind":"note","target":"rail","slot":"upper","body":{"text":"R two"}}
+        ]),
+    );
+    let id = |s: &str| Ref::parse(s).expect("an id");
+    let asks = Asks::default();
+    view.update(cx, |v, cx| {
+        v.agent_rail.vis = Some(Rc::new(Placed { placed: vec![(id("a"), Slot::Upper), (id("r1"), Slot::End)], tomb: id("r2") }));
+        v.desires = Box::new(asks.clone());
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let order = view.read_with(cx, |v, _| v.walk_order());
+    for r in ["a", "r1", "r2"] {
+        assert!(order.contains(&At::Rail(row(r))), "{r} in the walk: {order:?}");
+    }
+    enter(cx, w, &view);
+    // a, pinned into the rail: `z` folds the section drawn there.
+    walk_on(cx, w, &view, At::Rail(row("a")));
+    let open = |cx: &mut TestAppContext, r: &str| has(cx, w, format!("agent-body {}", row(r)));
+    let was = open(cx, "a");
+    press(cx, w, "z");
+    wait(cx, w, &view, 1000);
+    assert_eq!(view.read_with(cx, |v, _| v.agent_rail.lease.note), None, "the block as painted: no note");
+    assert_ne!(open(cx, "a"), was, "folded where it is drawn");
+    press(cx, w, "p");
+    assert_eq!(asks.2.borrow().last().copied(), Some((Place::Rail(Slot::Upper), None)), "asked of its slot as drawn");
+    // r2, a tombstone: walked to; `z` does nothing, `u` names its token.
+    walk_on(cx, w, &view, At::Rail(row("r2")));
+    assert!(ring(cx, w, row("r2")), "its ring");
+    let asked = asks.0.borrow().len();
+    press(cx, w, "z");
+    press(cx, w, "p");
+    assert_eq!(asks.0.borrow().len(), asked, "a tombstone: only x and u");
+    press(cx, w, "u");
+    assert_eq!(asks.2.borrow().last().copied(), Some((Place::Rail(Slot::Upper), Some(7))), "its token as painted");
+    // r1, moved to the end slot: `m` names the end.
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "m");
+    assert_eq!(asks.2.borrow().last().copied(), Some((Place::Rail(Slot::End), None)), "the slot the user put it in");
+}
+
+/// P2-6: undo puts back what the action set, only while the block still
+/// shows it (§3.5): the agent's `collapse` since makes it a no-op that
+/// says so, never a new fold.
+#[gpui_kit::test]
+fn an_agent_collapse_since_voids_the_undo(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    enter(cx, w, &view);
+    press(cx, w, "k");
+    wait(cx, w, &view, 300);
+    press(cx, w, "z");
+    assert!(folded(cx, &view, "b"), "the user's fold");
+    // The agent opens it: its collapse wins over the user's fold.
+    ops(cx, w, &view, "toolu_co", json!([{"op":"collapse","id":"b","open":true}]));
+    wait(cx, w, &view, 300);
+    assert!(!folded(cx, &view, "b"), "the agent's collapse wins");
+    press(cx, w, "ctrl-z");
+    assert!(!folded(cx, &view, "b"), "not folded again: the fold no longer holds");
+    assert_eq!(note(cx, &view), Some((row("b"), "changed since · not undone")), "and says so");
+}
+
+/// P2-6: the rail's fifth expansion folded back the oldest of the user's
+/// four (§4); its undo folds the fifth back and gives the oldest its
+/// place back.
+#[gpui_kit::test]
+fn undoing_a_fifth_expansion_gives_the_displaced_one_back(cx: &mut TestAppContext) {
+    use crate::agent_rail::State;
+    let (w, view, _events) = open_at(cx, (1280., 2400.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::RAIL, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    // The user's choices: plan folded; findings (oldest), retry, rot, file
+    // expanded.
+    view.update(cx, |v, cx| {
+        let sid = v.rail_sid().expect("a session").to_string();
+        let to = |v: &mut AppView, name: &str, open: bool| {
+            let r = Ref::parse(name).expect("an id");
+            for _ in 0..3 {
+                let (_, lay) = v.rail_layout().expect("the rail");
+                let s = lay.section(&r).expect("a section");
+                if (open && s.state == State::Open && s.expanded_by_user) || (!open && s.state == State::Summary) {
+                    return;
+                }
+                let _ = v.agent_rail.local_mut(&sid).toggle(&lay, &r);
+            }
+            panic!("{name} not set");
+        };
+        to(v, "plan", false);
+        for name in ["findings", "retry", "rot", "file"] {
+            to(v, name, true);
+        }
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    let open = |cx: &mut TestAppContext, r: &str| has(cx, w, format!("agent-body {}", row(r)));
+    assert!(open(cx, "findings") && !open(cx, "plan"), "as set");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("plan")));
+    press(cx, w, "z");
+    wait(cx, w, &view, 1000);
+    assert!(open(cx, "plan") && !open(cx, "findings"), "the fifth expansion folds the oldest back");
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 1000);
+    assert!(!open(cx, "plan"), "the fifth folded back");
+    assert!(open(cx, "findings"), "and the oldest given its place back");
+}
+
+/// P2-7: the op log's lines are the board's ≤ 256, each one's time looked
+/// up by its call: unrelated history adds nothing to the work of drawing
+/// it (D5's bounded views).
+#[gpui_kit::test]
+fn the_op_logs_view_is_bounded_by_its_lines_not_the_history(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    let work = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| {
+            crate::oplog::VISITS.with(|n| n.set(0));
+            let n = v.oplog_lines().len();
+            (n, crate::oplog::VISITS.with(std::cell::Cell::get))
+        })
+    };
+    let (lines, before) = work(cx);
+    assert!(lines > 0 && before <= lines, "{before} visits for {lines} lines");
+    let rows0 = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().len());
+    // Unrelated history: two thousand rows, no block op.
+    let evs: Vec<Value> = (0..2000)
+        .map(|k| llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "bash", "tool_id": format!("toolu_x{k}")})))
+        .collect();
+    heard(cx, w, &view, evs);
+    let rows1 = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().len());
+    assert!(rows1 >= rows0 + 2000, "{rows0} rows, then {rows1}");
+    assert_eq!(work(cx), (lines, before), "the same work, whatever the history");
 }

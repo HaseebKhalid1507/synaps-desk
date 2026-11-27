@@ -275,11 +275,14 @@ pub(crate) fn cols(s: &str) -> usize {
     s.chars().map(|c| if (c as u32) < 0x1100 { 1 } else { 2 }).sum()
 }
 
+/// One user fold: open or not, and the agent's `collapse` it overrode.
+pub(crate) type Fold = (bool, Option<cards_spec::board::Pos>);
+
 /// The user's own folds (§3.5: presentation, local), by block row: open
 /// or folded, and the agent's `collapse` it overrode. The agent's next one
 /// wins again.
 #[derive(Default)]
-pub(crate) struct Folds(HashMap<u64, (bool, Option<cards_spec::board::Pos>)>);
+pub(crate) struct Folds(HashMap<u64, Fold>);
 
 impl Folds {
     /// Whether block `s` (row `id`) draws folded.
@@ -301,9 +304,26 @@ impl Folds {
         self.0.keys().copied().collect()
     }
 
-    pub(crate) fn toggle(&mut self, id: u64, s: &Shown) {
+    /// Block `s` (row `id`) folded if open, opened if folded: the fold
+    /// before (none: the agent's) and the one made (D7's undo).
+    pub(crate) fn toggle(&mut self, id: u64, s: &Shown) -> (Option<Fold>, Fold) {
         let folded = self.folded(id, s);
-        self.0.insert(id, (folded, s.block.folded_at));
+        let after = (folded, s.block.folded_at);
+        (self.0.insert(id, after), after)
+    }
+
+    /// Row `id`'s fold of the user's, as kept (whether it still holds or
+    /// not).
+    pub(crate) fn entry(&self, id: u64) -> Option<Fold> {
+        self.0.get(&id).copied()
+    }
+
+    /// Row `id`'s fold put back as `f` (none: the agent's).
+    pub(crate) fn set(&mut self, id: u64, f: Option<Fold>) {
+        match f {
+            Some(f) => self.0.insert(id, f),
+            None => self.0.remove(&id),
+        };
     }
 }
 
@@ -374,10 +394,17 @@ impl AppView {
         let tag = s.block.tag;
         // A past revision in the walk's view (D7, §3.6): its header and
         // body, from the re-fold scratch once there; its label in place of
-        // `rN`. A group's past members are its lines.
+        // `rN`. A group's past members are its lines. Until the scratch has
+        // it, or if it can't, its frame says so: never the live block
+        // under a past label.
         let past = self.walk_past(id);
-        let drawn = past.as_ref().and_then(|v| v.shown.as_ref()).unwrap_or(s);
-        let head = self.block_head(drawn, id, p.card_d, folded, streaming && past.is_none(), fit, &g, p, m, cx);
+        let ready = past.as_ref().and_then(|v| v.ready());
+        let wait = past.as_ref().and_then(|v| Some((v.wait()?, v.head())));
+        let head = match (&wait, ready) {
+            (Some((w, label)), _) => past_wait_head(id, w, label, &g, p, m),
+            (None, Some(ps)) => self.block_head(ps, id, p.card_d, folded, false, fit, &g, p, m, cx),
+            (None, None) => self.block_head(s, id, p.card_d, folded, streaming, fit, &g, p, m, cx),
+        };
         // Its hover actions (D7): over the header's right end, never
         // reflowing it, unless the lease's note is there.
         let hovered = self.panes.cur.lease.head.filter(|h| h.0 == id && past.is_none());
@@ -407,7 +434,7 @@ impl AppView {
             .id(("block-head", id))
             .on_hover(cx.listener(move |this, over: &bool, _, cx| this.head_hover(pane, id, *over, cx)))
             .children(acts);
-        let body = (!folded).then(|| match past.as_ref().and_then(|v| v.shown.as_ref()) {
+        let body = (!folded && wait.is_none()).then(|| match ready {
             Some(ps) if matches!(ps.block.body, Body::Group(_)) => past_members(ps, id, p, m),
             Some(ps) => self.block_body(ps, id, None, false, fit, &g, p, m, cx),
             None => self.block_body(s, id, None, streaming, fit, &g, p, m, cx),
@@ -429,7 +456,7 @@ impl AppView {
             .children(body)
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
             // The walk's ring (D7): its keys act once it is painted.
-            .children(self.walk_ring(crate::walk::At::Block(id), tag, p))
+            .children(self.walk_ring(crate::walk::At::Block(id), tag, None, p))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
@@ -497,10 +524,7 @@ impl AppView {
         let title_c = glow(1, bound_value(s, |_| s.bound.as_ref().map(|b| b.title.clone())), p.prose_t);
         let past = self.walk_past(id);
         let rev = if let Some(v) = &past {
-            match v.newer {
-                Some(n) => format!("{} · r{n} new", v.label),
-                None => v.label.clone(),
-            }
+            v.head()
         } else if b.pending {
             "pending".to_string()
         } else if b.replaced.is_some() {
@@ -1171,6 +1195,46 @@ impl AppView {
             })
             .into_any_element()
     }
+}
+
+/// A past revision's header while its body isn't drawn (D7, §3.6): what
+/// the frame says (`loading r2…`, `r2 unavailable · why`) where the title
+/// is, and its label where `rN` is. Nothing of the live block.
+fn past_wait_head(id: u64, wait: &str, label: &str, g: &Geo, p: &Palette, m: &Metrics) -> Div {
+    let (w, l) = (wait.to_string(), label.to_string());
+    h_flex()
+        .relative()
+        .h(px(g.head))
+        .w_full()
+        .gap(px(g.gap))
+        .items_center()
+        .whitespace_nowrap()
+        .font_family(fonts::SANS)
+        .text_px(m.label)
+        .debug_selector(move || format!("block-head {id}"))
+        .child(
+            div()
+                .min_w_0()
+                .flex_shrink(1.)
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_color(p.dim_t)
+                .debug_selector(move || format!("block-past-wait {id} {w}"))
+                .child(wait.to_string()),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .min_w_0()
+                .flex_shrink(1.)
+                .overflow_hidden()
+                .text_ellipsis()
+                .font_family(fonts::MONO)
+                .text_px(m.meta)
+                .text_color(p.acc)
+                .debug_selector(move || format!("block-rev {id} {l}"))
+                .child(label.to_string()),
+        )
 }
 
 /// A group's past revision (D7, §3.6): its members then, a line each (their

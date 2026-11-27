@@ -573,11 +573,12 @@ impl AppView {
                 Some((ix, s)) if held => {
                     match act {
                         Act::Fold => {
-                            this.panes.cur.block_folds.toggle(row, &s);
-                            // A top-level block's fold: its undo (D7).
+                            let (before, after) = this.panes.cur.block_folds.toggle(row, &s);
+                            // A top-level block's fold: its undo (D7), what
+                            // it set and what was before.
                             if this.block_shown(row).is_some() {
-                                let u =
-                                    crate::walk::Undo { at: crate::walk::At::Block(row), tag: s.block.tag, act: crate::walk::Undid::Fold };
+                                let act = crate::walk::Undid::Fold { before, after };
+                                let u = crate::walk::Undo { at: crate::walk::At::Block(row), tag: s.block.tag, act };
                                 this.panes.cur.walk.push(u);
                             }
                         }

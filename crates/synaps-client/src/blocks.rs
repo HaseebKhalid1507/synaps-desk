@@ -2158,17 +2158,27 @@ pub struct Drawn {
     /// Live blocks on the board, groups and members included.
     pub live: usize,
     /// The board's op log (§3.8: ≤ 256 lines, oldest first), each line
-    /// with the row of the event it is at (its time is that row's), and
-    /// the revision records and tombstones it still holds (§1.8), records
-    /// with their rows too: what D7's op log and revision walk read
-    /// (§3.6). Copies of the board's, counted at B2's count of them.
-    pub log: Arc<[(Logged, Option<u64>)]>,
-    pub records: Arc<[(Record, Option<u64>)]>,
+    /// with where its event is ([`Mark`]: its time is its row's), and the
+    /// revision records and tombstones it still holds (§1.8), records
+    /// marked too: what D7's op log and revision walk read (§3.6). Copies
+    /// of the board's, counted at B2's count of them.
+    pub log: Arc<[(Logged, Mark)]>,
+    pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates. A row's [`Arc`] of it is its.
     pub bytes: usize,
+}
+
+/// Where a log line or a record's event is: its row, and the call that
+/// made it (its `tool_id`), by which the row's time is found
+/// ([`crate::Transcript::call_at`]: a lookup, never a walk of the rows).
+/// Only a call has a row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mark {
+    pub row: Option<u64>,
+    pub call: Option<Arc<str>>,
 }
 
 /// What a [`Worker`] keeps, counted: the journal's events (and a row
@@ -2614,13 +2624,23 @@ impl Worker {
         let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
         // The op log, records and tombstones (D7): copies, each record and
-        // line with its event's row; B2's count of its owners bounds them
-        // (their deques' slots and heap), plus a row each and their Arcs.
-        let log: Arc<[(Logged, Option<u64>)]> = view.log().map(|l| (l.clone(), row(l.at.event))).collect();
-        let records: Arc<[(Record, Option<u64>)]> = view.records().map(|r| (r.clone(), row(r.at.event))).collect();
+        // line with its event's mark (its row, its call); B2's count of
+        // its owners bounds them (their deques' slots and heap), plus a
+        // mark each and their Arcs.
+        let mark = |pos: usize| Mark {
+            row: row(pos),
+            call: match self.journal.get(pos) {
+                Some(Event::Call { tool_id, .. }) if row(pos).is_some() => Some(Arc::from(tool_id.as_str())),
+                _ => None,
+            },
+        };
+        let log: Arc<[(Logged, Mark)]> = view.log().map(|l| (l.clone(), mark(l.at.event))).collect();
+        let records: Arc<[(Record, Mark)]> = view.records().map(|r| (r.clone(), mark(r.at.event))).collect();
         let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
         let [_, tombs, recs, _, _, _, logs] = view.owned_by_owner();
-        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Option<u64>>() + 3 * ARC;
+        let calls: usize =
+            log.iter().map(|(_, m)| m).chain(records.iter().map(|(_, m)| m)).filter_map(|m| m.call.as_ref()).map(|c| c.len() + ARC).sum();
+        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Mark>() + calls + 3 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()

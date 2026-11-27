@@ -2434,6 +2434,10 @@ pub struct AppView {
     pub(crate) desires: Box<dyn crate::walk::BlockDesires>,
     /// The op log, open ([`crate::oplog`], D7).
     pub(crate) oplog: Option<crate::oplog::OpLog>,
+    /// The sessions' archives (D7, §5.2: [`crate::oplog::Archives`]), and
+    /// the captures a batch's compactions asked for, run after it.
+    pub(crate) archives: crate::oplog::Archives,
+    pub(crate) captures: Vec<crate::oplog::Capture>,
 
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -3048,6 +3052,8 @@ impl AppView {
             ask_presses: Default::default(),
             desires: Box::new(crate::walk::NoDesires),
             oplog: None,
+            archives: Default::default(),
+            captures: Vec::new(),
 
             _tasks: Vec::new(),
             _subs: subs,
@@ -3094,6 +3100,8 @@ impl AppView {
             }
         }
         self.start_tabs();
+        // A compaction's archive, captured off the frame (D7).
+        self.archive_run(cx);
         // An attach may have named or merged a pane's visible tab.
         for id in self.panes.ids() {
             self.in_pane(id, |v| v.reconcile(None));
@@ -3154,22 +3162,16 @@ impl AppView {
                 self.model.view_dirty = true;
             }
             // A compaction: the predecessor's final blocks and op log are the
-            // session's archive (blocks.md §5.2, D7), as its board drew them.
-            if let Event::Session { attach_seq, event: synaps_client::protocol::SessionEvent::CompactionApplied { .. }, .. } = &ev
+            // session's archive (blocks.md §5.2, D7), captured from its
+            // history as this boundary leaves it ([`crate::oplog`]).
+            if let Event::Session {
+                attach_seq,
+                event: synaps_client::protocol::SessionEvent::CompactionApplied { session_id: journal, .. },
+                ..
+            } = &ev
                 && let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].current(*attach_seq))
             {
-                let l = &self.model.lives[live];
-                if let Some(d) = l.transcript.drawn().filter(|d| !d.log.is_empty() || d.live > 0) {
-                    let items: std::collections::HashMap<u64, &synaps_client::transcript::Item> =
-                        l.transcript.items().iter().map(|i| (i.id, i)).collect();
-                    let a = crate::oplog::Archive::of(d, |row| {
-                        row.and_then(|r| items.get(&r))
-                            .and_then(|i| i.at.as_deref())
-                            .and_then(crate::times::Stamp::local)
-                            .map(|t| t.hhmm.to_string())
-                    });
-                    self.model.lives[live].archive = Some(std::sync::Arc::new(a));
-                }
+                self.archive_boundary(live, journal);
             }
             // The store's attachment detached: what its panes held for its
             // blocks goes (Shady #101 P2-4).
