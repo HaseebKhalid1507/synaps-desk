@@ -701,9 +701,16 @@ impl AppView {
         }
     }
 
-    /// Lines under a CONFIG row: the refusal, or that it waits for a reload.
-    fn config_under(&self, key: &'static str, p: &Palette) -> Vec<AnyElement> {
+    /// Lines under a CONFIG row: what its editor takes when the row's help
+    /// names more ([`settings::editor_note`], at `config-note-<key>`), the
+    /// refusal, or that it waits for a reload.
+    fn config_under(&self, key: &'static str, writable: bool, p: &Palette) -> Vec<AnyElement> {
         let mut out = Vec::new();
+        let editor = writable && self.shown_config().is_some_and(|c| c.exposes(key));
+        if let Some(note) = settings::editor_note(key).filter(|_| editor) {
+            let selector = format!("config-note-{key}");
+            out.push(mono(note, 12., p.dim).whitespace_normal().debug_selector(move || selector).into_any_element());
+        }
         if let Some(Write::Refused(m)) = self.settings.writes.get(key) {
             out.push(mono(m.clone(), 12., p.err).whitespace_normal().into_any_element());
         }
@@ -1326,7 +1333,7 @@ impl AppView {
                 if let Some(t) = self.applies(key) {
                     under.push(mono(t, 12., p.dim).into_any_element());
                 }
-                under.extend(self.config_under(key, p));
+                under.extend(self.config_under(key, writable, p));
             }
             rows.push(Row {
                 id: format!("session-{key}").into(),
@@ -1442,7 +1449,7 @@ impl AppView {
                     help: d.help,
                     control: self.config_control(key, writable, p, cx),
                     tag: self.applies(key),
-                    under: self.config_under(key, p),
+                    under: self.config_under(key, writable, p),
                 });
             }
             if !rows.is_empty() {

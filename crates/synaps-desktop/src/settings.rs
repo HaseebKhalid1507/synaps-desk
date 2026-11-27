@@ -405,6 +405,19 @@ pub fn check(key: &str, typed: &str) -> Option<String> {
     }
 }
 
+/// What the dash-backed editor of `key` takes where the row's help (the
+/// CLI's, kept as it is) names more, shown beside the editor: synaps-dash's
+/// validator and [`check`] take provider/model or empty (unset) for
+/// `compaction_model`, not its policy words (Shady #107 P3-1).
+pub fn editor_note(key: &str) -> Option<&'static str> {
+    match key {
+        "compaction_model" => Some(
+            "This editor takes provider/model, or empty to unset. match, provider-small, auto and default can be set only in the config file or the TUI for now.",
+        ),
+        _ => None,
+    }
+}
+
 /// A model setting's value checked as the dash does (`provider/model`).
 pub fn model_ok(v: &str) -> bool {
     let ok = |s: &str, extra: &[char]| {
