@@ -145,6 +145,9 @@ pub(crate) struct Lease {
     pub above: Rc<RefCell<Vec<u64>>>,
     /// Block rows' slides ([`SlideY`]), by row.
     pub slides: Rc<RefCell<HashMap<u64, Sliding>>>,
+    /// The rail's: rows an agent op's glide moved, by the frame it moved
+    /// them in (`AppView::rail_retire`).
+    pub glided: Rc<RefCell<HashMap<u64, u64>>>,
     /// The pane's frames drawn.
     pub frame: Rc<Cell<u64>>,
     /// The list neither follows its tail nor scrolled since the last frame
@@ -169,13 +172,23 @@ impl Lease {
         self.agent_frame.set(None);
         self.above.borrow_mut().clear();
         self.slides.borrow_mut().clear();
+        self.glided.borrow_mut().clear();
     }
 
     /// Whether the pane's frame `frame` draws an agent op for row `slid`
     /// (the top-level block row it slides with): the frame that draws a
-    /// board published, or one of a slide an agent op started.
-    fn agent_in(agent: &Cell<Option<u64>>, slides: &RefCell<HashMap<u64, Sliding>>, frame: u64, slid: u64) -> bool {
-        agent.get() == Some(frame) || slides.borrow().get(&slid).is_some_and(|s| s.moved == frame)
+    /// board published, or one of a slide an agent op started (in the
+    /// rail, of a glide that moved it).
+    fn agent_in(
+        agent: &Cell<Option<u64>>,
+        slides: &RefCell<HashMap<u64, Sliding>>,
+        glided: &RefCell<HashMap<u64, u64>>,
+        frame: u64,
+        slid: u64,
+    ) -> bool {
+        agent.get() == Some(frame)
+            || slides.borrow().get(&slid).is_some_and(|s| s.moved == frame)
+            || glided.borrow().get(&slid) == Some(&frame)
     }
 }
 
@@ -719,13 +732,13 @@ impl Element for SlideY {
 /// that draws an agent op (for row `slid`, the top-level block row it
 /// slides with) marks it just moved; painted in view, it leaves the pill.
 pub(crate) fn probe(l: &Lease, fx: &Rc<crate::motion::Motion>, row: u64, tag: Tag, slid: u64) -> impl IntoElement + use<> {
-    let (painted, agent, slides, frame, above, fx) =
-        (l.painted.clone(), l.agent_frame.clone(), l.slides.clone(), l.frame.clone(), l.above.clone(), fx.clone());
+    let (painted, agent, slides, glided, frame, above, fx) =
+        (l.painted.clone(), l.agent_frame.clone(), l.slides.clone(), l.glided.clone(), l.frame.clone(), l.above.clone(), fx.clone());
     canvas(
         |_, _, _| {},
         move |bounds, (), window, _| {
             let now = fx.now();
-            let agent = Lease::agent_in(&agent, &slides, frame.get(), slid);
+            let agent = Lease::agent_in(&agent, &slides, &glided, frame.get(), slid);
             let mut map = painted.borrow_mut();
             match map.get_mut(&row) {
                 Some(p) if p.bounds != bounds || p.tag != tag => {

@@ -486,7 +486,7 @@ fn the_rails_caches_keep_to_what_it_draws(cx: &mut TestAppContext) {
     ops(cx, w, &view, "toolu_c0", put(0));
     wait(cx, w, &view, 1000);
     let base = kept(cx);
-    assert!(base.0 > 0 && base.1 > 0, "the rail's targets and reveals: {base:?}");
+    assert!(base.painted > 0 && base.reveals > 0 && base.sections > 0, "the rail's targets, reveals and sections: {base:?}");
     // Leaving, c0 keeps its records while it glides shut, then gives them up.
     ops(cx, w, &view, "toolu_c1", put(1));
     wait(cx, w, &view, 80);
@@ -499,17 +499,20 @@ fn the_rails_caches_keep_to_what_it_draws(cx: &mut TestAppContext) {
     for k in 2..1002 {
         ops(cx, w, &view, &format!("toolu_c{k}"), put(k));
         let now = kept(cx);
-        assert!(now.0 <= base.0 && now.1 <= base.1, "round {k}: {now:?}, began at {base:?}");
+        assert!(
+            now.painted <= base.painted && now.reveals <= base.reveals && now.sections <= base.sections && now.glides <= base.glides,
+            "round {k}: {now:?}, began at {base:?}"
+        );
     }
     // The last one removed: file has its place back, and the upper slot's
     // `+N` row goes.
     ops(cx, w, &view, "toolu_cz", json!([{"op": "remove", "id": "c1001"}]));
     let end = kept(cx);
-    assert!(end.0 < base.0 && end.1 <= base.1, "retired: {end:?} of {base:?}");
+    assert!(end.painted < base.painted && end.reveals <= base.reveals && end.sections <= base.sections, "retired: {end:?} of {base:?}");
     // Another session on screen: none of this one's.
     open_session(cx, w, &view, crate::demo::SID, Place::Current);
     wait(cx, w, &view, 1000);
-    assert_eq!(kept(cx), (0, 0), "the session's rail state went with it");
+    assert_eq!(kept(cx), crate::agent_rail_view::Retained::default(), "the session's rail state went with it");
 }
 
 /// The panel at its 296 px floor (1600 px wide: the right panel's default).
@@ -836,4 +839,266 @@ fn a_long_revision_keeps_the_headers_controls_inside_at_296_and_520(cx: &mut Tes
     });
     wait(cx, w, &view, 1500);
     inside(cx, "520");
+}
+
+// -- Shady #104 round 2 (438035c) ----------------------------------------------
+
+fn kept(cx: &mut TestAppContext, view: &Entity<AppView>) -> crate::agent_rail_view::Retained {
+    view.read_with(cx, |v, _| v.rail_retained())
+}
+
+/// The block section `name` draws, as the rail's layout has it (weak: its
+/// owners are the board's and what the rail keeps).
+fn block_of(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> std::sync::Weak<synaps_client::blocks::Block> {
+    view.read_with(cx, |v, _| {
+        let (_, l) = v.rail_layout().expect("a rail");
+        std::sync::Arc::downgrade(&l.section(&Ref::parse(name).expect("an id")).expect("drawn").s.block)
+    })
+}
+
+/// R2-1: a rail not drawn keeps nothing of what it drew: no section (its
+/// snapshots own their blocks), painted target, glide or reveal. Another
+/// session on screen whose rail is empty, the session's own emptied, the
+/// panel folded to its strip, and a detach; drawn again, the rail draws
+/// what it holds at once.
+#[gpui_kit::test]
+fn a_rail_not_drawn_keeps_none_of_its_sections(cx: &mut TestAppContext) {
+    let none = crate::agent_rail_view::Retained::default();
+    let drawn_now = |cx: &mut TestAppContext, view: &Entity<AppView>| {
+        let k = kept(cx, view);
+        assert!(k.sections > 0 && k.painted > 0 && k.glides > 0, "drawn: {k:?}");
+    };
+    // Another session on screen, with no rail: the first one's sections and
+    // their blocks go.
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    drawn_now(cx, &view);
+    let plan = block_of(cx, &view, "plan");
+    let owners = plan.strong_count();
+    open_session(cx, w, &view, crate::demo::SID, Place::Current);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.rail_layout().is_none_or(|(_, l)| !l.any())), "the other session has no rail");
+    assert_eq!(kept(cx, &view), none, "another session's empty rail on screen");
+    assert!(plan.strong_count() < owners, "the rail's own hold on plan's block released: {owners} → {}", plan.strong_count());
+
+    // The session's own rail emptied by the agent.
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let gone = json!(
+        ["n1", "n2", "findings", "plan", "now", "cause", "file", "rot", "retry"]
+            .iter()
+            .map(|id| json!({"op": "remove", "id": id}))
+            .collect::<Vec<_>>()
+    );
+    ops(cx, w, &view, "toolu_e1", gone);
+    wait(cx, w, &view, 1000);
+    assert!(view.read_with(cx, |v, _| v.rail_layout().is_some_and(|(_, l)| !l.any())), "the rail emptied");
+    assert_eq!(kept(cx, &view), none, "its own rail emptied");
+
+    // Folded to its strip, then open again: drawn at once (no turn: at
+    // rest, nothing on the beat).
+    let (w, view) = rail(cx);
+    away(cx, w);
+    drawn_now(cx, &view);
+    let full = glide(cx, w, "plan");
+    let fold = |cx: &mut TestAppContext, folded: bool| {
+        view.update(cx, |v, cx| {
+            let p = crate::theme::Panels { right_collapsed: folded, ..v.panels };
+            v.set_panels_pub(p, cx);
+        });
+        wait(cx, w, &view, 2000);
+    };
+    fold(cx, true);
+    assert!(!has_sec(cx, w, "plan"), "folded");
+    assert_eq!(kept(cx, &view), none, "the panel folded to its strip");
+    fold(cx, false);
+    assert_eq!(glide(cx, w, "plan"), full, "open again: plan as it was");
+    drawn_now(cx, &view);
+    assert_eq!(settle(cx, w, 8), 0, "at rest");
+
+    // Detached.
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    drawn_now(cx, &view);
+    let (seq, sid) = super::answer_tests::attachment(cx, &view);
+    view.update(cx, |v, cx| {
+        v.apply_batch(vec![synaps_client::Event::Detached { attach_seq: seq, session_id: Some(sid), reason: "gone".into() }], cx);
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    assert_eq!(kept(cx, &view), none, "detached");
+}
+
+/// R2-2: an agent op's glide held under the pointer moves nothing, so what
+/// the user moves meanwhile (their fold, past its 600 ms) is theirs: a
+/// click on it acts at once. Let go, the glide goes on, and what it moves
+/// is just moved to its end; then the rail sleeps.
+#[gpui_kit::test]
+fn what_the_user_moves_while_an_agent_glide_is_held_is_theirs(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let arrive = json!([{"op": "put", "id": "extra", "kind": "status", "title": "Extra", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": "one more"}}]);
+    ops(cx, w, &view, "toolu_h1", arrive);
+    wait(cx, w, &view, 80);
+    // Held, the pointer over plan (above it), past the glide's window.
+    let over = head(cx, w, "plan");
+    let hold = |cx: &mut TestAppContext, ms: u64| {
+        for _ in 0..ms / 100 {
+            wait(cx, w, &view, 100);
+            mouse(cx, w, over, "move");
+        }
+    };
+    mouse(cx, w, over, "move");
+    let held = glide(cx, w, "extra");
+    hold(cx, 800);
+    assert_eq!(glide(cx, w, "extra"), held, "extra held under the pointer");
+    // The user folds now: cause moves up, for them.
+    let y = head_y(cx, w, "cause");
+    let at = head(cx, w, "now");
+    click(cx, w, at);
+    assert_eq!(says(cx, &view), None, "now: the click acts");
+    hold(cx, 400);
+    assert!(!open(cx, w, "now"), "now folded");
+    assert!(head_y(cx, w, "cause") < y - 0.5, "cause moved up, by the user's fold");
+    assert_eq!(glide(cx, w, "extra"), held, "extra still held");
+    // A click on cause at once (its move well inside 600 ms): it acts.
+    let at = head(cx, w, "cause");
+    click(cx, w, at);
+    assert_eq!(says(cx, &view), None, "cause, moved by the user: the click acts");
+    hold(cx, 1000);
+    assert!(!open(cx, w, "cause"), "cause folded");
+    assert_eq!(glide(cx, w, "extra"), held, "extra still held");
+    // Let go: extra glides on, moving cause; just after, a click on it does
+    // nothing, once.
+    let y = head_y(cx, w, "cause");
+    away(cx, w);
+    wait(cx, w, &view, 1000);
+    assert!(glide(cx, w, "extra") > held, "extra went on");
+    assert!(head_y(cx, w, "cause") > y + 0.5, "cause moved down, by extra");
+    let at = head(cx, w, "cause");
+    click(cx, w, at);
+    assert_eq!(says(cx, &view), Some((row("cause"), crate::lease::MOVED)), "just after extra's glide: nothing");
+    assert!(!open(cx, w, "cause"));
+    away(cx, w);
+    wait(cx, w, &view, 700);
+    let at = head(cx, w, "cause");
+    click(cx, w, at);
+    wait(cx, w, &view, 1000);
+    assert!(open(cx, w, "cause"), "700 ms on, the click acts");
+    away(cx, w);
+    wait(cx, w, &view, 1000);
+    assert_eq!(settle(cx, w, 8), 0, "once it landed, at rest: no frames");
+}
+
+/// A section's exit held under the pointer for good: the agent's next
+/// boards each change the rail, so they wait (one at a time), and what the
+/// rail keeps stays as it was; the pointer gone, it all lands, and the
+/// rail sleeps.
+#[gpui_kit::test]
+fn an_exit_held_for_good_keeps_the_rail_bounded_and_it_sleeps_once_let_go(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let put = |k: usize| {
+        let mut o = vec![
+            json!({"op": "put", "id": format!("c{k}"), "kind": "status", "title": "C", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": format!("round {k}")}}),
+        ];
+        if k > 0 {
+            o.insert(0, json!({"op": "remove", "id": format!("c{}", k - 1)}));
+        }
+        Value::Array(o)
+    };
+    ops(cx, w, &view, "toolu_k0", put(0));
+    wait(cx, w, &view, 1000);
+    let base = kept(cx, &view);
+    // c0 leaves; held mid-way.
+    ops(cx, w, &view, "toolu_k1", put(1));
+    wait(cx, w, &view, 80);
+    let over = head(cx, w, "plan");
+    mouse(cx, w, over, "move");
+    let held = glide(cx, w, "c0");
+    assert!(held > 0., "c0 on its way out");
+    let hold = kept(cx, &view);
+    assert!(hold.sections == base.sections + 1 && hold.moved == 0, "c0 kept while it leaves, nothing marked: {hold:?} of {base:?}");
+    for k in 2..202 {
+        ops(cx, w, &view, &format!("toolu_k{k}"), put(k));
+        wait(cx, w, &view, 100);
+        mouse(cx, w, over, "move");
+        let now = kept(cx, &view);
+        assert!(waiting(cx, &view), "round {k}: the board waits");
+        assert_eq!(glide(cx, w, "c0"), held, "round {k}: c0 held");
+        assert_eq!(now, hold, "round {k}: what the rail keeps, as the hold began");
+    }
+    away(cx, w);
+    wait(cx, w, &view, 1000);
+    wait(cx, w, &view, 1000);
+    assert!(!waiting(cx, &view) && !has_sec(cx, w, "c0") && has_sec(cx, w, "c201"), "landed");
+    let end = kept(cx, &view);
+    assert!(end.painted <= base.painted && end.reveals <= base.reveals && end.sections <= base.sections, "{end:?} of {base:?}");
+    assert_eq!(settle(cx, w, 8), 0, "at rest: no frames");
+}
+
+/// An agent op's glide held, then turned by the user's own action: file,
+/// leaving for extra's place, gets it back as the user folds now. It goes
+/// on from where it was held, never from where it would have been had it
+/// not been held.
+#[gpui_kit::test]
+fn a_held_glide_the_user_turns_goes_on_from_where_it_was_held(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let arrive = json!([{"op": "put", "id": "extra", "kind": "status", "title": "Extra", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": "one more"}}]);
+    ops(cx, w, &view, "toolu_t1", arrive);
+    wait(cx, w, &view, 80);
+    let over = head(cx, w, "plan");
+    mouse(cx, w, over, "move");
+    let held = glide(cx, w, "file");
+    for _ in 0..8 {
+        wait(cx, w, &view, 100);
+        mouse(cx, w, over, "move");
+    }
+    assert_eq!(glide(cx, w, "file"), held, "file held on its way out");
+    let at = head(cx, w, "now");
+    click(cx, w, at);
+    settle(cx, w, 1);
+    let turned = glide(cx, w, "file");
+    assert!((turned - held).abs() <= 1., "file turns back from where it was held: {held} → {turned}");
+    wait(cx, w, &view, 40);
+    assert!(glide(cx, w, "file") > turned, "and opens");
+}
+
+/// What an agent op's glide moves through the panel's scroll is just moved
+/// too: the panel at its end, the agent folds cause, and the scroll gives
+/// way as the panel gets shorter, moving now (above cause) down. A click
+/// on now just after does nothing, once.
+#[gpui_kit::test]
+fn what_the_panels_scroll_moves_for_an_agent_glide_is_just_moved(cx: &mut TestAppContext) {
+    let (w, view) = rail_at(cx, 1280., 900.);
+    go(cx, w, &view);
+    away(cx, w);
+    view.update(cx, |v, cx| {
+        v.bars.right.scroll.set_offset(point(px(0.), px(-100_000.)));
+        cx.notify();
+    });
+    settle(cx, w, 8);
+    let y = head_y(cx, w, "now");
+    assert!(y > 0. && y < 860., "now in view: {y}");
+    ops(cx, w, &view, "toolu_s1", json!([{"op": "collapse", "id": "cause"}]));
+    wait(cx, w, &view, 1000);
+    assert!(!open(cx, w, "cause"), "cause folded");
+    assert!(head_y(cx, w, "now") > y + 0.5, "now moved down, the scroll giving way: {y} → {}", head_y(cx, w, "now"));
+    let at = head(cx, w, "now");
+    click(cx, w, at);
+    assert_eq!(says(cx, &view), Some((row("now"), crate::lease::MOVED)), "just after: nothing");
+    assert!(open(cx, w, "now"));
+    away(cx, w);
+    wait(cx, w, &view, 700);
+    let at = head(cx, w, "now");
+    click(cx, w, at);
+    wait(cx, w, &view, 1000);
+    assert!(!open(cx, w, "now"), "700 ms on, the click acts");
 }

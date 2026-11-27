@@ -484,3 +484,36 @@ fn a_whole_notes_text_is_in_the_structure_a_cut_ones_is_not() {
     assert_ne!(sh(&d("aaaa bbbb", &long)), sh(&d("aaaabbbb", &long)), "whole: its text (a space out: the same lines)");
     assert_eq!(sh(&d("aaaa bbbb", &long)), sh(&d("aaaa bbbb", &other)), "cut: its fixed lines");
 }
+
+/// A tombstone's token is in the structure the rail's lease compares
+/// (Shady #104 R2-3), a section's own as a group member's: another token
+/// (D6b's visibility version for its action) is another structure, the
+/// same token and text the same one.
+#[test]
+fn a_tombstones_token_is_in_the_structure_its_own_and_a_members() {
+    /// `id` softly dismissed, its tombstone at `token`.
+    struct Tok(&'static str, u64);
+    impl RailVisibility for Tok {
+        fn seen(&self, id: &Ref) -> Seen {
+            if id.to_string() == self.0 {
+                Seen::Tombstone(Tomb { text: "dismissed before compaction · u show".into(), token: self.1 })
+            } else {
+                Seen::Shown
+            }
+        }
+    }
+    let d = drawn(&[json!([
+        note("t1", "upper"),
+        note("m1", "upper"),
+        note("m2", "upper"),
+        {"op": "merge", "into": "g", "title": "Group", "ids": ["m1", "m2"]}
+    ])]);
+    let sh = |v: &Tok| shape(&layout(&d, v, &Local::default()), &Local::default(), &est, &|_| None);
+    // A section's own tombstone.
+    assert!(matches!(layout(&d, &Tok("t1", 7), &Local::default()).section(&r("t1")).map(|s| &s.state), Some(State::Tombstone(_))));
+    assert_eq!(sh(&Tok("t1", 7)), sh(&Tok("t1", 7)), "the same token: the same structure");
+    assert_ne!(sh(&Tok("t1", 7)), sh(&Tok("t1", 8)), "another token, its own: another structure");
+    // A member's.
+    assert_eq!(sh(&Tok("m2", 7)), sh(&Tok("m2", 7)));
+    assert_ne!(sh(&Tok("m2", 7)), sh(&Tok("m2", 8)), "another token, a member's: another structure");
+}

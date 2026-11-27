@@ -34,13 +34,18 @@
 //!   target and holds the lease; up acts only if the bound board still
 //!   holds it, else `this block changed · look again`. A target an agent
 //!   op moved in the last 600 ms does nothing, once (`this moved just
-//!   now`): its glides' frames are the agent op's until they land, so the
-//!   window runs from the motion's end. The rail's frames are counted like
-//!   a pane's.
+//!   now`): the frame that draws its board, and each frame one of its
+//!   glides moves in for what that glide moves (its section and those
+//!   drawn after it; all of them if the panel's scroll gives way), so the
+//!   window runs from the motion's end. A glide held under the lease moves
+//!   nothing, and what the user moves (a fold, a scroll) is never marked.
+//!   The rail's frames are counted like a pane's.
 //! - **What it keeps** keeps to what it draws ([`AppView::rail_retire`]):
-//!   its painted targets and its glides go with their rows (one leaving
-//!   once its glide is over), bounded by the board's caps for the
-//!   session's life.
+//!   its painted targets, its glides and the sections it drew go with
+//!   their rows (one leaving once its glide is over), bounded by the
+//!   board's caps for the session's life; a frame that does not draw it
+//!   (another session's rail empty, a detach, the panel folded to its
+//!   strip or under a view) keeps none ([`AppView::rail_unseen`]).
 //! - **NOW** draws a call's verb and target and a prompt's scope through
 //!   the desk's sanitizer (`Now::text`).
 //! - **Motion.** A section's body opens and folds on the glide, the panel
@@ -162,6 +167,16 @@ pub(crate) struct RailState {
     /// leaving and its `+N` rows. Its records keep to them
     /// ([`AppView::rail_retire`]).
     drew_rows: RefCell<HashSet<u64>>,
+    /// The same rows, in the order drawn down the panel (the upper slot's
+    /// first): what an agent op's glide moves is its row and those after
+    /// it ([`AppView::rail_retire`]).
+    order: RefCell<Vec<u64>>,
+    /// The rail drew in the window's frame (else it keeps nothing:
+    /// [`AppView::rail_unseen`]).
+    drawn: Cell<bool>,
+    /// An agent op's glide moved this frame: the panel's scroll giving way
+    /// then moves every row for it ([`KeepY`]).
+    stepping: Rc<Cell<bool>>,
     /// Its glides ([`AppView::rail_reveal`]).
     glides: RefCell<Glides>,
     /// The rail frame that draws the last board published (an agent op's).
@@ -201,7 +216,10 @@ struct Drew {
 struct Glides {
     to: HashMap<u64, bool>,
     agent: HashMap<u64, Flight>,
-    /// An agent op's glides moved as the last rail frame ended.
+    /// An agent op's glides that move this frame (not held): their keys.
+    stepped: HashSet<u64>,
+    /// An agent op's glides in flight (moving or held) as the last rail
+    /// frame ended.
     flight: bool,
     /// One was held this frame (the rail's lease).
     held: bool,
@@ -215,12 +233,28 @@ struct Flight {
     held: Option<Instant>,
 }
 
-/// How a section's frame comes: there, arriving or leaving.
+/// Tests: what the rail retains of its renderer state ([`AppView::rail_retained`]):
+/// its painted targets, the chrome's reveals, the sections it drew (last
+/// frame's and this one's), its glides' records, and the rows marked moved.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retained {
+    pub painted: usize,
+    pub reveals: usize,
+    pub sections: usize,
+    pub glides: usize,
+    pub moved: usize,
+}
+
+/// How a section's frame comes: there, arriving or leaving; or gone, its
+/// glide shut over this frame (not drawn: where it was is what its end
+/// moves).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Come {
     Stay,
     Arrive,
     Leave,
+    Gone,
 }
 
 static EMPTY: LazyLock<Local> = LazyLock::new(Local::default);
@@ -321,11 +355,19 @@ impl AppView {
         &ALL_SHOWN
     }
 
-    /// Tests: what the rail retains of its renderer state: its painted
-    /// targets and the chrome's reveals.
+    /// Tests: what the rail retains of its renderer state.
     #[cfg(test)]
-    pub(crate) fn rail_retained(&self) -> (usize, usize) {
-        (self.agent_rail.lease.painted.borrow().len(), self.fx.chrome().reveal_count())
+    pub(crate) fn rail_retained(&self) -> Retained {
+        let r = &self.agent_rail;
+        let seen = r.seen.borrow();
+        let g = r.glides.borrow();
+        Retained {
+            painted: r.lease.painted.borrow().len(),
+            reveals: self.fx.chrome().reveal_count(),
+            sections: seen.last.len() + seen.this.len(),
+            glides: g.to.len() + g.agent.len(),
+            moved: r.lease.glided.borrow().len(),
+        }
     }
 
     /// The agent zone's footer (D6b's seam: `1 dismissed · show`). D6a has
@@ -504,7 +546,9 @@ impl AppView {
     pub(crate) fn rail_frame(&self) {
         let f = &self.agent_rail.lease.frame;
         f.set(f.get() + 1);
+        self.agent_rail.drawn.set(true);
         self.agent_rail.drew_rows.borrow_mut().clear();
+        self.agent_rail.order.borrow_mut().clear();
         let s = self.rail_sid();
         let mut of = self.agent_rail.painted_of.borrow_mut();
         if of.as_deref() != s {
@@ -527,10 +571,13 @@ impl AppView {
         let mut g = r.glides.borrow_mut();
         let g = &mut *g;
         if g.to.insert(key, open) != Some(open) {
+            // A glide held, turned another way: its time goes on from where
+            // it was held (not as if it had moved on meanwhile).
+            if let Some(since) = g.agent.remove(&key).and_then(|e| e.held) {
+                chrome.resume_reveal(key, now.saturating_duration_since(since));
+            }
             if r.landed.get() == Some(frame) {
                 g.agent.insert(key, Flight { k: f32::NAN, sink: Rc::default(), held: None });
-            } else {
-                g.agent.remove(&key);
             }
         }
         if let Some(e) = g.agent.get_mut(&key).filter(|e| !e.k.is_nan()) {
@@ -543,6 +590,11 @@ impl AppView {
             if let Some(since) = e.held.take() {
                 chrome.resume_reveal(key, now.saturating_duration_since(since));
             }
+        }
+        // An agent op's, not held: it moves this frame (its last too, as
+        // it lands on its end).
+        if g.agent.contains_key(&key) {
+            g.stepped.insert(key);
         }
         let (shown, sink) = chrome.reveal(key, open, Duration::ZERO, 0);
         match shown {
@@ -558,15 +610,20 @@ impl AppView {
         (shown, sink)
     }
 
-    /// The rail's frame drawn (both slots). What it keeps of its renderer
-    /// state keeps to what it drew: its painted targets and its glides in
-    /// the chrome's motion go with their rows (a section leaving keeps its
-    /// own until its glide is over; none of another session's, a new
-    /// generation's gone blocks or a rail no longer drawn), so they are
-    /// bounded by the board's caps for the session's life. While an agent
-    /// op's glides move, and in the frame they land in, the rail's frames
-    /// draw an agent op: what they move is just moved, from the motion's
-    /// end. A glide held asks one frame, at the lease's end.
+    /// The rail's frame drawn (both slots), or not drawn at all
+    /// ([`AppView::rail_unseen`]). What it keeps of its renderer state
+    /// keeps to what it drew: its painted targets, its glides in the
+    /// chrome's motion and the sections it drew (its snapshots, kept a
+    /// frame: what arrives and leaves) go with their rows (a section
+    /// leaving keeps its own until its glide is over; none of another
+    /// session's, a new generation's gone blocks or a rail not drawn), so
+    /// they are bounded by the board's caps for the session's life.
+    ///
+    /// What an agent op's glide moves this frame is just moved (from the
+    /// motion's end): its section and those drawn after it, by row, for
+    /// the probes this frame paints (Shady #104 R2-2: never the whole
+    /// rail for a glide held, nor what the user moves meanwhile). A glide
+    /// held asks one frame, at the lease's end.
     pub(crate) fn rail_retire(&self) {
         let r = &self.agent_rail;
         let drew = r.drew_rows.borrow();
@@ -579,17 +636,50 @@ impl AppView {
             g.agent.remove(k);
         }
         self.fx.chrome().forget_reveals(&gone);
-        let flight = !g.agent.is_empty();
-        if flight || g.flight {
-            r.lease.agent_frame.set(Some(r.lease.frame.get()));
+        // The sections drawn: last frame's are read as this one draws (what
+        // arrives, what leaves); this frame's are kept for the next, if it
+        // drew them for the session on screen.
+        {
+            let mut seen = r.seen.borrow_mut();
+            seen.last.clear();
+            let frame = r.lease.frame.get();
+            if !r.drawn.get() || seen.frame != frame || seen.of.as_deref() != self.rail_sid() {
+                *seen = Seen::default();
+            }
         }
-        g.flight = flight;
+        let frame = r.lease.frame.get();
+        let order = r.order.borrow();
+        let moves = |row: &u64| g.stepped.contains(&motion::key(ARRIVE, *row)) || g.stepped.contains(&motion::key(BODY, *row));
+        let mut glided = r.lease.glided.borrow_mut();
+        glided.clear();
+        if r.drawn.get()
+            && let Some(i) = order.iter().position(moves)
+        {
+            glided.extend(order[i..].iter().map(|row| (*row, frame)));
+        }
+        r.stepping.set(r.drawn.get() && !g.stepped.is_empty());
+        g.stepped.clear();
+        g.flight = !g.agent.is_empty();
         if std::mem::take(&mut g.held)
             && !r.lease.pressed
             && let Some(t) = r.lease.moved
         {
             self.fx.want_at(t + crate::lease::LEASE);
         }
+    }
+
+    /// The window's frame drawn (the end of its render): a rail it did not
+    /// draw (the panel folded to its strip or under a view, closed) keeps
+    /// nothing of what it drew last: no painted target, glide or section.
+    pub(crate) fn rail_unseen(&self) {
+        let r = &self.agent_rail;
+        if r.drawn.replace(false) {
+            return;
+        }
+        r.drew_rows.borrow_mut().clear();
+        r.order.borrow_mut().clear();
+        *r.painted_of.borrow_mut() = None;
+        self.rail_retire();
     }
 
     /// An agent op's glides in flight in the rail (moving, or held).
@@ -673,21 +763,30 @@ impl AppView {
         }
         for d in gone {
             let row = crate::blocks::row_id(&d.sec.s.block.id);
-            if self.rail_reveal(motion::key(ARRIVE, row), false).0.is_none() {
-                continue;
-            }
+            let come = if self.rail_reveal(motion::key(ARRIVE, row), false).0.is_none() { Come::Gone } else { Come::Leave };
             // After the last still drawn that came before it.
             let was = |x: &Drew| self.agent_rail.seen.borrow().last.get(&crate::blocks::row_id(&x.sec.s.block.id)).map(|w| w.at);
             let at = draw
                 .iter()
                 .rposition(|(x, _)| x.listed == d.listed && was(x).is_some_and(|w| w < d.at))
                 .map_or_else(|| draw.iter().position(|(x, _)| x.listed == d.listed).unwrap_or(draw.len()), |i| i + 1);
-            self.agent_rail.still(d.clone());
-            draw.insert(at, (d, Come::Leave));
+            if come == Come::Leave {
+                self.agent_rail.still(d.clone());
+            }
+            draw.insert(at, (d, come));
         }
         {
             let mut drew = self.agent_rail.drew_rows.borrow_mut();
-            drew.extend(draw.iter().map(|(d, _)| crate::blocks::row_id(&d.sec.s.block.id)));
+            let mut order = self.agent_rail.order.borrow_mut();
+            let row = |d: &Drew| crate::blocks::row_id(&d.sec.s.block.id);
+            // Down the slot: its own, its `+N` row, those listed under it.
+            order.extend(draw.iter().filter(|(d, _)| !d.listed).map(|(d, _)| row(d)));
+            if l.more[k].is_some() {
+                order.push(MORE_ROW | k as u64);
+            }
+            order.extend(draw.iter().filter(|(d, _)| d.listed).map(|(d, _)| row(d)));
+            draw.retain(|(_, come)| *come != Come::Gone);
+            drew.extend(draw.iter().map(|(d, _)| row(d)));
             if l.more[k].is_some() {
                 drew.insert(MORE_ROW | k as u64);
             }
@@ -1414,17 +1513,33 @@ impl Element for Mark {
 /// its screen y (§4), each frame's offset puts its section where it was
 /// (its layout read before the panel's own prepaint applies the offset,
 /// which GPUI then clamps to what the panel can scroll: as far as it can).
+///
+/// The scroll giving way as the panel prepaints (its content shorter than
+/// the offset reaches) moves every row on screen: in a frame an agent op's
+/// glide moves, that frame draws the agent op for all of them.
 pub(crate) struct KeepY {
     child: AnyElement,
     keep: Rc<Cell<Option<(u64, f32, Instant)>>>,
     mark: Rc<Cell<Option<LayoutId>>>,
     scroll: ScrollHandle,
     now: Instant,
+    stepping: Rc<Cell<bool>>,
+    agent: Rc<Cell<Option<u64>>>,
+    frame: Rc<Cell<u64>>,
 }
 
 impl KeepY {
     pub(crate) fn new(child: AnyElement, r: &RailState, scroll: &ScrollHandle, now: Instant) -> Self {
-        KeepY { child, keep: r.keep.clone(), mark: r.mark.clone(), scroll: scroll.clone(), now }
+        KeepY {
+            child,
+            keep: r.keep.clone(),
+            mark: r.mark.clone(),
+            scroll: scroll.clone(),
+            now,
+            stepping: r.stepping.clone(),
+            agent: r.lease.agent_frame.clone(),
+            frame: r.lease.frame.clone(),
+        }
     }
 }
 
@@ -1484,7 +1599,11 @@ impl Element for KeepY {
             Some(_) => self.keep.set(None),
             None => {}
         }
+        let at = self.scroll.offset();
         self.child.prepaint(window, cx);
+        if self.stepping.get() && self.scroll.offset() != at {
+            self.agent.set(Some(self.frame.get()));
+        }
     }
 
     fn paint(

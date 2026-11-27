@@ -10318,7 +10318,7 @@ impl Render for AppView {
         self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
-        h_flex()
+        let root = h_flex()
             .id("root")
             .track_focus(&self.focus)
             // A divider dragged: its resize cursor wherever the pointer
@@ -10737,7 +10737,10 @@ impl Render for AppView {
                 .absolute()
                 .size_0()
             })
-            .children(self.draw_probe(cx))
+            .children(self.draw_probe(cx));
+        // A rail this frame did not draw keeps nothing (D6a).
+        self.rail_unseen();
+        root
     }
 }
 

@@ -522,8 +522,8 @@ fn hash(v: impl Hash) -> u64 {
 }
 
 /// The rail's structure as drawn (§6.2, §4): each slot's sections, their
-/// incarnations, states and heights, a group's members (and which are
-/// tombstones), the `+N` rows. Under the rail's lease, a board that changes
+/// incarnations, states and heights, tombstones whole (a section's own
+/// and a group's members': text and token), the `+N` rows. Under the rail's lease, a board that changes
 /// it waits: a cap change, a section added, removed or reordered, one
 /// replaced or changing height. One that keeps it (a tick, a label) draws
 /// in place. A note open and whole is as tall as its text lays out: its
@@ -540,6 +540,12 @@ pub(crate) fn shape(l: &Layout, local: &Local, note: NoteLines, diff: &dyn Fn(&S
                 State::Listed => 3,
                 State::Tombstone(_) => 4,
             };
+            // A tombstone whole, its own or a member's: its text and D6b's
+            // token (another token is another structure, Shady #104 R2-3).
+            let tomb = match &sec.state {
+                State::Tombstone(t) => Some(t),
+                _ => None,
+            };
             let members: Vec<u64> =
                 sec.s.members.iter().zip(&sec.tombs).map(|(m, t)| hash((m.block.id.to_string(), m.block.tag, t))).collect();
             let text = match &sec.s.block.body {
@@ -554,6 +560,7 @@ pub(crate) fn shape(l: &Layout, local: &Local, note: NoteLines, diff: &dyn Fn(&S
                 sec.s.block.tag,
                 st,
                 lines(&sec.s, &sec.state, local, note, diff(&sec.s)),
+                tomb,
                 members,
                 text,
             )));
