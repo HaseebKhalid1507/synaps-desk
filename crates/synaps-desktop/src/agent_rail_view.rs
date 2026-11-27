@@ -130,6 +130,9 @@ pub(crate) enum RailAct {
     More,
     /// A slot's `+N` row: its leftovers' headers listed, or not.
     List,
+    /// A header's hover action (D7, [`crate::walk::Hover`]): its own up,
+    /// [`AppView::rail_hover_up`].
+    Hover(crate::walk::Hover),
 }
 
 /// A press's painted target in the rail.
@@ -900,12 +903,22 @@ impl AppView {
                 .into_any_element();
         }
         let open = sec.state == State::Open;
-        let head = self.rail_head(sec, open, streaming, p, cx);
+        // A past revision in the walk's view (D7, §3.6): its header and
+        // body from the re-fold scratch once there (a group's past members
+        // as lines, never tombstones of now).
+        let past = self.walk_past(row).and_then(|v| v.shown);
+        let head = match &past {
+            Some(ps) => self.rail_head(&Section { s: ps.clone(), ..sec.clone() }, open, false, p, cx),
+            None => self.rail_head(sec, open, streaming, p, cx),
+        };
         // The body opens and folds on the glide; one listed or folded has
         // its summary line, or nothing.
         let (shown, sink) = self.rail_reveal(motion::key(BODY, row), open);
         let body = (open || shown.is_some()).then(|| {
-            let b = self.rail_body(s, &sec.tombs, local, live, streaming, p, cx);
+            let b = match &past {
+                Some(ps) => self.rail_body(ps, &[], local, live, false, p, cx),
+                None => self.rail_body(s, &sec.tombs, local, live, streaming, p, cx),
+            };
             crate::turns::revealed(b, shown, sink).debug_selector(move || format!("agent-body {row}"))
         });
         let summary = (sec.state == State::Summary).then(|| {
@@ -937,6 +950,8 @@ impl AppView {
             .children(body)
             .children(summary)
             .child(crate::lease::probe(&self.agent_rail.lease, &self.fx, row, tag, row))
+            // The walk's ring (D7): the focused pane's walk.
+            .children(self.walk_ring(crate::walk::At::Rail(row), tag, p))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.rail_hover(row, tag, *over)));
         // Arriving: from nothing, on the glide (the chrome's motion: Off
         // and Reduced, at once); shut first in its first frame, then open.
@@ -960,10 +975,18 @@ impl AppView {
         let row = crate::blocks::row_id(&b.id);
         let tag = b.tag;
         let (life, _) = crate::blocks::life_of(&b.body, streaming);
-        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(crate::blocks::GLOW_KEYS, row ^ field.rotate_left(13)), v, c);
+        // A past revision in view has its own motion keys (D7).
+        let gid = row ^ self.past_salt(row);
+        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(crate::blocks::GLOW_KEYS, gid ^ field.rotate_left(13)), v, c);
         let title_c = glow(1, crate::blocks::bound_value(s, |_| s.bound.as_ref().map(|b| b.title.clone())), p.prose_t);
         let title = crate::blocks::title_of(s);
-        let rev = if b.pending {
+        let past = self.walk_past(row);
+        let rev = if let Some(v) = &past {
+            match v.newer {
+                Some(n) => format!("{} · r{n} new", v.label),
+                None => v.label.clone(),
+            }
+        } else if b.pending {
             "pending".to_string()
         } else if b.replaced.is_some() {
             format!("r{} · replaced", b.rev)
@@ -980,8 +1003,32 @@ impl AppView {
         let chip = self.rail_mono_w("AGENT", size::META) + 2. * CHIP_PAD;
         let fixed = glyph::LIFE + chip + SPACER + CHEVRON + 5. * GAP;
         let rev_max = (self.rail_text_w() - fixed - TITLE_MIN).max(REV_MIN);
+        // Its hover actions (D7): over its right end, never reflowing it,
+        // unless the lease's note is there or a past revision is in view.
+        let hovered = self.agent_rail.lease.head.filter(|h| h.0 == row && past.is_none() && says.is_none());
+        let acts = hovered.map(|(_, since)| {
+            let offers = self.hover_offers(s, true);
+            self.hover_actions(row, since, &offers, p.card_d, p, |act, el| {
+                let press = RailPress { at: Target { row, tag }, act: RailAct::Hover(act) };
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.rail_down(press, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.rail_hover_up(row, act, window, cx);
+                    }),
+                )
+            })
+        });
         h_flex()
             .id(("agent-head", row))
+            .relative()
             .h(px(HEAD))
             .w_full()
             .gap(px(GAP))
@@ -1053,6 +1100,8 @@ impl AppView {
                     .debug_selector(move || format!("agent-chevron {row}"))
                     .child(glyph::turn(turn, p.dim_t)),
             )
+            .children(acts)
+            .on_hover(cx.listener(move |this, over: &bool, _, cx| this.rail_head_hover(row, *over, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.rail_down(press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.rail_up(row, RailAct::Fold, cx)))
     }
@@ -1072,7 +1121,8 @@ impl AppView {
     ) -> AnyElement {
         let b = &s.block;
         let row = crate::blocks::row_id(&b.id);
-        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(crate::blocks::GLOW_KEYS, row ^ field.rotate_left(13)), v, c);
+        let gid = row ^ self.past_salt(row);
+        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(crate::blocks::GLOW_KEYS, gid ^ field.rotate_left(13)), v, c);
         let line = || h_flex().h(px(LINE)).w_full().items_center().gap(px(6.)).whitespace_nowrap();
         let text = |t: String, c: Hsla| mono(t, size::META, c).min_w_0().overflow_hidden().text_ellipsis();
         let mut col = v_flex().w_full().font_family(fonts::MONO).text_px(size::META);
@@ -1373,7 +1423,7 @@ impl AppView {
                 let k = (row & !MORE_ROW) as usize;
                 b.more.get(k).and_then(Option::as_ref).is_some_and(|m| more_tag(m) == down.at.tag)
             }
-            RailAct::Fold | RailAct::More => b
+            RailAct::Fold | RailAct::More | RailAct::Hover(_) => b
                 .sections()
                 .any(|s| crate::blocks::row_id(&s.s.block.id) == row && s.s.bound.as_ref().is_some_and(|x| x.tag == down.at.tag)),
         });
@@ -1392,7 +1442,11 @@ impl AppView {
                         }
                     }
                     self.agent_rail.local_mut(&session).toggle(&lay, &id);
+                    // Its undo (D7), in the focused pane's walk.
+                    let u = crate::walk::Undo { at: crate::walk::At::Rail(row), tag: down.at.tag, act: crate::walk::Undid::Fold };
+                    self.panes.cur.walk.push(u);
                 }
+                RailAct::Hover(_) => {}
                 RailAct::More => {
                     if let Some(sec) = lay.sections().find(|s| crate::blocks::row_id(&s.s.block.id) == row) {
                         let id = sec.s.block.id.clone();

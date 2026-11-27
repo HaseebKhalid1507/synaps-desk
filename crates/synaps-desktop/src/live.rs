@@ -73,6 +73,10 @@ pub struct Live {
     pub cancels: crate::wtabs::Cancels,
     /// Its transcript's board, worked off the frame ([`crate::board`]).
     pub(crate) board: crate::board::Work,
+    /// The archive (blocks.md §5.2, D7): the predecessor's final blocks
+    /// and op log at its last compaction, for the op log's "before
+    /// compaction" tab ([`crate::oplog::Archive`]).
+    pub(crate) archive: Option<std::sync::Arc<crate::oplog::Archive>>,
 }
 
 impl Default for Live {
@@ -92,6 +96,7 @@ impl Default for Live {
             watch: Watch::default(),
             cancels: Default::default(),
             board: Default::default(),
+            archive: None,
         }
     }
 }

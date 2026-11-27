@@ -139,7 +139,7 @@ use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
 pub use cards_spec::block::{BlockId, Body, Kind, Ref, Tag};
-pub use cards_spec::board::Block;
+pub use cards_spec::board::{Block, Logged, Record, Tombstone};
 
 use crate::transcript::{Item, ItemKind};
 
@@ -2157,6 +2157,14 @@ pub struct Drawn {
     pub committed_to: u64,
     /// Live blocks on the board, groups and members included.
     pub live: usize,
+    /// The board's op log (§3.8: ≤ 256 lines, oldest first), each line
+    /// with the row of the event it is at (its time is that row's), and
+    /// the revision records and tombstones it still holds (§1.8), records
+    /// with their rows too: what D7's op log and revision walk read
+    /// (§3.6). Copies of the board's, counted at B2's count of them.
+    pub log: Arc<[(Logged, Option<u64>)]>,
+    pub records: Arc<[(Record, Option<u64>)]>,
+    pub tombstones: Arc<[Tombstone]>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates. A row's [`Arc`] of it is its.
@@ -2605,13 +2613,22 @@ impl Worker {
             + (shown_n + bound_n) * ARC;
         let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
+        // The op log, records and tombstones (D7): copies, each record and
+        // line with its event's row; B2's count of its owners bounds them
+        // (their deques' slots and heap), plus a row each and their Arcs.
+        let log: Arc<[(Logged, Option<u64>)]> = view.log().map(|l| (l.clone(), row(l.at.event))).collect();
+        let records: Arc<[(Record, Option<u64>)]> = view.records().map(|r| (r.clone(), row(r.at.event))).collect();
+        let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
+        let [_, tombs, recs, _, _, _, logs] = view.owned_by_owner();
+        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Option<u64>>() + 3 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
             + rail.iter().map(Shown::list_bytes).sum::<usize>()
             + blocks
             + ARC
-            + committed.len() * std::mem::size_of::<(u64, Fate)>();
+            + committed.len() * std::mem::size_of::<(u64, Fate)>()
+            + kept;
         Drawn {
             epoch: input.epoch,
             generation: Some(input.generation),
@@ -2622,6 +2639,9 @@ impl Worker {
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
+            log,
+            records,
+            tombstones,
             bytes,
         }
     }

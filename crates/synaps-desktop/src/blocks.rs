@@ -354,6 +354,10 @@ impl crate::pane::Pane {
     pub(crate) fn blocks_reset(&mut self) {
         self.lease.clear();
         self.block_scroll.borrow_mut().clear();
+        // The walk was of this list's rows (its focus hands the keys to
+        // the composer at the next frame, `AppView::sync_walk`).
+        self.walk.walk = None;
+        self.walk.undo.clear();
     }
 }
 
@@ -366,10 +370,48 @@ impl AppView {
         let fit = Fit::of(self.panes.cur.layout.column);
         let folded = self.panes.cur.block_folds.folded(id, s);
         let streaming = self.model.lives[self.panes.cur.live].shown().busy();
-        let head = self.block_head(s, id, p.card_d, folded, streaming, fit, &g, p, m, cx);
-        let body = (!folded).then(|| self.block_body(s, id, None, streaming, fit, &g, p, m, cx));
         let pane = self.panes.cur.id;
         let tag = s.block.tag;
+        // A past revision in the walk's view (D7, §3.6): its header and
+        // body, from the re-fold scratch once there; its label in place of
+        // `rN`. A group's past members are its lines.
+        let past = self.walk_past(id);
+        let drawn = past.as_ref().and_then(|v| v.shown.as_ref()).unwrap_or(s);
+        let head = self.block_head(drawn, id, p.card_d, folded, streaming && past.is_none(), fit, &g, p, m, cx);
+        // Its hover actions (D7): over the header's right end, never
+        // reflowing it, unless the lease's note is there.
+        let hovered = self.panes.cur.lease.head.filter(|h| h.0 == id && past.is_none());
+        let says = self.panes.cur.lease.note.is_some_and(|n| n.0 == id);
+        let acts = hovered.filter(|_| !says).map(|(_, since)| {
+            let offers = self.hover_offers(s, false);
+            self.hover_actions(id, since, &offers, p.card_d, p, |act, el| {
+                let press =
+                    crate::lease::Press { at: crate::lease::Target { row: id, tag }, act: crate::lease::Act::Hover(act), group: None };
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.block_down(pane, press, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.in_pane(pane, |this| this.hover_up(id, act, window, cx));
+                    }),
+                )
+            })
+        });
+        let head = head
+            .id(("block-head", id))
+            .on_hover(cx.listener(move |this, over: &bool, _, cx| this.head_hover(pane, id, *over, cx)))
+            .children(acts);
+        let body = (!folded).then(|| match past.as_ref().and_then(|v| v.shown.as_ref()) {
+            Some(ps) if matches!(ps.block.body, Body::Group(_)) => past_members(ps, id, p, m),
+            Some(ps) => self.block_body(ps, id, None, false, fit, &g, p, m, cx),
+            None => self.block_body(s, id, None, streaming, fit, &g, p, m, cx),
+        });
         let press = crate::lease::Press { at: crate::lease::Target { row: id, tag }, act: crate::lease::Act::Fold, group: None };
         let el = div()
             .id(("block", id))
@@ -386,6 +428,8 @@ impl AppView {
             .child(head)
             .children(body)
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
+            // The walk's ring (D7): its keys act once it is painted.
+            .children(self.walk_ring(crate::walk::At::Block(id), tag, p))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
@@ -446,9 +490,18 @@ impl AppView {
             Some(_) => b.title.as_deref().filter(|t| !t.is_empty()).map(|t| crate::ask::shown(t, cards_spec::Lines::Single)),
             None => Some(title_of(s)),
         };
-        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, id ^ field.rotate_left(13)), v, c);
+        // A past revision in view has its own motion keys (D7: stepping
+        // through revisions never glows).
+        let gid = id ^ self.past_salt(id);
+        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, gid ^ field.rotate_left(13)), v, c);
         let title_c = glow(1, bound_value(s, |_| s.bound.as_ref().map(|b| b.title.clone())), p.prose_t);
-        let rev = if b.pending {
+        let past = self.walk_past(id);
+        let rev = if let Some(v) = &past {
+            match v.newer {
+                Some(n) => format!("{} · r{n} new", v.label),
+                None => v.label.clone(),
+            }
+        } else if b.pending {
             "pending".to_string()
         } else if b.replaced.is_some() {
             format!("r{} · replaced", b.rev)
@@ -485,7 +538,7 @@ impl AppView {
                 life,
                 p.card_d,
                 p,
-                self.fx.col(self.panes.cur.id).change(motion::Tag::Outcome, id, life.code(), None),
+                self.fx.col(self.panes.cur.id).change(motion::Tag::Outcome, gid, life.code(), None),
                 None,
             )))
             .when_some(title, |d, title| {
@@ -558,18 +611,22 @@ impl AppView {
                 )
             })
             .child(div().flex_1().min_w(px(8.)))
-            .when(fit.rev, |d| {
+            .when(fit.rev || past.is_some(), |d| {
+                // A past revision's label gives way before the title's
+                // floor (its whole in the walk's status line).
+                let text = if past.is_some() { rev.clone() } else { format!("{kind} · {rev}") };
                 d.child(
                     div()
-                        .flex_none()
+                        .when(past.is_none(), |d| d.flex_none())
+                        .when(past.is_some(), |d| d.min_w_0().flex_shrink(1.).overflow_hidden().text_ellipsis())
                         .font_family(fonts::MONO)
                         .text_px(m.meta)
-                        .text_color(p.dim_t)
+                        .text_color(if past.is_some() { p.acc } else { p.dim_t })
                         .debug_selector({
-                            let t = format!("block-rev {id} {kind} · {rev}");
+                            let t = format!("block-rev {id} {text}");
                             move || t.clone()
                         })
-                        .child(format!("{kind} · {rev}")),
+                        .child(text),
                 )
             })
             .when(!fit.rev && b.pending, |d| d.child(div().flex_none().text_px(m.meta).text_color(p.dim_t).child("pending")))
@@ -686,7 +743,8 @@ impl AppView {
         m: &Metrics,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, id ^ field.rotate_left(13)), v, c);
+        let gid = id ^ self.past_salt(id);
+        let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, gid ^ field.rotate_left(13)), v, c);
         let pb = px((6. * m.r).round());
         match &s.block.body {
             Body::Plan(pl) => {
@@ -724,7 +782,7 @@ impl AppView {
                                 p,
                                 self.fx.col(self.panes.cur.id).change(
                                     motion::Tag::Outcome,
-                                    id ^ (sid & 0xFFFF_FFFF) << 8,
+                                    gid ^ (sid & 0xFFFF_FFFF) << 8,
                                     life.code(),
                                     None,
                                 ),
@@ -1113,6 +1171,31 @@ impl AppView {
             })
             .into_any_element()
     }
+}
+
+/// A group's past revision (D7, §3.6): its members then, a line each (their
+/// own past is theirs to walk), read-only.
+fn past_members(ps: &Shown, id: u64, p: &Palette, m: &Metrics) -> AnyElement {
+    let pb = px((6. * m.r).round());
+    v_flex()
+        .w_full()
+        .pb(pb)
+        .gap(px(4.))
+        .debug_selector(move || format!("block-past-members {id}"))
+        .children(ps.members.iter().map(|ms| {
+            div()
+                .h(px((20. * m.r).round()))
+                .flex()
+                .items_center()
+                .font_family(fonts::SANS)
+                .text_px(m.label)
+                .text_color(p.prose_t)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(format!("{} · r{}", title_of(ms), ms.block.rev))
+        }))
+        .into_any_element()
 }
 
 fn text_w_max(cw: f32) -> f32 {

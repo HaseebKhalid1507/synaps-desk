@@ -520,7 +520,8 @@ pub fn bind_keys(cx: &mut App) {
     // An entered agent card's Tab and Shift+Tab, on it or in its inputs:
     // no binding (not the kit's focus cycling, nor an input's indent), so
     // they come as keys, whose repeats are known (`ask_keys::ask_tab_key`).
-    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX] {
+    // The op log's Tab flips its tabs (D7), the same way.
+    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX, crate::oplog::LOG_CTX] {
         keys.push(KeyBinding::new("tab", gpui_kit::NoAction, Some(ctx)));
         keys.push(KeyBinding::new("shift-tab", gpui_kit::NoAction, Some(ctx)));
     }
@@ -2428,6 +2429,11 @@ pub struct AppView {
     /// Every key's presses: an entered card's keys act on new ones only
     /// ([`crate::ask_keys::Presses`]).
     pub(crate) ask_presses: crate::ask_keys::Presses,
+    /// D6b's side of the walk's shared and stored keys ([`crate::walk::BlockDesires`]):
+    /// nothing wired until D6b (#103) lands.
+    pub(crate) desires: Box<dyn crate::walk::BlockDesires>,
+    /// The op log, open ([`crate::oplog`], D7).
+    pub(crate) oplog: Option<crate::oplog::OpLog>,
 
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -3040,6 +3046,8 @@ impl AppView {
             card_tick: None,
             memo_seen: 0,
             ask_presses: Default::default(),
+            desires: Box::new(crate::walk::NoDesires),
+            oplog: None,
 
             _tasks: Vec::new(),
             _subs: subs,
@@ -3144,6 +3152,24 @@ impl AppView {
             {
                 self.panes.cur.watch_note = None;
                 self.model.view_dirty = true;
+            }
+            // A compaction: the predecessor's final blocks and op log are the
+            // session's archive (blocks.md §5.2, D7), as its board drew them.
+            if let Event::Session { attach_seq, event: synaps_client::protocol::SessionEvent::CompactionApplied { .. }, .. } = &ev
+                && let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].current(*attach_seq))
+            {
+                let l = &self.model.lives[live];
+                if let Some(d) = l.transcript.drawn().filter(|d| !d.log.is_empty() || d.live > 0) {
+                    let items: std::collections::HashMap<u64, &synaps_client::transcript::Item> =
+                        l.transcript.items().iter().map(|i| (i.id, i)).collect();
+                    let a = crate::oplog::Archive::of(d, |row| {
+                        row.and_then(|r| items.get(&r))
+                            .and_then(|i| i.at.as_deref())
+                            .and_then(crate::times::Stamp::local)
+                            .map(|t| t.hhmm.to_string())
+                    });
+                    self.model.lives[live].archive = Some(std::sync::Arc::new(a));
+                }
             }
             // The store's attachment detached: what its panes held for its
             // blocks goes (Shady #101 P2-4).
@@ -9250,7 +9276,9 @@ impl AppView {
                         .children(hold_back.filter(|_| !hold))
                         .children(rehint.filter(|_| !hold))
                         .children((!hold).then_some(transcript_bar))
-                        .children((!hold).then(|| self.blocks_pill(&p, &m, cx)).flatten()),
+                        .children((!hold).then(|| self.blocks_pill(&p, &m, cx)).flatten())
+                        // The walk's status line (D7): a layer at its foot.
+                        .children((!hold).then(|| self.walk_status(&p)).flatten()),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
@@ -9266,8 +9294,9 @@ impl AppView {
                     window,
                     cx,
                 ))
-                // An agent card's keys (D2b).
+                // An agent card's keys (D2b), the block walk's (D7).
                 .map(|d| self.ask_hooks(d, cx))
+                .map(|d| self.walk_hooks(d, cx))
         }
     }
 
@@ -9367,6 +9396,7 @@ impl AppView {
         self.sync_list();
         self.read_card_on_screen();
         self.sync_ask(window, cx);
+        self.sync_walk(window, cx);
         if self.panes.cur.stub_away.is_some()
             && (self.card_on_screen() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
         {
@@ -10398,7 +10428,10 @@ impl Render for AppView {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // A key releases the pointer lease (blocks.md §6.2), after
                 // it acts.
-                if this.panes.iter().any(|p| p.lease.moved.is_some() || p.lease.note.is_some()) {
+                if this.panes.iter().any(|p| p.lease.moved.is_some() || p.lease.note.is_some())
+                    || this.agent_rail.lease.moved.is_some()
+                    || this.agent_rail.lease.note.is_some()
+                {
                     cx.defer_in(window, |this, _, cx| this.lease_key(cx));
                 }
                 // Esc while a tab or a row is dragged: the drag ends, and
@@ -10452,6 +10485,30 @@ impl Render for AppView {
                         this.close_palette(window, cx);
                     }
                     this.jump_to_card(window, cx);
+                    return;
+                }
+                // Ctrl+G (Cmd+G): block walk in the focused pane; Ctrl+O
+                // (Cmd+O): the op log (blocks.md §3.8, D7). New presses
+                // only (a held one, once), never mid IME composition.
+                let mac = cfg!(target_os = "macos");
+                if crate::walk::chord(&ev.keystroke, "g", mac) && !this.composing_now(window, cx) {
+                    cx.stop_propagation();
+                    if this.ask_presses.last {
+                        if this.oplog.is_some() {
+                            this.oplog_close(window, cx);
+                        }
+                        if this.palette.is_some() {
+                            this.close_palette(window, cx);
+                        }
+                        this.walk_enter(window, cx);
+                    }
+                    return;
+                }
+                if crate::walk::chord(&ev.keystroke, "o", mac) && !this.composing_now(window, cx) {
+                    cx.stop_propagation();
+                    if this.ask_presses.last {
+                        this.oplog_toggle(window, cx);
+                    }
                     return;
                 }
                 // A menu item picked from the keyboard: that key's repeats
@@ -10716,6 +10773,14 @@ impl Render for AppView {
                 },
                 // Over a view there is no composer: the window's end.
                 if view.is_some() { self.height } else { self.panes.cur.composer_top.get().min(self.panes.cur.over_composer.get()) },
+                &p,
+                cx,
+            ))
+            // The op log (D7), over the focused pane.
+            .children(self.render_oplog(
+                crate::chrome::MARK + rail_w + self.panes.cur.rect.get().x,
+                if self.panes.split() { self.panes.cur.rect.get().w } else { pane },
+                self.panes.cur.composer_top.get().min(self.panes.cur.over_composer.get()),
                 &p,
                 cx,
             ))
