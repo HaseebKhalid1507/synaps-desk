@@ -32,7 +32,9 @@
 //!   now`). The rail's frames are counted like a pane's.
 //! - **Motion.** A section's body opens and folds on the glide, the panel
 //!   chrome's motion ([`crate::motion::Motion::chrome`]); a section that
-//!   arrives glides open from nothing; Reduced and Off at once. NOW's
+//!   arrives glides open from nothing, and one that goes (past the cap, a
+//!   list closed, removed) glides shut where it was, drawn from the frame
+//!   before; Reduced and Off at once. NOW's
 //!   glyph runs on the window's beat only while the turn streams. Nothing
 //!   asks for a frame at rest.
 
@@ -61,9 +63,13 @@ use crate::theme::Palette;
 /// A slot's `+N` row's id: its slot with this bit (a block row's is
 /// [`crate::blocks::BLOCK_ID`]'s).
 pub(crate) const MORE_ROW: u64 = 1 << 58;
-/// A section's arrival's key in the chrome's motion: its row with this bit
-/// (its body's is its row).
-const ARRIVE: u64 = 1 << 57;
+/// A section's keys in the chrome's motion, each its own space
+/// ([`motion::key`]): a row id keeps 59 bits of its hash, so no bit of it
+/// can tell two keys of one row apart. Its arrival's and leaving's glide,
+/// its body's open and fold, its chevron's turn.
+const ARRIVE: u64 = 0x7B20 << 48;
+const BODY: u64 = 0x7B21 << 48;
+const TURN: u64 = 0x7B22 << 48;
 /// Sessions whose rail state this desk keeps (the least recently drawn
 /// goes past them).
 const KEPT: usize = 32;
@@ -77,6 +83,9 @@ const NOW_H: f32 = 22.;
 const SPINE: f32 = 2.;
 const PAD: f32 = 10.;
 const GAP: f32 = 8.;
+/// A section's margin above it, inside its arrival's glide: [`KeepY`]
+/// keeps the section's own top, not its glide's.
+const ABOVE: f32 = 8.;
 /// A section's left and right padding in the panel (its sections'): 248
 /// px of content at the panel's 296 px floor (§4).
 pub(crate) const INSET: f32 = 24.;
@@ -108,8 +117,11 @@ pub(crate) struct RailState {
     used: u64,
     pub(crate) lease: Lease,
     pub(crate) down: Option<RailPress>,
-    /// The session the lease's targets are of.
+    /// The session the pointer's press and note are of.
     pub(crate) of: Option<String>,
+    /// The session the painted targets are of: another's are dropped as
+    /// the rail draws it ([`AppView::rail_frame`]).
+    painted_of: RefCell<Option<String>>,
     /// The header clicked to expand: its row, its screen y then, until when.
     pub(crate) keep: Rc<Cell<Option<(u64, f32, Instant)>>>,
     /// Its section's layout this frame ([`Mark`]).
@@ -121,13 +133,32 @@ pub(crate) struct RailState {
     pub(crate) inner: Cell<f32>,
 }
 
-/// The sections drawn, by rail frame ([`RailState::arrives`]).
+/// The sections drawn, by rail frame ([`RailState::drew`]).
 #[derive(Default)]
 struct Seen {
     of: Option<String>,
     frame: u64,
-    last: HashSet<u64>,
-    this: HashSet<u64>,
+    last: HashMap<u64, Drew>,
+    this: HashMap<u64, Drew>,
+}
+
+/// A section as drawn in a frame: its slot, its place among the slot's
+/// drawn sections, listed under the slot's `+N` or not, and itself (one
+/// leaving is drawn from it as it glides shut).
+#[derive(Clone)]
+struct Drew {
+    k: usize,
+    at: usize,
+    listed: bool,
+    sec: Section,
+}
+
+/// How a section's frame comes: there, arriving or leaving.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Come {
+    Stay,
+    Arrive,
+    Leave,
 }
 
 static EMPTY: LazyLock<Local> = LazyLock::new(Local::default);
@@ -154,12 +185,10 @@ impl RailState {
         &mut e.1
     }
 
-    /// Section `row` of session `s`, drawn in rail frame `frame`: whether it
-    /// arrives (§6.3: it glides open). Only into a rail drawn the frame
-    /// before for the same session, with sections: a session opened, the
-    /// panel unfolded or a history attached draws what it holds at once
-    /// (history never animates).
-    fn arrives(&self, s: &str, frame: u64, row: u64) -> bool {
+    /// Rail frame `frame` of session `s`: the sections drawn the frame
+    /// before are last frame's; a gap (the rail not drawn, another
+    /// session) forgets them.
+    fn begin(&self, s: &str, frame: u64) {
         let mut seen = self.seen.borrow_mut();
         if seen.of.as_deref() != Some(s) {
             *seen = Seen { of: Some(s.to_string()), frame, ..Seen::default() };
@@ -171,8 +200,37 @@ impl RailState {
                 seen.last.clear();
             }
         }
-        seen.this.insert(row);
-        !seen.last.is_empty() && !seen.last.contains(&row)
+    }
+
+    /// Section `d` drawn in rail frame `frame` of session `s`: how it comes
+    /// (§6.3). It arrives (glides open) only into a rail drawn the frame
+    /// before for the same session, with sections: a session opened, the
+    /// panel unfolded or a history attached draws what it holds at once
+    /// (history never animates).
+    fn drew(&self, s: &str, frame: u64, d: Drew) -> Come {
+        self.begin(s, frame);
+        let mut seen = self.seen.borrow_mut();
+        let row = crate::blocks::row_id(&d.sec.s.block.id);
+        let come = if !seen.last.is_empty() && !seen.last.contains_key(&row) { Come::Arrive } else { Come::Stay };
+        seen.this.insert(row, d);
+        come
+    }
+
+    /// Slot `k`'s sections drawn the frame before that this frame's rail
+    /// does not draw (`now`: the rows it draws, either slot): leaving, in
+    /// the order they were drawn.
+    fn leaving(&self, s: &str, frame: u64, k: usize, now: &HashSet<u64>) -> Vec<Drew> {
+        self.begin(s, frame);
+        let seen = self.seen.borrow();
+        let mut gone: Vec<Drew> = seen.last.iter().filter(|(r, d)| d.k == k && !now.contains(r)).map(|(_, d)| d.clone()).collect();
+        gone.sort_by_key(|d| d.at);
+        gone
+    }
+
+    /// Section `d`, leaving, still drawn this frame (it glides shut).
+    fn still(&self, d: Drew) {
+        let row = crate::blocks::row_id(&d.sec.s.block.id);
+        self.seen.borrow_mut().this.insert(row, d);
     }
 }
 
@@ -328,9 +386,16 @@ impl AppView {
     }
 
     /// The rail's frame: counted as it draws (its targets' just-moved).
+    /// Another session's: its painted targets are not this one's.
     pub(crate) fn rail_frame(&self) {
         let f = &self.agent_rail.lease.frame;
         f.set(f.get() + 1);
+        let s = self.rail_sid();
+        let mut of = self.agent_rail.painted_of.borrow_mut();
+        if of.as_deref() != s {
+            self.agent_rail.lease.painted.borrow_mut().clear();
+            *of = s.map(str::to_string);
+        }
     }
 
     /// Slot `slot`'s zone in the panel `width` px wide, if the rail has one:
@@ -392,19 +457,44 @@ impl AppView {
                     .child(div().h(px(1.)).flex_1().bg(p.hair)),
             ),
         };
-        for sec in &l.slots[k] {
-            let row = crate::blocks::row_id(&sec.s.block.id);
-            if !matches!(sec.state, State::Over | State::Listed) {
-                let arriving = self.agent_rail.arrives(&session, frame, row);
-                zone = zone.child(self.rail_section(sec, local, live, streaming, arriving, p, cx));
+        // This frame's sections, in order: the slot's own, then those
+        // listed under its `+N`; and those drawn last frame that it no
+        // longer draws (pushed past the cap, a list closed, removed),
+        // each where it was, gliding shut.
+        let now_rows: HashSet<u64> =
+            l.sections().filter(|s| s.state != State::Over).map(|s| crate::blocks::row_id(&s.s.block.id)).collect();
+        let gone = self.agent_rail.leaving(&session, frame, k, &now_rows);
+        let here = l.slots[k].iter().filter(|s| !matches!(s.state, State::Over | State::Listed)).map(|s| (false, s));
+        let listed = l.slots[k].iter().filter(|s| s.state == State::Listed).map(|s| (true, s));
+        let mut draw: Vec<(Drew, Come)> = Vec::new();
+        for (at, (listed, sec)) in here.chain(listed).enumerate() {
+            let d = Drew { k, at, listed, sec: sec.clone() };
+            let come = self.agent_rail.drew(&session, frame, d.clone());
+            draw.push((d, come));
+        }
+        let chrome = self.fx.chrome();
+        for d in gone {
+            let row = crate::blocks::row_id(&d.sec.s.block.id);
+            if chrome.reveal(motion::key(ARRIVE, row), false, Duration::ZERO, 0).0.is_none() {
+                continue;
             }
+            // After the last still drawn that came before it.
+            let was = |x: &Drew| self.agent_rail.seen.borrow().last.get(&crate::blocks::row_id(&x.sec.s.block.id)).map(|w| w.at);
+            let at = draw
+                .iter()
+                .rposition(|(x, _)| x.listed == d.listed && was(x).is_some_and(|w| w < d.at))
+                .map_or_else(|| draw.iter().position(|(x, _)| x.listed == d.listed).unwrap_or(draw.len()), |i| i + 1);
+            self.agent_rail.still(d.clone());
+            draw.insert(at, (d, Come::Leave));
+        }
+        for (d, come) in draw.iter().filter(|(d, _)| !d.listed) {
+            zone = zone.child(self.rail_section(&d.sec, local, live, streaming, *come, p, cx));
         }
         if let Some(m) = &l.more[k] {
             zone = zone.child(self.more_row(k, m, p, cx));
-            for sec in l.slots[k].iter().filter(|s| s.state == State::Listed) {
-                let arriving = self.agent_rail.arrives(&session, frame, crate::blocks::row_id(&sec.s.block.id));
-                zone = zone.child(self.rail_section(sec, local, live, streaming, arriving, p, cx));
-            }
+        }
+        for (d, come) in draw.iter().filter(|(d, _)| d.listed) {
+            zone = zone.child(self.rail_section(&d.sec, local, live, streaming, *come, p, cx));
         }
         if slot == Slot::Upper {
             zone = zone.children(self.rail_footer(live, p, cx));
@@ -439,7 +529,12 @@ impl AppView {
                 move || t.clone()
             })
             .child(display(label::NOW, size::D_S, p.dim_ch).flex_none())
-            .child(div().flex_none().child(glyph::indicator(&self.fx, life, p.chrome, p, None, None)))
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("agent-now-life {life:?}"))
+                    .child(glyph::indicator(&self.fx, life, p.chrome, p, None, None)),
+            )
             .child(mono(text, size::META, ink).min_w_0().overflow_hidden().text_ellipsis())
     }
 
@@ -482,7 +577,7 @@ impl AppView {
         local: &Local,
         live: LiveId,
         streaming: bool,
-        arriving: bool,
+        come: Come,
         p: &Palette,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -505,7 +600,7 @@ impl AppView {
         let chrome = self.fx.chrome();
         // The body opens and folds on the glide; one listed or folded has
         // its summary line, or nothing.
-        let (shown, sink) = chrome.reveal(row, open, Duration::ZERO, 0);
+        let (shown, sink) = chrome.reveal(motion::key(BODY, row), open, Duration::ZERO, 0);
         let body = (open || shown.is_some()).then(|| {
             let b = self.rail_body(s, local, live, streaming, p, cx);
             crate::turns::revealed(b, shown, sink).debug_selector(move || format!("agent-body {row}"))
@@ -526,7 +621,7 @@ impl AppView {
             .id(("agent-section", row))
             .debug_selector(move || format!("agent-section {row}"))
             .relative()
-            .mt(px(8.))
+            .mt(px(ABOVE))
             .w_full()
             .bg(p.card_d)
             .pl(px(SPINE + PAD))
@@ -541,12 +636,15 @@ impl AppView {
             .child(crate::lease::probe(&self.agent_rail.lease, &self.fx, row, tag, row))
             .on_hover(cx.listener(move |this, over: &bool, _, _| this.rail_hover(row, tag, *over)));
         // Arriving: from nothing, on the glide (the chrome's motion: Off
-        // and Reduced, at once). Shut first in its first frame, then open.
-        if arriving {
-            let _ = chrome.reveal(ARRIVE | row, false, Duration::ZERO, 0);
+        // and Reduced, at once); shut first in its first frame, then open.
+        // Leaving: to nothing, the same way.
+        if come == Come::Arrive {
+            let _ = chrome.reveal(motion::key(ARRIVE, row), false, Duration::ZERO, 0);
         }
-        let (grow, gsink) = chrome.reveal(ARRIVE | row, true, Duration::ZERO, 0);
-        let el = crate::turns::revealed(el.into_any_element(), grow, gsink).into_any_element();
+        let (grow, gsink) = chrome.reveal(motion::key(ARRIVE, row), come != Come::Leave, Duration::ZERO, 0);
+        let el = crate::turns::revealed(el.into_any_element(), grow, gsink)
+            .debug_selector(move || format!("agent-glide {row}"))
+            .into_any_element();
         let keep = self.agent_rail.keep.get().filter(|k| k.0 == row);
         if keep.is_some() { Mark { child: el, at: self.agent_rail.mark.clone() }.into_any_element() } else { el }
     }
@@ -571,7 +669,7 @@ impl AppView {
         };
         let says = self.agent_rail.lease.note.filter(|n| n.0 == row).map(|n| n.1);
         let press = RailPress { at: Target { row, tag }, act: RailAct::Fold };
-        let turn = self.fx.chrome().turn(row, open);
+        let turn = self.fx.chrome().turn(motion::key(TURN, row), open);
         h_flex()
             .id(("agent-head", row))
             .h(px(HEAD))
@@ -605,7 +703,7 @@ impl AppView {
                     .px(px(4.))
                     .bg(p.well_d)
                     .font_family(fonts::MONO)
-                    .text_px(size::META - 2.)
+                    .text_px(size::META)
                     .text_color(p.dim_t)
                     .debug_selector(move || format!("agent-chip {row}"))
                     .child("AGENT"),
@@ -630,7 +728,6 @@ impl AppView {
 
     /// A section's body in its kind's layout, in 20 px lines, at most
     /// [`ar::LINES`] (§4's overflow per kind).
-    #[allow(clippy::too_many_arguments)]
     fn rail_body(&self, s: &Shown, local: &Local, live: LiveId, streaming: bool, p: &Palette, cx: &Context<Self>) -> AnyElement {
         let b = &s.block;
         let row = crate::blocks::row_id(&b.id);
@@ -849,9 +946,10 @@ impl AppView {
         let r = &mut self.agent_rail;
         (r.lease.moved, r.lease.over) = (Some(now), true);
         if r.of != s {
-            // Another session's targets: none held.
-            (r.lease.hover, r.down, r.lease.note, r.lease.pressed) = (None, None, None, false);
-            r.lease.painted.borrow_mut().clear();
+            // Another session's press and note: none held.
+            if r.of.is_some() {
+                (r.lease.hover, r.down, r.lease.note, r.lease.pressed) = (None, None, None, false);
+            }
             r.of = s;
         }
         if !buttons && (self.agent_rail.lease.pressed || self.panes.iter().any(|p| p.lease.pressed)) {
@@ -1114,8 +1212,9 @@ impl Element for KeepY {
         match self.keep.get() {
             Some((_, y, until)) if self.now < until => {
                 if let Some(id) = self.mark.get() {
-                    // Its top as laid out, the panel unscrolled.
-                    let top = f32::from(window.layout_bounds(id).top());
+                    // Its top as laid out, the panel unscrolled (the
+                    // section's, below its margin).
+                    let top = f32::from(window.layout_bounds(id).top()) + ABOVE;
                     let off = self.scroll.offset();
                     let want = px((y - top).min(0.));
                     if want != off.y {

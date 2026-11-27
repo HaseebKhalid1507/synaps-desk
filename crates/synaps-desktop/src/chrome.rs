@@ -2516,6 +2516,7 @@ impl AppView {
         let tilde = |approx: bool| if approx { "~" } else { "" };
         let approx = tilde(ledger.approx());
         let mut files = v_flex()
+            .debug_selector(|| "right-files".into())
             .px(px(24.))
             .pt(px(24.))
             .pb(px(26.))
