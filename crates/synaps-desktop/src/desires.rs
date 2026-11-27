@@ -177,7 +177,7 @@ impl Desire {
 }
 
 /// The same wish: both none, or the same state at the same version.
-fn same(a: Option<&Desire>, b: Option<&Desire>) -> bool {
+pub(crate) fn same(a: Option<&Desire>, b: Option<&Desire>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => (a.dismissed, a.version) == (b.dismissed, b.version),

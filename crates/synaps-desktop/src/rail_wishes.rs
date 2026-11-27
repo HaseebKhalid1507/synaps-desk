@@ -25,8 +25,11 @@
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
 //!   tombstone ended; and only where its key is offered now (a block the
-//!   agent moved since is refused, [`MOVED_SINCE`]). A key's token names
-//!   its undo ([`UNDO_KEPT`] kept).
+//!   agent moved since is refused, [`MOVED_SINCE`]). An undo whose desire
+//!   is a write away puts its presentation back at once (the desire draws
+//!   as before until it is written); that write failing puts both back as
+//!   the key left them ([`Stores::undo_landed`]). A key's token names its
+//!   undo ([`UNDO_KEPT`] kept).
 //! - **Riding** ([`AppView::ride_notices`]): the composer's `Submit` (idle)
 //!   or `Steer` (a turn runs) carries what [`Desires::ride`] attaches; one
 //!   whose marks aren't written yet goes once they are ([`Landed::Send`]),
@@ -64,7 +67,7 @@ use synaps_client::blocks::{Drawn, Ref, Shown};
 use crate::agent_rail::{RailVisibility, Seen, Tomb};
 use crate::app::AppView;
 use crate::blockfiles::{NotOwned, Owned, Writer};
-use crate::desires::{Ask, Carry, Desire, Desires, Landed, Refused, Ride, Riding};
+use crate::desires::{Ask, Carry, Desire, Desires, Landed, Refused, Ride, Riding, same};
 use crate::live::LiveId;
 use crate::presentation::{Mark, Presentation};
 use crate::walk::{Aim, Asked, BlockDesires, Wish};
@@ -167,6 +170,8 @@ pub(crate) struct Stores {
     /// D7's undo of each key's change, by its token, oldest first.
     undos: VecDeque<(u64, Undo)>,
     next_undo: u64,
+    /// Undos whose desire's write is out, their presentation put back.
+    undoing: VecDeque<Undoing>,
     /// Tests: every message sent to a session, as it went.
     #[cfg(test)]
     pub(crate) outbox: Vec<String>,
@@ -192,6 +197,20 @@ struct Undo {
     r: Ref,
     pres: (Mark, Mark),
     desire: Option<(Generation, BlockId, Option<Desire>)>,
+}
+
+/// An undo's desire not written yet, its presentation put back already:
+/// if that write fails, and the desire is back to what the key left, the
+/// presentation goes back too ([`Stores::undo_landed`]).
+struct Undoing {
+    conv: String,
+    generation: Generation,
+    id: BlockId,
+    r: Ref,
+    /// The desire as the key left it.
+    left: Option<Desire>,
+    /// The presentation: put back to this, from this.
+    pres: (Mark, Mark),
 }
 
 /// A message waiting for its marks: its attachment, and whether a turn
@@ -249,6 +268,7 @@ impl Stores {
             said: None,
             undos: VecDeque::new(),
             next_undo: 0,
+            undoing: VecDeque::new(),
             #[cfg(test)]
             outbox: Vec::new(),
         }
@@ -463,21 +483,51 @@ impl BlockDesires for Stores {
             self.said = Some(format!("{}: {why}", u.r));
             return Asked::Refused(why.into());
         }
-        let (_, u) = self.undos.remove(k).expect("found");
-        if let Some((g, id, _)) = &u.desire {
+        if let Some((g, id, left)) = &u.desire {
             let shared = &aim.drawn.visibility;
             // The opposite wish: over one no notice went for, a cancel.
             let undone = match wish {
                 Wish::Dismiss => self.desires.show(&u.conv, g, id, shared),
                 _ => self.desires.dismiss(&u.conv, g, id, shared),
             };
-            if let Err(Refused(why)) = undone {
-                self.said = Some(format!("{id}: {why}"));
-                return Asked::Refused(why);
+            match undone {
+                Err(Refused(why)) => {
+                    self.said = Some(format!("{id}: {why}"));
+                    return Asked::Refused(why);
+                }
+                // A write away, and the presentation with it.
+                Ok(Ask::Saving) if u.pres.0 != u.pres.1 => {
+                    let (conv, id, r, left, pres) = (u.conv.clone(), id.clone(), u.r.clone(), left.clone(), u.pres.clone());
+                    self.undoing.push_back(Undoing { conv, generation: *g, id, r, left, pres });
+                    if self.undoing.len() > UNDO_KEPT {
+                        self.undoing.pop_front();
+                    }
+                }
+                Ok(_) => {}
             }
         }
+        let (_, u) = self.undos.remove(k).expect("found");
         self.pres.put_back(&u.conv, &u.r, &u.pres.0);
         Asked::Done(token)
+    }
+}
+
+impl Stores {
+    /// A desire's write landed (`kept`) or failed: an undo it carried
+    /// stands, or, the desire back to what its key left, its presentation
+    /// goes back too (unless it changed since): all of it, or nothing.
+    pub(crate) fn undo_landed(&mut self, conv: &str, id: &BlockId, kept: bool) {
+        let (mine, rest): (VecDeque<Undoing>, VecDeque<Undoing>) =
+            std::mem::take(&mut self.undoing).into_iter().partition(|u| u.conv == conv && u.id == *id);
+        self.undoing = rest;
+        if kept {
+            return;
+        }
+        for u in mine.into_iter().rev() {
+            if same(self.desires.wish(&u.conv, &u.generation, &u.id), u.left.as_ref()) && self.pres.mark(&u.conv, &u.r) == u.pres.0 {
+                self.pres.put_back(&u.conv, &u.r, &u.pres.1);
+            }
+        }
     }
 }
 
@@ -665,8 +715,12 @@ impl AppView {
     fn wishes_landed(&mut self, landed: Vec<Landed>, cx: &mut Context<Self>) {
         for l in landed {
             match l {
-                Landed::Wish { id, done: Err(Refused(why)), .. } => self.wishes.said = Some(format!("{id}: {why}")),
-                Landed::Wish { .. } => {}
+                Landed::Wish { conv, id, done } => {
+                    self.wishes.undo_landed(&conv, &id, done.is_ok());
+                    if let Err(Refused(why)) = done {
+                        self.wishes.said = Some(format!("{id}: {why}"));
+                    }
+                }
                 Landed::Send { ticket, ride } => {
                     if let Some(w) = self.wishes.waiting.remove(&ticket) {
                         self.send_ride(ticket, w.seq, w.busy, ride);

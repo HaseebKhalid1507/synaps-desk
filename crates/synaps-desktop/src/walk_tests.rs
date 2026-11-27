@@ -1040,6 +1040,88 @@ fn ctrl_z_is_refused_where_its_key_isnt_offered(cx: &mut TestAppContext) {
     assert_eq!(sent.last().map(String::as_str), Some("go on"), "no notice rode: {sent:?}");
 }
 
+/// Soft dismissals of `ids` carried into the pane's conversation (a
+/// compaction's), written.
+fn softly(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ids: &[String]) {
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let ids: Vec<_> = ids.iter().map(|i| cards_spec::block::BlockId::parse(i).expect("an id")).collect();
+        v.wishes.pres.compacted("before-compaction", &conv, &ids);
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, view);
+}
+
+fn is_soft(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> bool {
+    view.read_with(cx, |v, _| {
+        v.wishes.pres.soft(&v.conversation(v.panes.cur.live), &cards_spec::block::BlockId::parse(name).expect("an id"))
+    })
+}
+
+/// `r1` and `r2` soft tombstones, and `x` on `r1`'s: its dismissal
+/// written, its tombstone ended.
+fn x_on_a_tombstone(cx: &mut TestAppContext) -> W {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    softly(cx, w, &view, &["r1".into(), "r2".into()]);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "dismissed");
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "a desire, and its tombstone ended");
+    (w, view)
+}
+
+/// Shady #106 P2-2: Ctrl+Z of `x` on a soft tombstone is both stores'
+/// (the dismissal cancelled, the tombstone back). The disk refusing the
+/// desire's write puts the presentation back too: both as `x` left them,
+/// in memory, on the rail and in the files; its token gone.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn an_undo_whose_desire_isnt_written_leaves_both_stores_as_its_key_did(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "r1"), None, "still dismissed");
+    assert_eq!(desires(cx, &view), 1, "the dismissal, as x left it");
+    assert!(!is_soft(cx, &view, "r1"), "and its tombstone, as x left it: ended");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "its token went: nothing again");
+    // The disk back as x wrote it: a restart reads both as x left them.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"));
+}
+
+/// Shady #106 P2-2: the same undo, its write late: until it lands the
+/// rail draws what `x` left; then both stores, the rail and the files are
+/// what was before `x`, together.
+#[gpui_kit::test]
+fn a_late_undo_puts_both_stores_back_together(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert_eq!(sec(cx, &view, "r1"), None, "not written yet: the dismissal draws");
+    release(cx, w, &view, hold);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "undone: its tombstone");
+    assert!(desires(cx, &view) == 0 && is_soft(cx, &view, "r1"), "both stores");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "and the files");
+    assert_eq!(desires(cx, &view), 0);
+}
+
 // ── the op log ────────────────────────────────────────────────────────
 
 fn oplog_lines(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
