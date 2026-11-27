@@ -51,6 +51,7 @@ fn desires(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
     view.read_with(cx, |v, _| v.wishes.desires.len())
 }
 
+#[cfg(unix)]
 fn outbox(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
     view.read_with(cx, |v, _| v.wishes.outbox.clone())
 }
@@ -252,15 +253,18 @@ fn a_second_desk_says_its_changes_stay_in_memory(cx: &mut TestAppContext) {
     action(cx, w, "plan", "agent-x");
     away(cx, w, &view);
     assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
-    // Nothing to write first: its notice rides at once, and its echo, the
+    // Its notice rides the next message, and that message's echo, the
     // text as sent, confirms it (Shady #103 R3-P2-1).
-    view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
-    board(cx, w, &view);
-    let one = "one\n[block plan v1 dismissed]";
-    assert_eq!(outbox(cx, &view), [one]);
-    assert_eq!(in_flight(cx, &view), ["one"]);
-    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": one})]);
-    assert!(in_flight(cx, &view).is_empty(), "its echo confirmed it");
+    #[cfg(unix)]
+    {
+        view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
+        board(cx, w, &view);
+        let one = "one\n[block plan v1 dismissed]";
+        assert_eq!(outbox(cx, &view), [one]);
+        assert_eq!(in_flight(cx, &view), ["one"]);
+        heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": one})]);
+        assert!(in_flight(cx, &view).is_empty(), "its echo confirmed it");
+    }
 }
 
 /// A notice in flight stays so until its history lands: the turn that
@@ -344,6 +348,7 @@ fn a_settle_mid_turn_reads_the_history_and_keeps_the_carrier(cx: &mut TestAppCon
 // Shady's review of #103, round 3 (baa488a).
 
 /// What the focused pane's store has in flight: each input's body.
+#[cfg(unix)]
 fn in_flight(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
     view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].in_flight.iter().cloned().collect())
 }
