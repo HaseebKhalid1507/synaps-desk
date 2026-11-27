@@ -227,6 +227,8 @@ impl Stored for Book {
                     None => bad += 1,
                 }
             }
+            // A counter behind its entries (an older desk's undo): past them.
+            conv.seq = conv.seq.max(conv.entries.iter().map(|k| k.seq).max().unwrap_or(0));
             book.conversations.insert(key.clone(), conv);
         }
         Ok((book, bad))
@@ -577,6 +579,9 @@ impl Presentation {
         let c = next.conversations.entry(conv.to_string()).or_default();
         c.entries.retain(|k| !k.entry.of(r));
         c.entries.extend(was.0.iter().cloned());
+        // The counter past what came back (an emptied conversation's
+        // starts again): what the user does next sorts after it.
+        c.seq = c.seq.max(was.0.iter().map(|k| k.seq).max().unwrap_or(0));
         next.stamp(conv);
         next.fit();
         let kept = next.conversations.get(conv).map(|c| c.entries.iter().filter(|k| k.entry.of(r)).cloned().collect());

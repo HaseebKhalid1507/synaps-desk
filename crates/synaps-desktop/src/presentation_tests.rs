@@ -320,6 +320,20 @@ fn putting_back_keeps_what_it_puts_back_or_changes_nothing() {
     assert!(!p.book.conversations.contains_key("k000"), "the least recently touched went");
 }
 
+/// Shady #106 P2-4: a counter behind its entries in the file (an older
+/// desk's undo wrote it) is read past them: the next placement sorts last.
+#[test]
+fn a_counter_behind_its_entries_is_read_past_them() {
+    let d = dir("seq");
+    let entry = json!({"ref": "plan", "to": "upper", "pin": 1, "agent": "t0", "seq": 3});
+    let text = json!({"version": FORMAT, "conversations": {J: {"touched": 1, "seq": 0, "entries": [entry]}}});
+    std::fs::write(d.join(FILE), text.to_string()).unwrap();
+    let mut p = presentation(&d);
+    let h = H::with(&["plan", "b1"]);
+    pin(&mut p, &h, "b1").unwrap();
+    assert_eq!(p.user_rail(J), [(r("plan"), Slot::Upper), (r("b1"), Slot::Upper)]);
+}
+
 /// One writer: a second store of the file (another process, here another
 /// in this one) doesn't get its lock, and keeps its placements in memory
 /// only: drawn at once, never written, the file untouched; said. Once the

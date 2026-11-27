@@ -1201,6 +1201,49 @@ fn an_undo_of_both_stores_the_caps_would_drop_changes_neither(cx: &mut TestAppCo
     assert!(said(cx, &view).contains("no room to put it back"), "refused, said: {}", said(cx, &view));
 }
 
+/// Shady #106 P2-4: an undo that brings an emptied conversation back
+/// keeps its counter past what it puts back. `c` pinned and moved twice
+/// (its entry the conversation's third), unpinned (the conversation
+/// gone), Ctrl+Z; after a restart `b` pinned into the same slot sorts
+/// after `c`, and `c`, the older, is the first the cap drops.
+#[gpui_kit::test]
+fn an_undo_keeps_the_conversations_order_past_a_restart(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::End, true, false)));
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)));
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert!(sec(cx, &view, "c").is_none() && entries(cx, &view) == 0, "unpinned: the conversation's last");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "undone");
+    press(cx, w, "escape");
+    restart(cx, w, &view);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("b")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    let rail = view.read_with(cx, |v, _| v.wishes.pres.user_rail(&v.conversation(v.panes.cur.live)));
+    let (c, b) = (Ref::parse("c").expect("an id"), Ref::parse("b").expect("an id"));
+    assert_eq!(rail, [(c, Slot::Upper), (b, Slot::Upper)], "c, the older, first");
+    // One past the cap: the oldest goes.
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    assert_eq!(sec(cx, &view, "c"), None, "c went first");
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b stays");
+}
+
 // ── the op log ────────────────────────────────────────────────────────
 
 fn oplog_lines(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
