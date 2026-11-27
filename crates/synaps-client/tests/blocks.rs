@@ -1185,7 +1185,7 @@ fn the_same_input_again_is_one_allocation() {
     let lost = alive.iter().filter(|a| !rows.iter().any(|r| Arc::ptr_eq(a, r))).count();
     assert_eq!(lost, 0, "{} inputs alive for {calls} rows: {lost} no row's (uncounted)", alive.len());
     let kept: usize = d.t.items().iter().map(|i| i.kept_bytes()).sum();
-    let distinct: usize = rows.iter().map(|r| std::mem::size_of::<Value>() + synaps_client::blocks::value_bytes(r)).sum();
+    let distinct: usize = rows.iter().map(|r| synaps_client::blocks::kept_bytes(r)).sum();
     assert_eq!(kept, distinct, "the rows count every allocation once");
     drop((rows, alive));
     drop(d);

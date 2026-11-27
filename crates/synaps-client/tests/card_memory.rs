@@ -4,7 +4,7 @@
 //! draws (the rows keep those); counted (`Transcript::card_sync_bytes`);
 //! and let go as soon as it can't be used: a detach, a trim, a tab cached.
 //!
-//! The heap is counted by the allocator below, by thread, two ways:
+//! The heap is counted by the allocator ([`heap`]), by thread, two ways:
 //! - [`held`]: each block is charged to the account of the thread that
 //!   allocated it ([`mine`]: each test's its own) and taken off that
 //!   account wherever it is freed. What a test's transcript still holds,
@@ -23,102 +23,15 @@
 //! too. With the disposer held, what it was handed stays this account's
 //! until it drains ([`a_trim_with_the_disposer_held_frees_its_inputs_once_it_drains`]).
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::alloc::{GlobalAlloc, Layout};
 
 use serde_json::{Value, json};
 use synaps_client::blocks::dispose::Disposer;
 use synaps_client::protocol::*;
 use synaps_client::transcript::Transcript;
 
-struct Counting;
-
-/// The accounts: the bytes each holds. 0: the threads that took none.
-static HELD: [AtomicIsize; 64] = [const { AtomicIsize::new(0) }; 64];
-static NEXT: AtomicUsize = AtomicUsize::new(1);
-
-thread_local! {
-    static ACCOUNT: Cell<usize> = const { Cell::new(0) };
-    static HERE: Cell<isize> = const { Cell::new(0) };
-}
-
-/// A block of `l` and its account before it: the block's alignment (a
-/// word at least) of room, the account at its start. None: too big.
-fn outer(l: Layout) -> Option<(Layout, usize)> {
-    let room = l.align().max(std::mem::size_of::<usize>());
-    Some((Layout::from_size_align(l.size().checked_add(room)?, room).ok()?, room))
-}
-
-/// `l`'s block at `base` (null: none), charged to this thread's account.
-unsafe fn opened(base: *mut u8, l: Layout, room: usize) -> *mut u8 {
-    if base.is_null() {
-        return base;
-    }
-    let account = ACCOUNT.get();
-    unsafe { (base as *mut usize).write(account) };
-    HELD[account].fetch_add(l.size() as isize, Ordering::Relaxed);
-    HERE.set(HERE.get() + l.size() as isize);
-    unsafe { base.add(room) }
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
-        unsafe { opened(System.alloc(o), l, room) }
-    }
-    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
-        unsafe { opened(System.alloc_zeroed(o), l, room) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        let (o, room) = outer(l).expect("a block allocated");
-        let base = unsafe { p.sub(room) };
-        let account = unsafe { (base as *const usize).read() };
-        HELD[account].fetch_sub(l.size() as isize, Ordering::Relaxed);
-        HERE.set(HERE.get() - l.size() as isize);
-        unsafe { System.dealloc(base, o) };
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        let (o, room) = outer(l).expect("a block allocated");
-        // The block it grows to, room added, must be a layout too: if not,
-        // none, and `p` is left as it was.
-        let Some((grown, _)) = Layout::from_size_align(size, l.align()).ok().and_then(outer) else {
-            return std::ptr::null_mut();
-        };
-        let base = unsafe { p.sub(room) };
-        let account = unsafe { (base as *const usize).read() };
-        let q = unsafe { System.realloc(base, o, grown.size()) };
-        if q.is_null() {
-            return q;
-        }
-        // The block's account is the one it was allocated on, moved with it.
-        HELD[account].fetch_add(size as isize - l.size() as isize, Ordering::Relaxed);
-        HERE.set(HERE.get() + size as isize - l.size() as isize);
-        unsafe { q.add(room) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// This thread's own account, from now on (a test's first line).
-fn mine() {
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    assert!(n < HELD.len(), "more tests than accounts");
-    ACCOUNT.set(n);
-}
-
-/// The bytes this thread's account holds: what it allocated (since
-/// [`mine`]) and is not freed, wherever it is freed.
-fn held() -> isize {
-    HELD[ACCOUNT.get()].load(Ordering::Relaxed)
-}
-
-/// The bytes this thread allocated less those it freed, whoever's.
-fn here() -> isize {
-    HERE.get()
-}
+mod heap;
+use heap::{COUNTING, held, here, mine, outer};
 
 /// [`held`] once `d` has dropped all it was handed before (a hold of it
 /// standing, this waits for the hold to go: drop it first).

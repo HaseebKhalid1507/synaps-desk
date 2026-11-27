@@ -360,7 +360,7 @@ impl Item {
     /// What its kept input holds (bytes, heap included: [`Item`]'s
     /// `kept_input`, a card or block call's input whole).
     pub fn kept_bytes(&self) -> usize {
-        self.kept_input.as_deref().map_or(0, |v| std::mem::size_of::<Value>() + crate::blocks::value_bytes(v))
+        self.kept_input.as_deref().map_or(0, crate::blocks::kept_bytes)
     }
 
     /// A notice or error this client added (not part of the history).

@@ -362,15 +362,109 @@ impl HistoryBlocks {
     }
 }
 
-/// What JSON value `v` holds on the heap (bytes, roughly: its strings, and
-/// its arrays' and maps' slots).
+/// What JSON value `v` holds on the heap (bytes, as asked of the allocator:
+/// the sizes of its blocks' layouts, never less), for a value as parsing
+/// or a clone leaves it (every value an input is kept as: a clone of the
+/// one parsed off the wire). A string's and an array's room is read, not
+/// assumed: their capacities (a clone's is its length, a parse's what its
+/// pushes grew to). A map's room can't be read (`serde_json::Map` has no
+/// capacity): its storage is `map_bytes` for its length, every way such
+/// a map is built, then its keys' and values' own. The allocator's own
+/// bookkeeping per block is not counted, as nowhere in the app.
+/// `tests/json_memory.rs` checks it against a counting allocator, both map
+/// backends: parsed, cloned and kept, every shape at least what it
+/// allocates; maps exactly, length by length.
 pub fn value_bytes(v: &Value) -> usize {
     match v {
         Value::String(s) => s.capacity(),
         Value::Array(a) => a.capacity() * std::mem::size_of::<Value>() + a.iter().map(value_bytes).sum::<usize>(),
-        Value::Object(m) => m.iter().map(|(k, v)| k.capacity() + std::mem::size_of::<(String, Value)>() + 16 + value_bytes(v)).sum(),
+        Value::Object(m) => map_bytes(m.len()) + m.iter().map(|(k, v)| k.capacity() + value_bytes(v)).sum::<usize>(),
         _ => 0,
     }
+}
+
+/// What a kept input holds (bytes, heap included: [`Item::kept_bytes`],
+/// a live call's): its `Arc`'s block (two counts and the value), then
+/// what the value holds ([`value_bytes`]).
+pub fn kept_bytes(v: &Value) -> usize {
+    /// `Arc<Value>`'s block (std's `ArcInner`): its strong and weak counts.
+    #[allow(dead_code)]
+    struct ArcBlock(usize, usize, Value);
+    std::mem::size_of::<ArcBlock>() + value_bytes(v)
+}
+
+/// serde_json's maps keep their order (its `preserve_order`, the desk's
+/// through GPUI): an `IndexMap` each. If not (the client built alone), a
+/// `BTreeMap`. Asked of serde_json itself, once.
+fn ordered_maps() -> bool {
+    static ORDERED: LazyLock<bool> = LazyLock::new(|| {
+        let mut m = serde_json::Map::new();
+        m.insert("b".into(), Value::Null);
+        m.insert("a".into(), Value::Null);
+        m.keys().next().is_some_and(|k| k == "b")
+    });
+    *ORDERED
+}
+
+/// A JSON map's storage for `n` entries (bytes, as allocated; its keys'
+/// and values' own heap not included), as every way a map is built leaves
+/// it: parsing (`Map::new`, one insert at a time), a clone, `json!`,
+/// `to_value` (`Map::with_capacity` of its length). Never one emptied by
+/// removals (nothing here removes from a kept input). The locked crates'
+/// layouts, mirrored below so the compiler sizes them:
+/// - **`IndexMap`** (indexmap 2.14.2, hashbrown 0.17.1): its entries and
+///   their index table. The table has hashbrown's fewest buckets for `n`
+///   (`raw.rs` `capacity_to_buckets`, its minimum of 3 for a `usize`
+///   index: 4 buckets; inserts grow it no further, and a clone copies it).
+///   The entries are as many as the table can hold, not `n`: an insert
+///   reserves entries up to the table's capacity (`inner.rs`
+///   `push_entry`, `reserve_entries`), and so does a clone
+///   (`Core::clone_from`): a singleton map has room for 3. Each entry is
+///   its hash, key and value (`Bucket`). The table is a `usize` per
+///   bucket, then a control byte per bucket and a group's more
+///   (`TableLayout::calculate_layout_for`; the group is 16 bytes with
+///   SSE2, 8 otherwise: 16 is charged).
+/// - **`BTreeMap`** (std): its nodes, 11 entries' room each, however few
+///   it holds: a map of 11 or fewer is one leaf. Past that, every node
+///   but the root holds 5 or more (std's `MIN_LEN`, kept by every insert,
+///   removal and clone), so a map of `n` has `1 + (n - 1) / 5` nodes at
+///   most, each charged as an internal node (a leaf and its 12 edges).
+///
+/// `tests/json_memory.rs` measures both against a counting allocator:
+/// equal for every `n` to 300 (`IndexMap`; `BTreeMap` to 11), at least
+/// the allocation past that.
+fn map_bytes(n: usize) -> usize {
+    use std::mem::{MaybeUninit, size_of};
+    use std::ptr::NonNull;
+    /// indexmap's entry.
+    #[allow(dead_code)]
+    struct Bucket(usize, String, Value);
+    /// std's `LeafNode<String, Value>` and `InternalNode`.
+    #[allow(dead_code)]
+    struct Leaf {
+        parent: Option<NonNull<u8>>,
+        parent_idx: MaybeUninit<u16>,
+        len: u16,
+        keys: [MaybeUninit<String>; 11],
+        vals: [MaybeUninit<Value>; 11],
+    }
+    #[allow(dead_code)]
+    struct Internal(Leaf, [MaybeUninit<NonNull<u8>>; 12]);
+    const GROUP: usize = 16;
+    if n == 0 {
+        return 0;
+    }
+    if !ordered_maps() {
+        return if n <= 11 { size_of::<Leaf>() } else { (1 + (n - 1) / 5) * size_of::<Internal>() };
+    }
+    let buckets = match n {
+        0..4 => 4,
+        4..8 => 8,
+        8..15 => 16,
+        _ => (n * 8 / 7).next_power_of_two(),
+    };
+    let entries = if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 };
+    entries * size_of::<Bucket>() + (buckets * size_of::<usize>()).next_multiple_of(GROUP) + buckets + GROUP
 }
 
 /// What event `e` keeps, heap included (bytes).
@@ -1041,7 +1135,7 @@ impl Round {
     fn walk(&self) -> usize {
         let strs: usize = self.calls.iter().map(|c| c.tool_id.capacity() + c.name.capacity()).sum::<usize>()
             + self.ids.keys().map(String::capacity).sum::<usize>();
-        let inputs: usize = self.calls.iter().filter_map(|c| c.input.as_deref()).map(input_size).sum();
+        let inputs: usize = self.calls.iter().filter_map(|c| c.input.as_deref()).map(kept_bytes).sum();
         self.calls.capacity() * std::mem::size_of::<LiveCall>()
             + strs
             + inputs
@@ -1098,11 +1192,6 @@ impl Round {
         c.size = size;
         std::mem::replace(&mut c.input, input)
     }
-}
-
-/// What a call's input keeps, heap included (bytes).
-fn input_size(v: &Value) -> usize {
-    std::mem::size_of::<Value>() + value_bytes(v)
 }
 
 /// A round's calls, ids and rows go off the frame ([`dispose`]): whatever
@@ -1172,7 +1261,7 @@ struct LiveCall {
     name: String,
     /// A card's or block's input, whole ([`keeps_input`]): its row's.
     input: Option<Arc<Value>>,
-    /// Its input's bytes, heap included ([`input_size`]; none, 0).
+    /// Its input's bytes, heap included ([`kept_bytes`]; none, 0).
     size: usize,
     /// Its input is whole (`ToolUse`).
     whole: bool,
@@ -1554,7 +1643,7 @@ impl LiveLog {
         let s = &mut *held;
         let mut moved = self.opened(s) | (was != self.blocks);
         let r = self.open.as_mut().expect("opened");
-        let size = input.as_deref().map_or(0, input_size);
+        let size = input.as_deref().map_or(0, kept_bytes);
         let fact = |input: &Option<Arc<Value>>| Fact::Call { tool_id: tool_id.into(), name: name.into(), input: input.clone(), row, size };
         let mut kept = input.clone();
         match r.rows.get(&row).copied() {

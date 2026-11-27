@@ -454,3 +454,39 @@ fn a_gap_draws_nothing_until_another_epoch() {
     assert!(fresh.run(&Input::of(&again, &LiveLog::default()).unwrap(), &mut || true).is_some());
     assert!(!fresh.gap());
 }
+
+/// Shady #101 R7 (hardening): an unwind while a store's real lock is held
+/// ([`hold`]) and something is set aside under it (dropped in place: here
+/// a bin with no disposer, as refused or closed) still drops it after the
+/// lock is let go, never under it, as the stack unwinds ([`Held`]'s
+/// fields: the lock, then the guard that drains the spill). It leaves the
+/// thread holding no lock and nothing set aside, and the store usable.
+#[test]
+fn an_unwind_under_a_stores_lock_drops_what_it_set_aside_after_the_lock() {
+    use std::sync::atomic::AtomicU8;
+    use std::sync::{TryLockError, Weak};
+    /// Dropped: 1 with the store's lock free, 2 under it (0: not yet).
+    struct Payload(Weak<Mutex<Store>>, Arc<AtomicU8>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            let store = self.0.upgrade().expect("the store outlives it");
+            let under = matches!(store.try_lock(), Err(TryLockError::WouldBlock));
+            self.1.store(if under { 2 } else { 1 }, Ordering::SeqCst);
+        }
+    }
+    let store = Arc::new(Mutex::new(Store::in_bin(dispose::Bin::default())));
+    let seen = Arc::new(AtomicU8::new(0));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = hold(&store);
+        dispose::Bin::default().retire(Payload(Arc::downgrade(&store), seen.clone()), 1, 64);
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "set aside under the lock, not dropped");
+        panic!("an unwind, the store's lock and what it set aside live");
+    }));
+    assert!(unwound.is_err(), "it unwound");
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "dropped as the stack unwound, after the lock was let go (2: under it)");
+    let again = Arc::new(AtomicU8::new(0));
+    dispose::Bin::default().retire(Payload(Arc::downgrade(&store), again.clone()), 1, 64);
+    assert_eq!(again.load(Ordering::SeqCst), 1, "no lock left counted on the thread: dropped at once");
+    // Poisoned by the unwind, taken anyway.
+    drop(hold(&store));
+}

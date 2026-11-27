@@ -39,29 +39,32 @@
 //! holds is let go, then goes, in the order it was let go.
 //!
 //! **Charged until dropped.** What it holds is charged, heap included, as
-//! allocated, from its hand-over until the disposer has dropped all of it
-//! ([`Backlog::bytes`]): the charge goes after the drop, never before, and
-//! it is part of what the app retains besides its tabs' counts. Every
-//! owner retired on its own is charged with all it keeps, its payload
+//! asked of the allocator (its blocks' layouts: a JSON input's by its
+//! representation, [`super::value_bytes`], checked against a counting
+//! allocator; the allocator's own per-block bookkeeping is not counted, as
+//! nowhere in the app), from its hand-over until the disposer has dropped
+//! all of it ([`Backlog::bytes`]): the charge goes after the drop, never
+//! before, and it is part of what the app retains besides its tabs' counts.
+//! Every owner retired on its own is charged with all it keeps, its payload
 //! included: a round with its calls' inputs, a reset with its round's and
 //! its facts', a store with its facts', a log with its rounds' and its
 //! store's. A unit is retired whole (a reset's round, facts and results
 //! together; a log's store moved into its unit, never a second handle to
 //! it), so no owner of a payload outlives the charge that covers it, the
-//! order the queue drops them in aside. A store a job
-//! still reads when its log goes is charged from then on ([`Bin::charge`],
-//! the charge kept with the store), until its last reader lets go and the
-//! disposer drops it. That charge is taken whatever the cap (the store is
-//! alive either way): it can pass [`MAX_BYTES`] by those stores, one a job
-//! running at most, and nothing new is admitted until it is back under.
-//! A job's batch of a store's handles ([`super::COPY`] at most, for as
-//! long as it makes them events) is the job's working set, not charged
-//! here. The estimates overcount on purpose where an allocation is
-//! shared: a retired call's input is charged whether or not a row still
-//! keeps it (a history landing keeps its rows), once by each owner retired
-//! with it (a round's call and its fact keep one input: a reset charges
-//! it twice), and a hash table is charged by hashbrown's layout for its
-//! capacity. They never undercount what the disposer holds.
+//! order the queue drops them in aside. A store a job still reads when its
+//! log goes is charged from then on ([`Bin::charge`], the charge kept with
+//! the store), until its last reader lets go and the disposer drops it.
+//! That charge is taken whatever the cap (the store is alive either way):
+//! it can pass [`MAX_BYTES`] by those stores, one a job running at most,
+//! and nothing new is admitted until it is back under. A job's batch of a
+//! store's handles ([`super::COPY`] at most, for as long as it makes them
+//! events) is the job's working set, not charged here. The estimates
+//! overcount on purpose where an allocation is shared: a retired call's
+//! input is charged whether or not a row still keeps it (a history landing
+//! keeps its rows), once by each owner retired with it (a round's call and
+//! its fact keep one input: a reset charges it twice), a hash table is
+//! charged by hashbrown's layout for its capacity, and a JSON map by its
+//! backend's for its length. They never undercount what the disposer holds.
 //!
 //! A thread's own share of destruction is counted ([`destroyed`]): a
 //! hand-over is one element, whatever it holds; what a thread drops in
