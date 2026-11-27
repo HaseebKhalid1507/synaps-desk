@@ -2775,14 +2775,14 @@ impl AppView {
         // waits for Linux's bus task to close them, within GPUI's shutdown
         // allowance.
         // The rail's stores (D6b): each file's last snapshot handed to the
-        // process's writer, which the app's shutdown waits for (quitting
-        // waits here too, within GPUI's allowance).
+        // process's writer, which the app's quit waits for, this window
+        // open or not (`rail_wishes::Home::on_quit`).
         subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            drop(this.flush_wishes());
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
@@ -2791,12 +2791,9 @@ impl AppView {
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
-            let wrote = this.flush_wishes();
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
-            async move {
-                gone.wait().await;
-                let _ = wrote.recv().await;
-            }
+            async move { gone.wait().await }
         }));
         // The dash poll waits while the window is in the background.
         // And a card a notification landed on is entered as it comes up.

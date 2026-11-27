@@ -432,6 +432,17 @@ impl Presentation {
         self.sweep = false;
     }
 
+    /// The writer took no more (`why`: it didn't start, or stopped): the
+    /// file isn't this desk's to write from now (memory only, and why);
+    /// the write out, if any, is gone, and memory keeps it all.
+    pub(crate) fn writer_lost(&mut self, why: &str) {
+        if self.owner.is_ok() {
+            self.owner = Err(NotOwned::Failed(why.to_string()));
+        }
+        self.sweep = false;
+        self.out = None;
+    }
+
     /// A write as it ran. Failed: said, and memory keeps it all.
     pub(crate) fn landed(&mut self, l: Landing) -> Result<(), String> {
         if self.out != Some(l.ticket) {

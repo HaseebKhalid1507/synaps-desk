@@ -648,6 +648,26 @@ impl Desires {
         self.sweep = false;
     }
 
+    /// The writer took no more (`why`: it didn't start, or stopped): the
+    /// file isn't this desk's to write from now (memory only, and why), and
+    /// memory is all there is: what a write out carried, and what changed
+    /// since, lands as kept, and the messages waiting for it go.
+    pub(crate) fn writer_lost(&mut self, why: &str) -> Vec<Landed> {
+        if self.owner.is_ok() {
+            self.owner = Err(NotOwned::Failed(why.to_string()));
+        }
+        self.sweep = false;
+        let ticket = match self.out {
+            Some(t) => t,
+            None => {
+                self.next_ticket += 1;
+                self.next_ticket
+            }
+        };
+        self.out = Some(ticket);
+        self.landed(Landing { ticket, seq: self.seq, sweep: false, done: Ok(None) })
+    }
+
     /// A write as it ran ([`Write::run`]): the wishes it carried draw (or,
     /// failed, are refused, what drew before drawn again), and the messages
     /// whose turn came go.

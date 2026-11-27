@@ -361,11 +361,14 @@ impl Input {
     }
 }
 
-/// Input sent and not yet confirmed, oldest first, each with what sent it
+/// Input sent and not yet confirmed, each with what sent it
 /// (split/architecture.md §6.5): a refusal or a detach gives it back to
 /// that pane's composer, never another's, or to its card. Its echo
 /// confirms it by the text as sent ([`Input::echoed`]), never the body
-/// alone.
+/// alone. The inputs sent are in the order they went on the wire (one
+/// that waited for its marks takes its place when it goes, behind what
+/// went before it: Shady #103 R4-P2-1), so the oldest sent is the one the
+/// daemon handles first; one still waiting has no place in that order.
 #[derive(Default, Debug)]
 pub(crate) struct InFlight(VecDeque<Input>);
 
@@ -403,18 +406,12 @@ impl InFlight {
         }
     }
 
-    /// The input waiting on `ticket` went as `wire` (its echo's text now),
-    /// or wasn't sent (`None`): no longer in flight, what sent it and its
-    /// text, to give back.
+    /// The input waiting on `ticket` went as `wire` (its echo's text now):
+    /// sent now, behind every input that went before it, whenever it was
+    /// typed. Or it wasn't sent (`None`): no longer in flight, what sent it
+    /// and its text, to give back.
     pub(crate) fn went(&mut self, ticket: u64, wire: Option<String>) -> Option<(Target, String)> {
-        let i = self.0.iter().position(|i| i.wire == Err(ticket))?;
-        match wire {
-            Some(w) => {
-                self.0[i].wire = Ok(w);
-                None
-            }
-            None => self.0.remove(i).map(|i| (i.to, i.body)),
-        }
+        went(&mut self.0, ticket, wire)
     }
 
     /// Pane `from` left the store (closed, or on another session now):
@@ -428,6 +425,21 @@ impl InFlight {
     /// Everything, oldest first; none left.
     pub(crate) fn take(&mut self) -> Vec<Input> {
         std::mem::take(&mut self.0).into()
+    }
+}
+
+/// [`InFlight::went`] on `inputs` (a live store's, or an attachment's a
+/// tab switch left, [`crate::model::Model::left_went`]).
+pub(crate) fn went(inputs: &mut VecDeque<Input>, ticket: u64, wire: Option<String>) -> Option<(Target, String)> {
+    let i = inputs.iter().position(|i| i.wire == Err(ticket))?;
+    let mut input = inputs.remove(i)?;
+    match wire {
+        Some(w) => {
+            input.wire = Ok(w);
+            inputs.push_back(input);
+            None
+        }
+        None => Some((input.to, input.body)),
     }
 }
 

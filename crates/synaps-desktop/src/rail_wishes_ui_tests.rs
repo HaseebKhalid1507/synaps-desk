@@ -810,3 +810,190 @@ fn a_resend_after_a_restart_is_confirmed_by_its_echo(cx: &mut TestAppContext) {
     heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": two})]);
     assert_eq!(in_flight(cx, &view), ["one"], "its echo, the text as sent, confirmed it");
 }
+
+// Shady's review of #103, round 4 (2ae2b6e).
+
+/// A folder of the test home's own, new, and its two files' paths.
+#[cfg(unix)]
+fn files(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = crate::theme::test_home::root().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the folder");
+    (dir.join(crate::desires::FILE), dir.join(crate::presentation::FILE))
+}
+
+/// R4-P2-2: a writer that takes nothing (shut down: one whose thread
+/// stopped takes nothing either) never has a disk job run in its place,
+/// on this thread or any. The desk keeps its rail in memory only and says
+/// so; a dismissal draws, its notice rides the next message at once, and
+/// the window's end hands nothing over.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_writer_that_takes_nothing_runs_no_disk_job_here(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let (path, ppath) = files("writer-off");
+    let mut home = crate::rail_wishes::Home::take(Some(path.clone()), Some(ppath.clone()));
+    let writer = crate::blockfiles::Writer::start();
+    assert!(writer.shutdown());
+    home.writer = writer;
+    let before = crate::blockfiles::on_this_thread();
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    away(cx, w, &view);
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
+    let said = view.read_with(cx, |v, _| v.wishes.memory_only()).expect("memory only, said");
+    assert!(said.contains(crate::rail_wishes::MEMORY_ONLY) && said.contains("its writer shut down"), "{said}");
+    assert!(has(cx, w, format!("agent-memory {}", crate::ask::shown(&said, cards_spec::Lines::Single))), "on the rail");
+    view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
+    board(cx, w, &view);
+    assert_eq!(outbox(cx, &view), ["one\n[block plan v1 dismissed]"], "it rode at once");
+    view.update(cx, |v, _| {
+        v.flush_wishes();
+    });
+    assert_eq!(crate::blockfiles::on_this_thread(), before, "no disk job ran here");
+    assert!(!path.exists() && !ppath.exists(), "nor anywhere");
+}
+
+/// R4-P2-2: a writer whose thread didn't start takes no lock (another
+/// desk may have the files) and runs nothing: memory only from the
+/// launch, and why; the app's quit has nothing to wait for.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_writer_that_didnt_start_takes_no_lock_and_keeps_the_rail_in_memory(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let (path, ppath) = files("writer-never");
+    let writer = crate::blockfiles::Writer::start_with(crate::blockfiles::JOIN, |_| Err(std::io::Error::other("no threads left")));
+    let home = crate::rail_wishes::Home::with(Some(path.clone()), Some(ppath.clone()), writer.clone());
+    let before = crate::blockfiles::on_this_thread();
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    away(cx, w, &view);
+    assert!(crate::blockfiles::own(&path).is_ok(), "no lock taken");
+    let said = view.read_with(cx, |v, _| v.wishes.memory_only()).expect("memory only, said");
+    assert!(said.contains("its writer didn't start (no threads left)"), "{said}");
+    assert!(has(cx, w, format!("agent-memory {}", crate::ask::shown(&said, cards_spec::Lines::Single))), "on the rail");
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
+    view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
+    board(cx, w, &view);
+    assert_eq!(outbox(cx, &view), ["one\n[block plan v1 dismissed]"], "it rode at once");
+    assert_eq!(crate::blockfiles::on_this_thread(), before, "no disk job ran here");
+    assert!(!path.exists() && !ppath.exists(), "nor anywhere");
+    let t = std::time::Instant::now();
+    assert!(writer.shutdown());
+    assert!(t.elapsed() < std::time::Duration::from_millis(500), "nothing to wait for");
+}
+
+/// R4-P2-2: the writer stops with a write out (its job dropped unrun, as
+/// a thread whose job panicked drops it): the message waiting for that
+/// write (its notice's mark) goes with its notice, memory keeping what the
+/// write carried, and the desk says it keeps its changes in memory only.
+/// No disk job runs here, then or after.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_writer_that_stops_with_a_write_out_leaves_the_rail_in_memory(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let (writer, path) = view.read_with(cx, |v, _| (v.wishes.home.writer.clone(), v.wishes.desires.path().expect("a file").to_path_buf()));
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    let written = std::fs::read(&path).expect("its dismissal, written");
+    let hold = writer.hold();
+    view.update(cx, |v, cx| assert!(v.enter("one".into(), cx)));
+    assert!(outbox(cx, &view).is_empty(), "it waits for its mark (sent) to be written");
+    let before = crate::blockfiles::on_this_thread();
+    writer.stop();
+    drop(hold);
+    board(cx, w, &view);
+    assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
+    assert_eq!(outbox(cx, &view), ["one\n[block plan v1 dismissed]"], "the message went, its notice with it");
+    let said = view.read_with(cx, |v, _| v.wishes.memory_only()).expect("memory only, said");
+    assert!(said.contains("its writer stopped"), "{said}");
+    action(cx, w, "cause", "agent-x");
+    away(cx, w, &view);
+    assert!(!has_sec(cx, &view, "cause"), "and after");
+    assert_eq!(crate::blockfiles::on_this_thread(), before, "no disk job ran here");
+    assert_eq!(std::fs::read(&path).expect("the file"), written, "nor anywhere: the file as it was");
+}
+
+/// The view's last change, made and its window closed at once (no frame
+/// between: no write asked for it but the release's last snapshot): `plan`
+/// dismissed. The window, its view and its quit hook are gone.
+fn close_with_a_change(cx: &mut TestAppContext, w: AnyWindowHandle, view: Entity<AppView>) {
+    let gone = view.downgrade();
+    cx.update(|cx| {
+        view.update(cx, |v, _| {
+            let live = v.panes.cur.live;
+            let d = v.model.lives[live].transcript.drawn().cloned().expect("a board");
+            let conv = v.conversation(live);
+            let id = cards_spec::block::BlockId::parse("plan").expect("an id");
+            assert!(v.wishes.desires.dismiss(&conv, &d.generation.expect("a generation"), &id, &d.visibility).is_ok());
+        });
+        w.update(cx, |_, window, _| window.remove_window()).expect("the window");
+    });
+    drop(view);
+    cx.update(|_| {});
+    cx.run_until_parked();
+    assert!(gone.upgrade().is_none(), "the view and its quit hook are gone");
+    assert!(cx.update(|cx| cx.windows().is_empty()), "no window open");
+}
+
+/// R4-P2-3: the app's quit waits for the writer with no window open (a
+/// macOS Quit after its last window closed). The window closed with its
+/// last snapshot behind a write stuck on the writer's thread; the quit,
+/// its hook the app's (`main`'s, [`crate::rail_wishes::Home::on_quit`]),
+/// returns once the stuck write is freed and the snapshot written.
+#[gpui_kit::test]
+fn a_quit_with_no_window_open_waits_for_the_last_snapshot(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let writer = crate::blockfiles::Writer::start();
+    let (home, path) = view.update(cx, |v, _| {
+        v.wishes.home.writer = writer.clone();
+        (v.wishes.home.clone(), v.wishes.desires.path().expect("a file").to_path_buf())
+    });
+    cx.update(|cx| home.on_quit(cx));
+    drop(home);
+    let (go, gate) = std::sync::mpsc::channel::<()>();
+    drop(writer.run(move || gate.recv_timeout(std::time::Duration::from_secs(10)).is_ok()).expect("taken"));
+    close_with_a_change(cx, w, view);
+    assert!(!path.exists(), "behind the stuck write");
+    let freed = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        go.send(()).expect("the job waits");
+    });
+    let t = std::time::Instant::now();
+    cx.quit();
+    let waited = t.elapsed();
+    freed.join().expect("freed");
+    let text = std::fs::read_to_string(&path).expect("written before the quit returned");
+    assert!(text.contains("\"plan\""), "the last snapshot: {text}");
+    assert!(waited >= std::time::Duration::from_millis(250) && waited < crate::blockfiles::JOIN, "it waited, within its bound: {waited:?}");
+}
+
+/// R4-P2-3: stuck past its bound, the quit still returns (bounded), and
+/// the snapshot it couldn't wait for keeps the file's lock until it ran.
+#[gpui_kit::test]
+fn a_quit_stuck_past_its_bound_returns_and_the_snapshot_keeps_its_lock(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let bound = std::time::Duration::from_millis(150);
+    let writer = crate::blockfiles::Writer::start_with(bound, |f| std::thread::Builder::new().spawn(f));
+    let (home, path) = view.update(cx, |v, _| {
+        v.wishes.home.writer = writer.clone();
+        (v.wishes.home.clone(), v.wishes.desires.path().expect("a file").to_path_buf())
+    });
+    cx.update(|cx| home.on_quit(cx));
+    drop(home);
+    let (go, gate) = std::sync::mpsc::channel::<()>();
+    drop(writer.run(move || gate.recv_timeout(std::time::Duration::from_secs(10)).is_ok()).expect("taken"));
+    close_with_a_change(cx, w, view);
+    let t = std::time::Instant::now();
+    cx.quit();
+    let waited = t.elapsed();
+    assert!(waited >= bound && waited < std::time::Duration::from_secs(1), "bounded: {waited:?}");
+    assert!(!path.exists(), "not written yet");
+    assert_eq!(crate::blockfiles::own(&path).err(), Some(crate::blockfiles::NotOwned::Held), "the snapshot out holds the lock");
+    go.send(()).expect("the job waits");
+    let free = crate::blockfiles::own_once_free(&path);
+    assert!(free.is_ok(), "it ran: free ({:?})", free.err());
+    assert!(std::fs::read_to_string(&path).expect("written").contains("\"plan\""));
+}

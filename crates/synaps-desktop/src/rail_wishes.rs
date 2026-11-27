@@ -28,9 +28,13 @@
 //! - **Writes** run on the process's writer, off the UI thread, one at a
 //!   time per file ([`AppView::pump_wishes`]), whatever changed memory: a
 //!   click, a message, a settle or a compaction's carry (each board drawn,
-//!   [`AppView::wishes_on_board`]). The files' locks are the app's, taken
-//!   once at its launch ([`Home`]); a window closing or the app quitting
-//!   hands the writer each file's last snapshot ([`AppView::flush_wishes`]).
+//!   [`AppView::wishes_on_board`]); never anywhere else. A writer that
+//!   didn't start, or stopped, takes nothing: the desk keeps its changes
+//!   in memory only from then on, and says so ([`Stores::writer_lost`]).
+//!   The files' locks are the app's, taken once at its launch ([`Home`]);
+//!   a window closing or the app quitting hands the writer each file's
+//!   last snapshot ([`AppView::flush_wishes`]), and the app's quit, a
+//!   window open or not, waits for them ([`Home::on_quit`]).
 //! - **The rail's footer** says what a refusal or a settle said last, and,
 //!   for as long as this desk doesn't own its files, that it keeps its
 //!   changes in memory only ([`Stores::memory_only`]).
@@ -66,7 +70,8 @@ pub(crate) const MEMORY_ONLY: &str = "this desk keeps rail changes in memory onl
 /// each one's lock, taken once at the launch (`main`, before any window)
 /// and held until the app shuts down ([`Home::shutdown`]), and the one
 /// writer. The window's stores hold a clone; every write they issue holds
-/// its file's lock until it ran.
+/// its file's lock until it ran. Its writer didn't start: no lock taken,
+/// memory only.
 #[derive(Clone)]
 pub(crate) struct Home {
     desires: Option<(PathBuf, Result<Owned, NotOwned>)>,
@@ -75,31 +80,58 @@ pub(crate) struct Home {
 }
 
 impl Home {
-    /// Both files' locks, taken now without waiting, and the writer.
+    /// The writer, and both files' locks, taken now without waiting.
     pub(crate) fn take(desires: Option<PathBuf>, pres: Option<PathBuf>) -> Home {
-        let own = |p: Option<PathBuf>| {
-            p.map(|p| {
-                let o = crate::blockfiles::own(&p);
-                (p, o)
-            })
-        };
         // Tests: a writer that queues, run by the window's executor.
         #[cfg(test)]
         let writer = Writer::queued();
         #[cfg(not(test))]
         let writer = Writer::start();
-        Home { desires: own(desires), pres: own(pres), writer }
+        Self::with(desires, pres, writer)
+    }
+
+    /// [`Home::take`] with `writer` (tests: one that didn't start, a real
+    /// one). One that didn't start takes no lock: memory only, and why.
+    pub(crate) fn with(desires: Option<PathBuf>, pres: Option<PathBuf>, writer: Arc<Writer>) -> Home {
+        let own = |p: Option<PathBuf>| {
+            p.map(|p| {
+                let o = match writer.never_started() {
+                    Some(why) => Err(NotOwned::Failed(why.to_string())),
+                    None => crate::blockfiles::own(&p),
+                };
+                (p, o)
+            })
+        };
+        Home { desires: own(desires), pres: own(pres), writer: writer.clone() }
     }
 
     /// No file (before the launch's): nothing to write.
     #[cfg(not(test))]
     fn none() -> Home {
-        Home { desires: None, pres: None, writer: Writer::closed() }
+        Home { desires: None, pres: None, writer: Writer::never("no settings folder".into()) }
+    }
+
+    /// The app's quit, a window open or not (macOS quits from within
+    /// `run`, its last window possibly closed long before; Linux and
+    /// Windows too): what the writer holds then waited for, its bound
+    /// ([`crate::blockfiles::JOIN`]) at most. The wait is the quit's
+    /// future: GPUI polls it once it released the windows, so the last
+    /// snapshots their release hands over are in the queue by then.
+    pub(crate) fn on_quit(&self, cx: &mut App) {
+        let writer = self.writer.clone();
+        cx.on_app_quit(move |_| {
+            let writer = writer.clone();
+            async move {
+                writer.shutdown();
+            }
+        })
+        .detach();
     }
 
     /// The app's end: its queue closed, the last writes it holds run,
     /// waited for [`crate::blockfiles::JOIN`] at most; then this hold on
-    /// the locks goes (a write still running keeps its own).
+    /// the locks goes (a write still running keeps its own). After
+    /// [`Home::on_quit`]'s: nothing more.
     pub(crate) fn shutdown(self) -> bool {
         self.writer.shutdown()
     }
@@ -187,6 +219,15 @@ impl Stores {
     #[cfg(all(test, unix))]
     pub(crate) fn forget_boards(&mut self) {
         self.track.clear();
+    }
+
+    /// The writer took no more (it didn't start, or stopped: `why`): the
+    /// files are no longer this desk's to write. Memory only from now, said
+    /// for as long as it lasts ([`Stores::memory_only`]); what a write out
+    /// carried is kept in memory, and the messages waiting for it go.
+    pub(crate) fn writer_lost(&mut self, why: &str) -> Vec<Landed> {
+        self.pres.writer_lost(why);
+        self.desires.writer_lost(why)
     }
 
     /// While either file isn't this desk's: that it keeps its changes in
@@ -322,12 +363,15 @@ impl AppView {
             self.wishes.said = self.wishes.pres.trouble.clone();
         }
         self.pump_wishes(cx);
+        // The rail draws what it has now (memory only, said).
+        cx.notify();
     }
 
     /// The window's end, or the app's: each file's last snapshot (what
     /// memory changed since the file has), handed to the writer after what
-    /// it holds. What to wait for: the writer having run them.
-    pub(crate) fn flush_wishes(&mut self) -> async_channel::Receiver<()> {
+    /// it holds; the app's quit waits for it ([`Home::on_quit`]). Memory
+    /// only: nothing (no file to write).
+    pub(crate) fn flush_wishes(&mut self) {
         let writer = self.wishes.home.writer.clone();
         if let Some(w) = self.wishes.desires.last_write() {
             drop(writer.run(move || drop(w.run())));
@@ -335,14 +379,18 @@ impl AppView {
         if let Some(w) = self.wishes.pres.last_write() {
             drop(writer.run(move || drop(w.run())));
         }
-        writer.run(|| ())
     }
 
-    /// `job` handed to the writer; what it returns, once it ran. (Tests:
+    /// `job` handed to the writer; what it returns, once it ran. Not taken
+    /// (the writer didn't start or stopped): why; it never runs. (Tests:
     /// the writer queues, and this window's executor runs what it holds.)
-    fn hand<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static, cx: &mut Context<Self>) -> async_channel::Receiver<R> {
+    fn hand<R: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> R + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Result<async_channel::Receiver<R>, String> {
         let writer = self.wishes.home.writer.clone();
-        let done = writer.run(job);
+        let done = writer.run(job).map_err(|s| s.0);
         #[cfg(test)]
         cx.background_spawn(async move { writer.drain() }).detach();
         #[cfg(not(test))]
@@ -350,35 +398,75 @@ impl AppView {
         done
     }
 
-    /// Writes to make, each file's next, on the writer (off the UI thread).
+    /// Writes to make, each file's next, on the writer (off the UI thread),
+    /// never here. The writer took none, or stopped before it ran one:
+    /// memory only from then ([`Stores::writer_lost`]).
     pub(crate) fn pump_wishes(&mut self, cx: &mut Context<Self>) {
+        // Memory only now: what memory changed since is kept there, and
+        // the messages it held go; again until nothing is left to write.
+        while let Some(why) = self.pump_once(cx) {
+            let landed = self.wishes.writer_lost(&why);
+            self.wishes_landed(landed, cx);
+        }
+    }
+
+    /// Each file's next write handed over; why not, if the writer took
+    /// none.
+    fn pump_once(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let mut lost = None;
         if let Some(w) = self.wishes.desires.next_write() {
-            let done = self.hand(move || w.run(), cx);
-            cx.spawn(async move |this, cx| {
-                let Ok(l) = done.recv().await else { return };
-                let _ = this.update(cx, |v, cx| {
-                    let landed = v.wishes.desires.landed(l);
-                    v.wishes_landed(landed, cx);
-                    v.pump_wishes(cx);
-                    cx.notify();
-                });
-            })
-            .detach();
+            match self.hand(move || w.run(), cx) {
+                Ok(done) => {
+                    cx.spawn(async move |this, cx| {
+                        let landed = done.recv().await;
+                        let _ = this.update(cx, |v, cx| {
+                            match landed {
+                                Ok(l) => {
+                                    let landed = v.wishes.desires.landed(l);
+                                    v.wishes_landed(landed, cx);
+                                }
+                                // Dropped unrun: the writer stopped.
+                                Err(_) => {
+                                    let landed = v.wishes.writer_lost("its writer stopped");
+                                    v.wishes_landed(landed, cx);
+                                }
+                            }
+                            v.pump_wishes(cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(why) => lost = Some(why),
+            }
         }
         if let Some(w) = self.wishes.pres.next_write() {
-            let done = self.hand(move || w.run(), cx);
-            cx.spawn(async move |this, cx| {
-                let Ok(l) = done.recv().await else { return };
-                let _ = this.update(cx, |v, cx| {
-                    if let Err(why) = v.wishes.pres.landed(l) {
-                        v.wishes.said = Some(why);
-                    }
-                    v.pump_wishes(cx);
-                    cx.notify();
-                });
-            })
-            .detach();
+            match self.hand(move || w.run(), cx) {
+                Ok(done) => {
+                    cx.spawn(async move |this, cx| {
+                        let landed = done.recv().await;
+                        let _ = this.update(cx, |v, cx| {
+                            match landed {
+                                Ok(l) => {
+                                    if let Err(why) = v.wishes.pres.landed(l) {
+                                        v.wishes.said = Some(why);
+                                    }
+                                }
+                                Err(_) => {
+                                    let landed = v.wishes.writer_lost("its writer stopped");
+                                    v.wishes_landed(landed, cx);
+                                }
+                            }
+                            v.pump_wishes(cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(why) => lost = lost.or(Some(why)),
+            }
         }
+        lost
     }
 
     /// A write landed: a wish drawn or refused, the messages whose turn
@@ -427,6 +515,11 @@ impl AppView {
             None => {
                 if let Some(k) = ride.carrier {
                     self.wishes.desires.lost(k);
+                }
+                // Its attachment left (a tab switch): not sent; its text
+                // back to its pane, as a refusal there gives it.
+                if let Some(e) = self.model.left_went(seq, ticket) {
+                    self.effect(e);
                 }
             }
         }

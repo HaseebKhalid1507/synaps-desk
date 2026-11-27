@@ -354,15 +354,16 @@ fn main() {
     let _disposing = disposer.install();
     // The rail's two files (D6b, `rail_wishes::Home`): their locks taken
     // once, now, for the process (another desk has them: memory only), and
-    // their writer. It shuts down as the disposer does, when `run`
-    // returns: what the window handed it last written, waited for
-    // `blockfiles::JOIN` at most, then the locks go.
+    // their writer. The app's quit waits for what it holds, the windows'
+    // last snapshots included, a window open or not (`Home::on_quit`),
+    // `blockfiles::JOIN` at most; then the locks go.
     let wishes = rail_wishes::Home::take(desires::path(), presentation::path());
     let wishes_home = wishes.clone();
     diag::mark("before_application");
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
     gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
         diag::mark("app_run_callback");
+        wishes_home.on_quit(cx);
         house(motion_setting, choice, cx);
         app::bind_keys(cx);
         let mut options = window_options(window_size, bench, cx);
@@ -433,8 +434,9 @@ fn main() {
         }
         cx.activate(true);
     });
-    // Linux's and Windows' quit returns here (macOS exits within `run`:
-    // its quit hook waited for the writer, within GPUI's allowance).
+    // Linux's and Windows' `run` returns here (macOS exits within it): the
+    // quit waited already (`Home::on_quit`); a `run` that ended without
+    // one waits now.
     wishes.shutdown();
 }
 

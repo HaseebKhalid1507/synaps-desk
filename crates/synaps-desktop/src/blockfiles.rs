@@ -24,15 +24,18 @@
 //! swept by the owner's first write ([`sweep`]: regular files of exactly
 //! that pattern, nothing else, no link followed).
 //!
-//! **Off the UI thread, on the process's writer.** [`sweep`] and [`write`]
-//! touch the disk: the stores hand them to the [`Writer`], one thread that
-//! runs them in order, and take back what they return. A window closing or
-//! the app quitting hands it the last snapshot of each file memory has
-//! changed since ([`crate::rail_wishes`]); the app's shutdown waits for it
-//! [`JOIN`] at most, as D5's disposer does, then lets go of its locks
-//! (a write still running keeps its own until it ends). At a launch the UI
-//! thread only takes the lock (never waiting for it) and reads the file
-//! once ([`peek`]).
+//! **Off the UI thread, on the process's writer, always.** [`sweep`] and
+//! [`write`] touch the disk: the stores hand them to the [`Writer`], one
+//! thread that runs them in order, and take back what they return. Nothing
+//! else runs them: a writer whose thread didn't start, or stopped, takes
+//! no job (the job never runs), and the desk keeps its rail changes in
+//! memory only from then on, and says so, as a second desk does
+//! ([`crate::rail_wishes`]). A window closing hands it the last snapshot
+//! of each file memory has changed since; the app's quit, a window open or
+//! not, waits for it [`JOIN`] at most, as D5's disposer does, then lets go
+//! of its locks (a write still running keeps its own until it ends). At a
+//! launch the UI thread only takes the lock (never waiting for it) and
+//! reads the file once ([`peek`]).
 //!
 //! **A file that doesn't parse** reads as empty, and the sweep copies it
 //! aside to `<file>.bad` before anything is written over it; the log says
@@ -110,10 +113,11 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// The process's one writer of the block stores' files (module docs): a
 /// thread that runs each write handed to it, in order. Shut down (or
-/// dropped): its queue closed, what it holds run, waited for [`JOIN`] at
-/// most (then it ends alone, detached: each write it still holds keeps
-/// its file's lock until it ran). One whose thread didn't start, or shut
-/// down, runs what it is handed where it is (a degraded mode, said once).
+/// dropped): its queue closed, what it holds run, waited for its bound
+/// ([`JOIN`]) at most (then it ends alone, detached: each write it still
+/// holds keeps its file's lock until it ran). One whose thread didn't
+/// start, stopped (a job that panicked) or shut down takes nothing more:
+/// [`Writer::run`] says why, and the job never runs, here or anywhere.
 ///
 /// Tests' windows have one that queues ([`Writer::queued`]): what it is
 /// handed runs, in order, when [`Writer::drain`] is called (by the
@@ -122,16 +126,25 @@ type Job = Box<dyn FnOnce() + Send>;
 pub(crate) struct Writer {
     tx: Mutex<Option<Sender<Job>>>,
     thread: Mutex<Option<(JoinHandle<()>, Receiver<()>)>>,
+    /// How long its shutdown waits for what it holds.
+    join: Duration,
+    /// Why it never had a thread (none: it had one).
+    never: Option<String>,
     #[cfg(test)]
     queued: Option<Mutex<Queued>>,
 }
 
-/// Tests: a queuing writer's jobs, and its holds.
+/// Why a [`Writer`] took no job: it never started, stopped or shut down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stopped(pub(crate) String);
+
+/// Tests: a queuing writer's jobs, its holds, and whether it stopped.
 #[cfg(test)]
 #[derive(Default)]
 struct Queued {
     jobs: std::collections::VecDeque<Job>,
     holds: usize,
+    stopped: bool,
 }
 
 /// Tests: a queuing writer held ([`Writer::hold`]) until this goes.
@@ -152,45 +165,64 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Writer {
-    /// A writer and its thread.
+    /// A writer and its thread, its shutdown waiting [`JOIN`] at most.
     pub(crate) fn start() -> Arc<Writer> {
+        Self::start_with(JOIN, |f| std::thread::Builder::new().name("synaps-blockfiles".into()).spawn(f))
+    }
+
+    /// A writer whose thread `spawn` starts, its shutdown waiting `join`
+    /// at most (tests: a spawn that fails, a short bound). Not started: a
+    /// writer that takes nothing ([`Writer::never`]).
+    pub(crate) fn start_with(
+        join: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Arc<Writer> {
         let (tx, rx) = channel::<Job>();
         let (done_tx, done) = sync_channel(1);
-        let spawned = std::thread::Builder::new().name("synaps-blockfiles".into()).spawn(move || {
+        let spawned = spawn(Box::new(move || {
             for job in rx {
                 job();
             }
             let _ = done_tx.send(());
-        });
+        }));
         match spawned {
             Ok(t) => Arc::new(Writer {
                 tx: Mutex::new(Some(tx)),
                 thread: Mutex::new(Some((t, done))),
+                join,
+                never: None,
                 #[cfg(test)]
                 queued: None,
             }),
             Err(e) => {
-                eprintln!("synaps-desktop: the block stores' writer did not start ({e}): their writes run in place");
-                Writer::closed()
+                log::warn!(target: "synaps_desktop::blocks", "the block stores' writer did not start ({e}): rail changes are kept in memory only");
+                Writer::never(format!("its writer didn't start ({e})"))
             }
         }
     }
 
-    /// One with no thread: what it is handed runs in place (a store with
-    /// no file: its writes touch nothing).
-    pub(crate) fn closed() -> Arc<Writer> {
+    /// One with no thread, that takes nothing, and why (`main` before its
+    /// launch's: no file; a thread that didn't start).
+    pub(crate) fn never(why: String) -> Arc<Writer> {
         Arc::new(Writer {
             tx: Mutex::new(None),
             thread: Mutex::new(None),
+            join: JOIN,
+            never: Some(why),
             #[cfg(test)]
             queued: None,
         })
     }
 
+    /// Why it has no thread and never will, if so.
+    pub(crate) fn never_started(&self) -> Option<&str> {
+        self.never.as_deref()
+    }
+
     /// Tests: one that queues (type docs).
     #[cfg(test)]
     pub(crate) fn queued() -> Arc<Writer> {
-        Arc::new(Writer { tx: Mutex::new(None), thread: Mutex::new(None), queued: Some(Mutex::default()) })
+        Arc::new(Writer { tx: Mutex::new(None), thread: Mutex::new(None), join: JOIN, never: None, queued: Some(Mutex::default()) })
     }
 
     /// Tests: a queuing writer's jobs run here, in order, until none is
@@ -213,6 +245,18 @@ impl Writer {
         }
     }
 
+    /// Tests: a queuing writer stops as a thread whose job panicked does:
+    /// what it holds dropped, never run (their receivers close), and it
+    /// takes nothing more.
+    #[cfg(all(test, unix))]
+    pub(crate) fn stop(&self) {
+        if let Some(q) = &self.queued {
+            let mut q = locked(q);
+            q.stopped = true;
+            q.jobs.clear();
+        }
+    }
+
     /// Tests: a queuing writer runs nothing until the hold goes (then
     /// [`Writer::drain`] runs what it holds).
     #[cfg(test)]
@@ -224,29 +268,33 @@ impl Writer {
     }
 
     /// `job` run after everything handed over before it, on the writer's
-    /// thread; what it returns, once it ran.
-    pub(crate) fn run<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> async_channel::Receiver<R> {
+    /// thread; what it returns, once it ran (the receiver closed, nothing
+    /// sent: the thread stopped before it ran it). A writer that never
+    /// started, stopped or shut down takes nothing: why, and `job` dropped,
+    /// never run.
+    pub(crate) fn run<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> Result<async_channel::Receiver<R>, Stopped> {
         let (tx, rx) = async_channel::bounded(1);
         let job: Job = Box::new(move || {
             let _ = tx.try_send(job());
         });
         #[cfg(test)]
         if let Some(q) = &self.queued {
-            locked(q).jobs.push_back(job);
-            return rx;
+            let mut q = locked(q);
+            if q.stopped {
+                return Err(Stopped("its writer stopped".into()));
+            }
+            q.jobs.push_back(job);
+            return Ok(rx);
         }
-        let left = match &*locked(&self.tx) {
-            Some(q) => q.send(job).err().map(|e| e.0),
-            None => Some(job),
-        };
-        if let Some(job) = left {
-            job();
+        match &*locked(&self.tx) {
+            Some(q) => q.send(job).map(|()| rx).map_err(|_| Stopped("its writer stopped".into())),
+            None => Err(Stopped(self.never.clone().unwrap_or_else(|| "its writer shut down".into()))),
         }
-        rx
     }
 
-    /// Its queue closed, and waited for [`JOIN`] at most while its thread
-    /// runs what it holds: `true` if it ended (joined).
+    /// Its queue closed, and waited for its bound ([`JOIN`]) at most while
+    /// its thread runs what it holds: `true` if it ended (joined). Again:
+    /// nothing (`true`).
     pub(crate) fn shutdown(&self) -> bool {
         #[cfg(test)]
         if let Some(q) = &self.queued {
@@ -256,7 +304,7 @@ impl Writer {
         }
         drop(locked(&self.tx).take());
         let Some((thread, done)) = locked(&self.thread).take() else { return true };
-        match done.recv_timeout(JOIN) {
+        match done.recv_timeout(self.join) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => thread.join().is_ok(),
             Err(RecvTimeoutError::Timeout) => false,
         }
@@ -387,21 +435,24 @@ mod tests {
 
     /// The writer's thread runs what it is handed in order, off the
     /// caller's thread; its shutdown runs what it holds and joins; handed
-    /// anything after, it runs it in place.
+    /// anything after, it takes nothing and the job never runs (Shady #103
+    /// R4-P2-2: never in place).
     #[test]
     fn the_writer_runs_in_order_and_its_shutdown_drains_it() {
         let w = Writer::start();
         let here = std::thread::current().id();
         let (go, wait) = channel::<()>();
-        let first = w.run(move || {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-            std::thread::current().id()
-        });
+        let first = w
+            .run(move || {
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+                std::thread::current().id()
+            })
+            .expect("taken");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let after: Vec<_> = (0..8)
             .map(|k| {
                 let seen = seen.clone();
-                w.run(move || locked(&seen).push(k))
+                w.run(move || locked(&seen).push(k)).expect("taken")
             })
             .collect();
         assert!(locked(&seen).is_empty(), "behind the first");
@@ -410,13 +461,75 @@ mod tests {
         assert!(w.shutdown(), "drained and joined within JOIN");
         assert!(after.iter().all(|r| r.recv_blocking().is_ok()));
         assert_eq!(*locked(&seen), (0..8).collect::<Vec<_>>(), "in order");
-        let late = w.run(|| std::thread::current().id());
-        assert_eq!(late.recv_blocking().unwrap(), here, "shut down: in place");
+        let ran = Arc::new(Mutex::new(false));
+        let late = {
+            let ran = ran.clone();
+            w.run(move || *locked(&ran) = true)
+        };
+        assert_eq!(late.err(), Some(Stopped("its writer shut down".into())), "shut down: taken by no one");
+        assert!(!*locked(&ran), "never run in place");
+        assert!(w.shutdown(), "again: nothing");
+    }
+
+    /// Shady #103 R4-P2-2: a writer whose thread didn't start takes no job
+    /// (it never runs, on the caller's thread or any), says why, and its
+    /// shutdown has nothing to wait for.
+    #[test]
+    fn a_writer_whose_thread_didnt_start_takes_nothing() {
+        let w = Writer::start_with(JOIN, |_| Err(std::io::Error::other("no threads left")));
+        assert_eq!(w.never_started(), Some("its writer didn't start (no threads left)"));
+        let ran = Arc::new(Mutex::new(false));
+        let job = {
+            let ran = ran.clone();
+            w.run(move || *locked(&ran) = true)
+        };
+        assert_eq!(job.err(), Some(Stopped("its writer didn't start (no threads left)".into())));
+        assert!(!*locked(&ran), "never run");
+        let t = std::time::Instant::now();
+        assert!(w.shutdown());
+        assert!(t.elapsed() < Duration::from_millis(500), "nothing waited for");
+    }
+
+    /// Shady #103 R4-P2-2/-3: a shutdown whose writer is stuck waits its
+    /// bound, not longer, and returns; the job it still holds keeps its
+    /// file's lock until it ran, and then runs.
+    #[test]
+    fn a_shutdown_that_waits_in_vain_returns_and_the_job_keeps_its_lock() {
+        let d = std::env::temp_dir().join(format!("synaps-desktop-blockfiles-vain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("x.json");
+        let owned = own_once_free(&path).expect("free");
+        let w = Writer::start_with(Duration::from_millis(100), |f| std::thread::Builder::new().spawn(f));
+        let (go, wait) = channel::<()>();
+        let job = {
+            let owned = owned.clone();
+            let path = path.clone();
+            w.run(move || {
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+                let done = write(&path, "{}");
+                drop(owned);
+                done
+            })
+            .expect("taken")
+        };
+        drop(owned);
+        let t = std::time::Instant::now();
+        assert!(!w.shutdown(), "stuck: not joined");
+        let waited = t.elapsed();
+        assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(2), "its bound: {waited:?}");
+        assert_eq!(own(&path).err(), Some(NotOwned::Held), "the job still holds the lock");
+        assert!(!path.exists(), "not run yet");
+        go.send(()).unwrap();
+        assert_eq!(job.recv_blocking().unwrap(), Ok(()), "it ran, detached");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let free = own_once_free(&path);
+        assert!(free.is_ok(), "then free ({:?})", free.err());
     }
 
     /// A write's ownership outlives its store's: the lock stays taken while
-    /// the writer still holds a job carrying it (Shady #103 R3-P2-3), and
-    /// a shutdown that waits [`JOIN`] in vain leaves it to the job.
+    /// the writer still holds a job carrying it (Shady #103 R3-P2-3). (A
+    /// shutdown that waits in vain: the test after the next.)
     #[test]
     fn a_job_holding_the_lock_keeps_it_until_it_ran() {
         let d = std::env::temp_dir().join(format!("synaps-desktop-blockfiles-{}", std::process::id()));
@@ -435,6 +548,7 @@ mod tests {
                 drop(owned);
                 done
             })
+            .expect("taken")
         };
         drop(owned);
         assert_eq!(own(&path).err(), Some(NotOwned::Held), "the job out holds it");

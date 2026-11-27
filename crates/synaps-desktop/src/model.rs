@@ -1409,6 +1409,22 @@ impl Model {
         self.unread.retain(|k| sessions.iter().any(|s| s.is(k)) || n.saved.iter().chain(&n.recent).any(|v| v.id == *k));
     }
 
+    /// The input waiting on `ticket` in attachment `seq`, which a tab switch
+    /// left before it went: it can't go there now, so it isn't sent; its
+    /// text goes back to the pane that sent it (a card's: nothing to give).
+    pub(crate) fn left_went(&mut self, seq: u64, ticket: u64) -> Option<Effect> {
+        let i = self.left.iter().position(|l| l.0 == seq)?;
+        let (to, text) = crate::live::went(&mut self.left[i].2, ticket, None)?;
+        let session = self.left[i].1.clone();
+        if self.left[i].2.is_empty() {
+            self.left.remove(i);
+        }
+        match to {
+            crate::live::Target::Pane(pane) => Some(Effect::Unsent { pane, session, text }),
+            crate::live::Target::Card(_) => None,
+        }
+    }
+
     /// An event of an attachment a tab switch left, while it still has
     /// input unconfirmed: an echo confirms it, a refusal gives the oldest
     /// back, the end gives back the rest (to that tab's draft). `None`:
