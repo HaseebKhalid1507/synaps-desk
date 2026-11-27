@@ -1243,3 +1243,217 @@ fn the_op_logs_view_is_bounded_by_its_lines_not_the_history(cx: &mut TestAppCont
     assert!(rows1 >= rows0 + 2000, "{rows0} rows, then {rows1}");
     assert_eq!(work(cx), (lines, before), "the same work, whatever the history");
 }
+
+/// The rail demo, the user's choices made: plan folded, four sections
+/// expanded (`oldest` first, then the rest of findings, retry, rot,
+/// file); then `z` on plan in the walk, a fifth expansion that folds
+/// `oldest` back (§4).
+fn fifth_folded_back(cx: &mut TestAppContext, oldest: &str) -> W {
+    use crate::agent_rail::State;
+    let (w, view, _events) = open_at(cx, (1280., 2400.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::RAIL, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    let order: Vec<&str> =
+        std::iter::once(oldest).chain(["findings", "retry", "rot", "file"].into_iter().filter(|n| *n != oldest)).collect();
+    view.update(cx, |v, cx| {
+        let sid = v.rail_sid().expect("a session").to_string();
+        let to = |v: &mut AppView, name: &str, open: bool| {
+            let r = Ref::parse(name).expect("an id");
+            for _ in 0..3 {
+                let (_, lay) = v.rail_layout().expect("the rail");
+                let s = lay.section(&r).expect("a section");
+                if (open && s.state == State::Open && s.expanded_by_user) || (!open && s.state == State::Summary) {
+                    return;
+                }
+                let _ = v.agent_rail.local_mut(&sid).toggle(&lay, &r);
+            }
+            panic!("{name} not set");
+        };
+        to(v, "plan", false);
+        for name in &order {
+            to(v, name, true);
+        }
+        cx.notify();
+    });
+    wait(cx, w, &view, 1000);
+    assert!(rail_open(cx, w, oldest) && !rail_open(cx, w, "plan"), "as set");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("plan")));
+    press(cx, w, "z");
+    wait(cx, w, &view, 1000);
+    assert!(rail_open(cx, w, "plan") && !rail_open(cx, w, oldest), "the fifth expansion folds the oldest back");
+    (w, view)
+}
+
+/// Whether rail section `name` draws its body.
+fn rail_open(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str) -> bool {
+    has(cx, w, format!("agent-body {}", row(name)))
+}
+
+/// Shady #105 R2-3: the undo of a fifth expansion writes two sections and
+/// checks both, all or nothing. The expansion it folded back changed
+/// since (`rounds`: the agent's): undo leaves it folded, the fifth open,
+/// and says `changed since · not undone`.
+fn the_displaced_one_changed(cx: &mut TestAppContext, what: &str, rounds: Vec<Value>) {
+    let (w, view) = fifth_folded_back(cx, "file");
+    let was = view.read_with(cx, |v, _| v.rail_layout().and_then(|(_, l)| l.section(&Ref::parse("file").unwrap()).map(|s| s.s.block.tag)));
+    turn(cx, w, &view);
+    for (k, ops) in rounds.into_iter().enumerate() {
+        round(cx, w, &view, &[(&format!("toolu_dc{k}"), ops, true)]);
+    }
+    wait(cx, w, &view, 1000);
+    let (now, folded_at) = view
+        .read_with(cx, |v, _| {
+            v.rail_layout().and_then(|(_, l)| l.section(&Ref::parse("file").unwrap()).map(|s| (s.s.block.tag, s.s.block.folded_at)))
+        })
+        .expect("file laid out");
+    assert!(now != was.expect("file was laid out") || folded_at.is_some(), "{what}: the agent's change landed");
+    assert!(rail_open(cx, w, "plan") && !rail_open(cx, w, "file"), "{what}: as the agent left it");
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 1000);
+    assert!(rail_open(cx, w, "plan"), "{what}: nothing undone, the fifth still open");
+    assert!(!rail_open(cx, w, "file"), "{what}: the old choice never opens what is there now");
+    assert_eq!(view.read_with(cx, |v, _| v.agent_rail.lease.note), Some((row("plan"), crate::walk::STALE)), "{what}: and says so");
+}
+
+#[gpui_kit::test]
+fn undoing_a_fifth_expansion_refuses_if_the_displaced_one_was_replaced(cx: &mut TestAppContext) {
+    let replace = json!([{"op":"replace","id":"file","kind":"file","body":{"path":"crates/relay/src/lock.rs","state":"editing"}}]);
+    the_displaced_one_changed(cx, "replaced under its id", vec![replace]);
+}
+
+#[gpui_kit::test]
+fn undoing_a_fifth_expansion_refuses_if_the_agent_collapsed_the_displaced_one(cx: &mut TestAppContext) {
+    the_displaced_one_changed(cx, "collapsed by the agent", vec![json!([{"op":"collapse","id":"file","open":false}])]);
+}
+
+#[gpui_kit::test]
+fn undoing_a_fifth_expansion_refuses_if_the_displaced_one_was_made_again(cx: &mut TestAppContext) {
+    let again = json!([{"op":"put","id":"file","kind":"file","target":"rail","slot":"upper","body":{"path":"crates/relay/src/token_store.rs","line":118,"note":"TokenStore::rotate","state":"editing"}}]);
+    the_displaced_one_changed(cx, "removed and made again", vec![json!([{"op":"remove","id":"file"}]), again]);
+}
+
+/// The successor's history (`successor`) after a compaction into
+/// `journal`, in one batch with it, as a daemon can send them: the
+/// capture begins with the predecessor's input, then the transcript lets
+/// go of the predecessor's history, its own handle of the worker.
+fn compaction_onto(cx: &mut TestAppContext, view: &Entity<AppView>, journal: &str, successor: Vec<Value>) -> Vec<synaps_client::Event> {
+    let (seq, sid) = attachment(cx, view);
+    let e = json!({"ev": "compaction_applied", "previous_session_id": sid, "session_id": journal, "chains_advanced": [], "msg_count": 4});
+    let ev = synaps_client::protocol::decode_event(&e).expect("a compaction");
+    vec![
+        synaps_client::Event::session(seq, sid.clone(), 0, ev, std::sync::Arc::new(e)),
+        synaps_client::Event::History {
+            attach_seq: seq,
+            session_id: sid,
+            seq: 0,
+            update: synaps_client::HistoryUpdate::Replace { messages: successor },
+        },
+    ]
+}
+
+/// The pane's history replaced by `messages`, its board folded.
+fn history_now(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+    let (seq, sid) = attachment(cx, view);
+    let update = synaps_client::HistoryUpdate::Replace { messages };
+    view.update(cx, |v, cx| v.apply_batch(vec![synaps_client::Event::History { attach_seq: seq, session_id: sid, seq: 0, update }], cx));
+    cx.run_until_parked();
+    wait(cx, w, view, 300);
+}
+
+/// The history's worker, held weakly, and the events its journal holds.
+fn worker_now(
+    cx: &mut TestAppContext,
+    view: &Entity<AppView>,
+) -> (std::sync::Weak<std::sync::Mutex<synaps_client::blocks::Worker>>, usize) {
+    view.read_with(cx, |v, _| {
+        let t = &v.model.lives[v.panes.cur.live].transcript;
+        (std::sync::Arc::downgrade(&t.blocks_input().expect("a board").worker), t.blocks_retained().journal)
+    })
+}
+
+/// The blocks demo, its history replaced by a large one (the blocks
+/// history, then 6,000 messages), the app's own disposer installed.
+/// (Its fields drop in order: the disposer uninstalled, then shut down.)
+struct Large {
+    _in: synaps_client::blocks::dispose::Installed,
+    disposer: synaps_client::blocks::dispose::Disposer,
+    w: AnyWindowHandle,
+    view: Entity<AppView>,
+    sid: String,
+}
+
+fn large(cx: &mut TestAppContext) -> Large {
+    let disposer = synaps_client::blocks::dispose::Disposer::start();
+    let _in = disposer.install();
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, w, &view);
+    let sid = attachment(cx, &view).1;
+    let big = synaps_client::synthetic::blocks_history().into_iter().chain(synaps_client::synthetic::history(6_000, 3)).collect();
+    history_now(cx, w, &view, big);
+    Large { _in, disposer, w, view, sid }
+}
+
+fn after(s: &str) -> Vec<Value> {
+    vec![json!({"role": "user", "content": format!("after the compaction {s}")})]
+}
+
+fn archive_of(cx: &mut TestAppContext, l: &Large, journal: &str) -> Option<std::sync::Arc<crate::oplog::Archive>> {
+    l.view.read_with(cx, |v, _| v.archives.of(&l.sid, journal).and_then(|h| h.archive.clone()))
+}
+
+/// Shady #105 R2-2: a compaction's capture can be the last owner of the
+/// predecessor's history (the successor's replaced the transcript's while
+/// it ran). Done, it lets go of it off the frame: handed to the app's
+/// disposer (held here: the history alive in its queue, charged), the
+/// frame's share of destruction a hand-over's.
+#[gpui_kit::test]
+fn a_done_captures_predecessor_is_let_go_off_the_frame(cx: &mut TestAppContext) {
+    use synaps_client::blocks::dispose::destroyed;
+    let l = large(cx);
+    let (pred, journal) = worker_now(cx, &l.view);
+    assert!(journal >= 6_000, "a large predecessor: {journal} events");
+    let hold = l.disposer.hold();
+    let (was, queued) = (destroyed(), l.disposer.backlog());
+    let batch = compaction_onto(cx, &l.view, "j-one", after("one"));
+    l.view.update(cx, |v, cx| v.apply_batch(batch, cx));
+    cx.run_until_parked();
+    wait(cx, l.w, &l.view, 300);
+    assert!(archive_of(cx, &l, "j-one").is_some_and(|a| !a.blocks.is_empty()), "the capture is done");
+    assert!(pred.upgrade().is_some(), "the predecessor's history not destroyed on the frame: in the disposer's queue");
+    let now = l.disposer.backlog();
+    assert!(now.items > queued.items && now.bytes >= queued.bytes + journal, "handed over, charged: {queued:?} then {now:?}");
+    assert!(destroyed() - was <= 64, "the frame's share: hand-overs, {} elements", destroyed() - was);
+    drop(hold);
+    l.disposer.flush();
+    assert!(pred.upgrade().is_none(), "the disposer let it go");
+}
+
+/// Shady #105 R2-2: the same, the capture superseded by the session's
+/// next compaction before it ran (the same batch): its predecessor goes
+/// to the disposer too, and it never publishes.
+#[gpui_kit::test]
+fn a_superseded_captures_predecessor_is_let_go_off_the_frame(cx: &mut TestAppContext) {
+    use synaps_client::blocks::dispose::destroyed;
+    let l = large(cx);
+    let (pred, journal) = worker_now(cx, &l.view);
+    assert!(journal >= 6_000, "a large predecessor: {journal} events");
+    let hold = l.disposer.hold();
+    let was = destroyed();
+    let mut batch = compaction_onto(cx, &l.view, "j-two", after("two"));
+    batch.extend(compaction_onto(cx, &l.view, "j-three", after("three")));
+    l.view.update(cx, |v, cx| v.apply_batch(batch, cx));
+    cx.run_until_parked();
+    wait(cx, l.w, &l.view, 300);
+    assert!(pred.upgrade().is_some(), "superseded: its predecessor in the disposer's queue, not destroyed on the frame");
+    assert!(destroyed() - was <= 64, "the frame's share: hand-overs, {} elements", destroyed() - was);
+    assert!(archive_of(cx, &l, "j-two").is_none(), "the superseded capture never published");
+    assert!(
+        archive_of(cx, &l, "j-three").is_some_and(|a| a.blocks.is_empty() && a.log.is_empty()),
+        "the next one's: an empty predecessor's"
+    );
+    drop(hold);
+    l.disposer.flush();
+    assert!(pred.upgrade().is_none(), "the disposer let it go");
+}

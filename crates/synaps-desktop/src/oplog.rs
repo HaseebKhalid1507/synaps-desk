@@ -7,13 +7,13 @@
 //! - **Ops** lists the board's latest 256 lines ([`Drawn::log`], the board
 //!   drawn, the live turn's included), newest first: the time (its row's,
 //!   found by the line's call, a lookup each: never "now", and never a
-//!   walk of the history to find it), who, the op, the id, and how it
-//!   went (applied, placed
-//!   here, no change, exists, skipped and why, a path skipped, unbound,
-//!   a stale notice). A pending line says so. It is where an agent's
-//!   skipped op, which the agent never learns of, becomes visible.
-//!   Clicking a line whose block is live jumps to it: the walk entered on
-//!   it ([`crate::walk`]).
+//!   walk of the history to find it; `—` where the board kept no id for
+//!   its call, past [`synaps_client::blocks::Mark`]'s budget), who, the
+//!   op, the id, and how it went (applied, placed here, no change,
+//!   exists, skipped and why, a path skipped, unbound, a stale notice).
+//!   A pending line says so. It is where an agent's skipped op, which the
+//!   agent never learns of, becomes visible. Clicking a line whose block
+//!   is live jumps to it: the walk entered on it ([`crate::walk`]).
 //! - **Before compaction** is the archive (§5.2): the predecessor's final
 //!   blocks, whole (each block's contents as canonical JSON, every kind,
 //!   a group's members after it, sanitized for the screen), and its op
@@ -30,7 +30,9 @@
 //!   archive. Another session, or another conversation of this one (a
 //!   clear, a resume), shows none; switching tabs, splitting panes or
 //!   reattaching changes nothing of it. At most [`ARCHIVES_MAX`]
-//!   sessions' are held; a desk restart loses them.
+//!   sessions' are held; a desk restart loses them. A capture can be the
+//!   predecessor's history's last owner: it lets go of it off the frame,
+//!   to the app's disposer, however it ends ([`Predecessor`]).
 //! - **Derived and read-only**: nothing here changes the board.
 
 use std::collections::HashMap;
@@ -382,10 +384,29 @@ impl Archives {
 pub(crate) struct Capture {
     session: String,
     capture: u64,
-    input: Option<Input>,
+    input: Predecessor,
     bound: Option<Arc<Drawn>>,
     times: HashMap<Arc<str>, String>,
     epoch: u64,
+}
+
+/// A capture's hold of the predecessor's input (Shady #105 R2-2): once
+/// the successor's history replaced the transcript's, it can be the last
+/// owner of the predecessor's history (its worker's journal and board, its
+/// staged chunks), whose drop is the history's size. So it is never
+/// dropped on the frame: its handle goes to the app's disposer in O(1)
+/// ([`Input::retire`]), whichever way the capture ends: done, superseded
+/// by another compaction of its session, evicted, or its task dropped
+/// before it ran. A step running off the frame holds its own handle, and
+/// lets it go there.
+pub(crate) struct Predecessor(Option<Arc<Input>>);
+
+impl Drop for Predecessor {
+    fn drop(&mut self) {
+        if let Some(i) = self.0.take() {
+            Input::retire(i);
+        }
+    }
 }
 
 /// Archive `a`'s row `k` as the tab lists it ([`Archive::rows`]).
@@ -523,7 +544,7 @@ impl AppView {
         let l = &self.model.lives[live];
         let Some(session) = l.active.as_ref().map(|a| a.session_id.clone()) else { return };
         let t = &l.transcript;
-        let input = t.blocks_input();
+        let input = Predecessor(t.blocks_input().map(Arc::new));
         let bound = l.board.waiting.clone().or_else(|| t.drawn().cloned()).filter(|d| d.epoch == t.blocks_epoch());
         let mut times = HashMap::new();
         for (_, m) in bound.iter().flat_map(|d| d.log.iter()) {
@@ -544,20 +565,22 @@ impl AppView {
     /// time as a board job's; its lines' times; its archive written off
     /// the frame, and held if it is still the one asked for. A live turn
     /// changed under the fold (its log reset) leaves the board bound at
-    /// the boundary.
+    /// the boundary. The predecessor's input is let go off the frame
+    /// ([`Predecessor`]) once folded, or with the task if it never ends.
     pub(crate) fn archive_run(&mut self, cx: &mut Context<Self>) {
         for c in std::mem::take(&mut self.captures) {
             let Capture { session, capture, input, bound, times, epoch } = c;
             let s = session.clone();
             let task = cx.spawn(async move |this, cx| {
-                let drawn = match input {
+                // Only `input` holds it here: each step its own handle,
+                // off the frame.
+                let drawn = match input.0.as_ref() {
                     None => None,
                     Some(input) => {
-                        let (input, stop) = (Arc::new(input), Arc::new(AtomicBool::new(false)));
-                        let worker = input.worker.clone();
+                        let stop = Arc::new(AtomicBool::new(false));
                         loop {
-                            let (w, i, s) = (worker.clone(), input.clone(), stop.clone());
-                            match cx.background_spawn(async move { crate::board::step(&w, &i, &s, crate::board::STEP) }).await {
+                            let (i, s) = (input.clone(), stop.clone());
+                            match cx.background_spawn(async move { crate::board::step(&i.worker, &i, &s, crate::board::STEP) }).await {
                                 crate::board::Step::Done(d) => break Some(d),
                                 crate::board::Step::Paused => {}
                                 crate::board::Step::Stopped => break bound,
@@ -565,6 +588,7 @@ impl AppView {
                         }
                     }
                 };
+                drop(input);
                 let Ok(times) = this.update(cx, |v, _| v.archive_times(drawn.as_deref(), &times, epoch)) else { return };
                 let a = cx.background_spawn(async move { drawn.map_or_else(Archive::default, |d| Archive::of(&d, &times)) }).await;
                 let _ = this.update(cx, |v, cx| {

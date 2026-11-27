@@ -55,10 +55,12 @@
 //!   slot move or a dismissal not yet sent, with D6b's token for it. It
 //!   is the inverse of what the action set, never a toggle: it puts back
 //!   what was there before (an expansion the rail's cap folded back for
-//!   it too), only while the block still shows what the action set. An
-//!   agent `collapse` since, or the rail's cap since, makes it a no-op
-//!   that says so ([`STALE`]); another incarnation says
-//!   `this block changed`. The walk goes to it.
+//!   it too), only while the block still shows what the action set, and
+//!   all or nothing: it checks every section it writes. An agent
+//!   `collapse` since, the rail's cap since, or the expansion it folded
+//!   back replaced, made again or collapsed by the agent since, makes it
+//!   a no-op that says so ([`STALE`]); another incarnation of the block
+//!   itself says `this block changed`. The walk goes to it.
 //! - **Leaving.** Esc returns to the composer, never to the window, so a
 //!   second Esc can't deny a prompt (design §5.1): the composer's Esc with
 //!   a prompt up only hands the prompt its keys, after their wait. Any
@@ -766,14 +768,17 @@ impl AppView {
             },
             Undid::RailFold { toggled, open } => {
                 let session = self.rail_sid().map(str::to_string);
-                let drawn = self.rail_layout().map(|(d, _)| d);
-                match (session, drawn) {
+                let laid = self.rail_layout();
+                match (session, laid) {
                     // Still what it set: its choice as made (no agent
                     // `collapse` since), the expansion it folded back
-                    // still folded back, and it draws as it did then (no
-                    // change of the cap's since).
-                    (Some(session), Some(d)) if f.s.block.folded_at == toggled.after.at && self.rail_open(&d, &toggled.id) == *open => {
-                        self.agent_rail.local_mut(&session).undo(toggled)
+                    // still folded back, the same incarnation, its own
+                    // choice holding (`Local::undo`), and it draws as it
+                    // did then (no change of the cap's since).
+                    (Some(session), Some((d, lay)))
+                        if f.s.block.folded_at == toggled.after.at && self.rail_open(&d, &toggled.id) == *open =>
+                    {
+                        self.agent_rail.local_mut(&session).undo(toggled, &lay)
                     }
                     _ => false,
                 }
