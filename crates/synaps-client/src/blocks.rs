@@ -322,7 +322,7 @@ impl HistoryBlocks {
                     self.blocks |= is_block_tool(name);
                     ids.insert(id.to_string(), kept);
                     n += 1;
-                    let input = if kept { b["input"].clone() } else { Value::Null };
+                    let input = if kept { canonical(&b["input"]) } else { Value::Null };
                     let row = tools.by_ref().find(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == id)).map(|i| i.id);
                     push(Event::Call { tool_id: id.into(), name: name.into(), input }, row);
                 }
@@ -362,18 +362,61 @@ impl HistoryBlocks {
     }
 }
 
+/// `v` as an input is kept (Shady #101 R8-1): rebuilt whole, so what it
+/// holds is what [`value_bytes`] charges, whatever made `v` (a parse, a
+/// clone, an insert). Each string at its length; each array at its length;
+/// each map built in one pass at the room a clone of it has: under
+/// `IndexMap`, made with as many entries' room as its index table holds
+/// (`index_layout`), then filled, so it never grows (an insert reserves
+/// before it looks a key up: a duplicate key on the wire or a key set
+/// again grows a full table, its length the same, and a clone then copies
+/// that table and reserves entries to its capacity); under `BTreeMap`,
+/// built in bulk from its sorted entries (`FromIterator`: full nodes, the
+/// right border topped up), and a clone copies it node for node.
+///
+/// So the layout is a clone's fixed point: a clone of a canonical value is
+/// laid out as it is, and charged alike. Every input a row, a call or an
+/// event keeps is canonical, made here at the one place it is first kept
+/// (a history's call, its row's, a live call's row's: one each), then
+/// shared (an `Arc`) or cloned, never changed (nothing writes a kept
+/// input: [`value_bytes`]). It costs about what the clone it replaces did
+/// (its maps' keys are hashed again, where an `IndexMap`'s clone copies
+/// its table): 1.24× a clone on the demo's inputs, 0.23 µs more each.
+pub fn canonical(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.as_str().into()),
+        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+        Value::Object(m) if ordered_maps() => {
+            let mut out = serde_json::Map::with_capacity(index_layout(m.len()).1);
+            for (k, v) in m {
+                out.insert(k.as_str().into(), canonical(v));
+            }
+            Value::Object(out)
+        }
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.as_str().into(), canonical(v))).collect()),
+        Value::Null | Value::Bool(_) | Value::Number(_) => v.clone(),
+    }
+}
+
 /// What JSON value `v` holds on the heap (bytes, as asked of the allocator:
-/// the sizes of its blocks' layouts, never less), for a value as parsing
-/// or a clone leaves it (every value an input is kept as: a clone of the
-/// one parsed off the wire). A string's and an array's room is read, not
-/// assumed: their capacities (a clone's is its length, a parse's what its
-/// pushes grew to). A map's room can't be read (`serde_json::Map` has no
-/// capacity): its storage is `map_bytes` for its length, every way such
-/// a map is built, then its keys' and values' own. The allocator's own
-/// bookkeeping per block is not counted, as nowhere in the app.
-/// `tests/json_memory.rs` checks it against a counting allocator, both map
-/// backends: parsed, cloned and kept, every shape at least what it
-/// allocates; maps exactly, length by length.
+/// the sizes of its blocks' layouts), `v` canonical ([`canonical`]) or a
+/// clone of one: exactly. Its strings' and arrays' room is read (their
+/// capacities); a map's can't be (`serde_json::Map` has no capacity), so
+/// it is `map_bytes` for its length, the room [`canonical`] builds it
+/// with, then its keys' and values' own. The allocator's own bookkeeping
+/// per block is not counted, as nowhere in the app.
+///
+/// Every value charged here is canonical or a clone of one, and is never
+/// changed once kept: a row's input, a live call's and its fact's are one
+/// `Arc`; a history's call event and the journal's events are written
+/// once and only read (cloned, as a whole journal is when a reader holds
+/// it; truncated; dropped). Another map (parsed, or set again after a
+/// clone) can hold more than its length says, and is not charged here.
+/// `tests/json_memory.rs` checks it on a counting allocator, both map
+/// backends: every shape, canonical and cloned, exactly; maps at every
+/// length to 300; and the inputs that defeated the length alone
+/// (duplicate keys at each table's capacity, a key set again after a
+/// clone), off the wire and through an attach.
 pub fn value_bytes(v: &Value) -> usize {
     match v {
         Value::String(s) => s.capacity(),
@@ -385,7 +428,7 @@ pub fn value_bytes(v: &Value) -> usize {
 
 /// What a kept input holds (bytes, heap included: [`Item::kept_bytes`],
 /// a live call's): its `Arc`'s block (two counts and the value), then
-/// what the value holds ([`value_bytes`]).
+/// what the value holds ([`value_bytes`]: canonical, [`canonical`]).
 pub fn kept_bytes(v: &Value) -> usize {
     /// `Arc<Value>`'s block (std's `ArcInner`): its strong and weak counts.
     #[allow(dead_code)]
@@ -406,33 +449,50 @@ fn ordered_maps() -> bool {
     *ORDERED
 }
 
-/// A JSON map's storage for `n` entries (bytes, as allocated; its keys'
-/// and values' own heap not included), as every way a map is built leaves
-/// it: parsing (`Map::new`, one insert at a time), a clone, `json!`,
-/// `to_value` (`Map::with_capacity` of its length). Never one emptied by
-/// removals (nothing here removes from a kept input). The locked crates'
-/// layouts, mirrored below so the compiler sizes them:
-/// - **`IndexMap`** (indexmap 2.14.2, hashbrown 0.17.1): its entries and
-///   their index table. The table has hashbrown's fewest buckets for `n`
-///   (`raw.rs` `capacity_to_buckets`, its minimum of 3 for a `usize`
-///   index: 4 buckets; inserts grow it no further, and a clone copies it).
-///   The entries are as many as the table can hold, not `n`: an insert
-///   reserves entries up to the table's capacity (`inner.rs`
-///   `push_entry`, `reserve_entries`), and so does a clone
-///   (`Core::clone_from`): a singleton map has room for 3. Each entry is
-///   its hash, key and value (`Bucket`). The table is a `usize` per
-///   bucket, then a control byte per bucket and a group's more
-///   (`TableLayout::calculate_layout_for`; the group is 16 bytes with
-///   SSE2, 8 otherwise: 16 is charged).
-/// - **`BTreeMap`** (std): its nodes, 11 entries' room each, however few
-///   it holds: a map of 11 or fewer is one leaf. Past that, every node
-///   but the root holds 5 or more (std's `MIN_LEN`, kept by every insert,
-///   removal and clone), so a map of `n` has `1 + (n - 1) / 5` nodes at
-///   most, each charged as an internal node (a leaf and its 12 edges).
+/// A canonical `IndexMap` of `n` entries ([`canonical`]; a clone of one
+/// alike): its index table's buckets, and its entries' room, the table's
+/// capacity (indexmap 2.14.2, hashbrown 0.17.1). The buckets are
+/// hashbrown's fewest for `n` (`raw.rs` `capacity_to_buckets`, its
+/// minimum of 3 for a `usize` index: 4); the capacity, all of them but
+/// one under 8, else 7 in 8 (`bucket_mask_to_capacity`). A table made for
+/// that capacity has those buckets again, and a clone copies the table,
+/// then reserves its entries to its capacity (`inner.rs`
+/// `Core::clone_from`, `reserve_entries`).
+fn index_layout(n: usize) -> (usize, usize) {
+    if n == 0 {
+        return (0, 0);
+    }
+    let buckets = match n {
+        0..4 => 4,
+        4..8 => 8,
+        8..15 => 16,
+        _ => (n * 8 / 7).next_power_of_two(),
+    };
+    (buckets, if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 })
+}
+
+/// A canonical JSON map's storage for `n` entries ([`canonical`]; a clone
+/// of one alike), its keys' and values' own heap not included (bytes, as
+/// allocated). The locked crates' layouts, mirrored below so the compiler
+/// sizes them:
+/// - **`IndexMap`**: its entries, as many as its table holds
+///   ([`index_layout`]), each its hash, key and value (`Bucket`); its
+///   table, a `usize` per bucket, then a control byte per bucket and a
+///   group's more (`TableLayout::calculate_layout_for`; the group is 16
+///   bytes with SSE2, 8 otherwise: 16 is charged).
+/// - **`BTreeMap`** (std): its nodes, built in bulk (`bulk_push`): each
+///   leaf takes 11 entries, then the next goes up a level as a separator
+///   and a new leaf (and a node at each level between) starts; a level's
+///   nodes fill alike. So a map of `n` has `n / 12 + 1` leaves, and each
+///   level above `(m - 1) / 12 + 1` nodes for the `m` below it, up to one
+///   root; topping up the right border moves entries, never a node.
 ///
 /// `tests/json_memory.rs` measures both against a counting allocator:
-/// equal for every `n` to 300 (`IndexMap`; `BTreeMap` to 11), at least
-/// the allocation past that.
+/// equal for every `n` to 300, canonical and cloned (x86-64's 16-byte
+/// group). The layouts are the audited versions', held by `Cargo.lock`
+/// and the pinned toolchain; nothing checks them at run time. A change of
+/// either needs that evidence again: a drift in a crate's layout, or in
+/// std's, fails those tests (CI runs both backends).
 fn map_bytes(n: usize) -> usize {
     use std::mem::{MaybeUninit, size_of};
     use std::ptr::NonNull;
@@ -455,15 +515,15 @@ fn map_bytes(n: usize) -> usize {
         return 0;
     }
     if !ordered_maps() {
-        return if n <= 11 { size_of::<Leaf>() } else { (1 + (n - 1) / 5) * size_of::<Internal>() };
+        let mut nodes = n / 12 + 1;
+        let mut bytes = nodes * size_of::<Leaf>();
+        while nodes > 1 {
+            nodes = (nodes - 1) / 12 + 1;
+            bytes += nodes * size_of::<Internal>();
+        }
+        return bytes;
     }
-    let buckets = match n {
-        0..4 => 4,
-        4..8 => 8,
-        8..15 => 16,
-        _ => (n * 8 / 7).next_power_of_two(),
-    };
-    let entries = if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 };
+    let (buckets, entries) = index_layout(n);
     entries * size_of::<Bucket>() + (buckets * size_of::<usize>()).next_multiple_of(GROUP) + buckets + GROUP
 }
 
@@ -515,6 +575,7 @@ impl Fact {
     fn event(&self) -> (Event, Option<u64>) {
         match self {
             Fact::Call { tool_id, name, input, row, .. } => {
+                // A clone of the row's canonical input: laid out as it is.
                 let input = input.as_deref().cloned().unwrap_or(Value::Null);
                 (Event::Call { tool_id: tool_id.clone(), name: name.clone(), input }, Some(*row))
             }
@@ -1628,10 +1689,10 @@ impl LiveLog {
     }
 
     /// Call `tool_id`'s input is whole (`input`: kept, a card's or a
-    /// block's). Again for the same row: its input is this one. Its input
-    /// as kept, for the row to keep: the same input again is the one kept
-    /// before, so the row, the call and its fact keep one allocation (the
-    /// row's count is the one).
+    /// block's, as its row keeps it: [`canonical`]). Again for the same
+    /// row: its input is this one. Its input as kept, for the row to keep:
+    /// the same input again is the one kept before, so the row, the call
+    /// and its fact keep one allocation (the row's count is the one).
     #[must_use]
     pub fn call(&mut self, history: &HistoryBlocks, row: u64, tool_id: &str, name: &str, input: Option<Arc<Value>>) -> Option<Arc<Value>> {
         self.init(history);

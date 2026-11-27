@@ -343,7 +343,9 @@ pub struct Item {
     /// A card or block call's input, whole ([`crate::blocks::keeps_input`]):
     /// [`ToolCall::input`] is a preview, and either input may be up to
     /// 8 KiB (synaps-cards design §2.1, blocks.md §5.1): the live call's
-    /// (`ToolUse`), the history call's from its message.
+    /// (`ToolUse`), the history call's from its message. Rebuilt as kept
+    /// ([`crate::blocks::canonical`]), never changed after: what it holds
+    /// is what [`Item::kept_bytes`] charges.
     kept_input: Option<Arc<Value>>,
     /// A live row's place in the stream ([`Transcript::came`]; 0: not
     /// yet): its call, once no longer streaming (a user row: its message),
@@ -1919,8 +1921,8 @@ impl Transcript {
                                 tail: String::new(),
                                 status: Some(ToolStatus::Running),
                             };
-                            let kept =
-                                crate::blocks::keeps_input(&tool.name).then(|| Arc::new(b.get("input").cloned().unwrap_or(Value::Null)));
+                            let kept = crate::blocks::keeps_input(&tool.name)
+                                .then(|| Arc::new(crate::blocks::canonical(b.get("input").unwrap_or(&Value::Null))));
                             let ix = self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
                             self.items[ix].kept_input = kept;
                         }
@@ -2296,7 +2298,7 @@ impl Transcript {
                         t.status = Some(ToolStatus::Running);
                     }
                     let card = crate::cards::is_card_tool(tool_name);
-                    let kept = crate::blocks::keeps_input(tool_name).then(|| Arc::new(input.clone()));
+                    let kept = crate::blocks::keeps_input(tool_name).then(|| Arc::new(crate::blocks::canonical(input)));
                     // A live call; the history's own (an attach's replay of
                     // a call its history holds) is the history's. The row
                     // keeps the input as the log does: the same input again
