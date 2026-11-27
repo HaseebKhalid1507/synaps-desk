@@ -384,8 +384,9 @@ impl LiveCards {
     }
 
     /// The heap it keeps beyond the fold, capacities counted: what
-    /// [`LiveCards::unkeep`] lets go. (A row's card is the row's: counted
-    /// as a pointer.)
+    /// [`LiveCards::unkeep`] lets go. (A row's card is the row's, and a
+    /// live close's card its row's ([`LiveCards::share_closes`]): counted
+    /// as pointers.)
     pub(crate) fn bytes(&self) -> usize {
         let r = &self.read;
         map_bytes(&self.seen)
@@ -463,6 +464,26 @@ impl LiveCards {
         rows.extend(self.want.keys());
         self.want = next;
         Some(Step { cards: before != self.read.fold.cards(), rows })
+    }
+
+    /// Each live close's card made its row's (`want`'s), not the copy this
+    /// read made of it (the same card: a row draws its close). Called after
+    /// a read of every row, where a row drawing the same card as before
+    /// kept its own (`Transcript::sync_cards`). A step needs none: it keeps
+    /// a row's card only if no close came for the row since, and a row's
+    /// close comes once (its tool id's latest call's, pending once).
+    pub(crate) fn share_closes(&mut self) {
+        for (r, doc) in &mut self.read.closes {
+            if let Some(CardRow::Close(c)) = self.want.get(r).map(|c| &**c) {
+                *doc = c.doc.clone();
+            }
+        }
+    }
+
+    /// The live closes: their rows and cards (tests).
+    #[cfg(test)]
+    pub(crate) fn closes(&self) -> &[(u64, Arc<CardDoc>)] {
+        &self.read.closes
     }
 }
 

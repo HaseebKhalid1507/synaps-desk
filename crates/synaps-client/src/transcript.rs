@@ -1503,6 +1503,7 @@ impl Transcript {
                 }
             }
         }
+        self.card_live.share_closes();
         for ix in changed {
             self.touch(ix);
         }

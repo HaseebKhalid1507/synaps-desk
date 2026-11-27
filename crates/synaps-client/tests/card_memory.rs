@@ -1,18 +1,26 @@
 //! What the card sync keeps to read what changed (`Transcript::sync_cards`,
 //! Shady #102 P2-1), measured on the heap: digests and places of the live
-//! events, never a second copy of their inputs or text (the rows keep
-//! those); counted (`Transcript::card_sync_bytes`); and let go as soon as
-//! it can't be used: a detach, a trim, a tab cached.
+//! events, never a second copy of their inputs or text, or of a card a row
+//! draws (the rows keep those); counted (`Transcript::card_sync_bytes`);
+//! and let go as soon as it can't be used: a detach, a trim, a tab cached.
 //!
-//! The heap is the process's, counted by the allocator below: what is
-//! allocated and not freed, whichever thread frees it (a disposer thread
-//! may drop what a transcript lets go: what is let go is waited for,
-//! [`settled`]). The tests here run one at a time ([`one`]).
+//! The heap is counted by the allocator below, by thread, two ways:
+//! - [`held`]: each block is charged to the account of the thread that
+//!   allocated it ([`mine`]: each test's its own) and taken off that
+//!   account wherever it is freed. What a test's transcript still holds,
+//!   not the harness's or another test's heap; what another thread frees
+//!   of it (a disposer's) counts once freed.
+//! - [`here`]: what this thread allocated less what it freed, whoever's.
+//!   Read across something this thread does (a shed), it is what that
+//!   frees, whatever another thread does meanwhile.
+//!
+//! Here nothing is freed elsewhere (no disposer): what a transcript lets
+//! go is freed as it is let go, so every measurement is read directly,
+//! nothing waited for.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::{Duration, Instant};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use synaps_client::protocol::*;
@@ -20,69 +28,86 @@ use synaps_client::transcript::Transcript;
 
 struct Counting;
 
-static HELD: AtomicIsize = AtomicIsize::new(0);
+/// The accounts: the bytes each holds. 0: the threads that took none.
+static HELD: [AtomicIsize; 64] = [const { AtomicIsize::new(0) }; 64];
+static NEXT: AtomicUsize = AtomicUsize::new(1);
 
-fn count(n: isize) {
-    HELD.fetch_add(n, Ordering::Relaxed);
+thread_local! {
+    static ACCOUNT: Cell<usize> = const { Cell::new(0) };
+    static HERE: Cell<isize> = const { Cell::new(0) };
+}
+
+/// A block of `l` and its account before it: the block's alignment (a
+/// word at least) of room, the account at its start. None: too big.
+fn outer(l: Layout) -> Option<(Layout, usize)> {
+    let room = l.align().max(std::mem::size_of::<usize>());
+    Some((Layout::from_size_align(l.size().checked_add(room)?, room).ok()?, room))
+}
+
+/// `l`'s block at `base` (null: none), charged to this thread's account.
+unsafe fn opened(base: *mut u8, l: Layout, room: usize) -> *mut u8 {
+    if base.is_null() {
+        return base;
+    }
+    let account = ACCOUNT.get();
+    unsafe { (base as *mut usize).write(account) };
+    HELD[account].fetch_add(l.size() as isize, Ordering::Relaxed);
+    HERE.set(HERE.get() + l.size() as isize);
+    unsafe { base.add(room) }
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(l) };
-        if !p.is_null() {
-            count(l.size() as isize);
-        }
-        p
+        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
+        unsafe { opened(System.alloc(o), l, room) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc_zeroed(l) };
-        if !p.is_null() {
-            count(l.size() as isize);
-        }
-        p
+        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
+        unsafe { opened(System.alloc_zeroed(o), l, room) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        unsafe { System.dealloc(p, l) };
-        count(-(l.size() as isize));
+        let (o, room) = outer(l).expect("a block allocated");
+        let base = unsafe { p.sub(room) };
+        let account = unsafe { (base as *const usize).read() };
+        HELD[account].fetch_sub(l.size() as isize, Ordering::Relaxed);
+        HERE.set(HERE.get() - l.size() as isize);
+        unsafe { System.dealloc(base, o) };
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        let q = unsafe { System.realloc(p, l, size) };
-        if !q.is_null() {
-            count(size as isize - l.size() as isize);
+        let (o, room) = outer(l).expect("a block allocated");
+        let Some(grown) = size.checked_add(room) else { return std::ptr::null_mut() };
+        let base = unsafe { p.sub(room) };
+        let account = unsafe { (base as *const usize).read() };
+        let q = unsafe { System.realloc(base, o, grown) };
+        if q.is_null() {
+            return q;
         }
-        q
+        // The block's account is the one it was allocated on, moved with it.
+        HELD[account].fetch_add(size as isize - l.size() as isize, Ordering::Relaxed);
+        HERE.set(HERE.get() + size as isize - l.size() as isize);
+        unsafe { q.add(room) }
     }
 }
 
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// The bytes the process holds.
+/// This thread's own account, from now on (a test's first line).
+fn mine() {
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(n < HELD.len(), "more tests than accounts");
+    ACCOUNT.set(n);
+}
+
+/// The bytes this thread's account holds: what it allocated (since
+/// [`mine`]) and is not freed, wherever it is freed.
 fn held() -> isize {
-    HELD.load(Ordering::Relaxed)
+    HELD[ACCOUNT.get()].load(Ordering::Relaxed)
 }
 
-/// One test at a time: the heap counted is the process's.
-fn one() -> std::sync::MutexGuard<'static, ()> {
-    static ONE: Mutex<()> = Mutex::new(());
-    ONE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The bytes held over `base` once what was let go is freed: once `done`
-/// holds of them, or, if it never does, once they stopped moving (5 s at
-/// most).
-fn settled(base: isize, done: impl Fn(isize) -> bool) -> isize {
-    let start = Instant::now();
-    let mut last = held() - base;
-    while !done(last) && start.elapsed() < Duration::from_secs(5) {
-        std::thread::sleep(Duration::from_millis(20));
-        let now = held() - base;
-        if now == last && start.elapsed() > Duration::from_millis(500) {
-            break;
-        }
-        last = now;
-    }
-    last
+/// The bytes this thread allocated less those it freed, whoever's.
+fn here() -> isize {
+    HERE.get()
 }
 
 const MIB: usize = 1 << 20;
@@ -165,7 +190,7 @@ fn turn(t: &mut Transcript) {
 /// the cards and lets the sync's state go; a reattach keeps none of it.
 #[test]
 fn nine_refused_inputs_of_8_mib_are_kept_once() {
-    let _one = one();
+    mine();
     let mut t = attach(&with_a_card());
     let base = held();
     turn(&mut t);
@@ -173,7 +198,7 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
         refused(&mut t, &format!("r{k}"), 8 * MIB);
     }
     let inputs = (9 * 8 * MIB) as isize;
-    let kept = settled(base, |n| n < inputs + 2 * MIB as isize);
+    let kept = held() - base;
     assert!(kept >= inputs, "the rows keep their inputs: {kept} bytes held");
     assert!(kept < inputs + 2 * MIB as isize, "{kept} bytes held for {inputs} of inputs: a copy more");
     let sync = t.card_sync_bytes();
@@ -181,12 +206,12 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
     let cards = t.cards().cards().to_vec();
     assert_eq!(cards.len(), 10, "the history's card and the nine refused");
     t.set_detached();
-    let detached = settled(base, |n| n < inputs + 2 * MIB as isize);
+    let detached = held() - base;
     assert!(detached < inputs + 2 * MIB as isize, "detached: {detached} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "detached: the card sync's state let go");
     assert_eq!(t.cards().cards(), &cards[..], "detached: the cards kept");
     t.load_attached(&attached(&with_a_card())).unwrap();
-    let again = settled(base, |n| n < MIB as isize);
+    let again = held() - base;
     assert!(again < MIB as isize, "reattached: the live rows gone, {again} bytes held");
 }
 
@@ -196,7 +221,7 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
 /// next sync).
 #[test]
 fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
-    let _one = one();
+    mine();
     let mut t = attach(&[]);
     let base = held();
     turn(&mut t);
@@ -210,7 +235,7 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
     assert!(t.card_sync_bytes() > 0, "the card sync kept");
     let n = t.trim_live_front(10, usize::MAX);
     assert!(n > 4, "the front trimmed: {n} rows");
-    let kept = settled(base, |n| n < MIB as isize);
+    let kept = held() - base;
     assert!(kept < MIB as isize, "trimmed, no event since: {kept} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "trimmed: the card sync's state let go");
     // The next event reads every row again, and keeps what it reads.
@@ -223,7 +248,7 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
 /// a little more (its tables' estimate), never less.
 #[test]
 fn the_card_sync_counts_what_it_keeps() {
-    let _one = one();
+    mine();
     let mut t = attach(&with_a_card());
     turn(&mut t);
     for k in 0..2_000 {
@@ -233,13 +258,79 @@ fn the_card_sync_counts_what_it_keeps() {
         }
     }
     let counted = t.card_sync_bytes();
-    // Nothing let go before is still being freed.
-    settled(0, |_| false);
-    let before = held();
+    let before = here();
     t.shed_card_sync();
-    let freed = before - held();
+    let freed = before - here();
     assert!(freed > 0, "shedding frees what it kept");
     assert!(counted as isize >= freed, "{counted} bytes counted, {freed} freed");
     assert!((counted as isize) < freed * 3 / 2 + 4096, "{counted} bytes counted, {freed} freed: near");
     assert_eq!(t.card_sync_bytes(), 0);
+}
+
+/// A block another thread frees is taken off the account of the thread
+/// that allocated it, once freed, not before (what a disposer's thread
+/// drops of a transcript's counts so).
+#[test]
+fn a_block_freed_on_another_thread_leaves_the_account_it_was_charged_to() {
+    let (give, take) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let (go, wait) = std::sync::mpsc::sync_channel::<()>(1);
+    let (freed, done) = std::sync::mpsc::sync_channel::<()>(1);
+    let other = std::thread::spawn(move || {
+        let block = take.recv().unwrap();
+        wait.recv().unwrap();
+        drop(block);
+        freed.send(()).unwrap();
+    });
+    // The thread and channels are not this account's: the block alone is.
+    mine();
+    let base = held();
+    give.send(vec![7u8; MIB]).unwrap();
+    assert_eq!(held() - base, MIB as isize, "allocated here, held by the other thread");
+    go.send(()).unwrap();
+    // Not `recv`: a thread's first wait allocates (its waiting context).
+    while done.try_recv().is_err() {
+        std::thread::yield_now();
+    }
+    assert_eq!(held() - base, 0, "freed there");
+    other.join().unwrap();
+}
+
+/// A card of the most its schema lets an input say, more or less.
+fn big(k: usize) -> Value {
+    json!({"question": format!("Ship build {k}?"), "detail": "d".repeat(1_400),
+        "options": (0..9).map(|i| json!({"label": format!("{i}{}", "l".repeat(50)), "hint": "h".repeat(110)})).collect::<Vec<_>>()})
+}
+
+fn big_card(k: usize) -> String {
+    format!("cbig00{k}")
+}
+
+/// A live close read again whose meaning did not change (its result
+/// reported again, a line more: the fold reads its first) keeps the card
+/// its row draws, not the copy the read made of it (31d66e7 kept that copy
+/// with the close, a card's heap per close that no count had, Shady #102
+/// P3-1): shedding the card sync frees what it counts, no more.
+#[test]
+fn a_close_read_again_keeps_no_copy_of_its_card() {
+    mine();
+    let mut h = vec![json!({"role": "user", "content": "go"})];
+    h.push(json!({"role": "assistant", "content": (0..4).map(|k|
+        json!({"type": "tool_use", "id": format!("h{k}"), "name": "cards_ui", "input": big(k)})).collect::<Vec<_>>()}));
+    h.push(json!({"role": "user", "content": (0..4).map(|k|
+        json!({"type": "tool_result", "tool_use_id": format!("h{k}"), "content": showing(&big_card(k), &big(k))})).collect::<Vec<_>>()}));
+    let mut t = attach(&h);
+    turn(&mut t);
+    for k in 0..4 {
+        let closed = cards_spec::Envelope::closed(cards_spec::CardId::parse(&big_card(k)).unwrap()).to_string();
+        call(&mut t, "cards_ui", &format!("x{k}"), json!({ "close": big_card(k) }), &closed);
+        apply(&mut t, json!({"kind": "llm", "llm": "tool_result", "tool_id": format!("x{k}"), "result": format!("{closed}\nagain")}));
+    }
+    let closed = t.cards().cards().iter().filter(|c| c.state == cards_spec::fold::State::Closed).count();
+    assert_eq!(closed, 4, "the four closed");
+    let counted = t.card_sync_bytes();
+    let before = here();
+    t.shed_card_sync();
+    let freed = before - here();
+    assert!(freed > 0, "shedding frees what it kept");
+    assert!(counted as isize >= freed, "{counted} bytes counted, {freed} freed: a card kept apart");
 }

@@ -298,6 +298,14 @@ fn shares(t: &Transcript, what: &str) {
         let row = t.items.iter().find(|i| i.id == *id).and_then(|i| i.card.as_ref());
         assert!(row.is_some_and(|r| Arc::ptr_eq(r, c)), "{what}: row {id}'s card kept apart from the row's");
     }
+    // A live close's card is its row's, not a copy a read made (Shady #102 P3-1).
+    for (id, doc) in t.card_live.closes() {
+        let drawn = t.card_live.want.get(id).map(|c| &**c);
+        assert!(
+            matches!(drawn, Some(CardRow::Close(c)) if Arc::ptr_eq(&c.doc, doc)),
+            "{what}: row {id}'s close keeps a card apart from the row's"
+        );
+    }
 }
 
 /// `ops` on a transcript attached to `h`, the sync that reads only what
@@ -346,6 +354,24 @@ fn a_row_that_moved_is_read_where_it_is() {
     let t = both(&with_a_card(), &ops, "answered after");
     let x1 = t.items().iter().find(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "x1")).unwrap();
     assert!(matches!(x1.card.as_deref(), Some(CardRow::Ask(a)) if a.answers == 1), "the answer is its");
+}
+
+/// A close read again that means the same (its result reported again, a
+/// line more: the fold reads the first) is drawn with the card its row
+/// had, and the close the sync keeps has that card too, not the copy the
+/// read made of it (Shady #102 P3-1: no count had that copy).
+#[test]
+fn a_close_read_again_keeps_its_rows_card() {
+    let closed = Envelope::closed(card(CARDS[0])).to_string();
+    let mut ops = vec![Op::Event(turn(Some("go")))];
+    ops.extend(call("cards_ui", "x1", json!({ "close": CARDS[0] })).map(Op::Event));
+    ops.push(Op::Event(result("x1", &closed)));
+    ops.push(Op::Event(result("x1", &format!("{closed}\nagain"))));
+    ops.extend(call("bash", "b1", json!({"command": "ls"})).map(Op::Event));
+    let t = both(&with_a_card(), &ops, "a close read again");
+    let x1 = t.items().iter().find(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "x1")).unwrap();
+    assert!(matches!(x1.card.as_deref(), Some(CardRow::Close(_))), "it closed the card");
+    assert_eq!(t.card_live.closes().len(), 1, "one close kept");
 }
 
 /// Over random streams (calls of cards and of other tools, results that
