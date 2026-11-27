@@ -81,12 +81,10 @@ pub(crate) enum Seen {
     Shown,
     /// Not drawn (dismissed): it counts in the header's `M dismissed`
     /// only through [`RailVisibility::dismissed`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "D6b's dismissals make it"))]
     Hidden,
     /// Drawn as a fixed one-line tombstone ([`Tomb`]): it takes no place
     /// under the cap. A group's member too: its line in the group is the
     /// tombstone's, never the member's content.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D6b's soft dismissals make it; D6a draws it"))]
     Tombstone(Tomb),
 }
 
@@ -136,9 +134,11 @@ pub(crate) trait RailVisibility {
     }
 }
 
-/// Everything shown, as the board places it: D6a's visibility.
+/// Everything shown, as the board places it (D6a's tests).
+#[cfg(test)]
 pub(crate) struct AllShown;
 
+#[cfg(test)]
 impl RailVisibility for AllShown {}
 
 // ---------------------------------------------------------------------------

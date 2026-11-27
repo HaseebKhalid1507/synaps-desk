@@ -134,7 +134,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
-use cards_spec::board::{Board, Event, Place, State};
+use cards_spec::board::{Board, Event, Place, State, Visibility};
 use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
@@ -2157,6 +2157,11 @@ pub struct Drawn {
     pub committed_to: u64,
     /// Live blocks on the board, groups and members included.
     pub live: usize,
+    /// Its visibility records (§3.5): as drawn, the live turn's included
+    /// (what a click is made on), and the history's alone (settled: what a
+    /// desire settles against). D6b's.
+    pub visibility: Arc<Visibility>,
+    pub settled: Arc<Visibility>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates. A row's [`Arc`] of it is its.
@@ -2204,6 +2209,8 @@ pub struct Worker {
     /// events come and go.
     bytes: usize,
     board: Board,
+    /// The history's visibility records, as of the history read last.
+    settled: Arc<Visibility>,
     /// The board's card fold's bytes ([`Board::card_fold_bytes`], an
     /// estimate that reads every card), as of its position then: read
     /// again when the history is read on, not per slice.
@@ -2251,6 +2258,7 @@ impl Default for Worker {
             hist: 0,
             bytes: 0,
             board: Board::new(block::Generation::of(&Value::Null)),
+            settled: Arc::default(),
             cards: (0, 0),
             batch: Batch::default(),
             committed: VecDeque::new(),
@@ -2460,6 +2468,12 @@ impl Worker {
         let history = input.history_len;
         let (log, want) = (input.live.log, input.live.len);
         if !self.over.as_ref().is_some_and(|o| o.log == log && o.history == history) {
+            // The history's records (once a history: its view's replay
+            // changes no record).
+            let settled = self.board.view(&self.journal[..history]);
+            if *settled.visibility() != *self.settled {
+                self.settled = Arc::new(settled.visibility().clone());
+            }
             // Its fold a copy of the board's, counted as copied (a copy
             // has no room to spare).
             let board = self.board.clone();
@@ -2622,6 +2636,8 @@ impl Worker {
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
+            visibility: if *view.visibility() == *self.settled { self.settled.clone() } else { Arc::new(view.visibility().clone()) },
+            settled: self.settled.clone(),
             bytes,
         }
     }

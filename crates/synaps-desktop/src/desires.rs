@@ -89,7 +89,7 @@ use std::path::{Path, PathBuf};
 
 use cards_spec::block::message::{self, NOTICE_IDS_MAX, Notice, NoticeLine, Trailer, VERSION_MAX, Visibility as Seen};
 use cards_spec::block::{BlockId, Generation};
-use cards_spec::board::{State, Visibility};
+use cards_spec::board::Visibility;
 use serde_json::{Value, json};
 
 use crate::blockfiles::{self, Stored};
@@ -104,6 +104,7 @@ pub(crate) const PER_DESK: usize = 512;
 pub(crate) const RESERVE: usize = 64 * 1024;
 /// One desire in the file, bytes at most (§1.8): a 24-character id, its
 /// state, a 9-digit version and its sent mark.
+#[cfg_attr(not(test), expect(dead_code, reason = "the bound the tests hold an entry to"))]
 pub(crate) const ENTRY_MAX: usize = 64;
 /// A conversation's key (its journal id), bytes at most.
 pub(crate) const KEY_MAX: usize = 128;
@@ -167,6 +168,7 @@ impl Desire {
         if self.dismissed { Seen::Dismissed } else { Seen::Shown }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "the tests' view of a carrier"))]
     pub(crate) fn in_flight(&self) -> bool {
         self.carrier.is_some()
     }
@@ -366,6 +368,7 @@ pub(crate) enum Carry {
     /// Typed text while a turn runs.
     Steer,
     /// A block edit handed back, or restored (D8), or its Resend.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D8's hand-back carries notices"))]
     HandBack,
     /// A card answer: all grammar, never a notice (§3.5).
     Answer,
@@ -538,11 +541,13 @@ impl Desires {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
     /// Whether this process owns the file (else memory only).
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn owns_file(&self) -> bool {
         self.owner.is_some()
     }
@@ -567,6 +572,7 @@ impl Desires {
     }
 
     /// Whether a write is out or to make.
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn writing(&self) -> bool {
         self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq))
     }
@@ -706,6 +712,7 @@ impl Desires {
     }
 
     /// Why `id`'s last wish wasn't kept, until its next wish.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's block walk says it on the block"))]
     pub(crate) fn refused(&self, conv: &str, id: &BlockId) -> Option<&str> {
         self.refusals.get(&(conv.to_string(), id.clone())).map(|(_, why)| why.as_str())
     }
@@ -719,16 +726,19 @@ impl Desires {
     /// Why `id` draws other than this desk wished: until it is seen
     /// ([`Desires::feedback_seen`]), the id's next wish, or its generation
     /// or conversation goes.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's block walk says it on the block"))]
     pub(crate) fn feedback(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<Feedback> {
         self.feedback.get(&Self::key(conv, generation, id)).map(|(_, f)| *f)
     }
 
     /// `id`'s feedback was shown: it goes.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's block walk says it on the block"))]
     pub(crate) fn feedback_seen(&mut self, conv: &str, generation: &Generation, id: &BlockId) {
         self.feedback.remove(&Self::key(conv, generation, id));
     }
 
     /// The side tables' sizes: feedback and refusals kept (tests; Settings).
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn notes(&self) -> (usize, usize) {
         (self.feedback.len(), self.refusals.len())
     }
@@ -765,10 +775,12 @@ impl Desires {
 
     /// Every desire of every conversation, by conversation (every
     /// generation's): the `discard` list.
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn waiting(&self) -> Vec<(String, usize)> {
         self.book.conversations.keys().map(|k| (k.clone(), self.book.conversation_len(k))).collect()
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn len(&self) -> usize {
         self.book.len()
     }
@@ -1067,20 +1079,19 @@ impl Desires {
         out
     }
 
-    /// `conv` was compacted (`state`: its board at the end): its
+    /// `conv` was compacted (`generation`, `shared`: its history's records
+    /// at the end): its
     /// generation's desires dropped, and the ids this desk drew dismissed
     /// returned (the successor's soft dismissals): every id the board's
     /// visibility records ([`Visibility::records`]) or a desire names,
     /// drawn dismissed. An id drawn dismissed has one or the other, so
     /// none is missed.
-    pub(crate) fn compacted(&mut self, conv: &str, state: &State) -> Vec<BlockId> {
-        let generation = state.generation();
-        let shared = state.visibility();
-        let g = generation_key(&generation);
+    pub(crate) fn compacted(&mut self, conv: &str, generation: &Generation, shared: &Visibility) -> Vec<BlockId> {
+        let g = generation_key(generation);
         let mut ids: BTreeSet<BlockId> = shared.records().filter(|(_, r)| r.dismissed).map(|(id, _)| id.clone()).collect();
         ids.extend(self.book.slot(conv, &g).into_iter().flat_map(BTreeMap::keys).cloned());
         ids.extend(self.asked.keys().filter(|(c, ag, _)| c == conv && *ag == g).map(|(.., id)| id.clone()));
-        let out: Vec<BlockId> = ids.into_iter().filter(|id| self.dismissed(conv, &generation, id, shared)).collect();
+        let out: Vec<BlockId> = ids.into_iter().filter(|id| self.dismissed(conv, generation, id, shared)).collect();
         self.asked.retain(|(c, ag, _), _| !(c == conv && *ag == g));
         self.feedback.retain(|(c, ..), _| c != conv);
         self.refusals.retain(|(c, _), _| c != conv);
@@ -1095,6 +1106,7 @@ impl Desires {
     /// The user's discard: `conv`'s unsent desires dropped, every
     /// generation's (a desire that may have been sent stays until it
     /// settles); how many.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the full desk's discard, with D7"))]
     pub(crate) fn discard(&mut self, conv: &str) -> usize {
         let before = self.book.conversation_len(conv);
         self.feedback.retain(|(c, ..), _| c != conv);

@@ -138,7 +138,7 @@ impl Flushed for Desires {
     }
 
     fn compacted_now(&mut self, conv: &str, state: &State) -> Vec<BlockId> {
-        let out = self.compacted(conv, state);
+        let out = self.compacted(conv, &state.generation(), state.visibility());
         flush(self);
         out
     }
@@ -786,7 +786,7 @@ fn the_ui_thread_never_touches_the_file() {
     assert_eq!(a.ride(J, &g, &h.vis(), "go", Carry::Submit), Ok(plain), "nothing rides, nothing waits: it goes");
     a.settle(J, &g, &h.vis(), &[]);
     a.discard("another");
-    a.compacted("a-third", &h.state());
+    a.compacted("a-third", &h.state().generation(), h.state().visibility());
     let w = a.next_write().expect("the launch's sweep");
     assert!(a.next_write().is_none(), "one out at a time");
     assert_eq!(blockfiles::on_this_thread(), disk, "no write on the UI thread");
@@ -1443,7 +1443,8 @@ fn a_wish_out_across_a_generation_switch_is_retired() {
         if how == "switch" {
             a.settle(J, &g2, &h.vis(), &[]);
         } else {
-            assert_eq!(a.compacted(J, &h.state()), [], "never drawn dismissed");
+            let s = h.state();
+            assert_eq!(a.compacted(J, &s.generation(), s.visibility()), [], "never drawn dismissed");
         }
         assert!(!a.pending(J, &g1, &id("tests")));
         let mut landed = a.landed(in_background(w));

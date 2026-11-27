@@ -445,6 +445,9 @@ pub struct Transcript {
     /// to another journal is another conversation, and carries no time of
     /// this one's.
     journal_id: String,
+    /// Compactions applied since it was made (the journal moved to its
+    /// successor): D6b carries the predecessor's dismissals across.
+    compactions: u64,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
@@ -605,6 +608,17 @@ impl Transcript {
     }
 
     /// A turn is running.
+    /// The journal of the conversation shown (module docs: clear, resume
+    /// and compaction move it).
+    pub fn journal_id(&self) -> &str {
+        &self.journal_id
+    }
+
+    /// Compactions applied since it was made.
+    pub fn compactions(&self) -> u64 {
+        self.compactions
+    }
+
     pub fn busy(&self) -> bool {
         self.busy
     }
@@ -1309,6 +1323,7 @@ impl Transcript {
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
+            compactions: if same { self.compactions } else { 0 },
             drawn,
             // Its log's bin carries over ([`crate::blocks::dispose`]).
             live_log: self.live_log.renewed(),
@@ -2213,6 +2228,7 @@ impl Transcript {
             SessionEvent::CompactionStarted => self.compacting = true,
             SessionEvent::CompactionApplied { session_id, msg_count, .. } => {
                 self.compacting = false;
+                self.compactions += 1;
                 self.swap_pending = true;
                 self.swapped = true;
                 self.journal_id.clone_from(session_id);

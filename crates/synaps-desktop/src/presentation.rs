@@ -355,6 +355,7 @@ impl Presentation {
     }
 
     /// Whether a write is out or to make.
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn writing(&self) -> bool {
         self.owner.is_some() && (self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq)))
     }
@@ -403,6 +404,7 @@ impl Presentation {
     /// `slot`'s sections in `conv`, in drawing order: the user's first, in
     /// the order the user placed them, then the agent's in its order. A
     /// group's members draw in it, not here.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the transcript's pins, with D7"))]
     pub(crate) fn order(&self, conv: &str, state: &State, slot: Slot) -> Vec<Ref> {
         let c = self.book.conversations.get(conv);
         let mut user: Vec<(u64, Ref)> = c
@@ -423,7 +425,24 @@ impl Presentation {
         user.into_iter().map(|(_, r)| r).chain(agent).collect()
     }
 
+    /// The user's rail placements in `conv`, pins and slot moves, in the
+    /// order the user made them (D6a's `RailVisibility::placed`).
+    pub(crate) fn user_rail(&self, conv: &str) -> Vec<(Ref, Slot)> {
+        let Some(c) = self.book.conversations.get(conv) else { return Vec::new() };
+        let mut v: Vec<(u64, Ref, Slot)> = c
+            .entries
+            .iter()
+            .filter_map(|k| match &k.entry {
+                Entry::Placed { r, to: UserPlace::Rail(s), .. } => Some((k.seq, r.clone(), *s)),
+                _ => None,
+            })
+            .collect();
+        v.sort_by_key(|(seq, ..)| *seq);
+        v.into_iter().map(|(_, r, s)| (r, s)).collect()
+    }
+
     /// `p` on `b` (module docs): what it does now.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's `p`"))]
     pub(crate) fn pin(&mut self, conv: &str, b: &Block) -> Result<Placed, String> {
         Self::movable(conv, b)?;
         let on_rail = matches!(self.placed(conv, b).place, Place::Rail(_));
@@ -485,6 +504,7 @@ impl Presentation {
     }
 
     /// "Reset placement": the agent's placement for `r`. False: it had it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "D7's reset placement"))]
     pub(crate) fn reset(&mut self, conv: &str, r: &Ref) -> bool {
         let Some(c) = self.book.conversations.get_mut(conv) else { return false };
         let before = c.entries.len();

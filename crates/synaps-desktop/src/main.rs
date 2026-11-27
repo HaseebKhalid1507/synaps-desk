@@ -41,9 +41,6 @@ mod ask_keys;
 mod authorize;
 mod beat;
 mod bench;
-// D6b's stores (blocks.md §3.5): built and tested ahead of the rail's
-// seam (D6a's `RailVisibility`), which wires them.
-#[cfg_attr(not(test), allow(dead_code))]
 mod blockfiles;
 mod blocks;
 mod board;
@@ -54,7 +51,6 @@ mod chrome;
 mod dash;
 mod deliver;
 mod demo;
-#[cfg_attr(not(test), allow(dead_code))]
 mod desires;
 mod detail;
 mod diag;
@@ -80,9 +76,9 @@ mod palette;
 mod palettes;
 mod pane;
 mod presence;
-#[cfg_attr(not(test), allow(dead_code))]
 mod presentation;
 mod rail;
+mod rail_wishes;
 mod recall;
 #[cfg(test)]
 mod receipt_tests;
@@ -392,6 +388,9 @@ fn main() {
                 // (and what a crash left beside the file swept, off this thread).
                 let remember = recall::enabled(theme::settings_path().and_then(|p| theme::load_value(&p, recall::SETTING)).as_ref());
                 v.start_recall(remember, recall::path(), cx);
+                // The rail's dismissals and placements: this desk's files,
+                // read now (what a crash left swept off this thread).
+                v.start_wishes(cx);
                 v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
                 v.dash.socket = launch.endpoint.as_ref().map(|e| e.resolve());
                 v.dash.launch = launch;
