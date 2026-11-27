@@ -39,6 +39,8 @@ mod ask_keys;
 mod authorize;
 mod beat;
 mod bench;
+mod blocks;
+mod board;
 mod cards;
 mod chart;
 mod choice;
@@ -56,6 +58,7 @@ mod fit;
 mod fonts;
 mod glyph;
 mod lattice;
+mod lease;
 mod live;
 mod mem;
 mod menu;
@@ -330,6 +333,16 @@ fn main() {
         theme::carry_favourites(p, k, &favs);
     }
 
+    // What live turns let go is dropped off the frame by the app's own
+    // disposer (`synaps_client::blocks::dispose`): the main thread's, so
+    // every transcript the app makes hands over to it. It shuts down (its
+    // queue closed, drained, its thread joined `JOIN` at most, `JOIN`
+    // being its wait for the thread's last drop) when `run` returns, as
+    // Linux's and Windows' do once the app quits. macOS exits from within
+    // `run`, and a Windows end-session may exit the process from its
+    // handler: what it held then is memory only.
+    let disposer = synaps_client::blocks::dispose::Disposer::start();
+    let _disposing = disposer.install();
     diag::mark("before_application");
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
     gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {

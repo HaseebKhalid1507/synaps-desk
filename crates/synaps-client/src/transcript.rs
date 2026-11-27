@@ -50,7 +50,7 @@
 //! updates, [`Transcript::take_splice`] reports the first changed index and
 //! the old/new lengths, so the UI remeasures only the rows that changed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -336,26 +336,48 @@ pub struct Item {
     /// answer's, a close's. Part of `rev`: a row whose card changes (an
     /// answer came, it closed) is changed.
     pub card: Option<Arc<crate::cards::CardRow>>,
-    /// A live card call's input, whole (`ToolUse`): [`ToolCall::input`] is
-    /// a preview, and a card input may be up to 8 KiB (synaps-cards design
-    /// §2.1). A history call's is read from its message.
-    card_input: Option<Arc<Value>>,
+    /// What it draws of the blocks' board ([`crate::blocks`]): a block
+    /// call's fate, the blocks anchored at it, its run's title. Part of
+    /// `rev`: a row whose blocks change is changed.
+    pub blocks: Option<Arc<crate::blocks::RowBlocks>>,
+    /// A card or block call's input, whole ([`crate::blocks::keeps_input`]):
+    /// [`ToolCall::input`] is a preview, and either input may be up to
+    /// 8 KiB (synaps-cards design §2.1, blocks.md §5.1): the live call's
+    /// (`ToolUse`), the history call's from its message. Rebuilt as kept
+    /// ([`crate::blocks::canonical`]), never changed after: what it holds
+    /// is what [`Item::kept_bytes`] charges.
+    kept_input: Option<Arc<Value>>,
     /// A live row's place in the stream ([`Transcript::came`]; 0: not
     /// yet): its call, once no longer streaming (a user row: its message),
     /// and its result. The cards fold the live turn in this order, not the
     /// rows' ([`crate::cards`]): results need not come in call order.
     seq: [u64; 2],
+    /// A history block call's committed fate (a board published it once,
+    /// [`crate::blocks::Drawn::committed`]): its row keeps it, so no board
+    /// keeps or publishes it again.
+    fate: Option<crate::blocks::Fate>,
 }
 
 impl Item {
+    /// What its kept input holds (bytes, heap included: [`Item`]'s
+    /// `kept_input`, a card or block call's input whole).
+    pub fn kept_bytes(&self) -> usize {
+        self.kept_input.as_deref().map_or(0, crate::blocks::kept_bytes)
+    }
+
     /// A notice or error this client added (not part of the history).
     pub fn is_note(&self) -> bool {
         self.anchor.is_some()
     }
 
-    /// A live card call's whole input.
-    pub(crate) fn card_input(&self) -> Option<&Value> {
-        self.card_input.as_deref()
+    /// A card or block call's whole input.
+    pub(crate) fn kept_input(&self) -> Option<&Value> {
+        self.kept_input.as_deref()
+    }
+
+    /// Its kept input's allocation (tests: who else keeps it).
+    pub fn kept_allocation(&self) -> Option<&Arc<Value>> {
+        self.kept_input.as_ref()
     }
 
     /// Its place in the live stream: its call's (or message's), its
@@ -490,6 +512,24 @@ pub struct Transcript {
     card_rows: usize,
     /// The live stream's order so far ([`Item::seq()`]).
     live_seq: u64,
+    /// The blocks' input over the history folded so far ([`crate::blocks`]).
+    blocks: crate::blocks::HistoryBlocks,
+    /// The live turn's protocol facts since the history's last fold
+    /// ([`crate::blocks::LiveLog`]): the board's live input is read from
+    /// them, never from rows.
+    live_log: crate::blocks::LiveLog,
+    /// The blocks' input's revision ([`Transcript::blocks_rev`]).
+    blocks_rev: u64,
+    /// The board the rows draw, once one is published ([`Transcript::set_drawn`]).
+    drawn: Option<Arc<crate::blocks::Drawn>>,
+    /// The epoch whose committed calls' fates the rows keep ([`Item::fate`]).
+    fate_epoch: u64,
+    /// Rows were taken to be folded again since the last sync: they draw
+    /// the last board again ([`Transcript::sync_blocks`]).
+    rows_moved: bool,
+    /// The history's epoch and length, and the live log's version, at the
+    /// last sync.
+    blocks_seen: (u64, usize, (u64, u64)),
     /// A card call among the live rows: set as one starts, so a session
     /// without cards reads no row per event ([`Transcript::sync_cards`]).
     /// It may stay set once that row is gone: then the fold just runs.
@@ -593,6 +633,163 @@ impl Transcript {
     /// moved, empty or cloned, share theirs).
     pub fn cards_rev(&self) -> u64 {
         self.card_rev
+    }
+
+    /// The blocks' input's revision (blocks.md §1.7): it moves when the
+    /// board's input does (the history's events, the live turn's as the
+    /// board reads them), and only then, so a desk schedules the board's
+    /// work again only when this moves. One counter for the process.
+    pub fn blocks_rev(&self) -> u64 {
+        self.blocks_rev
+    }
+
+    /// The board's input now ([`crate::blocks::Input`]): `None` with no
+    /// block call in the history or the live turn.
+    pub fn blocks_input(&self) -> Option<crate::blocks::Input> {
+        crate::blocks::Input::of(&self.blocks, &self.live_log)
+    }
+
+    /// A block call in the history or the live turn: the board draws them.
+    pub fn has_blocks(&self) -> bool {
+        self.blocks.has_blocks() || self.live_log.has_blocks()
+    }
+
+    /// The history's epoch ([`crate::blocks::HistoryBlocks::epoch`]): a
+    /// board folded from another epoch's input is another history's.
+    pub fn blocks_epoch(&self) -> u64 {
+        self.blocks.epoch()
+    }
+
+    /// The history's events read so far: within an epoch it only grows.
+    pub fn blocks_len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// What the board's input and its output keep, heap included (bytes):
+    /// the history's blocks with its worker's fold
+    /// ([`crate::blocks::HistoryBlocks::bytes`]), the live turn's log
+    /// ([`crate::blocks::LiveLog::bytes`]), and the board the rows draw
+    /// ([`crate::blocks::Drawn::bytes`]), each owner once: a row's blocks
+    /// are the board's, but for a row's own entry (a committed fate added
+    /// to the board's: [`crate::blocks::RowBlocks::of`]).
+    pub fn blocks_bytes(&self) -> usize {
+        use crate::blocks::RowBlocks;
+        let drawn = self.drawn.as_deref();
+        let own = |(id, b): (u64, &Arc<RowBlocks>)| {
+            let board = drawn.and_then(|d| d.rows.get(&id)).is_some_and(|r| Arc::ptr_eq(r, b));
+            if board || RowBlocks::is_shared(b) { 0 } else { b.own_bytes() }
+        };
+        let rows: usize = self.items.iter().filter_map(|i| Some((i.id, i.blocks.as_ref()?))).map(own).sum();
+        self.blocks.bytes() + self.live_log.bytes() + drawn.map_or(0, |d| d.bytes) + rows
+    }
+
+    /// The frame's work for the board's live input so far: the events its
+    /// live log wrote and moved (tests: the events each live event adds,
+    /// never the turn so far).
+    #[doc(hidden)]
+    pub fn blocks_work(&self) -> usize {
+        self.live_log.work()
+    }
+
+    /// The live turn's log (tests: what it keeps).
+    #[doc(hidden)]
+    pub fn blocks_live(&self) -> &crate::blocks::LiveLog {
+        &self.live_log
+    }
+
+    /// What the history's worker keeps ([`crate::blocks::Retained`]).
+    pub fn blocks_retained(&self) -> crate::blocks::Retained {
+        self.blocks.worker().lock().unwrap_or_else(std::sync::PoisonError::into_inner).retained()
+    }
+
+    /// The board the rows draw, the last one published.
+    pub fn drawn(&self) -> Option<&Arc<crate::blocks::Drawn>> {
+        self.drawn.as_ref()
+    }
+
+    /// A finished board for the rows to draw ([`Item::blocks`]; `None`: no
+    /// board, as after a `/clear`): the rows it or the last one draws on,
+    /// and those of calls it says committed, are drawn again, and every
+    /// changed row is touched; the first board of a history draws every row
+    /// again. Rows are matched by id, so a board folded from an
+    /// input the rows have moved past since draws on the rows still there,
+    /// until the next one lands.
+    pub fn set_drawn(&mut self, drawn: Option<Arc<crate::blocks::Drawn>>) {
+        let old = std::mem::replace(&mut self.drawn, drawn);
+        let Some(d) = self.drawn.clone() else {
+            self.fate_epoch = 0;
+            for it in &mut self.items {
+                it.fate = None;
+            }
+            self.redraw_blocks();
+            return;
+        };
+        let committed: HashMap<u64, crate::blocks::Fate> = d.committed.iter().copied().collect();
+        if d.epoch != self.fate_epoch {
+            // Another history's first board: its committed calls are all.
+            self.fate_epoch = d.epoch;
+            for it in &mut self.items {
+                it.fate = committed.get(&it.id).copied();
+            }
+            self.redraw_blocks();
+        } else {
+            let mut ids: HashSet<u64> = d.rows.keys().chain(committed.keys()).copied().collect();
+            ids.extend(old.iter().flat_map(|o| o.rows.keys().copied()));
+            let mut changed = Vec::new();
+            for (ix, it) in self.items.iter_mut().enumerate().filter(|(_, it)| ids.contains(&it.id)) {
+                if let Some(&f) = committed.get(&it.id) {
+                    it.fate = Some(f);
+                }
+                // The board's own, even if the same as the one before: an
+                // older board's copy is let go (one owner, counted once).
+                let want = crate::blocks::RowBlocks::of(Some(&d), it.id, it.fate);
+                if it.blocks != want {
+                    changed.push(ix);
+                }
+                it.blocks = want;
+            }
+            for ix in changed {
+                self.touch(ix);
+            }
+        }
+        if d.epoch == self.blocks.epoch() {
+            self.blocks.took(d.committed_to);
+        }
+    }
+
+    /// Every row's blocks as [`Transcript::drawn`] and its call's committed
+    /// fate say; changed rows touched.
+    fn redraw_blocks(&mut self) {
+        let mut changed = Vec::new();
+        for (ix, it) in self.items.iter_mut().enumerate() {
+            let want = crate::blocks::RowBlocks::of(self.drawn.as_deref(), it.id, it.fate);
+            if it.blocks != want {
+                changed.push(ix);
+            }
+            it.blocks = want;
+        }
+        for ix in changed {
+            self.touch(ix);
+        }
+    }
+
+    /// The board's input again: [`Transcript::blocks_rev`] moves if the
+    /// history's events or the live log's did (its version: nothing of the
+    /// turn is read here, the log wrote each event as it came). Rows folded
+    /// again (the history replaced them) draw the last board's blocks
+    /// until the next one lands, so nothing blinks; no other row is read.
+    fn sync_blocks(&mut self) {
+        self.blocks.prune();
+        // With no block call there is no board: its live turn is no input.
+        let live = if self.has_blocks() { self.live_log.version() } else { (0, 0) };
+        let seen = (self.blocks.epoch(), self.blocks.len(), live);
+        if self.blocks_seen != seen {
+            self.blocks_seen = seen;
+            self.blocks_rev = next_card_rev();
+        }
+        if std::mem::take(&mut self.rows_moved) && (self.drawn.is_some() || self.fate_epoch != 0) {
+            self.redraw_blocks();
+        }
     }
 
     /// The agent cards' fold of the history alone, without the live turn:
@@ -849,8 +1046,10 @@ impl Transcript {
                 form: None,
                 anchor: None,
                 card: None,
-                card_input: None,
+                blocks: None,
+                kept_input: None,
                 seq: [0; 2],
+                fate: None,
             },
         );
         self.mark(ix);
@@ -984,6 +1183,7 @@ impl Transcript {
     /// themselves are kept in `self.before` for [`Transcript::keep_revs`].
     fn take_rows(&mut self, from: usize) -> (Vec<Item>, Reuse) {
         self.mark(from);
+        self.rows_moved = true;
         self.tools.retain(|_, ix| *ix < from);
         let mut notes = Vec::new();
         let mut reuse = Reuse::new();
@@ -1017,8 +1217,19 @@ impl Transcript {
             return;
         }
         let before: HashMap<u64, Item> = std::mem::take(&mut self.before).into_iter().map(|i| (i.id, i)).collect();
+        let drawn = self.drawn.clone();
         for it in self.items.iter_mut().filter(|i| i.anchor.is_none()) {
             let Some(o) = before.get(&it.id) else { continue };
+            // The same call, folded again: it keeps its committed fate
+            // until the new history's board says (nothing blinks).
+            if carry
+                && o.fate.is_some()
+                && it.fate.is_none()
+                && o.tool.as_ref().zip(it.tool.as_ref()).is_some_and(|(a, b)| a.tool_id == b.tool_id)
+            {
+                it.fate = o.fate;
+                it.blocks = crate::blocks::RowBlocks::of(drawn.as_deref(), it.id, it.fate);
+            }
             // An event row refolded from its form keeps what only its frame
             // had (sender, ASK, time; a `local_only` text): the same event.
             if carry
@@ -1046,6 +1257,7 @@ impl Transcript {
                 && o.tool == it.tool
                 && o.event == it.event
                 && o.card == it.card
+                && o.blocks == it.blocks
             {
                 it.rev = o.rev;
             }
@@ -1074,6 +1286,9 @@ impl Transcript {
         let stuck = if same { std::mem::take(&mut self.stuck) } else { Vec::new() };
         // Which calls ran: the same session's calls still are what they were.
         let (past_gate, past_gate_cap) = if same { (std::mem::take(&mut self.past_gate), self.past_gate_cap) } else { Default::default() };
+        // The same conversation's rows draw its last board until the next
+        // one lands (a reattach folds it again: nothing blinks).
+        let drawn = if carry { self.drawn.take() } else { None };
         *self = Transcript {
             next_id,
             clean_len,
@@ -1087,6 +1302,9 @@ impl Transcript {
             engine_pending: a.conversation.pending_events_len,
             session_id: Some(a.meta.id.clone()),
             journal_id: journal,
+            drawn,
+            // Its log's bin carries over ([`crate::blocks::dispose`]).
+            live_log: self.live_log.renewed(),
             ..Transcript::default()
         };
         self.dirty_from = Some(0);
@@ -1183,6 +1401,8 @@ impl Transcript {
         self.history_end = self.items.len();
         self.push_pending(pending);
         self.response_start = None;
+        // The live turn it took is the history's now.
+        self.live_log = self.live_log.renewed();
         if !self.busy {
             self.settle();
         }
@@ -1226,6 +1446,8 @@ impl Transcript {
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
         self.after_summary = false;
         self.cards = crate::cards::HistoryCards::default();
+        self.blocks = crate::blocks::HistoryBlocks::default();
+        self.live_log = self.live_log.renewed();
         self.cards_dirty = true;
         self.recount = true;
         let notes = self.hold_events(notes, messages);
@@ -1439,6 +1661,7 @@ impl Transcript {
         (self.stamp, self.event_ts) = outer;
         // Its rows are the ones it just pushed (notes go between messages).
         self.cards.message(m, &self.items[first..]);
+        self.blocks.message(m, &self.items[first..]);
         self.cards_dirty = true;
         self.recount = true;
     }
@@ -1452,6 +1675,7 @@ impl Transcript {
         if !std::mem::take(&mut self.cards_dirty) {
             return;
         }
+        self.sync_blocks();
         let live = self.history_end.min(self.items.len());
         if std::mem::take(&mut self.recount) {
             self.live_cards = self.items[live..].iter().any(|i| i.tool.as_ref().is_some_and(|t| crate::cards::is_card_tool(&t.name)));
@@ -1697,7 +1921,10 @@ impl Transcript {
                                 tail: String::new(),
                                 status: Some(ToolStatus::Running),
                             };
-                            self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
+                            let kept = crate::blocks::keeps_input(&tool.name)
+                                .then(|| Arc::new(crate::blocks::canonical(b.get("input").unwrap_or(&Value::Null))));
+                            let ix = self.push(ItemKind::Tool, String::new(), Some(tool), false, reuse);
+                            self.items[ix].kept_input = kept;
                         }
                         "tool_result" => {
                             flush(self, &mut text, reuse);
@@ -1792,10 +2019,12 @@ impl Transcript {
         match ev {
             WatchEvent::Steered { text } if !ExternalEvent::is_payload(text.trim_start()) => {
                 self.end_streaming_text();
-                self.push_new(ItemKind::User, text.clone(), None, false);
+                let ix = self.push_new(ItemKind::User, text.clone(), None, false);
+                self.live_log.user(&self.blocks, text, Some(self.items[ix].id));
             }
-            // A drained event's payload: its parent's business.
-            WatchEvent::Steered { .. } => {}
+            // A drained event's payload: its parent's business (its history
+            // holds it as a user message all the same).
+            WatchEvent::Steered { text } => self.live_log.user(&self.blocks, text, None),
             WatchEvent::Failed { category } => self.notice(ItemKind::Error, format!("subagent failed [{category}]")),
             other => {
                 if let Some(s) = other.to_stream() {
@@ -1837,6 +2066,9 @@ impl Transcript {
             return 0;
         }
         self.items.drain(..n);
+        // No history: no board reads the turn (a worker's), and its facts
+        // would outgrow the rows they left.
+        self.live_log = self.live_log.renewed();
         self.tools.retain(|_, ix| *ix >= n);
         for ix in self.tools.values_mut() {
             *ix -= n;
@@ -1884,7 +2116,8 @@ impl Transcript {
                 self.busy = true;
                 self.deliver_all();
                 if let Some(t) = user_text {
-                    self.push_new(ItemKind::User, t.clone(), None, false);
+                    let ix = self.push_new(ItemKind::User, t.clone(), None, false);
+                    self.live_log.user(&self.blocks, t, Some(self.items[ix].id));
                 }
             }
             SessionEvent::Stream { event } => self.apply_stream(event),
@@ -2006,6 +2239,7 @@ impl Transcript {
                 LlmEvent::ResponseStart => {
                     self.end_streaming_text();
                     self.response_start = Some(self.live_end());
+                    self.live_log.response();
                 }
                 // The response's rows go; an event's that came meanwhile stays.
                 LlmEvent::ResponseReset => {
@@ -2015,10 +2249,17 @@ impl Transcript {
                         self.items.extend(kept);
                         self.tools.retain(|_, ix| *ix < s);
                         self.mark(s);
+                        self.live_log.reset();
                     }
                 }
-                LlmEvent::Thinking { text } => self.append_live(ItemKind::Thinking, text),
-                LlmEvent::Text { text } => self.append_live(ItemKind::Assistant, text),
+                LlmEvent::Thinking { text } => {
+                    self.live_log.content(&self.blocks);
+                    self.append_live(ItemKind::Thinking, text)
+                }
+                LlmEvent::Text { text } => {
+                    self.live_log.content(&self.blocks);
+                    self.append_live(ItemKind::Assistant, text)
+                }
                 LlmEvent::ToolUseStart { tool_name, tool_id } => {
                     self.end_streaming_text();
                     self.live_cards |= crate::cards::is_card_tool(tool_name);
@@ -2028,7 +2269,8 @@ impl Transcript {
                         status: Some(ToolStatus::Streaming),
                         ..Default::default()
                     };
-                    self.push_new(ItemKind::Tool, String::new(), Some(tool), true);
+                    let ix = self.push_new(ItemKind::Tool, String::new(), Some(tool), true);
+                    self.live_log.started(&self.blocks, self.items[ix].id, tool_id, tool_name);
                 }
                 LlmEvent::ToolUseDelta { tool_id, delta } => {
                     if let Some(ix) = self.tool_mut(tool_id) {
@@ -2056,7 +2298,17 @@ impl Transcript {
                         t.status = Some(ToolStatus::Running);
                     }
                     let card = crate::cards::is_card_tool(tool_name);
-                    self.items[ix].card_input = card.then(|| Arc::new(input.clone()));
+                    let kept = crate::blocks::keeps_input(tool_name).then(|| Arc::new(crate::blocks::canonical(input)));
+                    // A live call; the history's own (an attach's replay of
+                    // a call its history holds) is the history's. The row
+                    // keeps the input as the log does: the same input again
+                    // is the one both kept, one allocation (counted once,
+                    // the row's).
+                    self.items[ix].kept_input = if ix >= self.history_end {
+                        self.live_log.call(&self.blocks, self.items[ix].id, tool_id, tool_name, kept)
+                    } else {
+                        kept
+                    };
                     self.live_cards |= card;
                     self.came(ix, false);
                     self.touch(ix);
@@ -2085,6 +2337,9 @@ impl Transcript {
                     }
                 }
                 LlmEvent::ToolResult { tool_id, result } => {
+                    // The final result, as the history will hold it: a
+                    // delta never is one, nor a row's preview.
+                    self.live_log.result(&self.blocks, tool_id, result);
                     if let Some(ix) = self.tool_mut(tool_id) {
                         let outcome = tool_outcome(result, false);
                         self.note_result(tool_id, result, outcome);
@@ -2113,6 +2368,11 @@ impl Transcript {
             },
             StreamEvent::Agent(a) => match a {
                 AgentEvent::SteeringDelivered { message } => {
+                    // The engine drained it into the history, after the
+                    // round's results: a user message of its text there
+                    // (an event's payload too; the board reads which text
+                    // is the user's own, blocks.md §7).
+                    self.live_log.user(&self.blocks, message, None);
                     if let Some(ev) = steered_event(message) {
                         self.delivered(ev);
                     }

@@ -13,7 +13,7 @@
 //! swapped exactly as before.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -95,6 +95,17 @@ pub struct Pane {
     pub(crate) toggled: Toggled,
     /// Runs the user unfolded (by their first item's id).
     pub(crate) open_runs: HashSet<u64>,
+    /// Blocks the user folded or unfolded here ([`crate::blocks::Folds`]),
+    /// notes opened past their 6 lines and diff wells' scroll, by block row
+    /// (an edit preview is the session ledger's: `files::Edits`).
+    pub(crate) block_folds: crate::blocks::Folds,
+    /// The pointer lease and painted targets ([`crate::lease`]).
+    pub(crate) lease: crate::lease::Lease,
+    pub(crate) block_more: HashSet<u64>,
+    pub(crate) block_scroll: std::cell::RefCell<HashMap<u64, gpui_kit::ScrollHandle>>,
+    /// The history the block state above is of: its session and
+    /// generation ([`crate::blocks::history_of`], [`Pane::blocks_over`]).
+    pub(crate) block_of: u64,
     /// The rows an unfold under Full is revealing: tail-follow is held
     /// paused while they do ([`AppView::hold_unfold`]).
     pub(crate) unfold_hold: Vec<u64>,
@@ -446,6 +457,20 @@ pub(crate) struct Parked {
 }
 
 impl Pane {
+    /// Its blocks' state goes (Shady #101 P2-4): the user's folds and
+    /// `more`, the wells' scroll, the edit previews, and the lease's
+    /// press, targets, slides and pill. What it held was another
+    /// session's, or a store's this pane no longer shows (a switch, a
+    /// detach, its last tab closed); a store another pane shows keeps that
+    /// pane's.
+    pub(crate) fn blocks_clear(&mut self) {
+        self.block_folds = Default::default();
+        self.block_more.clear();
+        self.block_scroll.borrow_mut().clear();
+        self.block_of = 0;
+        self.lease.clear();
+    }
+
     /// A pane with nothing on it yet: an empty list following its tail.
     pub(crate) fn fresh(
         id: PaneId,
@@ -468,6 +493,11 @@ impl Pane {
             list,
             toggled: Toggled::default(),
             open_runs: HashSet::new(),
+            block_folds: Default::default(),
+            lease: Default::default(),
+            block_more: HashSet::new(),
+            block_scroll: Default::default(),
+            block_of: 0,
             unfold_hold: Vec::new(),
             synced_busy: false,
             files_gen: 0,
@@ -1590,6 +1620,7 @@ impl crate::app::AppView {
     pub(crate) fn fresh_live(&mut self) -> crate::live::LiveId {
         match self.model.lives.ids().into_iter().find(|l| self.panes.showing(*l) == 0) {
             Some(l) => {
+                self.board_out(l);
                 self.model.lives[l] = crate::live::Live::default();
                 l
             }
@@ -1606,6 +1637,7 @@ impl crate::app::AppView {
         if let (Some(c), Some(seq)) = (&self.client, self.model.lives[live].release()) {
             let _ = c.on(seq).detach();
         }
+        self.board_out(live);
         if live == crate::live::LiveId::FIRST {
             self.model.lives[live] = crate::live::Live::default();
         } else {

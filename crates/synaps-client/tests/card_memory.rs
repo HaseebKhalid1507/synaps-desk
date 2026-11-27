@@ -4,7 +4,7 @@
 //! draws (the rows keep those); counted (`Transcript::card_sync_bytes`);
 //! and let go as soon as it can't be used: a detach, a trim, a tab cached.
 //!
-//! The heap is counted by the allocator below, by thread, two ways:
+//! The heap is counted by the allocator ([`heap`]), by thread, two ways:
 //! - [`held`]: each block is charged to the account of the thread that
 //!   allocated it ([`mine`]: each test's its own) and taken off that
 //!   account wherever it is freed. What a test's transcript still holds,
@@ -14,104 +14,38 @@
 //!   Read across something this thread does (a shed), it is what that
 //!   frees, whatever another thread does meanwhile.
 //!
-//! Here nothing is freed elsewhere (no disposer): what a transcript lets
-//! go is freed as it is let go, so every measurement is read directly,
-//! nothing waited for.
+//! Each test installs a disposer of its own before its account starts, as
+//! the app does (`synaps_client::blocks::dispose`): what a transcript's
+//! live log lets go (a trim's, a reattach's) is freed on the disposer's
+//! thread, off this one. So every [`held`] sample is taken after the
+//! disposer is flushed ([`held_after`]: all it was handed before is
+//! dropped), never after a quiet spell; a [`here`] baseline after a flush
+//! too. With the disposer held, what it was handed stays this account's
+//! until it drains ([`a_trim_with_the_disposer_held_frees_its_inputs_once_it_drains`]).
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::alloc::{GlobalAlloc, Layout};
 
 use serde_json::{Value, json};
+use synaps_client::blocks::dispose::Disposer;
 use synaps_client::protocol::*;
 use synaps_client::transcript::Transcript;
 
-struct Counting;
+mod heap;
+use heap::{COUNTING, held, here, mine, outer};
 
-/// The accounts: the bytes each holds. 0: the threads that took none.
-static HELD: [AtomicIsize; 64] = [const { AtomicIsize::new(0) }; 64];
-static NEXT: AtomicUsize = AtomicUsize::new(1);
-
-thread_local! {
-    static ACCOUNT: Cell<usize> = const { Cell::new(0) };
-    static HERE: Cell<isize> = const { Cell::new(0) };
+/// [`held`] once `d` has dropped all it was handed before (a hold of it
+/// standing, this waits for the hold to go: drop it first).
+fn held_after(d: &Disposer) -> isize {
+    d.flush();
+    held()
 }
 
-/// A block of `l` and its account before it: the block's alignment (a
-/// word at least) of room, the account at its start. None: too big.
-fn outer(l: Layout) -> Option<(Layout, usize)> {
-    let room = l.align().max(std::mem::size_of::<usize>());
-    Some((Layout::from_size_align(l.size().checked_add(room)?, room).ok()?, room))
-}
-
-/// `l`'s block at `base` (null: none), charged to this thread's account.
-unsafe fn opened(base: *mut u8, l: Layout, room: usize) -> *mut u8 {
-    if base.is_null() {
-        return base;
-    }
-    let account = ACCOUNT.get();
-    unsafe { (base as *mut usize).write(account) };
-    HELD[account].fetch_add(l.size() as isize, Ordering::Relaxed);
-    HERE.set(HERE.get() + l.size() as isize);
-    unsafe { base.add(room) }
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
-        unsafe { opened(System.alloc(o), l, room) }
-    }
-    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let Some((o, room)) = outer(l) else { return std::ptr::null_mut() };
-        unsafe { opened(System.alloc_zeroed(o), l, room) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        let (o, room) = outer(l).expect("a block allocated");
-        let base = unsafe { p.sub(room) };
-        let account = unsafe { (base as *const usize).read() };
-        HELD[account].fetch_sub(l.size() as isize, Ordering::Relaxed);
-        HERE.set(HERE.get() - l.size() as isize);
-        unsafe { System.dealloc(base, o) };
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        let (o, room) = outer(l).expect("a block allocated");
-        // The block it grows to, room added, must be a layout too: if not,
-        // none, and `p` is left as it was.
-        let Some((grown, _)) = Layout::from_size_align(size, l.align()).ok().and_then(outer) else {
-            return std::ptr::null_mut();
-        };
-        let base = unsafe { p.sub(room) };
-        let account = unsafe { (base as *const usize).read() };
-        let q = unsafe { System.realloc(base, o, grown.size()) };
-        if q.is_null() {
-            return q;
-        }
-        // The block's account is the one it was allocated on, moved with it.
-        HELD[account].fetch_add(size as isize - l.size() as isize, Ordering::Relaxed);
-        HERE.set(HERE.get() + size as isize - l.size() as isize);
-        unsafe { q.add(room) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// This thread's own account, from now on (a test's first line).
-fn mine() {
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    assert!(n < HELD.len(), "more tests than accounts");
-    ACCOUNT.set(n);
-}
-
-/// The bytes this thread's account holds: what it allocated (since
-/// [`mine`]) and is not freed, wherever it is freed.
-fn held() -> isize {
-    HELD[ACCOUNT.get()].load(Ordering::Relaxed)
-}
-
-/// The bytes this thread allocated less those it freed, whoever's.
-fn here() -> isize {
-    HERE.get()
+/// A disposer installed on this thread, as the app's (its thread and
+/// channels made before [`mine`]: not the test's account).
+fn disposer() -> (Disposer, synaps_client::blocks::dispose::Installed) {
+    let d = Disposer::start();
+    let installed = d.install();
+    (d, installed)
 }
 
 const MIB: usize = 1 << 20;
@@ -194,15 +128,16 @@ fn turn(t: &mut Transcript) {
 /// the cards and lets the sync's state go; a reattach keeps none of it.
 #[test]
 fn nine_refused_inputs_of_8_mib_are_kept_once() {
+    let (d, _in) = disposer();
     mine();
     let mut t = attach(&with_a_card());
-    let base = held();
+    let base = held_after(&d);
     turn(&mut t);
     for k in 0..9 {
         refused(&mut t, &format!("r{k}"), 8 * MIB);
     }
     let inputs = (9 * 8 * MIB) as isize;
-    let kept = held() - base;
+    let kept = held_after(&d) - base;
     assert!(kept >= inputs, "the rows keep their inputs: {kept} bytes held");
     assert!(kept < inputs + 2 * MIB as isize, "{kept} bytes held for {inputs} of inputs: a copy more");
     let sync = t.card_sync_bytes();
@@ -210,12 +145,12 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
     let cards = t.cards().cards().to_vec();
     assert_eq!(cards.len(), 10, "the history's card and the nine refused");
     t.set_detached();
-    let detached = held() - base;
+    let detached = held_after(&d) - base;
     assert!(detached < inputs + 2 * MIB as isize, "detached: {detached} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "detached: the card sync's state let go");
     assert_eq!(t.cards().cards(), &cards[..], "detached: the cards kept");
     t.load_attached(&attached(&with_a_card())).unwrap();
-    let again = held() - base;
+    let again = held_after(&d) - base;
     assert!(again < MIB as isize, "reattached: the live rows gone, {again} bytes held");
 }
 
@@ -225,9 +160,10 @@ fn nine_refused_inputs_of_8_mib_are_kept_once() {
 /// next sync).
 #[test]
 fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
+    let (d, _in) = disposer();
     mine();
     let mut t = attach(&[]);
-    let base = held();
+    let base = held_after(&d);
     turn(&mut t);
     for k in 0..4 {
         refused(&mut t, &format!("r{k}"), 8 * MIB);
@@ -235,11 +171,11 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
     for k in 0..20 {
         call(&mut t, "bash", &format!("b{k}"), json!({"command": "ls"}), "a b");
     }
-    assert!(held() - base >= (32 * MIB) as isize, "the rows keep their inputs");
+    assert!(held_after(&d) - base >= (32 * MIB) as isize, "the rows keep their inputs");
     assert!(t.card_sync_bytes() > 0, "the card sync kept");
     let n = t.trim_live_front(10, usize::MAX);
     assert!(n > 4, "the front trimmed: {n} rows");
-    let kept = held() - base;
+    let kept = held_after(&d) - base;
     assert!(kept < MIB as isize, "trimmed, no event since: {kept} bytes held");
     assert_eq!(t.card_sync_bytes(), 0, "trimmed: the card sync's state let go");
     // The next event reads every row again, and keeps what it reads.
@@ -247,11 +183,51 @@ fn a_trim_lets_go_of_the_card_sync_of_the_rows_it_takes() {
     assert!(t.card_sync_bytes() > 0, "read again and kept");
 }
 
+/// The trim's case with the disposer's thread held (Shady #102 P3-2): the
+/// trim takes the rows, but the inputs the live log kept go with its log,
+/// handed to the disposer, so they stay alive, still this account's and
+/// charged there, for as long as the disposer is held. The hold gone and
+/// the disposer drained, they are freed on its thread and leave this
+/// account: the release is the disposer's, seen after it, not a quiet
+/// sample.
+#[test]
+fn a_trim_with_the_disposer_held_frees_its_inputs_once_it_drains() {
+    let (d, _in) = disposer();
+    mine();
+    let mut t = attach(&[]);
+    let base = held_after(&d);
+    turn(&mut t);
+    for k in 0..3 {
+        refused(&mut t, &format!("r{k}"), 8 * MIB);
+    }
+    for k in 0..20 {
+        call(&mut t, "bash", &format!("b{k}"), json!({"command": "ls"}), "a b");
+    }
+    let inputs = (3 * 8 * MIB) as isize;
+    assert!(held_after(&d) - base >= inputs, "the rows keep their inputs");
+    let hold = d.hold();
+    let n = t.trim_live_front(10, usize::MAX);
+    assert!(n > 3, "the front trimmed: {n} rows");
+    assert_eq!(t.card_sync_bytes(), 0, "trimmed: the card sync's state let go");
+    // Held: nothing it was handed is dropped, so this reads the same now
+    // as at any later moment before the hold goes.
+    let queued = held() - base;
+    assert!(queued >= inputs, "the disposer held: the trimmed inputs alive, {queued} bytes held");
+    let b = d.backlog();
+    assert!(b.items > 0 && b.bytes >= inputs as usize, "and queued there, charged: {b:?}");
+    drop(hold);
+    let kept = held_after(&d) - base;
+    assert!(kept < MIB as isize, "drained: {kept} bytes held");
+    let b = d.backlog();
+    assert_eq!((b.items, b.bytes, b.in_place), (0, 0, 0), "drained: {b:?}");
+}
+
 /// What [`Transcript::card_sync_bytes`] counts is what the card sync
 /// holds: over 2,000 calls and five cards, the heap shedding it frees, or
 /// a little more (its tables' estimate), never less.
 #[test]
 fn the_card_sync_counts_what_it_keeps() {
+    let (d, _in) = disposer();
     mine();
     let mut t = attach(&with_a_card());
     turn(&mut t);
@@ -262,6 +238,7 @@ fn the_card_sync_counts_what_it_keeps() {
         }
     }
     let counted = t.card_sync_bytes();
+    d.flush();
     let before = here();
     t.shed_card_sync();
     let freed = before - here();
@@ -345,6 +322,7 @@ fn big_card(k: usize) -> String {
 /// P3-1): shedding the card sync frees what it counts, no more.
 #[test]
 fn a_close_read_again_keeps_no_copy_of_its_card() {
+    let (d, _in) = disposer();
     mine();
     let mut h = vec![json!({"role": "user", "content": "go"})];
     h.push(json!({"role": "assistant", "content": (0..4).map(|k|
@@ -361,6 +339,7 @@ fn a_close_read_again_keeps_no_copy_of_its_card() {
     let closed = t.cards().cards().iter().filter(|c| c.state == cards_spec::fold::State::Closed).count();
     assert_eq!(closed, 4, "the four closed");
     let counted = t.card_sync_bytes();
+    d.flush();
     let before = here();
     t.shed_card_sync();
     let freed = before - here();

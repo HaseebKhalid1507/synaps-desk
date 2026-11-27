@@ -118,6 +118,8 @@ pub(crate) struct TabCache {
     metrics_gen: u64,
     /// Its worker views (the one focused comes back focused).
     pub(crate) watch: Watch,
+    /// Its list's block state ([`crate::blocks::Kept`]).
+    blocks: crate::blocks::Kept,
 }
 
 /// What the user unfolded or folded: the rows they flipped from their
@@ -182,16 +184,20 @@ pub(crate) struct Column {
     metrics_gen: u64,
     /// Its transcript's changes it has not synced ([`Pane::pending`]).
     pending: Option<Splice>,
+    /// Its block state ([`crate::blocks::Kept`]).
+    blocks: crate::blocks::Kept,
 }
 
 impl TabCache {
     /// What it keeps, roughly (bytes): the transcript's items (texts, tool
-    /// inputs and results), the rows' strings, the display rows, the files
-    /// ledger, what the card sync keeps (`Transcript::card_sync_bytes`:
-    /// none, shed as the tab is left, [`AppView::cache_list`]), and per
-    /// item what the strings do not show (the list's heights, maps,
-    /// allocator slack: [`ITEM_OVERHEAD`]). Measured once, when the tab is
-    /// left.
+    /// inputs and results, a card's or block's input kept whole, heap
+    /// included), the rows' strings, the display rows, the files ledger,
+    /// the board's input (its history's journal and the live turn's log,
+    /// heap included: `Transcript::blocks_bytes`), what the card sync
+    /// keeps (`Transcript::card_sync_bytes`: none, shed as the tab is left,
+    /// [`AppView::cache_list`]), and per item what the strings do not show
+    /// (the list's heights, maps, allocator slack: [`ITEM_OVERHEAD`]).
+    /// Measured once, when the tab is left.
     pub(crate) fn bytes(&self) -> usize {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
@@ -199,6 +205,7 @@ impl TabCache {
                 + i.tool
                     .as_ref()
                     .map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity() + t.tail.capacity())
+                + i.kept_bytes()
         };
         let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len() + r.card.bytes();
         self.transcript.items().iter().map(item).sum::<usize>()
@@ -208,6 +215,7 @@ impl TabCache {
             + self.stats.files.bytes()
             + self.stats.subagents.bytes()
             + self.watch.bytes()
+            + self.transcript.blocks_bytes()
             + self.transcript.card_sync_bytes()
     }
 }
@@ -2222,6 +2230,10 @@ pub struct AppView {
     once: Option<OnceKey>,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
+    /// The pointer lease's one wake, while a board waits ([`crate::lease`]).
+    pub(crate) lease_wake: Option<Task<()>>,
+    /// The re-fold slot (`crate::board::Refolds`): one at a time, app-wide.
+    pub(crate) refolds: crate::board::Refolds,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
     /// they read, this app's own new settings, the gear's menu (and where
     /// the mouse-down that closed it from outside was), and the view on
@@ -2931,6 +2943,8 @@ impl AppView {
             dnd: Default::default(),
             once: None,
             attach_source: None,
+            lease_wake: None,
+            refolds: crate::board::Refolds::default(),
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),
@@ -3127,8 +3141,19 @@ impl AppView {
                 self.panes.cur.watch_note = None;
                 self.model.view_dirty = true;
             }
+            // The store's attachment detached: what its panes held for its
+            // blocks goes (Shady #101 P2-4).
+            let detached = match &ev {
+                Event::Detached { attach_seq, .. } if self.model.lives[self.panes.cur.live].current(*attach_seq) => {
+                    Some(self.panes.cur.live)
+                }
+                _ => None,
+            };
             for fx in self.model.apply(ev) {
                 self.effect(fx);
+            }
+            if let Some(live) = detached.filter(|l| self.model.lives[*l].active.is_none()) {
+                self.panes.iter_mut().filter(|p| p.live == live).for_each(crate::pane::Pane::blocks_clear);
             }
         }
     }
@@ -3802,6 +3827,7 @@ impl AppView {
         pane.summaries = Default::default();
         pane.toggled = Default::default();
         pane.open_runs.clear();
+        drop(pane.blocks_out());
         pane.synced_busy = false;
         pane.files_gen = 0;
         pane.waiting_on = None;
@@ -3810,6 +3836,7 @@ impl AppView {
         pane.main_column = None;
         pane.column_of = None;
         pane.worker_columns.clear();
+        pane.blocks_clear();
     }
 
     /// The current tab's worker view. A worker tab: its worker, checked
@@ -3878,6 +3905,7 @@ impl AppView {
         self.list_out();
         let key = self.model.lives[self.panes.cur.live].transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out(self.panes.cur.live);
+        self.board_out(self.panes.cur.live);
         self.cache_list(key, transcript, stats, watch);
     }
 
@@ -3920,6 +3948,8 @@ impl AppView {
             let own = self.fresh_live();
             let c = &mut self.model.lives[own];
             (c.transcript, c.stats) = (transcript, stats);
+            // Its board is the one drawn: nothing folded for it.
+            c.board.settled(c.transcript.blocks_rev());
             self.panes.cur.live = own;
             return;
         }
@@ -3927,7 +3957,10 @@ impl AppView {
         self.sync_list();
         self.panes.cur.closing_key = self.model.lives[live].transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out(live);
+        self.board_out(live);
         self.model.switch_in(live, transcript, stats);
+        let l = &mut self.model.lives[live];
+        l.board.settled(l.transcript.blocks_rev());
         if let (Some(c), Some(seq)) = (&self.client, self.model.lives[live].release()) {
             let _ = c.on(seq).detach();
         }
@@ -3945,6 +3978,7 @@ impl AppView {
             return;
         }
         self.list_out();
+        self.board_out(live);
         let l = &mut self.model.lives[live];
         let (transcript, stats, watch) = (std::mem::take(&mut l.transcript), std::mem::take(&mut l.stats), std::mem::take(&mut l.watch));
         self.cache_list(Some(key), transcript, stats, watch);
@@ -3978,7 +4012,9 @@ impl AppView {
             waiting_on: self.panes.cur.waiting_on.take(),
             metrics_gen: self.panes.cur.metrics_gen,
             watch,
+            blocks: self.panes.cur.blocks_out(),
         };
+        self.panes.cur.blocks_clear();
         self.panes.cur.rows_session = None;
         if let Some(k) = key {
             let tabs = &self.model.tabs;
@@ -3994,6 +4030,7 @@ impl AppView {
         // The last transcript's changes were synced as it left (`stash`).
         self.panes.cur.pending = None;
         self.disarm_halt();
+        self.panes.cur.blocks_clear();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(self.panes.cur.live, c.transcript, c.stats);
@@ -4007,6 +4044,7 @@ impl AppView {
                 self.panes.cur.synced_busy = c.synced_busy;
                 self.panes.cur.files_gen = c.files_gen;
                 self.panes.cur.waiting_on = c.waiting_on;
+                self.panes.cur.blocks_in(c.blocks);
                 if c.metrics_gen != self.panes.cur.metrics_gen {
                     // The text size changed while it was in the background.
                     self.panes.cur.list.remeasure();
@@ -6764,6 +6802,7 @@ impl AppView {
                         self.panes.cur.summaries.clear();
                         self.panes.cur.toggled.clear();
                         self.panes.cur.open_runs.clear();
+                        self.panes.cur.blocks_clear();
                         self.took.borrow_mut().clear();
                         self.ran.borrow_mut().clear();
                     }
@@ -6898,6 +6937,8 @@ impl AppView {
         self.panes.cur.touch_kept.set(false);
         self.panes.cur.list_gen = self.panes.next_gen();
         self.panes.cur.texts.borrow_mut().clear();
+        // The pointer lease and the diff wells' scroll were this list's.
+        self.panes.cur.blocks_reset();
     }
 
     /// The list's state, handed out; a fresh, empty list in its place.
@@ -6921,6 +6962,7 @@ impl AppView {
             scroll_carry: self.panes.cur.scroll_carry.take(),
             metrics_gen: self.panes.cur.metrics_gen,
             pending: self.panes.cur.pending.take(),
+            blocks: self.panes.cur.blocks_out(),
         }
     }
 
@@ -6939,6 +6981,7 @@ impl AppView {
         self.panes.cur.rows_session = p.rows_session;
         self.panes.cur.scroll_carry = p.scroll_carry;
         self.panes.cur.pending = p.pending;
+        self.panes.cur.blocks_in(p.blocks);
     }
 
     /// Each transcript's changes since the last frame, to the list showing
@@ -7095,13 +7138,16 @@ impl AppView {
         let items = shown.items();
         let rows = &self.panes.cur.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
-        let new = turns::build(
+        // The session's own transcript has a board (a worker's view has none).
+        let board = shown.has_blocks() && self.model.lives[self.panes.cur.live].watch.focused().is_none();
+        let new = turns::build_with(
             items,
             &day,
             start,
             shown.busy(),
             &self.panes.cur.open_runs,
             self.model.lives[self.panes.cur.live].shown_subagents(),
+            board,
         );
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
@@ -7161,13 +7207,14 @@ impl AppView {
             items.len() > 2_000
                 || self.panes.cur.disp
                     == crate::cards::mark_edges(crate::authorize::with_prompts(
-                        turns::build(
+                        turns::build_with(
                             items,
                             &day,
                             0,
                             shown.busy(),
                             &self.panes.cur.open_runs,
-                            self.model.lives[self.panes.cur.live].shown_subagents()
+                            self.model.lives[self.panes.cur.live].shown_subagents(),
+                            board
                         ),
                         &prompts,
                         0
@@ -9131,6 +9178,16 @@ impl AppView {
         if over.is_none() {
             self.panes.cur.over_composer.set(f32::INFINITY);
         }
+        // A block's slide reads whether the list held still since the last
+        // frame (`crate::lease::SlideY`): not following its tail, not
+        // scrolled.
+        {
+            let (l, list) = (&self.panes.cur.lease, &self.panes.cur.list);
+            let off = f32::from(list.scroll_px_offset_for_scrollbar().y);
+            l.anchored.set(!list.is_following_tail() && l.scrolled.get() == Some(off));
+            l.scrolled.set(Some(off));
+            l.frame.set(l.frame.get() + 1);
+        }
         // The list, and right after its layout, reading it as it paints,
         // the top message's label pinned (P15). Revealed, both in the pane
         // as it lands, moved by the reveal's `shift`; the pane clips them.
@@ -9165,10 +9222,16 @@ impl AppView {
                 )
                 .child(
                     div()
+                        .id(("pane-list", id.index()))
                         .debug_selector(move || format!("pane-list {}", id.index()))
                         .flex_1()
                         .min_h_0()
                         .relative()
+                        // The pointer lease (blocks.md §6.2): a move asks for no frame.
+                        .on_mouse_move(
+                            cx.listener(move |this, ev: &MouseMoveEvent, _, cx| this.lease_move(id, ev.pressed_button.is_some(), cx)),
+                        )
+                        .on_hover(cx.listener(move |this, over: &bool, _, cx| this.lease_over(id, *over, cx)))
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
                         // Held (a dropped row's flight), nothing drawn
                         // from the rows (finish gate #48 r2 N1): no list,
@@ -9182,7 +9245,8 @@ impl AppView {
                         .children(landing)
                         .children(hold_back.filter(|_| !hold))
                         .children(rehint.filter(|_| !hold))
-                        .children((!hold).then_some(transcript_bar)),
+                        .children((!hold).then_some(transcript_bar))
+                        .children((!hold).then(|| self.blocks_pill(&p, &m, cx)).flatten()),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
@@ -9290,6 +9354,9 @@ impl AppView {
                 self.find.clear();
             }
         }
+        // The board's work, if its input moved (off the frame: it lands as
+        // a later frame's change).
+        self.sync_board(self.panes.cur.live, cx);
         // The card first: its row in the list is its state's.
         self.read_list_view();
         self.sync_card(window, cx);
@@ -10290,6 +10357,22 @@ impl Render for AppView {
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
+            // A release that isn't on its press's target, in the window or
+            // outside it, ends the press after the target's own up has
+            // acted (§6.2 "Down and up"; Shady #101 P2-7).
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                if this.panes.iter().any(|p| p.lease.pressed) {
+                    cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    if this.panes.iter().any(|p| p.lease.pressed) {
+                        cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                    }
+                }),
+            )
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
                 Some(until) if ev.click_count > 1 && Instant::now() < until => cx.stop_propagation(),
                 Some(_) => this.swallow_clicks = None,
@@ -10305,6 +10388,11 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // A key releases the pointer lease (blocks.md §6.2), after
+                // it acts.
+                if this.panes.iter().any(|p| p.lease.moved.is_some() || p.lease.note.is_some()) {
+                    cx.defer_in(window, |this, _, cx| this.lease_key(cx));
+                }
                 // Esc while a tab or a row is dragged: the drag ends, and
                 // nothing drops (split.md §3); nothing else hears it.
                 if ev.keystroke.key == "escape" && this.cancel_drag(window, cx) {

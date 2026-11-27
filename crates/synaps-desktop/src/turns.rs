@@ -333,6 +333,13 @@ pub(crate) enum Kind {
     /// A user message that answers a card: the user's turn, drawn as one
     /// slim line, not the message's two ([`crate::ask`]).
     Answer,
+    /// A block the agent keeps (synaps-cards `docs/blocks.md` §1.2): the
+    /// `at`th of those anchored at its item's call, drawn after the run
+    /// that call is in (or after its card), never inside it
+    /// ([`crate::blocks`]).
+    Block {
+        at: u16,
+    },
 }
 
 /// A day line's row id: its item's, with this bit (item ids count up from 1).
@@ -430,6 +437,7 @@ fn live_call(x: &Item, subs: &Subagents) -> bool {
 /// the runs the user unfolded (by their first item's id); `subs`: a run
 /// holding a running subagent's call is live too; `day`: item `i`'s date
 /// (its row strings', `RowCache::time`), for the day lines.
+#[cfg(test)]
 pub(crate) fn build(
     items: &[Item],
     day: &dyn Fn(usize) -> Option<NaiveDate>,
@@ -437,6 +445,21 @@ pub(crate) fn build(
     busy: bool,
     open: &HashSet<u64>,
     subs: &Subagents,
+) -> Vec<Disp> {
+    build_with(items, day, from, busy, open, subs, false)
+}
+
+/// [`build`], `board`: the transcript's board draws its block calls, so a
+/// block call it hasn't drawn yet draws no row either ([`crate::blocks::silent`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with(
+    items: &[Item],
+    day: &dyn Fn(usize) -> Option<NaiveDate>,
+    from: usize,
+    busy: bool,
+    open: &HashSet<u64>,
+    subs: &Subagents,
+    board: bool,
 ) -> Vec<Disp> {
     let mut out = Vec::new();
     let mut agent = from > 0
@@ -469,6 +492,8 @@ pub(crate) fn build(
             ItemKind::Tool if crate::ask::asks(it) => {
                 out.push(row(Kind::Ask, gap(i), if agent { Who::None } else { Who::Agent }));
                 agent = true;
+                // A converted card's block, under its receipt (§1.5).
+                crate::blocks::rows(items, i..i + 1, &mut out, &mut agent, true);
                 i += 1;
             }
             ItemKind::User => {
@@ -493,18 +518,29 @@ pub(crate) fn build(
                         break;
                     }
                     days.next(day(end));
-                    if x.kind == ItemKind::Tool {
+                    if x.kind == ItemKind::Tool && !crate::blocks::silent(x, board) {
                         tools += 1;
                         done &= !live_call(x, subs);
                     }
                     (x.id, rev(x, subs)).hash(&mut h);
                     end += 1;
                 }
+                // A block call the board draws has no row: its blocks draw
+                // after the run (§1.2), and the run is the rest.
+                let shows = |k: usize| !crate::blocks::silent(&items[k], board);
+                let Some(first_row) = (start..end).find(|&k| shows(k)) else {
+                    crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
+                    i = end;
+                    continue;
+                };
                 let live = !done || (end == items.len() && busy);
                 let who = if agent { Who::None } else { Who::Agent };
                 agent = true;
                 let first = gap(start);
-                if !live && tools >= FOLD_AT {
+                // The agent titled it (`collapse` with `run`, §1.3): it folds
+                // under that title once finished, however short.
+                let titled = (start..end).any(|k| items[k].blocks.as_ref().is_some_and(|b| b.run.is_some()));
+                if !live && (tools >= FOLD_AT || titled && tools > 0) {
                     let unfolded = open.contains(&it.id);
                     out.push(Disp {
                         item: start,
@@ -515,7 +551,7 @@ pub(crate) fn build(
                         who,
                     });
                     if unfolded {
-                        out.extend((start..end).map(|k| Disp {
+                        out.extend((start..end).filter(|&k| shows(k)).map(|k| Disp {
                             item: k,
                             id: items[k].id,
                             rev: rev(&items[k], subs),
@@ -525,15 +561,16 @@ pub(crate) fn build(
                         }));
                     }
                 } else {
-                    out.extend((start..end).map(|k| Disp {
+                    out.extend((start..end).filter(|&k| shows(k)).map(|k| Disp {
                         item: k,
                         id: items[k].id,
                         rev: rev(&items[k], subs),
                         kind: Kind::Work,
-                        gap: if k == start { first } else { Gap::None },
-                        who: if k == start { who } else { Who::None },
+                        gap: if k == first_row { first } else { Gap::None },
+                        who: if k == first_row { who } else { Who::None },
                     }));
                 }
+                crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
                 i = end;
             }
             // An event: a message the agent answers, as a user's is (a
@@ -588,6 +625,8 @@ pub(crate) fn who_of(d: &Disp, p: &Palette, m: &Metrics) -> Option<(&'static str
                 Kind::Summary { .. } => m.summary,
                 // Level with the card's head line, under its slot's top.
                 Kind::Ask => return Some((label::AGENT, p.agent, crate::ask::label_top(m))),
+                // Level with a block's header.
+                Kind::Block { .. } => crate::blocks::Geo::of(m).head,
                 _ => m.row,
             };
             Some((label::AGENT, p.agent, ((row - m.body_line) / 2.).max(0.)))
@@ -1171,6 +1210,9 @@ fn plus(n: usize) -> SharedString {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunSummary {
     pub tools: usize,
+    /// The agent's title for it (`collapse` with `run`, blocks.md §1.3):
+    /// drawn where `N tool calls` is.
+    pub title: Option<SharedString>,
     pub label: SharedString,
     /// Most used first (then first used first).
     pub tally: Vec<Tally>,
@@ -1202,7 +1244,8 @@ impl RunSummary {
         let (mut tools, mut ok, mut failed, mut denied, mut cancelled, mut stopped) = (0, 0, 0, 0, 0, 0);
         let mut delta = CallDelta::default();
         let mut last = (Glyph::Ok, Family::Ok);
-        for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool) {
+        let title = items.iter().find_map(|i| i.blocks.as_ref()?.run.as_deref().map(SharedString::new));
+        for (it, row) in items.iter().zip(rows).filter(|(i, _)| i.kind == ItemKind::Tool && !crate::blocks::silent(i, true)) {
             tools += 1;
             let (g, _, family) = glyph::call(status(it), false, false);
             last = (g, family);
@@ -1255,6 +1298,7 @@ impl RunSummary {
             parts.into_iter().filter(|p| p.0 > 0).map(|(n, word, family)| (format!("{n} {word}").into(), family)).collect();
         RunSummary {
             tools,
+            title,
             label: format!("{tools} calls").into(),
             tally,
             ok,
@@ -1683,6 +1727,7 @@ impl AppView {
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
             Kind::Ask => self.render_ask(item, d.id, &p, &m, cx),
             Kind::Answer => self.render_answer(item, d.id, &p, &m),
+            Kind::Block { at } => self.render_block(item, at, d.id, &p, &m, cx),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
         // its slice, the first and last its edges. The slice (fill,
@@ -1958,22 +2003,71 @@ impl Geo {
 }
 
 /// A row's target (cards4/proposal.md §2): mono, the scanned part (a
-/// path's file, a command) in `prose_t`, a path's folder in `dim_t` (the
-/// folder gives way first), ellipsised. `quiet` (cancelled, denied): all
-/// of it `dim_t`.
-fn target_el(card: &Card, arg: &SharedString, quiet: bool, p: &Palette) -> Div {
+/// path's file, a command) in `prose_t`, a path's folder in `dim_t`,
+/// ellipsised. `quiet` (cancelled, denied): all of it `dim_t`. A path's
+/// folder gives way first; its file's name then middle-ellipsizes (its
+/// start and extension stay), never cut. Its flex basis is the name's own
+/// width, so the row's facts give way before the name ([`target_line`]).
+fn target_el(card: &Card, arg: &SharedString, quiet: bool, id: u64, p: &Palette, m: &Metrics) -> Div {
     let text = if card.target.is_empty() { arg.clone() } else { card.target.clone() };
     let lit = if quiet { p.dim_t } else { p.prose_t };
     match &card.path {
-        Some((dir, base)) => h_flex()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(p.dim_t).child(dir.clone()))
-            .child(div().flex_none().text_color(lit).child(base.clone())),
+        Some((dir, base)) => {
+            // The name's width, a little over (the facts wrap away early
+            // rather than squeeze it).
+            let name_w = (crate::blocks::cols(base) as f32 * m.mono * 0.62).ceil() + 2.;
+            let t = format!("tool-file {id} {base}");
+            h_flex()
+                .flex_grow(1.)
+                .flex_shrink(1.)
+                .flex_basis(px(name_w))
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .debug_selector(move || format!("tool-target {id}"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(p.dim_t)
+                        .debug_selector(move || format!("tool-dir {id}"))
+                        .child(dir.clone()),
+                )
+                // As wide as the name, the target at most: the folder
+                // shrinks alone while it can.
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w_full()
+                        .overflow_hidden()
+                        .text_ellipsis_middle()
+                        .text_color(lit)
+                        .debug_selector(move || t)
+                        .child(base.clone()),
+                )
+        }
         None => div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(lit).child(text),
     }
+}
+
+/// A path row's target and its facts on one line that wraps: the facts
+/// come after the target only while its file's name fits whole beside
+/// them; else they take a second line, out of sight, and the name has the
+/// row (a 320 px pane: `Edit token_store.rs`, not `token_store.r +3 −1`).
+fn target_line(target: Div, facts: Div, line: f32, gap: f32, id: u64) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .h(px(line))
+        .flex_wrap()
+        .gap_x(px(gap))
+        .items_center()
+        .overflow_hidden()
+        .debug_selector(move || format!("tool-line {id}"))
+        .child(target)
+        .child(facts)
 }
 
 /// A running call's clock (the TUI's `running 1.2s`): whole seconds since
@@ -2006,7 +2100,11 @@ impl AppView {
         // mono cell's width: a little room to spare), then `+N more`.
         let cw = m.meta * 0.6;
         let calls = format!("{} tool call{}", s.tools, if s.tools == 1 { "" } else { "s" });
-        let label_w = text_w(calls.chars().count(), m.label * 0.6);
+        // The agent's title, at most half the column (it ellipsizes).
+        let label_w = match &s.title {
+            Some(t) => text_w(t.chars().count(), m.label * 0.55).min(lay.column / 2.),
+            None => text_w(calls.chars().count(), m.label * 0.6),
+        };
         // The card's edges and inset, the row's padding, the glyph, the
         // label, the trail and the chevron, the four gaps between them.
         let trail = s.trail_w(m.meta, tight);
@@ -2089,18 +2187,35 @@ impl AppView {
             .cursor_pointer()
             .hover(|d| d.bg(p.hover))
             .child(glyph::life(life, glyph::life_ink(life, p.card_d, p)))
-            .child(
+            .child(match &s.title {
+                // The agent's title (blocks.md §1.3), the count in the tally's tip.
+                Some(t) => div()
+                    .flex_shrink(1.)
+                    .max_w(px(label_w))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family(fonts::SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_px(m.label)
+                    .text_color(p.prose_t)
+                    .debug_selector(move || format!("run-title {id}"))
+                    .child(t.clone())
+                    .into_any_element(),
                 // `N tool calls` rolls while the run grows (polish.md P5).
-                motion::roll_count(self.fx.col(self.panes.cur.id), motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
-                    div()
-                        .flex_none()
-                        .font_family(fonts::SANS)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_px(m.label)
-                        .text_color(p.prose_t)
-                        .child(t)
-                }),
-            )
+                None => {
+                    motion::roll_count(self.fx.col(self.panes.cur.id), motion::key(motion::ROLL_CALLS, id), s.tools, calls.into(), |t| {
+                        div()
+                            .flex_none()
+                            .font_family(fonts::SANS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_px(m.label)
+                            .text_color(p.prose_t)
+                            .child(t)
+                    })
+                }
+            })
             .child(tally)
             .child(crate::cards::facts(parts, p, m))
             .child(
@@ -2166,7 +2281,7 @@ impl AppView {
                 .text_color(p.think)
                 .child(row.arg.clone())
         } else {
-            target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), p)
+            target_el(&row.card, &row.arg, matches!(st, Some(ToolStatus::Cancelled | ToolStatus::Denied)), id, p, m)
         };
         // The call a prompt waits on ([`waiting_call`]).
         let waiting = !think
@@ -2267,7 +2382,15 @@ impl AppView {
         }
         let after = !parts.is_empty();
         let receipt_el = receipt.and_then(|_| self.receipt_el(call_id, st, after, running, p));
-        let facts = crate::cards::facts(parts, p, m).children(receipt_el);
+        // A path's facts may give way to its name ([`target_line`]); its
+        // receipt never does.
+        let path = !think && row.card.path.is_some() && after;
+        let (facts, receipt_el) = if path {
+            (crate::cards::facts(parts, p, m), receipt_el)
+        } else {
+            (crate::cards::facts(parts, p, m).children(receipt_el), None)
+        };
+        let facts = facts.debug_selector(move || format!("tool-facts {id}"));
         // "Exit N" slides in from +6 as the cross writes on (§8 #6).
         let word_el = word.map(|w| {
             let since = change.filter(|c| glyph::Life::was_live(c.1) || c.1 == glyph::Life::Queued.code()).map(|c| c.0);
@@ -2319,8 +2442,8 @@ impl AppView {
             .when(has_body && wash.is_some(), |d| d.cursor_pointer())
             .child(div().flex_none().size(px(g.glyph)).children(status_glyph).debug_selector(move || format!("tool-status {id}")))
             .child(verb)
-            .child(target)
-            .child(facts)
+            .map(|d| if path { d.child(target_line(target, facts, m.mono_line, g.gap, id)) } else { d.child(target).child(facts) })
+            .children(receipt_el.map(|r| div().flex_none().font_family(fonts::SANS).text_px(m.meta).whitespace_nowrap().child(r)))
             .children(word_el)
             .child(div().flex_none().w(px(g.chevron)).flex().items_center().justify_end().children(fold))
             .when(has_body, |d| {
@@ -2943,6 +3066,7 @@ mod tests {
                 Kind::Prompt => "prompt",
                 Kind::Ask => "ask",
                 Kind::Answer => "answer",
+                Kind::Block { .. } => "block",
             })
             .collect()
     }

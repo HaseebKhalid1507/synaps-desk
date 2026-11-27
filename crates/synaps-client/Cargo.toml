@@ -13,6 +13,13 @@ publish.workspace = true
 [lints.clippy]
 disallowed_methods = "allow"
 
+[features]
+# Tests only: the disposer's controls (`blocks::dispose`: `Disposer::hold`,
+# `Hold::step`, `Disposer::flush`, `Disposer::failed`, the probes) and
+# `LiveLog::lock_probe`. Off in every build the app ships; this crate's
+# tests (the dev-dependency below) and the desk's turn it on.
+test-support = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -33,3 +40,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# Its own tests take its test controls (`test-support`).
+synaps-client = { path = ".", features = ["test-support"] }

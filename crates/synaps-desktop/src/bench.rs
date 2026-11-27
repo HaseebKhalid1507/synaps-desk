@@ -671,6 +671,46 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                     });
                 };
                 level(cx, crate::motion::Level::Full);
+                // `SYNAPS_BENCH_BLOCKS=N` (D5, synaps-cards `docs/blocks.md`
+                // §6.3): the blocks session's history, then after N s a
+                // live turn that puts a status and a plan, ticks the plan
+                // and moves the status in place (each change glowing once
+                // bound), folds the plan, and ends. Then, past the last
+                // glow (480 ms), 3 s at rest: presents and app frames
+                // (none expected). `SYNAPS_BENCH_LIFE_LEVEL`: the level.
+                if let Some(after) = std::env::var("SYNAPS_BENCH_BLOCKS").ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let lv = std::env::var("SYNAPS_BENCH_LIFE_LEVEL").ok().and_then(|s| crate::motion::Level::parse(&s));
+                    level(cx, lv.unwrap_or(crate::motion::Level::Full));
+                    let apply = |cx: &mut AsyncWindowContext, evs: Vec<Value>| {
+                        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                        let _ = upd(cx, &|v, cx| {
+                            v.apply_batch(evs.iter().cloned().filter_map(local_raw).map(|e| e.with_ts(ts.clone())).collect(), cx);
+                            v.sync_list();
+                        });
+                    };
+                    let _ = upd(cx, &|v, _| {
+                        v.model.local_session(v.panes.cur.live, "bench");
+                        v.model.lives[v.panes.cur.live].transcript.apply_history(&dated(synthetic::blocks_history()));
+                        v.sync_list();
+                        v.panes.cur.list.set_follow_mode(FollowMode::Tail);
+                        v.panes.cur.list.scroll_to_end();
+                    });
+                    sleep(after).await;
+                    let mut out = json!({"bench": "blocks"});
+                    for (k, round) in crate::bench::blocks_turn().into_iter().enumerate() {
+                        apply(cx, round);
+                        sleep(if k == 0 { 1.4 } else { 1.2 }).await;
+                    }
+                    let published = view.update(cx, |v, _| v.model.lives[v.panes.cur.live].board.published).unwrap_or(0);
+                    sleep(0.6).await;
+                    let (t0, c0, f0) = (Instant::now(), cpu_ns(), counts(cx));
+                    sleep(3.).await;
+                    out["boards_published"] = json!(published);
+                    out["after_last_glow_3s"] = stats(cx, t0, Instant::now(), c0, f0);
+                    println!("{out}");
+                    let _ = cx.update(|_, cx| cx.quit());
+                    return;
+                }
                 // `SYNAPS_BENCH_LIFE=N` (Q3 evidence, polish.md §3 Life): after
                 // N s, a scripted turn on the bench's session, the scene a
                 // capture records: a bash call runs (the spinner, its clock,
@@ -2083,6 +2123,44 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
 /// daemon's do.
 /// A raw daemon event of the bench's local session, decoded as the client
 /// decodes one.
+/// The blocks scene's live turn ([`SYNAPS_BENCH_BLOCKS`]), a round of
+/// events each: a status and a plan put, three rounds of ticks and
+/// progress in place, the plan folded, the turn's end.
+pub(crate) fn blocks_turn() -> Vec<Vec<Value>> {
+    use synaps_client::synthetic::{block_input, block_receipt};
+    let call = |id: &str, ops: &Value| {
+        vec![
+            json!({"ev": "stream", "event": {"kind": "llm", "llm": "response_start"}}),
+            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id}}),
+            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_use", "tool_name": "cards_block", "tool_id": id, "input": block_input(ops.clone())}}),
+            json!({"ev": "stream", "event": {"kind": "llm", "llm": "tool_result", "tool_id": id, "result": block_receipt(ops)}}),
+        ]
+    };
+    let put = json!([
+        {"op":"put","id":"bisect","kind":"status","title":"Now","body":{"text":"Bisecting the cutoff","detail":"7 commits between good and bad","progress":{"n":0,"of":7},"state":"working"}},
+        {"op":"put","id":"cutoff","kind":"plan","title":"Find the cutoff","body":{"steps":[
+            {"id":"repro","label":"Reproduce with 32 concurrent refreshes","state":"doing"},
+            {"id":"bisect","label":"Bisect the 7 commits","state":"todo"},
+            {"id":"fix","label":"Fix the cutoff's owner","state":"todo"},
+            {"id":"verify","label":"Verify on staging","state":"todo"}]}}
+    ]);
+    let tick = |n: u32, steps: Value, detail: &str| json!([{"op":"patch","id":"bisect","set":{"progress":{"n":n,"of":7},"detail":detail}},{"op":"patch","id":"cutoff","state":steps}]);
+    let mut start = vec![json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": "Find the cutoff."})];
+    start.extend(call("toolu_live1", &put));
+    let mut end = call(
+        "toolu_live5",
+        &json!([{"op":"collapse","id":"cutoff"},{"op":"patch","id":"bisect","set":{"text":"Cutoff found: the session owns it","state":"done"}}]),
+    );
+    end.push(json!({"ev": "idle"}));
+    vec![
+        start,
+        call("toolu_live2", &tick(3, json!({"repro":"done","bisect":"doing"}), "4 commits left")),
+        call("toolu_live3", &tick(6, json!({"bisect":"done","fix":"doing"}), "1 commit left: 4e1c0de")),
+        call("toolu_live4", &tick(7, json!({"fix":"done","verify":"done"}), "found at 4e1c0de")),
+        end,
+    ]
+}
+
 fn local_raw(raw: Value) -> Option<Event> {
     let event = synaps_client::protocol::decode_event(&raw).ok()?;
     Some(Event::session(LOCAL_SEQ, "bench", 1, event, Arc::new(raw)))

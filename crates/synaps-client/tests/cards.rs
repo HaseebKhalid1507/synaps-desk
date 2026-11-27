@@ -472,6 +472,9 @@ fn live(t: &mut Transcript, e: &Event) {
         }
         Event::Result { tool_id, text } => t.apply(&llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": tool_id, "result": text}))),
         Event::User { text } => t.apply(&ev(json!({"ev": "turn_started", "turn_baseline": 1, "trigger": "user", "user_text": text}))),
+        // Where a message's results end: no frame of its own (the next
+        // round's start, or the turn's end, says it), nothing to the cards.
+        Event::ResultsEnd => {}
     }
 }
 

@@ -914,7 +914,7 @@ pub(crate) fn receipt(a: &Ask, reply: Option<&Reply>, look: Look, id: u64, chang
 /// semibold, italic, inline code as the prose draws it (`code_in` on its
 /// `well` chip); a list item's mark hangs in its own column, indented by
 /// its depth.
-fn detail_line(l: crate::detail::Line, p: &Palette, m: &Metrics) -> Div {
+pub(crate) fn detail_line(l: crate::detail::Line, p: &Palette, m: &Metrics) -> Div {
     let looks = l.looks.into_iter().map(|(range, k)| {
         let style = HighlightStyle {
             font_weight: k.bold.then_some(FontWeight::SEMIBOLD),
