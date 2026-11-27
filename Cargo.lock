@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "cards-spec"
 version = "0.1.1"
-source = "git+https://github.com/HaseebKhalid1507/synaps-cards?rev=bb7b6982fcd581d09f5ad261235253f4ea54588e#bb7b6982fcd581d09f5ad261235253f4ea54588e"
+source = "git+https://github.com/HaseebKhalid1507/synaps-cards?rev=3d0b97980a9c35a0f330ccbb7d830445a7c181c4#3d0b97980a9c35a0f330ccbb7d830445a7c181c4"
 dependencies = [
  "serde",
  "serde_json",
