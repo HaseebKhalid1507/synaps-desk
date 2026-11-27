@@ -2,7 +2,9 @@
 //! history here is folded by `cards_spec::board`, so what a desk attaches,
 //! settles and draws is checked against what the fold reads. §8.2's D6
 //! list for desires, §3.5's notice list, the file (its caps, a full file,
-//! a restart, a crash mid-write, the sweep, two processes on one file).
+//! a restart, a crash mid-write, the sweep, one writer and a second process
+//! in memory only), Shady's #103 findings, and a model of two desks whose
+//! boards age apart.
 
 use std::path::{Path, PathBuf};
 
@@ -31,8 +33,24 @@ pub(crate) fn dir(name: &str) -> PathBuf {
     d
 }
 
-/// The desires in `d`'s file, the launch's sweep run.
+/// The desires in `d`'s file, the launch's sweep run, as its owner. (A
+/// store just dropped may still hold the lock a moment: a process another
+/// test spawns then holds a copy of it until it execs.)
 pub(crate) fn desires(d: &Path) -> Desires {
+    let t = std::time::Instant::now();
+    loop {
+        let mut a = Desires::load(Some(d.join(FILE)));
+        if a.owns_file() || t.elapsed() > std::time::Duration::from_secs(10) {
+            flush(&mut a);
+            return a;
+        }
+        drop(a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A second desk on `d`'s file, its owner alive: memory only.
+fn second(d: &Path) -> Desires {
     let mut a = Desires::load(Some(d.join(FILE)));
     flush(&mut a);
     a
@@ -46,6 +64,11 @@ pub(crate) fn flush(a: &mut Desires) -> Vec<Landed> {
         out.extend(a.landed(w.run()));
     }
     out
+}
+
+/// What `d`'s file has, read as a restart would (its owner alive or not).
+pub(crate) fn in_file(d: &Path) -> Book {
+    blockfiles::peek::<Book>(&d.join(FILE)).0
 }
 
 /// What a wish did once its write landed (or at once).
@@ -79,7 +102,6 @@ fn landed(a: &mut Desires, asked: Result<Ask, Refused>, conv: &str, id: &BlockId
                 })
                 .expect("its write landed");
             done.map(|d| match d {
-                Done::Unchanged => Now::Unchanged,
                 Done::Cancelled => Now::Cancelled,
                 Done::Wished(v) => Now::Wished(v),
             })
@@ -122,7 +144,7 @@ impl Flushed for Desires {
     }
 
     fn ride_now(&mut self, conv: &str, g: &Generation, shared: &Visibility, body: &str, how: Carry) -> Ride {
-        match self.ride(conv, g, shared, body, how) {
+        match self.ride(conv, g, shared, body, how).expect("not refused") {
             Riding::Go(r) => r,
             Riding::Wait(t) => flush(self)
                 .into_iter()
@@ -225,7 +247,7 @@ fn a_notice_rides_a_typed_submit_and_a_steer_never_alone() {
     assert_eq!(a.settle_now(J, &g, &v, &[]), []);
     assert_eq!(a.len(), 0, "settled: dropped");
     assert!(a.dismissed(J, &g, &id("tests"), &v), "drawn from the shared record now");
-    assert_eq!(desires(&d).len(), 0, "and dropped from the file");
+    assert_eq!(in_file(&d).len(), 0, "and dropped from the file");
 }
 
 /// A steer that missed its turn's last drain is dropped: the settled
@@ -321,7 +343,7 @@ fn a_lost_carrier_then_show_then_a_resend_carries_shown_at_the_new_version() {
     let mut b = desires(&dir("lost-cancel"));
     b.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
     assert_eq!(b.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Cancelled));
-    assert_eq!((b.len(), desires(b.path().unwrap().parent().unwrap()).len()), (0, 0), "nothing kept");
+    assert_eq!((b.len(), in_file(b.path().unwrap().parent().unwrap()).len()), (0, 0), "nothing kept");
     let r = b.ride_now(J, &g, &h.vis(), "hello", Carry::Submit);
     assert_eq!((r.text.as_str(), r.carrier), ("hello", None), "nothing sent");
     // And the other way: a Show never sent over a delivered dismissal, then
@@ -518,7 +540,7 @@ fn a_restart_and_a_compaction_with_a_carrier_in_flight() {
     a.dismiss_now(J, &g, &id("notes"), &h.vis()).unwrap();
     let soft = a.compacted_now(J, &h.state());
     assert_eq!(soft, [id("notes"), id("tests")], "drawn dismissed here: plan was shown again on this desk");
-    assert_eq!((a.len(), desires(&d).len()), (0, 0), "the predecessor's desires dropped");
+    assert_eq!((a.len(), in_file(&d).len()), (0, 0), "the predecessor's desires dropped");
     const J2: &str = "20261127-020304-beef";
     p.compacted(J, J2, &soft);
     assert!(p.soft(J2, &id("tests")) && p.soft(J2, &id("notes")) && !p.soft(J2, &id("plan")));
@@ -649,14 +671,17 @@ fn dismissed_stays_dismissed_across_reattach_restart_and_a_second_desk() {
     let reattached = H { events: h.events.clone(), tools: 0 };
     a.settle_now(J, &g, &reattached.vis(), &[]);
     assert!(a.dismissed(J, &g, &id("tests"), &reattached.vis()), "reattach, undelivered: the desire");
-    assert!(desires(&d).dismissed(J, &g, &id("tests"), &h.vis()), "restart, undelivered: the file");
+    drop(a);
+    let mut a = desires(&d);
+    assert!(a.dismissed(J, &g, &id("tests"), &h.vis()), "restart, undelivered: the file");
     assert!(!b.dismissed(J, &g, &id("tests"), &h.vis()), "another desk: not yet");
     let r = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
     h.user(&r.text);
     h.ops(json!([{"op":"patch","id":"tests","set":{"text":"y"}}]));
     a.settle_now(J, &g, &h.vis(), &[]);
     let fresh = Board::fold(g, &h.events).view(&h.events);
-    for (what, desk) in [("this desk", &a), ("restarted", &desires(&d)), ("another desk", &b)] {
+    drop(a);
+    for (what, desk) in [("restarted", &desires(&d)), ("another desk", &b)] {
         assert!(desk.dismissed(J, &g, &id("tests"), fresh.visibility()), "{what}");
     }
 }
@@ -691,6 +716,7 @@ fn a_full_desire_file_refuses_before_drawing_and_a_restart_loses_no_desire() {
         .collect();
     let text = std::fs::read_to_string(d.join(FILE)).unwrap();
     assert!(text.len() <= RESERVE, "{} bytes", text.len());
+    drop(a);
     let b = desires(&d);
     assert_eq!(b.len(), PER_DESK, "a restart loses no desire");
     let after: Vec<_> = (0..8)
@@ -726,7 +752,7 @@ fn the_reserved_64_kib_refuses_before_drawing() {
     let (c, why) = refused.expect("the reserve binds first");
     assert!(why.starts_with(FULL_DESK) && c < PER_DESK, "{c}: {why}");
     assert!(std::fs::metadata(d.join(FILE)).unwrap().len() as usize <= RESERVE);
-    assert_eq!(desires(&d).len(), c, "every accepted one kept");
+    assert_eq!(in_file(&d).len(), c, "every accepted one kept");
     let mut m = serde_json::Map::new();
     m.insert(big.clone(), json!({"d": 1, "v": cards_spec::block::message::VERSION_MAX, "s": 1}));
     let entry = Value::Object(m).to_string();
@@ -735,69 +761,49 @@ fn the_reserved_64_kib_refuses_before_drawing() {
 
 const BLOCK_ID_LEN: usize = 24;
 
-/// The file's lock, held as another process would.
-fn hold_lock(d: &Path) -> std::fs::File {
-    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(d.join(format!("{FILE}.lock"))).unwrap();
-    held.try_lock().unwrap();
-    held
-}
-
-/// `a`'s next write (one is queued).
-fn a_write(a: &mut Desires) -> Write {
-    a.next_write().expect("a write queued")
-}
-
 /// `w` run on a thread of its own: the background task.
 fn in_background(w: Write) -> Landing {
     std::thread::spawn(move || w.run()).join().unwrap()
 }
 
-/// The UI thread never waits for the file nor writes it: with another
-/// process holding its lock, the load and every call return at once,
-/// nothing on this thread touches the disk, and a wish draws as before
-/// (pending) and rides nothing until its write, run in the background one
-/// at a time, lands.
+/// The UI thread never touches the file: every call returns having
+/// changed memory only. A wish draws as before (pending) and rides nothing
+/// until the snapshot with it, run in the background, one at a time, lands.
 #[test]
-fn the_ui_thread_never_waits_for_the_file() {
+fn the_ui_thread_never_touches_the_file() {
     let h = H::with(&["tests", "plan"]);
     let g = generation();
     let d = dir("never-waits");
-    let held = hold_lock(&d);
     let disk = blockfiles::on_this_thread();
-    let t = std::time::Instant::now();
     let mut a = Desires::load(Some(d.join(FILE)));
+    assert!(a.owns_file());
     assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
     assert_eq!(a.dismiss(J, &g, &id("plan"), &h.vis()), Ok(Ask::Saving));
     assert_eq!(a.dismiss(J, &g, &id("plan"), &h.vis()), Ok(Ask::Unchanged), "asked already");
     assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.pending(J, &g, &id("tests")), "drawn as before, pending");
     assert!(a.riding(J, &g, &h.vis()).is_empty(), "nothing rides before it is written");
     let plain = Riding::Go(Ride { text: "go".into(), carrier: None, notices: Vec::new() });
-    assert_eq!(a.ride(J, &g, &h.vis(), "go", Carry::Submit), plain, "nothing rides, nothing waits: it goes");
+    assert_eq!(a.ride(J, &g, &h.vis(), "go", Carry::Submit), Ok(plain), "nothing rides, nothing waits: it goes");
     a.settle(J, &g, &h.vis(), &[]);
     a.discard("another");
     a.compacted("a-third", &h.state());
     let w = a.next_write().expect("the launch's sweep");
     assert!(a.next_write().is_none(), "one out at a time");
-    assert!(t.elapsed() < blockfiles::LOCK_WAIT / 2, "{:?}", t.elapsed());
-    assert_eq!(blockfiles::on_this_thread(), disk, "no wait and no write on the UI thread");
-    // The background task waits for the lock, let go meanwhile.
-    let bg = std::thread::spawn(move || w.run());
-    std::thread::sleep(blockfiles::LOCK_WAIT / 5);
-    held.unlock().unwrap();
-    let mut landed = a.landed(bg.join().unwrap());
-    let w = a.next_write().expect("the first wish's write");
+    assert_eq!(blockfiles::on_this_thread(), disk, "no write on the UI thread");
+    let mut landed = a.landed(in_background(w));
+    let w = a.next_write().expect("memory, whole");
     landed.extend(a.landed(in_background(w)));
-    assert!(a.dismissed(J, &g, &id("tests"), &h.vis()) && !a.dismissed(J, &g, &id("plan"), &h.vis()), "the first landed, drawn");
-    while let Some(w) = a.next_write() {
-        landed.extend(a.landed(in_background(w)));
-    }
+    assert!(a.next_write().is_none() && !a.writing(), "one snapshot carried both");
     assert_eq!(blockfiles::on_this_thread(), disk);
-    assert_eq!(wish_done(&landed), [Ok(Done::Wished(1)), Ok(Done::Wished(2))]);
-    assert!(a.dismissed(J, &g, &id("plan"), &h.vis()) && !a.pending(J, &g, &id("plan")) && !a.writing());
+    let mut done = wish_done(&landed);
+    done.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(done, [Ok(Done::Wished(1)), Ok(Done::Wished(2))]);
+    assert!(a.dismissed(J, &g, &id("plan"), &h.vis()) && !a.pending(J, &g, &id("plan")));
     assert_eq!(a.riding(J, &g, &h.vis()).len(), 2, "written: they ride");
-    // A message carrying them waits for their mark, made in the background.
-    let Riding::Wait(t) = a.ride(J, &g, &h.vis(), "now", Carry::Submit) else { panic!("marked first") };
-    let w = a_write(&mut a);
+    // A message carrying them waits for their sent marks, written in the
+    // background.
+    let Ok(Riding::Wait(t)) = a.ride(J, &g, &h.vis(), "now", Carry::Submit) else { panic!("marked first") };
+    let w = a.next_write().expect("the marks");
     let sent = a.landed(in_background(w));
     assert_eq!(
         sent,
@@ -811,61 +817,84 @@ fn the_ui_thread_never_waits_for_the_file() {
         }]
     );
     assert_eq!(blockfiles::on_this_thread(), disk);
-    assert_eq!(desires(&d).len(), 2);
+    assert!(in_file(&d).slot(J, &generation_key(&g)).unwrap().values().all(|x| x.sent));
 }
 
-/// A write that times out (the lock held past its wait), fails (the
-/// disk), or is refused by the file (another process filled it) refuses
-/// the wish: it never drew, the block says why until the next wish, and a
-/// restart has nothing of it.
+/// A write the disk refuses refuses what it carried: the wishes in it are
+/// undone in memory (what drew before draws again, said on the block),
+/// the messages in it go plain; nothing waits for it, and the next change
+/// writes memory whole.
 #[test]
-fn a_write_that_fails_or_times_out_refuses_without_drawing() {
-    let h = H::with(&["tests"]);
+fn a_failed_write_refuses_and_draws_what_was_before() {
+    let h = H::with(&["tests", "plan", "other"]);
     let g = generation();
-    let refused = |landed: &[Landed]| match landed {
-        [Landed::Wish { done: Err(Refused(why)), .. }] => why.clone(),
+    let d = dir("fails");
+    let mut a = desires(&d);
+    a.dismiss_now(J, &g, &id("plan"), &h.vis()).unwrap();
+    a.dismiss_now(J, &g, &id("other"), &h.vis()).unwrap();
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(d.join(FILE)).unwrap();
+    std::fs::create_dir(d.join(FILE)).unwrap();
+    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
+    assert_eq!(a.show(J, &g, &id("plan"), &h.vis()), Ok(Ask::Saving), "a cancel, pending");
+    let Ok(Riding::Wait(t)) = a.ride(J, &g, &h.vis(), "words", Carry::Submit) else { panic!("its mark first") };
+    let landed = flush(&mut a);
+    let why = match &wish_done(&landed)[..] {
+        [Err(Refused(x)), Err(Refused(y))] if x == y && x.contains(FILE) => x.clone(),
         other => panic!("{other:?}"),
     };
-    let d = dir("timed-out");
-    let mut a = desires(&d);
-    let held = hold_lock(&d);
-    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
-    let w = a.next_write().unwrap();
-    let landed = a.landed(in_background(w));
-    let why = refused(&landed);
-    assert!(why.contains("not locked"), "{why}");
-    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && !a.pending(J, &g, &id("tests")), "never drawn");
+    assert!(landed.contains(&Landed::Send { ticket: t, ride: Ride { text: "words".into(), carrier: None, notices: Vec::new() } }), "plain");
+    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.dismissed(J, &g, &id("plan"), &h.vis()), "what drew before");
+    assert!(!a.pending(J, &g, &id("tests")) && !a.pending(J, &g, &id("plan")) && !a.writing());
     assert_eq!(a.refused(J, &id("tests")), Some(why.as_str()), "said on the block");
-    assert!(a.riding(J, &g, &h.vis()).is_empty() && a.len() == 0);
-    held.unlock().unwrap();
-    assert_eq!(desires(&d).len(), 0, "a restart has nothing of it");
-    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(1)), "the lock let go: written");
+    assert_eq!(
+        a.riding(J, &g, &h.vis()),
+        [(id("plan"), Seen::Dismissed, 1), (id("other"), Seen::Dismissed, 2)],
+        "plan's is back; other's not in flight"
+    );
+    std::fs::remove_dir(d.join(FILE)).unwrap();
+    assert!(matches!(a.dismiss_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(_))), "the disk back: written");
     assert_eq!(a.refused(J, &id("tests")), None);
-
-    let d = dir("unwritable");
-    std::fs::write(d.join("not-a-folder"), "x").unwrap();
-    let mut a = Desires::load(Some(d.join("not-a-folder").join(FILE)));
-    flush(&mut a);
-    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
-    let why = refused(&flush(&mut a));
-    assert!(why.contains("not-a-folder"), "{why}");
-    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.refused(J, &id("tests")).is_some());
-
-    let d = dir("filled");
-    let (mut a, mut b) = (desires(&d), desires(&d));
-    for i in 0..PER_CONVERSATION {
-        b.dismiss_now(J, &g, &id(&format!("b{i}")), &h.vis()).unwrap();
-    }
-    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving), "a's memory has none of b's");
-    assert_eq!(refused(&flush(&mut a)), FULL_HERE, "the file's cap, at the write");
-    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()));
-    assert_eq!(desires(&d).len(), PER_CONVERSATION, "b's kept, a's not written");
+    drop(a);
+    assert_eq!(desires(&d).len(), 3, "memory whole");
 }
 
-/// A write landing (the file as it wrote it) keeps what memory dropped
-/// since and hasn't written yet: a desire settled meanwhile stays settled.
+/// A write that failed isn't retried on its own, but a message that
+/// waits for it, and a settle, try it again: the disk back, the notice
+/// rides the next message, and the file has what memory has.
 #[test]
-fn a_landing_keeps_what_memory_dropped_since() {
+fn a_failed_write_is_tried_again_by_a_message_and_a_settle() {
+    let h = H::with(&["tests"]);
+    let g = generation();
+    let d = dir("retried");
+    let mut a = desires(&d);
+    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
+    std::fs::remove_file(d.join(FILE)).unwrap();
+    std::fs::create_dir(d.join(FILE)).unwrap();
+    assert_eq!(a.ride_now(J, &g, &h.vis(), "one", Carry::Submit).text, "one", "its mark not written: plain");
+    assert!(!a.writing(), "not retried on its own");
+    std::fs::remove_dir(d.join(FILE)).unwrap();
+    let r = a.ride_now(J, &g, &h.vis(), "two", Carry::Submit);
+    assert_eq!(r.text, "two\n[block tests v1 dismissed]", "a message waiting for the file tries it again");
+    drop(a);
+    assert!(desires(&d).desire(J, &g, &id("tests")).is_some_and(|d| d.sent));
+
+    let d = dir("retried-settle");
+    let mut a = desires(&d);
+    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
+    std::fs::remove_file(d.join(FILE)).unwrap();
+    std::fs::create_dir(d.join(FILE)).unwrap();
+    assert_eq!(a.ride_now(J, &g, &h.vis(), "one", Carry::Submit).text, "one");
+    std::fs::remove_dir(d.join(FILE)).unwrap();
+    assert_eq!(a.settle_now(J, &g, &h.vis(), &[]), []);
+    drop(a);
+    assert!(desires(&d).desire(J, &g, &id("tests")).is_some_and(|d| d.sent), "a settle tried it again");
+}
+
+/// A write landing keeps what memory changed since: a desire settled
+/// while the snapshot with it was out stays settled.
+#[test]
+fn a_landing_keeps_what_memory_changed_since() {
     let mut h = H::with(&["tests", "plan"]);
     let g = generation();
     let d = dir("dropped-since");
@@ -876,17 +905,22 @@ fn a_landing_keeps_what_memory_dropped_since() {
     let w = a.next_write().unwrap();
     h.user(&r.text);
     a.settle(J, &g, &h.vis(), &[]);
-    assert!(a.desire(J, &g, &id("tests")).is_none(), "settled: dropped in memory, its write queued");
-    a.landed(w.run());
-    assert!(a.desire(J, &g, &id("tests")).is_none(), "the plan's write had tests: still dropped");
+    assert!(a.desire(J, &g, &id("tests")).is_none(), "settled: dropped in memory");
+    assert_eq!(a.dismiss(J, &g, &id("notes"), &h.vis()), Ok(Ask::Saving), "decided after that snapshot");
+    let landed = a.landed(w.run());
+    assert_eq!(landed, [Landed::Wish { conv: J.into(), id: id("plan"), done: Ok(Done::Wished(2)) }], "plan's only");
+    assert!(a.desire(J, &g, &id("tests")).is_none(), "the plan's snapshot had tests: still dropped");
     assert!(a.desire(J, &g, &id("plan")).is_some());
+    assert!(a.pending(J, &g, &id("notes")) && !a.dismissed(J, &g, &id("notes"), &h.vis()), "not in it: still pending");
     flush(&mut a);
-    assert_eq!(desires(&d).waiting(), [(J.to_string(), 1)]);
+    assert!(a.dismissed(J, &g, &id("notes"), &h.vis()));
+    drop(a);
+    assert_eq!(desires(&d).waiting(), [(J.to_string(), 2)]);
 }
 
 /// A wish on one not yet written is decided against it: dismiss then show
-/// before either lands is a cancel (nothing kept, nothing rides), and they
-/// land in order.
+/// before either lands is a cancel (nothing kept, nothing rides), said
+/// once, when it lands.
 #[test]
 fn a_wish_on_a_pending_one_is_decided_against_it() {
     let h = H::with(&["tests"]);
@@ -895,10 +929,10 @@ fn a_wish_on_a_pending_one_is_decided_against_it() {
     let mut a = desires(&d);
     assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
     assert_eq!(a.show(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
-    assert_eq!(wish_done(&flush(&mut a)), [Ok(Done::Wished(1)), Ok(Done::Cancelled)]);
+    assert_eq!(wish_done(&flush(&mut a)), [Ok(Done::Cancelled)]);
     assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.len() == 0);
     assert_eq!(a.ride_now(J, &g, &h.vis(), "go", Carry::Submit).carrier, None, "nothing sent");
-    assert_eq!(desires(&d).len(), 0);
+    assert_eq!(in_file(&d).len(), 0);
 }
 
 /// No config folder: nothing can be kept, so every wish is refused.
@@ -920,16 +954,17 @@ fn an_unreadable_file_is_set_aside() {
     assert!(a.trouble.is_some() && a.len() == 0);
     assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), "{not json");
     a.dismiss_now(J, &generation(), &id("tests"), &H::default().vis()).unwrap();
+    drop(a);
     let g = generation_key(&generation());
-    let text = json!({"version": 2, "conversations": {J: {g: {"top": 1, "landed": 0, "owed": 0, "desires": {
-        "tests": {"d": 1, "v": 1, "s": 0}, "Bad": {"d": 1, "v": 1, "s": 0}, "plan": {"d": 1, "v": 0, "s": 0}}}}}, "settled": []});
+    let text = json!({"version": 3, "conversations": {J: {g: {
+        "tests": {"d": 1, "v": 1, "s": 0}, "Bad": {"d": 1, "v": 1, "s": 0}, "plan": {"d": 1, "v": 0, "s": 0}}}}});
     std::fs::write(d.join(FILE), text.to_string()).unwrap();
     assert_eq!(desires(&d).len(), 1);
 }
 
-/// What crashes left beside the file is swept at a load: regular files of
-/// exactly `<file>.tmp.<pid>.<n>`, never a link (nor what it names), a
-/// folder or another name.
+/// What crashes left beside the file is swept by its owner's first write:
+/// regular files of exactly `<file>.tmp.<pid>.<n>`, never a link (nor what
+/// it names), a folder or another name.
 #[test]
 fn a_load_sweeps_what_crashes_left() {
     let d = dir("sweep");
@@ -963,9 +998,9 @@ fn the_file_is_this_users_only() {
 }
 
 /// Another generation's desires under the same journal (its history
-/// replaced) count nowhere there, and go at the settle that sees the
-/// history move past them (the desk's first settle of the conversation, or
-/// one of another generation after one of theirs).
+/// replaced) count nowhere there, and go at the settle of another
+/// generation (the history moved on), at a launch's first settle too; a
+/// wish on the old one since is refused.
 #[test]
 fn another_generation_under_the_journal_drops_its_desires() {
     let h = H::with(&["tests"]);
@@ -975,51 +1010,20 @@ fn another_generation_under_the_journal_drops_its_desires() {
     a.settle_now(J, &g, &h.vis(), &[]);
     a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
     assert!(a.desire(J, &g2, &id("tests")).is_none() && !a.dismissed(J, &g2, &id("tests"), &h.vis()));
+    assert_eq!(a.dismiss_now(J, &g2, &id("tests"), &h.vis()), Err(Refused(MOVED_ON.into())), "not this history's");
     a.settle_now(J, &g2, &h.vis(), &[]);
-    assert_eq!((a.len(), desires(&d).len()), (0, 0), "seen moving past: dropped");
+    assert_eq!((a.len(), in_file(&d).len()), (0, 0), "seen moving past: dropped");
+    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h.vis()), Err(Refused(MOVED_ON.into())), "moved on");
+    // A launch before its first settle keeps g's wish; that settle, at
+    // g2, drops it.
+    drop(a);
     let mut b = desires(&d);
-    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
-    b.settle_now(J, &g2, &h.vis(), &[]);
-    assert_eq!(desires(&d).len(), 1, "b knew none of it: its first settle drops what it knew, none");
+    b.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
+    drop(b);
     let mut c = desires(&d);
+    assert_eq!(c.len(), 1);
     c.settle_now(J, &g2, &h.vis(), &[]);
-    assert_eq!((c.len(), desires(&d).len()), (0, 0), "c's first settle, on g2: g's go");
-}
-
-/// Two desks on one journal at different generations (its history
-/// replaced, one desk behind): the behind desk's wish, send, settle and
-/// compaction touch only its own generation, never the other's desires
-/// nor their marks.
-#[test]
-fn a_stale_generation_touches_no_other_generation() {
-    let h = H::with(&["tests", "plan", "notes"]);
-    let (g1, g2) = (generation(), Generation::of(&json!({"role":"user","content":"replaced"})));
-    let d = dir("generations");
-    let (mut old, mut new) = (desires(&d), desires(&d));
-    old.settle_now(J, &g1, &h.vis(), &[]);
-    old.dismiss_now(J, &g1, &id("tests"), &h.vis()).unwrap();
-    new.settle_now(J, &g2, &h.vis(), &[]);
-    assert_eq!(new.dismiss_now(J, &g2, &id("tests"), &h.vis()), Ok(Now::Wished(1)));
-    let kept = |what: &str| {
-        let f = desires(&d);
-        assert_eq!(f.desire(J, &g2, &id("tests")).map(|x| (x.dismissed, x.version, x.sent)), Some((true, 1, false)), "{what}");
-    };
-    old.dismiss_now(J, &g1, &id("plan"), &h.vis()).unwrap();
-    kept("after the old generation's wish");
-    let r = old.ride_now(J, &g1, &h.vis(), "old", Carry::Submit);
-    assert_eq!(line(&r), "[block tests v1, plan v2 dismissed]");
-    kept("after the old generation's send");
-    let mut h1 = h.clone();
-    h1.user(&r.text);
-    old.settle_now(J, &g1, &h1.vis(), &[]);
-    kept("after the old generation's settle");
-    old.dismiss_now(J, &g1, &id("notes"), &h1.vis()).unwrap();
-    assert_eq!(old.compacted_now(J, &h1.state()), [id("notes"), id("plan"), id("tests")]);
-    kept("after the old generation's compaction");
-    old.dismiss_now(J, &g1, &id("notes"), &h.vis()).unwrap();
-    old.settle_now(J, &g2, &h.vis(), &[]);
-    kept("after the old desk saw the history move: its g1 only");
-    assert!(desires(&d).desire(J, &g1, &id("notes")).is_none());
+    assert_eq!((c.len(), in_file(&d).len()), (0, 0), "c's first settle, on g2: g's go");
 }
 
 /// The chip's `×` keeps a notice back from the next message only; past 8
@@ -1040,20 +1044,7 @@ fn the_chip_keeps_one_back_and_eight_ride_at_most() {
     assert_eq!(line(&second), "[block b00 v1, b09 v10, b10 v11 dismissed]", "the held one rides the message after");
 }
 
-// Two desks on one file: processes.
-
-/// A wish of `conv`'s, as the board drew none of `id`.
-fn wish(conv: &str, i: &str) -> Wish {
-    Wish {
-        conv: conv.into(),
-        generation: generation_key(&generation()),
-        id: id(i),
-        dismiss: true,
-        shared_dismissed: false,
-        highest: 0,
-        had: false,
-    }
-}
+// One writer: processes.
 
 /// Waits for `path` (another process's signal), up to a minute.
 fn signalled(path: &Path) -> bool {
@@ -1074,31 +1065,24 @@ fn child() {
     let Ok(task) = std::env::var("SYNAPS_D6B_CHILD") else { return };
     let (what, folder) = task.split_once(':').unwrap();
     let d = PathBuf::from(folder);
-    let h = H::default();
+    let h = H::with(&["c0"]);
     match what {
-        "merge" => {
-            // The parent holds the file's lock mid-write: this desk's wish
-            // is refused (the lock not had in its wait), said; let go, it
-            // goes in, merged into what the parent wrote.
-            assert!(signalled(&d.join("holding")), "the parent never held the lock");
-            let mut a = desires(&d);
-            match a.dismiss_now("child", &generation(), &id("c0"), &h.vis()) {
-                Err(Refused(why)) => std::fs::write(d.join("refused"), why).unwrap(),
-                other => {
-                    std::fs::write(d.join("written"), format!("{other:?}")).unwrap();
-                    panic!("written under another process's lock: {other:?}");
-                }
-            }
-            assert!(signalled(&d.join("go")), "the parent never let go");
+        "memory" => {
+            // The parent owns the file: this desk keeps to memory, draws
+            // and sends its wishes, and never touches the file.
+            let before = std::fs::read(d.join(FILE)).unwrap();
+            let mut a = second(&d);
+            assert!(!a.owns_file() && a.trouble.as_deref().is_some_and(|t| t.contains("memory only")), "{:?}", a.trouble);
+            assert_eq!(a.len(), 0, "the file isn't read");
             assert_eq!(a.dismiss_now("child", &generation(), &id("c0"), &h.vis()), Ok(Now::Wished(1)));
+            assert!(a.dismissed("child", &generation(), &id("c0"), &h.vis()));
+            let r = a.ride_now("child", &generation(), &h.vis(), "go", Carry::Submit);
+            assert_eq!(line(&r), "[block c0 v1 dismissed]");
+            assert_eq!(std::fs::read(d.join(FILE)).unwrap(), before, "never written");
+            std::fs::write(d.join("done"), "").unwrap();
         }
         "crash" => {
-            let w = wish("child", "crashed");
-            let _ = blockfiles::update_then::<Book>(
-                &d.join(FILE),
-                |b| decide(b, &w).map(|_| ()),
-                || -> std::io::Result<()> { std::process::abort() },
-            );
+            let _ = blockfiles::write_then(&d.join(FILE), "{}", || -> std::io::Result<()> { std::process::abort() });
             unreachable!("aborted between the temporary file and the rename");
         }
         _ => panic!("{what}"),
@@ -1115,47 +1099,39 @@ fn spawn(task: &str, d: &Path) -> std::process::Child {
         .unwrap()
 }
 
-/// Two desk processes on one desire file, by a handshake, no sleep: while
-/// one is mid-write (its temporary file written, not yet renamed, the lock
-/// held), the other's wish is refused, and the first lets go only once it
-/// hears so; then the other's wish merges into what the first wrote. A
-/// writer that took no lock would write instead, and say so.
+/// One writer: a second desk process on the machine doesn't get the file's
+/// lock, and keeps its desires in memory only (drawn, sent, never written;
+/// said), as does a second store in this process; the owner goes on
+/// writing. Once the owner is gone, the next launch owns the file.
 #[test]
-fn a_second_process_is_refused_mid_write_then_merges_into_it() {
+fn a_second_desk_keeps_its_desires_in_memory_only() {
     let d = dir("processes");
-    let child = spawn("merge", &d);
-    let mine = wish("parent", "p0");
-    let held = blockfiles::update_then::<Book>(
-        &d.join(FILE),
-        |b| decide(b, &mine).map(|_| ()),
-        || {
-            std::fs::write(d.join("holding"), "")?;
-            let t = std::time::Instant::now();
-            while !d.join("refused").exists() && !d.join("written").exists() {
-                if t.elapsed() > std::time::Duration::from_secs(60) {
-                    return Err(std::io::Error::other("no answer from the second process"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Ok(())
-        },
-    );
-    assert!(held.is_ok(), "{held:?}");
-    std::fs::write(d.join("go"), "").unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let why = std::fs::read_to_string(d.join("refused")).unwrap();
-    assert!(why.contains("not locked"), "{why}");
-    assert_eq!(desires(&d).waiting(), [("child".to_string(), 1), ("parent".to_string(), 1)]);
+    let h = H::with(&["p0", "p1"]);
+    let g = generation();
+    let mut a = desires(&d);
+    a.dismiss_now("parent", &g, &id("p0"), &h.vis()).unwrap();
+    let out = spawn("memory", &d).wait_with_output().unwrap();
+    assert!(out.status.success() && signalled(&d.join("done")), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut b = second(&d);
+    assert!(!b.owns_file() && b.len() == 0);
+    assert_eq!(b.dismiss_now("second", &g, &id("p0"), &h.vis()), Ok(Now::Wished(1)));
+    assert!(b.next_write().is_none() && !b.writing(), "nothing to write: its memory is all");
+    a.dismiss_now("parent", &g, &id("p1"), &h.vis()).unwrap();
+    assert_eq!(in_file(&d).conversations.keys().collect::<Vec<_>>(), ["parent"], "the owner's only");
+    drop((a, b));
+    let c = desires(&d);
+    assert!(c.owns_file() && c.trouble.is_none());
+    assert_eq!(c.waiting(), [("parent".to_string(), 2)]);
 }
 
 /// A desk killed between writing its temporary file and the rename: the
-/// file is as it was, and the next load sweeps the leftover.
+/// file is as it was, and the next launch sweeps the leftover.
 #[test]
 fn a_crash_mid_write_keeps_the_file_and_the_next_load_sweeps() {
     let d = dir("crash");
     let mut a = desires(&d);
     a.dismiss_now(J, &generation(), &id("tests"), &H::default().vis()).unwrap();
+    drop(a);
     let before = std::fs::read(d.join(FILE)).unwrap();
     assert!(!spawn("crash", &d).wait_with_output().unwrap().status.success());
     assert_eq!(std::fs::read(d.join(FILE)).unwrap(), before, "atomic: the old file whole");
@@ -1170,50 +1146,7 @@ fn a_crash_mid_write_keeps_the_file_and_the_next_load_sweeps() {
     assert_eq!((left(), b.waiting()), (0, vec![(J.to_string(), 1)]));
 }
 
-/// Another process's wish of the other kind for the same id, at the same
-/// version or later, is under this click: re-minted above it, the newest
-/// click wins on every process that shares the file.
-#[test]
-fn a_wish_over_another_processs_later_one_is_minted_above_it() {
-    let d = dir("remint");
-    let h = H::with(&["tests"]);
-    let g = generation();
-    let (mut a, mut b) = (desires(&d), desires(&d));
-    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
-    a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
-    assert_eq!(a.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(2)));
-    assert_eq!(b.dismiss_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(3)), "b had seen none of it");
-    assert!(b.dismissed(J, &g, &id("tests"), &h.vis()), "drawn as clicked");
-    a.dismiss_now(J, &g, &id("plan"), &h.vis()).unwrap();
-    assert_eq!(
-        a.desire(J, &g, &id("tests")).map(|d| (d.dismissed, d.version, d.sent)),
-        Some((true, 3, true)),
-        "a takes it at its next write: another process's, it may have been sent"
-    );
-    assert_eq!(b.dismiss_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Unchanged));
-}
-
-/// Two desks in one process (two windows' stores) on one file: a desk's
-/// settle drops only what it settled, and the other's wishes survive it.
-#[test]
-fn a_second_desk_on_the_file_keeps_the_others_wishes() {
-    let d = dir("second");
-    let mut h = H::with(&["tests", "plan"]);
-    let g = generation();
-    let (mut a, mut b) = (desires(&d), desires(&d));
-    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
-    b.dismiss_now(J, &g, &id("plan"), &h.vis()).unwrap();
-    assert_eq!(b.len(), 2, "the write took the file as it was");
-    let r = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
-    assert_eq!(line(&r), "[block tests v1 dismissed]", "a's desire, a's carrier");
-    h.user(&r.text);
-    a.settle_now(J, &g, &h.vis(), &[]);
-    let c = desires(&d);
-    assert_eq!(c.desire(J, &g, &id("plan")).map(|d| d.version), Some(2), "minted above the file's, a's included");
-    assert!(c.desire(J, &g, &id("tests")).is_none());
-}
-
-// Shady's review of #103 (bba9546): each of these fails there.
+// Shady's review of #103, round 1 (bba9546).
 
 /// Dismiss (sent), Show, Dismiss, Show, the last three unsent: the first
 /// notice may still land, so the final Show is a newer `shown` notice,
@@ -1232,6 +1165,7 @@ fn a_superseded_notice_still_in_flight_keeps_the_final_show() {
         assert_eq!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(2)));
         assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(3)), "v1 may land: a new version");
         if restart {
+            drop(a);
             a = desires(&d);
         }
         assert_eq!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(4)), "v1 may still land: never a cancel");
@@ -1254,232 +1188,6 @@ fn a_superseded_notice_still_in_flight_keeps_the_final_show() {
     }
 }
 
-/// Cancellation is decided against the file, never this desk's memory: B
-/// sends A's unsent dismissal between A's dismiss and Show, so A's Show is
-/// a new version (B's copy may land); and with B's later dismissal (sent)
-/// on the file, A's Show supersedes it, and says what draws (P2-2).
-#[test]
-fn cancellation_is_decided_against_the_file() {
-    let h0 = H::with(&["tests"]);
-    let g = generation();
-    let d = dir("cancel-sent");
-    let mut a = desires(&d);
-    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
-    let mut b = desires(&d);
-    let carried = b.ride_now(J, &g, &h0.vis(), "from b", Carry::Submit);
-    assert_eq!(line(&carried), "[block tests v1 dismissed]", "b carries what the file has");
-    assert_eq!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(2)), "b sent it: a new version, never a cancel");
-    let mut h = h0.clone();
-    h.user(&carried.text);
-    let next = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
-    assert_eq!(line(&next), "[block tests v2 shown]");
-    h.user(&next.text);
-    assert!(!h.vis().dismissed(&id("tests")), "the Show holds");
-
-    let d = dir("cancel-later");
-    let mut a = desires(&d);
-    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
-    let mut b = desires(&d);
-    let sent = b.ride_now(J, &g, &h0.vis(), "from b", Carry::Submit);
-    assert_eq!(b.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(2)));
-    assert_eq!(b.dismiss_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(3)));
-    assert_eq!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(4)), "decided against b's v3, sent");
-    assert!(!a.dismissed(J, &g, &id("tests"), &h0.vis()), "and it draws what it said");
-    let restarted = desires(&d);
-    assert_eq!(restarted.desire(J, &g, &id("tests")).map(|x| (x.dismissed, x.version, x.sent)), Some((false, 4, true)));
-    let mut h = h0.clone();
-    h.user(&sent.text);
-    let next = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
-    assert_eq!(line(&next), "[block tests v4 shown]");
-}
-
-/// The user's discard drops the desires, not what they minted nor what
-/// they owe: a dismissal sent and still in flight, discarded, then the
-/// block dismissed and shown again. The new dismissal mints above the
-/// discarded v1 (a second v1 would be stale), and the Show can't cancel
-/// to nothing (v1 may still land): it is a notice, and it holds.
-#[test]
-fn a_discard_keeps_the_versions_and_what_may_still_land() {
-    let h0 = H::with(&["tests"]);
-    let g = generation();
-    for restart in [false, true] {
-        let d = dir(&format!("discard-owed-{restart}"));
-        let mut a = desires(&d);
-        a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
-        let first = a.ride_now(J, &g, &h0.vis(), "also", Carry::Steer);
-        assert_eq!(line(&first), "[block tests v1 dismissed]");
-        assert_eq!(a.discard(J), 1);
-        flush(&mut a);
-        if restart {
-            a = desires(&d);
-        }
-        assert_eq!(a.len(), 0);
-        assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(2)), "above the discarded v1");
-        assert_eq!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(3)), "v1 may land: never a cancel");
-        let next = a.ride_now(J, &g, &h0.vis(), "go", Carry::Submit);
-        assert_eq!(line(&next), "[block tests v3 shown]");
-        let mut h = h0.clone();
-        h.user(&next.text);
-        h.user(&first.text);
-        assert!(!h.vis().dismissed(&id("tests")), "restart {restart}: the Show holds");
-    }
-}
-
-/// What a board older than a settled history drew decides nothing: A's
-/// dismissal is sent and settled (dismissed in the history, gone from the
-/// file); B, whose board hasn't seen that history yet (its update on the
-/// way), dismisses the block (drawn shown there) and shows it again. The
-/// dismissal mints above the settled v1, and the Show is no cancel but a
-/// notice, which holds (found by the two-desk model: seed 89 of 1,500,
-/// seed 4,011 of 30,000).
-#[test]
-fn a_board_older_than_a_settle_decides_no_cancel() {
-    let h0 = H::with(&["tests"]);
-    let g = generation();
-    let d = dir("older-board");
-    let mut a = desires(&d);
-    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
-    let r = a.ride_now(J, &g, &h0.vis(), "from a", Carry::Submit);
-    let mut h = h0.clone();
-    h.user(&r.text);
-    a.settle_now(J, &g, &h.vis(), &[]);
-    assert_eq!(desires(&d).len(), 0, "settled: gone from the file");
-    let mut b = desires(&d);
-    assert!(!b.dismissed(J, &g, &id("tests"), &h0.vis()), "b's board is older: drawn shown");
-    assert_eq!(b.dismiss_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(2)), "above the settled v1");
-    assert_eq!(b.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(3)), "a notice, not a cancel");
-    let next = b.ride_now(J, &g, &h0.vis(), "more", Carry::Submit);
-    assert_eq!(line(&next), "[block tests v3 shown]");
-    h.user(&next.text);
-    assert!(!h.vis().dismissed(&id("tests")), "the Show holds");
-}
-
-/// Admission is decided under the lock, on the file as the wish leaves it:
-/// a desk whose memory still has an id the file no longer has can't make it
-/// the 65th of a conversation, nor the 513th of the desk. The refusal draws
-/// nothing new, and the desk takes the file (P2-4).
-#[test]
-fn a_stale_existing_id_cant_pass_the_caps() {
-    let g = generation();
-    let h = H::with(&["tests"]);
-    for desk_wide in [false, true] {
-        let d = dir(&format!("stale-caps-{desk_wide}"));
-        let mut a = desires(&d);
-        a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
-        let r = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
-        let mut hd = h.clone();
-        hd.user(&r.text);
-        let mut b = desires(&d);
-        b.settle_now(J, &g, &hd.vis(), &[]);
-        let here = if desk_wide { PER_CONVERSATION - 1 } else { PER_CONVERSATION };
-        for i in 0..here {
-            b.dismiss_now(J, &g, &id(&format!("b{i}")), &hd.vis()).unwrap();
-        }
-        if desk_wide {
-            for i in 0..PER_DESK - here {
-                b.dismiss_now(&format!("{J}-{}", i / PER_CONVERSATION), &g, &id(&format!("o{i}")), &hd.vis()).unwrap();
-            }
-        }
-        assert_eq!(b.len(), if desk_wide { PER_DESK } else { PER_CONVERSATION });
-        let before = std::fs::read(d.join(FILE)).unwrap();
-        assert!(a.desire(J, &g, &id("tests")).is_some(), "a's memory still has it");
-        assert_eq!(a.show(J, &g, &id("tests"), &hd.vis()), Ok(Ask::Saving), "in memory, an update: no preflight refusal");
-        let full = if desk_wide { FULL_DESK } else { FULL_HERE };
-        assert_eq!(wish_done(&flush(&mut a)), [Err(Refused(full.into()))]);
-        assert!(a.desire(J, &g, &id("tests")).is_none() && a.dismissed(J, &g, &id("tests"), &hd.vis()), "the file's, drawn");
-        assert_eq!(std::fs::read(d.join(FILE)).unwrap(), before, "nothing written");
-        assert_eq!(desires(&d).len(), b.len(), "a restart has the same");
-    }
-}
-
-/// A file made exactly `target` bytes long, of one-desire conversations
-/// keyed to fit: each desire dismissed at `v`, sent; no settled mark.
-fn edge_book(target: usize, v: u32) -> Book {
-    let gk = generation_key(&generation());
-    let add = |b: &mut Book, key: &str| {
-        let here = b.generation_mut(key, &gk);
-        here.top = v;
-        here.desires.insert(id(&format!("{:x<24}", "t")), Desire::new(true, v, true));
-    };
-    let size_with = |b: &Book, key: &str| {
-        let mut c = b.clone();
-        add(&mut c, key);
-        c.text().len()
-    };
-    let key = |n: usize, len: usize| format!("{n:04}{}", "k".repeat(len - 4));
-    let mut book = Book::default();
-    let mut n = 0;
-    while size_with(&book, &key(n, KEY_MAX)) <= target {
-        add(&mut book, &key(n, KEY_MAX));
-        n += 1;
-    }
-    let mut least = size_with(&book, &key(n, 4));
-    if least > target {
-        // Too little room for the last: the one before gives some back.
-        let k = least - target;
-        book.conversations.remove(&key(n - 1, KEY_MAX));
-        add(&mut book, &key(n - 1, KEY_MAX - k));
-        least = size_with(&book, &key(n, 4));
-    }
-    add(&mut book, &key(n, 4 + target - least));
-    assert_eq!(book.text().len(), target);
-    assert!(book.settled.is_empty());
-    book
-}
-
-/// The reserve on the file as written, version widths counted: a file
-/// exactly at 64 KiB refuses a Show of one of its desires that would
-/// write v10 over v9 (bytes more): nothing drawn, nothing written, and
-/// a restart has it the same. A new id is admitted only if every desire
-/// could still be superseded at its widest version (P2-4).
-#[test]
-fn the_reserve_counts_a_versions_width() {
-    let g = generation();
-    let d = dir("reserve-width");
-    let book = edge_book(RESERVE, 9);
-    std::fs::write(d.join(FILE), book.text()).unwrap();
-    let mut a = desires(&d);
-    assert_eq!(a.len(), book.len());
-    let (conv, slot) = book.conversations.iter().next().map(|(c, g)| (c.clone(), g.values().next().unwrap().desires.clone())).unwrap();
-    let t = slot.keys().next().unwrap().clone();
-    let shared = H::with(&[t.as_str()]).vis();
-    assert!(a.dismissed(&conv, &g, &t, &shared));
-    assert_eq!(a.show(&conv, &g, &t, &shared), Ok(Ask::Saving));
-    let refused = wish_done(&flush(&mut a));
-    // v10 over v9, and its generation's top: two bytes more.
-    assert!(matches!(&refused[..], [Err(Refused(why))] if why.starts_with(FULL_DESK) && why.contains("65538 bytes")), "{refused:?}");
-    assert!(a.dismissed(&conv, &g, &t, &shared), "nothing drawn");
-    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), book.text(), "nothing written");
-    assert!(desires(&d).dismissed(&conv, &g, &t, &shared));
-
-    // Admission at the widest: a book whose desires fit now but not at
-    // their widest takes no new id; one that fits at the widest takes it,
-    // and every desire can then go to VERSION_MAX.
-    let d = dir("reserve-widest");
-    let narrow = edge_book(RESERVE - 1_000, 1);
-    assert!(narrow.widest_bytes() > RESERVE && narrow.text().len() < RESERVE);
-    std::fs::write(d.join(FILE), narrow.text()).unwrap();
-    let mut a = desires(&d);
-    let refused = wish_done(&{
-        a.dismiss(J, &g, &id("new"), &H::default().vis()).unwrap();
-        flush(&mut a)
-    });
-    assert!(matches!(&refused[..], [Err(Refused(why))] if why.contains("at the widest")), "{refused:?}");
-    let mut fits = edge_book(RESERVE - 1_000, 1);
-    while fits.widest_bytes() + 200 > RESERVE {
-        let k = fits.conversations.keys().next().unwrap().clone();
-        fits.conversations.remove(&k);
-    }
-    let d = dir("reserve-fits");
-    std::fs::write(d.join(FILE), fits.text()).unwrap();
-    let mut a = desires(&d);
-    assert_eq!(a.dismiss_now(J, &g, &id("new"), &H::default().vis()), Ok(Now::Wished(1)));
-    let mut wide = desires(&d).book.clone();
-    wide.desires_mut().for_each(|x| x.version = VERSION_MAX);
-    wide.conversations.values_mut().flat_map(|g| g.values_mut()).for_each(|x| x.top = VERSION_MAX);
-    assert!(wide.text().len() <= RESERVE, "every admitted desire can be superseded: {}", wide.text().len());
-}
-
 /// Settled feedback is bounded per conversation and in all, goes once
 /// seen, and goes with its generation and its conversation, desires or
 /// none (P2-5).
@@ -1487,13 +1195,16 @@ fn the_reserve_counts_a_versions_width() {
 fn settled_feedback_is_bounded_and_goes() {
     let g = generation();
     let mut a = desires(&dir("feedback"));
+    let later = std::cell::Cell::new(1_000);
     let lose = |a: &mut Desires, conv: &str, prefix: &str| {
         let mut h = H::default();
         for i in 0..PER_CONVERSATION {
             a.dismiss_now(conv, &g, &id(&format!("{prefix}{i}")), &h.vis()).unwrap();
         }
-        // Another desk's later Shows of every one of them.
-        others(&mut h, prefix, PER_CONVERSATION, 1_000, "shown");
+        // Another desk's later Shows of every one of them: above all this
+        // desk has minted or settled.
+        later.set(later.get() + 1_000);
+        others(&mut h, prefix, PER_CONVERSATION, later.get(), "shown");
         assert_eq!(a.settle_now(conv, &g, &h.vis(), &[]).len(), PER_CONVERSATION);
         assert_eq!(a.len(), 0);
         h
@@ -1538,51 +1249,383 @@ fn a_pending_cancel_rides_nothing() {
     assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.len() == 0);
 }
 
-/// A message marks and carries only the notices the file still has as it
-/// picked them: B supersedes A's sent dismissal while A's message waits
-/// for its mark, so A's message goes plain, and B's Show (already an
-/// obligation, its sent mark inherited) rides A's next message.
+/// A message carries only the notices memory still has so when its turn
+/// comes: a Show supersedes the dismissal it picked while it waits for
+/// the file, so it goes plain, and the Show (an obligation, its sent mark
+/// inherited) rides the next message.
 #[test]
-fn a_send_carries_only_what_the_file_still_has() {
-    let h = H::with(&["tests"]);
+fn a_send_carries_only_what_memory_still_has() {
+    let h = H::with(&["tests", "plan"]);
     let g = generation();
-    let d = dir("send-checks-the-file");
-    let mut a = desires(&d);
+    let mut a = desires(&dir("send-checks-memory"));
     a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
     let first = a.ride_now(J, &g, &h.vis(), "first", Carry::Steer);
     a.lost(first.carrier.unwrap());
-    let mut b = desires(&d);
-    let Riding::Wait(t) = a.ride(J, &g, &h.vis(), "second", Carry::Submit) else { panic!("waits for its mark") };
-    let w = a.next_write().unwrap();
-    assert_eq!(b.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(2)));
-    let sent = a.landed(in_background(w)).into_iter().find_map(|l| match l {
+    assert_eq!(a.dismiss(J, &g, &id("plan"), &h.vis()), Ok(Ask::Saving), "the file behind memory");
+    let Ok(Riding::Wait(t)) = a.ride(J, &g, &h.vis(), "second", Carry::Submit) else { panic!("waits for the file") };
+    assert_eq!(a.show(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
+    let sent = flush(&mut a).into_iter().find_map(|l| match l {
         Landed::Send { ticket, ride } if ticket == t => Some(ride),
         _ => None,
     });
-    let sent = sent.expect("its mark landed");
-    assert_eq!((sent.text.as_str(), sent.carrier), ("second", None), "v1 is superseded in the file: nothing rides");
+    let sent = sent.expect("its turn came");
+    assert_eq!((sent.text.as_str(), sent.carrier), ("second", None), "v1 is superseded: nothing rides");
     let next = a.ride_now(J, &g, &h.vis(), "third", Carry::Submit);
-    assert_eq!(line(&next), "[block tests v2 shown]");
+    assert_eq!(line(&next), "[block tests v3 shown]");
+    assert!(next.text.contains("[block plan v2 dismissed]"));
 }
 
-/// A landed wish says what draws: a compaction made while the wish's write
-/// was out drops the generation, so the wish, decided in the file, doesn't
-/// draw, and says so (never `Wished` for a desire that isn't there).
+// Shady's review of #103, round 2 (22921cf): each of these fails there
+// (d6b-evidence/failfirst/r2), but R2-P2-4's (presentation_tests.rs).
+
+/// R2-P2-1, on one desk (two desks no longer share a file: the round-2
+/// case, one desk's file settling the other's notices, can't arise): its
+/// notices land out of order (v2, then v1); it settles both; then the
+/// user clicks on a board older than that settle, with the same highest
+/// (v2 seen, v1 not), dismiss then show. The Show must hold: what the
+/// desk settled draws the id dismissed, so the click's board doesn't
+/// decide a cancel, and the Show is a notice.
 #[test]
-fn a_landed_wish_says_what_draws() {
+fn a_board_older_than_the_desks_settle_decides_no_cancel() {
+    let h0 = H::with(&["tests", "other"]);
+    let g = generation();
+    let mut a = desires(&dir("older-board"));
+    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
+    let first = a.ride_now(J, &g, &h0.vis(), "one", Carry::Submit);
+    a.dismiss_now(J, &g, &id("other"), &h0.vis()).unwrap();
+    let second = a.ride_now(J, &g, &h0.vis(), "two", Carry::Submit);
+    let mut h = h0.clone();
+    h.user(&second.text);
+    let older = h.vis();
+    h.user(&first.text);
+    assert!(h.vis().dismissed(&id("tests")) && h.vis().highest() == 2 && older.highest() == 2);
+    a.settle_now(J, &g, &h.vis(), &[]);
+    assert_eq!(a.len(), 0);
+    assert!(!a.dismissed(J, &g, &id("tests"), &older), "the older board draws it shown");
+    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &older), Ok(Now::Wished(3)));
+    assert_eq!(a.show_now(J, &g, &id("tests"), &older), Ok(Now::Wished(4)), "a notice, not a cancel");
+    let next = a.ride_now(J, &g, &older, "three", Carry::Submit);
+    assert_eq!(line(&next), "[block tests v4 shown]");
+    h.user(&next.text);
+    assert!(!h.vis().dismissed(&id("tests")), "the Show holds");
+    // On a board as new as the settle, an unsent dismissal is simply
+    // cancelled (§3.5).
+    assert_eq!(a.settle_now(J, &g, &h.vis(), &[]), []);
+    assert_eq!(a.dismiss_now(J, &g, &id("other"), &h.vis()), Ok(Now::Unchanged), "already dismissed");
+    assert_eq!(a.show_now(J, &g, &id("other"), &h.vis()), Ok(Now::Wished(5)));
+    assert_eq!(a.dismiss_now(J, &g, &id("other"), &h.vis()), Ok(Now::Cancelled));
+}
+
+/// An unsent dismissal over a board that now draws the block dismissed
+/// (another desk's notice landed): Show is a new version, not a cancel,
+/// which would draw the shared state and lose the Show; and on a board
+/// that draws it shown, the cancel (§3.5).
+#[test]
+fn an_unsent_desire_the_board_now_draws_is_superseded() {
+    let h0 = H::with(&["tests"]);
+    let g = generation();
+    let mut a = desires(&dir("unsent-board"));
+    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
+    let mut h = h0.clone();
+    h.user("theirs\n[block tests v5 dismissed]");
+    assert_eq!(a.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(6)));
+    let r = a.ride_now(J, &g, &h.vis(), "go", Carry::Submit);
+    h.user(&r.text);
+    assert!(!h.vis().dismissed(&id("tests")), "the Show holds");
+    assert_eq!(a.settle_now(J, &g, &h.vis(), &[]), []);
+    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(7)));
+    assert_eq!(a.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Cancelled), "unsent, and every board draws it shown");
+}
+
+/// What this process knows of a conversation's history is bounded
+/// ([`KNOWN_MAX`] conversations without desires), and never forgotten for
+/// one with desires: there, a board older than its settle still decides
+/// no cancel (R2-P2-1's case) after 300 other conversations settled.
+#[test]
+fn what_is_known_is_bounded_but_kept_where_desires_wait() {
+    let h0 = H::with(&["tests", "other", "plan"]);
+    let g = generation();
+    let mut a = desires(&dir("known"));
+    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
+    let first = a.ride_now(J, &g, &h0.vis(), "one", Carry::Submit);
+    a.dismiss_now(J, &g, &id("other"), &h0.vis()).unwrap();
+    let second = a.ride_now(J, &g, &h0.vis(), "two", Carry::Submit);
+    a.hold(J, &g, &id("plan"), &h0.vis());
+    let mut h = h0.clone();
+    h.user(&second.text);
+    let older = h.vis();
+    h.user(&first.text);
+    a.settle_now(J, &g, &h.vis(), &[]);
+    a.dismiss_now(J, &g, &id("plan"), &h.vis()).unwrap();
+    assert_eq!(a.len(), 1, "plan waits");
+    for c in 0..300 {
+        a.settle_now(&format!("{J}-{c}"), &g, &h0.vis(), &[]);
+    }
+    assert!(a.known.len() <= KNOWN_MAX + 1, "{}", a.known.len());
+    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &older), Ok(Now::Wished(4)));
+    assert_eq!(a.show_now(J, &g, &id("tests"), &older), Ok(Now::Wished(5)), "a notice, not a cancel");
+}
+
+/// R2-P2-2: a version known settled is never minted under. A typed
+/// `shown` at v100 settles this desk's v1; a Dismiss on a board older
+/// than it (highest 0) mints v101, and holds.
+#[test]
+fn minting_goes_above_a_settled_typed_version() {
+    let h0 = H::with(&["tests"]);
+    let g = generation();
+    let mut a = desires(&dir("typed-v100"));
+    a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
+    let r = a.ride_now(J, &g, &h0.vis(), "one", Carry::Submit);
+    let mut h = h0.clone();
+    h.user(&r.text);
+    h.user("typed\n[block tests v100 shown]");
+    assert_eq!(a.settle_now(J, &g, &h.vis(), &[]), [(id("tests"), Feedback::ChangedByLater)]);
+    assert_eq!(a.dismiss_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(101)));
+    let next = a.ride_now(J, &g, &h0.vis(), "two", Carry::Submit);
+    h.user(&next.text);
+    assert!(h.vis().dismissed(&id("tests")), "the dismissal holds");
+}
+
+/// R2-P2-3: what may still land is never forgotten. The user's discard
+/// drops unsent desires only: a dismissal sent (its carrier delayed) stays,
+/// an obligation, through other conversations' churn (by count and by
+/// bytes) and a restart; the user's Show supersedes it, and holds
+/// whichever lands first.
+#[test]
+fn a_discard_keeps_what_may_still_land() {
+    let h0 = H::with(&["tests", "x"]);
+    let g = generation();
+    for (churn, restart) in [("count", false), ("bytes", false), ("count", true)] {
+        let d = dir(&format!("discard-{churn}-{restart}"));
+        let mut a = desires(&d);
+        a.dismiss_now(J, &g, &id("tests"), &h0.vis()).unwrap();
+        let first = a.ride_now(J, &g, &h0.vis(), "also", Carry::Steer);
+        assert_eq!(line(&first), "[block tests v1 dismissed]");
+        a.dismiss_now(J, &g, &id("x"), &h0.vis()).unwrap();
+        assert_eq!(a.discard(J), 1, "the unsent one");
+        assert!(a.desire(J, &g, &id("tests")).is_some_and(|d| d.sent) && a.desire(J, &g, &id("x")).is_none());
+        let (n, key) = if churn == "count" { (65, 0) } else { (300, KEY_MAX - 4) };
+        for i in 0..n {
+            let k = format!("{i:04}{}", "k".repeat(key));
+            a.dismiss_now(&k, &g, &id("x"), &h0.vis()).unwrap();
+            assert_eq!(a.show_now(&k, &g, &id("x"), &h0.vis()), Ok(Now::Cancelled));
+        }
+        if restart {
+            drop(a);
+            a = desires(&d);
+        }
+        assert!(a.dismissed(J, &g, &id("tests"), &h0.vis()), "{churn} {restart}: still this desk's wish");
+        assert!(matches!(a.show_now(J, &g, &id("tests"), &h0.vis()), Ok(Now::Wished(v)) if v > 1), "never a cancel");
+        let next = a.ride_now(J, &g, &h0.vis(), "go", Carry::Submit);
+        assert!(line(&next).ends_with("shown]"), "{}", next.text);
+        for order in [[&first, &next], [&next, &first]] {
+            let mut h = h0.clone();
+            order.iter().for_each(|r| h.user(&r.text));
+            assert!(!h.vis().dismissed(&id("tests")), "{churn} {restart}: the Show holds");
+        }
+    }
+}
+
+/// R2-P2-5: a generation switch (or a compaction) while the write of a
+/// wish of the old one is out: once it lands, no desire of the old
+/// generation stays (memory, file, restart), and the retired wish isn't
+/// reported (a section of the new history may have its id).
+#[test]
+fn a_wish_out_across_a_generation_switch_is_retired() {
+    let h = H::with(&["tests"]);
+    let (g1, g2) = (generation(), Generation::of(&json!({"role":"user","content":"another start"})));
+    for how in ["switch", "compaction"] {
+        let d = dir(&format!("retired-{how}"));
+        let mut a = desires(&d);
+        a.settle_now(J, &g1, &h.vis(), &[]);
+        assert_eq!(a.dismiss(J, &g1, &id("tests"), &h.vis()), Ok(Ask::Saving));
+        let w = a.next_write().expect("its write");
+        if how == "switch" {
+            a.settle(J, &g2, &h.vis(), &[]);
+        } else {
+            assert_eq!(a.compacted(J, &h.state()), [], "never drawn dismissed");
+        }
+        assert!(!a.pending(J, &g1, &id("tests")));
+        let mut landed = a.landed(in_background(w));
+        landed.extend(flush(&mut a));
+        assert_eq!(wish_done(&landed), [], "{how}: retired, never reported");
+        assert_eq!((a.len(), in_file(&d).len()), (0, 0), "{how}");
+        drop(a);
+        let mut b = desires(&d);
+        assert_eq!(b.len(), 0, "{how}: a restart");
+        b.settle_now(J, &g2, &h.vis(), &[]);
+        assert_eq!(b.len(), 0);
+    }
+}
+
+/// R2-P2-6: every wait is bounded. With the first message's write held
+/// (the background task stuck), messages queue behind it, and wishes wait
+/// for the file, interleaved with settles; past QUEUE_MAX in all (or
+/// QUEUE_BYTES_MAX of messages) the newest is refused, said, and nothing
+/// is dropped. Let go, every accepted message goes, in order.
+#[test]
+fn every_wait_is_bounded_and_the_newest_is_refused() {
     let h = H::with(&["tests"]);
     let g = generation();
-    let d = dir("landed-says");
+    let mut a = desires(&dir("bounded"));
+    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
+    let Ok(Riding::Wait(first)) = a.ride(J, &g, &h.vis(), "first", Carry::Submit) else { panic!("its mark first") };
+    let held = a.next_write().expect("the mark's write, held");
+    assert_eq!(a.ride(J, &g, &h.vis(), &"x".repeat(QUEUE_BYTES_MAX), Carry::Submit), Err(Refused(BUSY.into())), "bytes");
+    let (mut queued, mut wishes, mut refused) = (vec![first], 0, 0);
+    for i in 0..1000 {
+        match a.ride(J, &g, &h.vis(), &format!("m{i}"), Carry::Submit) {
+            Ok(Riding::Wait(t)) => queued.push(t),
+            Ok(Riding::Go(r)) => panic!("{r:?} went ahead of the first"),
+            Err(Refused(why)) => {
+                assert_eq!(why, BUSY);
+                refused += 1;
+            }
+        }
+        a.settle(J, &g, &h.vis(), &[]);
+        if i % 10 == 0 {
+            match a.dismiss(J, &g, &id(&format!("w{i}")), &h.vis()) {
+                Ok(Ask::Saving) => wishes += 1,
+                Err(Refused(why)) => assert_eq!(why, BUSY),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(a.waiting_actions() <= QUEUE_MAX, "{i}: {}", a.waiting_actions());
+    }
+    assert_eq!(queued.len() + wishes, QUEUE_MAX);
+    assert!(refused > 900);
+    let mut landed = a.landed(in_background(held));
+    landed.extend(flush(&mut a));
+    let sent: Vec<&Ride> = landed.iter().filter_map(|l| if let Landed::Send { ride, .. } = l { Some(ride) } else { None }).collect();
+    let order: Vec<u64> = landed.iter().filter_map(|l| if let Landed::Send { ticket, .. } = l { Some(*ticket) } else { None }).collect();
+    assert_eq!(order, queued, "every accepted one, in order");
+    assert_eq!(sent[0].text, "first\n[block tests v1 dismissed]");
+    assert_eq!(wish_done(&landed).len(), wishes);
+    assert_eq!(a.waiting_actions(), 0);
+}
+
+/// R2-P2-7: every transition keeps the file within its reserve. A file
+/// just under it (one 128-byte journal with 64 generations of one unsent
+/// desire, other journals of one), each of the 64 cancelled, the rest
+/// discarded: the file never grows past 64 KiB (at 22921cf each cancel
+/// left a mark repeating the 128-byte key: 65,578 bytes after 53).
+#[test]
+fn every_transition_keeps_the_reserve() {
+    let d = dir("reserve-every");
+    let big = "k".repeat(KEY_MAX);
+    let gens: Vec<Generation> = (0..64).map(|i| Generation::of(&json!({"role":"user","content":format!("start {i}")}))).collect();
+    let mut book = Book::default();
+    let one = |conv: &str, g: &Generation| (conv.to_string(), generation_key(g), id("a"), Some(Desire::new(true, VERSION_MAX, false)));
+    for g in &gens {
+        let (c, k, i, x) = one(&big, g);
+        book.set(&c, &k, &i, x);
+    }
+    let mut n = 0;
+    loop {
+        let mut next = book.clone();
+        let (c, k, i, x) = one(&format!("{}-{n:04}", "j".repeat(100)), &generation());
+        next.set(&c, &k, &i, x);
+        if next.widest_bytes() > RESERVE - 600 {
+            break;
+        }
+        book = next;
+        n += 1;
+    }
+    assert!(book.widest_bytes() <= RESERVE && book.len() <= PER_DESK, "{n}");
+    std::fs::write(d.join(FILE), book.text()).unwrap();
     let mut a = desires(&d);
-    flush(&mut a);
-    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
-    let w = a.next_write().unwrap();
-    a.compacted(J, &h.state());
-    let done = wish_done(&a.landed(in_background(w)));
-    assert_eq!(done, [Err(Refused(MOVED.into()))]);
-    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.refused(J, &id("tests")) == Some(MOVED));
-    flush(&mut a);
-    assert_eq!(desires(&d).len(), 0, "nor in the file");
+    assert_eq!(a.len(), 64 + n);
+    let shown = H::with(&["a"]).vis();
+    let mut last = book.text().len();
+    for (i, g) in gens.iter().enumerate() {
+        assert_eq!(a.show_now(&big, g, &id("a"), &shown), Ok(Now::Cancelled));
+        let bytes = std::fs::read(d.join(FILE)).unwrap().len();
+        assert!(bytes < last, "after {} cancels: {bytes} bytes, from {last}", i + 1);
+        last = bytes;
+    }
+    for i in 0..n {
+        assert_eq!(a.discard(&format!("{}-{i:04}", "j".repeat(100))), 1);
+        flush(&mut a);
+        let bytes = std::fs::read(d.join(FILE)).unwrap().len();
+        assert!(bytes < last, "after {} discards: {bytes} bytes", i + 1);
+        last = bytes;
+    }
+    assert_eq!((a.len(), in_file(&d).len()), (0, 0));
+}
+
+/// A file made exactly `target` bytes long, of one-desire conversations
+/// keyed to fit: each desire dismissed at `v`, sent.
+fn edge_book(target: usize, v: u32) -> Book {
+    let gk = generation_key(&generation());
+    let t = id(&format!("{:x<24}", "t"));
+    let add = |b: &mut Book, key: &str| b.set(key, &gk, &t, Some(Desire::new(true, v, true)));
+    let size_with = |b: &Book, key: &str| {
+        let mut c = b.clone();
+        add(&mut c, key);
+        c.text().len()
+    };
+    let key = |n: usize, len: usize| format!("{n:04}{}", "k".repeat(len - 4));
+    let mut book = Book::default();
+    let mut n = 0;
+    while size_with(&book, &key(n, KEY_MAX)) <= target {
+        add(&mut book, &key(n, KEY_MAX));
+        n += 1;
+    }
+    let mut least = size_with(&book, &key(n, 4));
+    if least > target {
+        // Too little room for the last: the one before gives some back.
+        let k = least - target;
+        book.conversations.remove(&key(n - 1, KEY_MAX));
+        add(&mut book, &key(n - 1, KEY_MAX - k));
+        least = size_with(&book, &key(n, 4));
+    }
+    add(&mut book, &key(n, 4 + target - least));
+    assert_eq!(book.text().len(), target);
+    book
+}
+
+/// The reserve on the file as written, version widths counted: a file
+/// exactly at 64 KiB refuses a Show of one of its desires that would
+/// write v10 over v9 (a byte more): refused at once, nothing drawn,
+/// nothing written. A new id is admitted only if every desire could still
+/// be superseded at its widest version.
+#[test]
+fn the_reserve_counts_a_versions_width() {
+    let g = generation();
+    let d = dir("reserve-width");
+    let book = edge_book(RESERVE, 9);
+    std::fs::write(d.join(FILE), book.text()).unwrap();
+    let mut a = desires(&d);
+    assert_eq!(a.len(), book.len());
+    let (conv, slot) = book.conversations.iter().next().map(|(c, g)| (c.clone(), g.values().next().unwrap().clone())).unwrap();
+    let t = slot.keys().next().unwrap().clone();
+    let shared = H::with(&[t.as_str()]).vis();
+    assert!(a.dismissed(&conv, &g, &t, &shared));
+    let refused = a.show(&conv, &g, &t, &shared);
+    assert!(matches!(&refused, Err(Refused(why)) if why.starts_with(FULL_DESK) && why.contains("65537 bytes")), "{refused:?}");
+    assert!(a.dismissed(&conv, &g, &t, &shared) && !a.pending(&conv, &g, &t) && !a.writing(), "nothing drawn, nothing to write");
+    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), book.text(), "nothing written");
+
+    // Admission at the widest: a book whose desires fit now but not at
+    // their widest takes no new id; one that fits at the widest takes it,
+    // and every desire can then go to VERSION_MAX.
+    let d = dir("reserve-widest");
+    let narrow = edge_book(RESERVE - 1_000, 1);
+    assert!(narrow.widest_bytes() > RESERVE && narrow.text().len() < RESERVE);
+    std::fs::write(d.join(FILE), narrow.text()).unwrap();
+    let mut a = desires(&d);
+    let refused = a.dismiss(J, &g, &id("new"), &H::default().vis());
+    assert!(matches!(&refused, Err(Refused(why)) if why.contains("at the widest")), "{refused:?}");
+    let mut fits = edge_book(RESERVE - 1_000, 1);
+    while fits.widest_bytes() + 200 > RESERVE {
+        let k = fits.conversations.keys().next().unwrap().clone();
+        fits.conversations.remove(&k);
+    }
+    let d = dir("reserve-fits");
+    std::fs::write(d.join(FILE), fits.text()).unwrap();
+    let mut a = desires(&d);
+    assert_eq!(a.dismiss_now(J, &g, &id("new"), &H::default().vis()), Ok(Now::Wished(1)));
+    assert!(in_file(&d).widest_bytes() <= RESERVE, "every admitted desire can be superseded");
 }
 
 /// A tiny xorshift: the model's dice.
@@ -1597,51 +1640,75 @@ impl Dice {
     }
 }
 
-/// A model of two desks on one file, one generation: random dismisses and
-/// shows on either, their writes landing at once or later (or lost to a
-/// restart, or failing), sends delivered in order, late, out of order or
-/// dropped, settles, restarts. Once everything is sent, delivered and
-/// settled, every id draws, in the history and on both desks, the state of
-/// the last wish the file took.
+/// One desk of the model: its store, its board (how much of the history it
+/// has seen, and as of its launch), its write out, the wishes it has asked
+/// and not yet written, and the highest version it was shown since launch.
+struct Desk {
+    store: Desires,
+    dir: PathBuf,
+    view: usize,
+    launched: usize,
+    out: Option<Write>,
+    asked: BTreeMap<BlockId, bool>,
+    seen: u32,
+}
+
+/// A model of two desks, each with its file, on one conversation's
+/// history, and a third party typing notices on the id both share. Each
+/// desk's board ages apart: it sees the history late, and clicks (on the
+/// opposite of what it draws) and sends against any board it has had since
+/// its launch, the newest or older ones. Writes land at once or later (a
+/// worker slow to finish), or fail; messages are delivered in order, late,
+/// out of order or dropped; desks settle and restart. Every version a desk
+/// mints is above every one it was shown since its launch. Once
+/// everything is written, sent, delivered and settled, nothing waits, and
+/// each id draws on both desks what the history has; for an id only one
+/// desk changes, its last wish written.
 #[test]
-fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
-    let names = ["a", "b", "c"];
+fn two_desks_whose_boards_age_apart_end_as_their_last_wishes() {
+    let names = ["a0", "a1", "b0", "b1", "e"];
+    let owner = |n: &str| n.as_bytes()[0];
     let g = generation();
+    let gk = generation_key(&g);
     // `SYNAPS_D6B_SEEDS` runs more (a deeper look); 40 by default.
     let seeds = std::env::var("SYNAPS_D6B_SEEDS").ok().and_then(|n| n.parse().ok()).unwrap_or(40u64);
     let first = std::env::var("SYNAPS_D6B_SEED").ok().and_then(|n| n.parse().ok()).unwrap_or(1u64);
     let steps = std::env::var("SYNAPS_D6B_STEPS").ok().and_then(|n| n.parse().ok()).unwrap_or(60usize);
     for seed in first..=seeds.max(first) {
-        let d = dir(&format!("model-{seed}"));
-        let bad = d.join("not-a-folder").join(FILE);
-        std::fs::write(d.join("not-a-folder"), "x").unwrap();
+        let root = dir(&format!("model-{seed}"));
+        let bad = Some(root.join("not-a-folder").join(FILE));
+        std::fs::write(root.join("not-a-folder"), "x").unwrap();
         let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut h = H::with(&names);
-        let mut desks = [desires(&d), desires(&d)];
+        let start = h.events.len();
+        let mut desks: Vec<Desk> = (0..2)
+            .map(|k| {
+                let d = root.join(format!("desk{k}"));
+                std::fs::create_dir_all(&d).unwrap();
+                Desk { store: desires(&d), dir: d, view: start, launched: start, out: None, asked: BTreeMap::new(), seen: 0 }
+            })
+            .collect();
         let mut want: BTreeMap<BlockId, bool> = BTreeMap::new();
         let mut net: Vec<(usize, Ride)> = Vec::new();
         let mut trace = Vec::new();
-        // Each desk's wishes queued, in order: they land in that order.
-        let land = |desk: &mut Desires,
-                    fail: bool,
-                    want: &mut BTreeMap<BlockId, bool>,
-                    asked: &mut VecDeque<(BlockId, bool)>,
-                    trace: &mut Vec<String>| {
+        let board = |h: &H, n: usize| H { events: h.events[..n].to_vec(), tools: 0 }.vis();
+        // A desk's writes: the one out (failing or not), then every one to
+        // make, at once. What landed: wishes kept or not, messages sent.
+        let land = |desk: &mut Desk, fail: bool, want: &mut BTreeMap<BlockId, bool>, trace: &mut Vec<String>| {
             let mut rides = Vec::new();
-            while let Some(mut w) = desk.next_write() {
+            while let Some(mut w) = desk.out.take().or_else(|| desk.store.next_write()) {
                 if fail {
-                    w.path = bad.clone();
+                    w.path.clone_from(&bad);
                 }
-                for l in desk.landed(w.run()) {
+                for l in desk.store.landed(w.run()) {
                     match l {
                         Landed::Wish { id, done, .. } => {
-                            let (was, dismiss) = asked.pop_front().expect("a wish queued");
+                            let dismiss = desk.asked.remove(&id).expect("asked");
                             trace.push(format!(
                                 "  landed {id} {}: {done:?}{}",
                                 if dismiss { "x" } else { "u" },
                                 if fail { " (failing)" } else { "" }
                             ));
-                            assert_eq!(was, id, "in order");
                             if done.is_ok() {
                                 want.insert(id, dismiss);
                             }
@@ -1652,38 +1719,56 @@ fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
                         }
                     }
                 }
+                let bytes = std::fs::metadata(desk.dir.join(FILE)).map_or(0, |m| m.len() as usize);
+                assert!(bytes <= RESERVE, "{bytes}");
             }
             rides
         };
-        let mut asked: [VecDeque<(BlockId, bool)>; 2] = Default::default();
         for _ in 0..steps {
             let k = dice.below(2);
-            let i = id(names[dice.below(names.len())]);
-            match dice.below(12) {
+            let aged = |dice: &mut Dice, desk: &Desk| desk.launched + dice.below(desk.view - desk.launched + 1);
+            match dice.below(16) {
                 0..=4 => {
-                    let dismiss = dice.below(2) == 0;
-                    let r = if dismiss { desks[k].dismiss(J, &g, &i, &h.vis()) } else { desks[k].show(J, &g, &i, &h.vis()) };
-                    trace.push(format!("{k} {} {i}: {r:?}", if dismiss { "x" } else { "u" }));
+                    let mine: Vec<&str> = names.iter().copied().filter(|n| owner(n) == b"ab"[k] || owner(n) == b'e').collect();
+                    let i = id(mine[dice.below(mine.len())]);
+                    let at = aged(&mut dice, &desks[k]);
+                    let v = board(&h, at);
+                    let desk = &mut desks[k];
+                    let dismiss = !desk.store.dismissed(J, &g, &i, &v);
+                    let floor = desk.seen.max(v.highest());
+                    let was = desk.store.book.get(J, &gk, &i).map(|x| x.version);
+                    let r = if dismiss { desk.store.dismiss(J, &g, &i, &v) } else { desk.store.show(J, &g, &i, &v) };
+                    trace.push(format!("{k} {} {i} on {at}/{}: {r:?}", if dismiss { "x" } else { "u" }, h.events.len()));
                     if r == Ok(Ask::Saving) {
-                        asked[k].push_back((i, dismiss));
-                        if dice.below(3) > 0 {
-                            let fail = dice.below(6) == 0;
-                            let rides = land(&mut desks[k], fail, &mut want, &mut asked[k], &mut trace);
-                            net.extend(rides.into_iter().map(|r| (k, r)));
+                        desk.asked.insert(i.clone(), dismiss);
+                        let now = desk.store.book.get(J, &gk, &i).map(|x| x.version);
+                        if let Some(n) = now.filter(|n| Some(*n) != was) {
+                            assert!(n > floor, "seed {seed}: minted v{n}, shown v{floor}\n{}", trace.join("\n"));
                         }
+                    }
+                    desk.seen = floor.max(desk.store.book.get(J, &gk, &i).map_or(0, |x| x.version));
+                    if dice.below(3) > 0 {
+                        let fail = dice.below(6) == 0;
+                        let rides = land(&mut desks[k], fail, &mut want, &mut trace);
+                        net.extend(rides.into_iter().map(|r| (k, r)));
                     }
                 }
                 5..=6 => {
+                    let at = aged(&mut dice, &desks[k]);
+                    let v = board(&h, at);
                     let body = format!("m{}", trace.len());
-                    match desks[k].ride(J, &g, &h.vis(), &body, Carry::Submit) {
-                        Riding::Go(r) => {
-                            trace.push(format!("{k} sends {:?}", r.text));
+                    desks[k].seen = desks[k].seen.max(v.highest());
+                    match desks[k].store.ride(J, &g, &v, &body, Carry::Submit) {
+                        Ok(Riding::Go(r)) => {
+                            trace.push(format!("{k} sends {:?} on {at}", r.text));
                             net.push((k, r));
                         }
-                        Riding::Wait(_) => {
-                            let rides = land(&mut desks[k], false, &mut want, &mut asked[k], &mut trace);
+                        Ok(Riding::Wait(_)) => {
+                            trace.push(format!("{k} waits {body:?} on {at}"));
+                            let rides = land(&mut desks[k], false, &mut want, &mut trace);
                             net.extend(rides.into_iter().map(|r| (k, r)));
                         }
+                        Err(e) => trace.push(format!("{k} refused {body:?}: {e:?}")),
                     }
                 }
                 7..=8 if !net.is_empty() => {
@@ -1691,24 +1776,58 @@ fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
                     if dice.below(5) == 0 {
                         trace.push(format!("dropped {:?}", r.text));
                         if let Some(c) = r.carrier {
-                            desks[from].lost(c);
+                            desks[from].store.lost(c);
                         }
                     } else {
                         trace.push(format!("delivered {:?}", r.text));
                         h.user(&r.text);
                     }
                 }
-                9..=10 => {
-                    trace.push(format!("{k} settles"));
+                9 => {
+                    let desk = &mut desks[k];
+                    desk.view += dice.below(h.events.len() - desk.view + 1);
+                }
+                10..=11 => {
+                    let v = board(&h, desks[k].view);
+                    trace.push(format!("{k} settles on {}", desks[k].view));
                     let flying: Vec<u64> = net.iter().filter(|(f, _)| *f == k).filter_map(|(_, r)| r.carrier).collect();
-                    desks[k].settle(J, &g, &h.vis(), &flying);
-                    let rides = land(&mut desks[k], false, &mut want, &mut asked[k], &mut trace);
+                    desks[k].seen = desks[k].seen.max(v.highest());
+                    desks[k].store.settle(J, &g, &v, &flying);
+                    if dice.below(2) == 0 {
+                        let rides = land(&mut desks[k], false, &mut want, &mut trace);
+                        net.extend(rides.into_iter().map(|r| (k, r)));
+                    }
+                }
+                12 => {
+                    // A third party types a notice on the shared id.
+                    let n = 1 + dice.below(board(&h, h.events.len()).highest() as usize + 2);
+                    let kind = if dice.below(2) == 0 { "dismissed" } else { "shown" };
+                    trace.push(format!("typed e v{n} {kind}"));
+                    h.user(&format!("typed\n[block e v{n} {kind}]"));
+                }
+                13 => {
+                    // The worker takes a write and is slow to finish it.
+                    if desks[k].out.is_none() {
+                        desks[k].out = desks[k].store.next_write();
+                        trace.push(format!("{k} write out: {}", desks[k].out.is_some()));
+                    }
+                }
+                14 => {
+                    let fail = dice.below(4) == 0;
+                    trace.push(format!("{k} lands{}", if fail { " (failing)" } else { "" }));
+                    let rides = land(&mut desks[k], fail, &mut want, &mut trace);
                     net.extend(rides.into_iter().map(|r| (k, r)));
                 }
-                _ => {
+                15 => {
                     trace.push(format!("{k} restarts"));
-                    desks[k] = desires(&d);
-                    asked[k].clear();
+                    let desk = &mut desks[k];
+                    desk.out = None;
+                    desk.asked.clear();
+                    let d = desk.dir.clone();
+                    drop(std::mem::replace(&mut desk.store, Desires::load(None)));
+                    desk.store = desires(&d);
+                    // It attaches to the history as it is now.
+                    (desk.view, desk.launched, desk.seen) = (h.events.len(), h.events.len(), 0);
                     // Its messages already sent are the network's now.
                     for (f, r) in &mut net {
                         if *f == k {
@@ -1716,16 +1835,19 @@ fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
                         }
                     }
                 }
+                _ => {}
             }
         }
         // Everything written, sent, delivered and settled.
         for round in 0..20 {
-            for k in 0..2 {
-                let rides = land(&mut desks[k], false, &mut want, &mut asked[k], &mut trace);
+            for (k, desk) in desks.iter_mut().enumerate() {
+                let rides = land(desk, false, &mut want, &mut trace);
                 net.extend(rides.into_iter().map(|r| (k, r)));
-                let rides = match desks[k].ride(J, &g, &h.vis(), "drain", Carry::Submit) {
+                desk.view = h.events.len();
+                let v = board(&h, desk.view);
+                let rides = match desk.store.ride(J, &g, &v, "drain", Carry::Submit).expect("nothing waits") {
                     Riding::Go(r) => vec![r],
-                    Riding::Wait(_) => land(&mut desks[k], false, &mut want, &mut asked[k], &mut trace),
+                    Riding::Wait(_) => land(desk, false, &mut want, &mut trace),
                 };
                 net.extend(rides.into_iter().map(|r| (k, r)));
             }
@@ -1733,12 +1855,13 @@ fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
                 h.user(&r.text);
             }
             for desk in &mut desks {
-                desk.settle(J, &g, &h.vis(), &[]);
+                desk.view = h.events.len();
+                desk.store.settle(J, &g, &h.vis(), &[]);
             }
-            for k in 0..2 {
-                land(&mut desks[k], false, &mut want, &mut asked[k], &mut trace);
+            for desk in &mut desks {
+                land(desk, false, &mut want, &mut trace);
             }
-            if desks.iter().all(|x| x.len() == 0) {
+            if desks.iter().all(|x| x.store.len() == 0 && x.store.waiting_actions() == 0) {
                 break;
             }
             assert!(round < 19, "seed {seed}: never settled\n{}", trace.join("\n"));
@@ -1746,10 +1869,18 @@ fn two_desks_on_one_file_end_as_the_last_wish_the_file_took() {
         let shared = h.vis();
         for n in names {
             let i = id(n);
-            let end = want.get(&i).copied().unwrap_or(false);
-            assert_eq!(shared.dismissed(&i), end, "seed {seed}, {n}: the history\n{}", trace.join("\n"));
-            for desk in &desks {
-                assert_eq!(desk.dismissed(J, &g, &i, &shared), end, "seed {seed}, {n}: a desk\n{}", trace.join("\n"));
+            for (k, desk) in desks.iter().enumerate() {
+                assert_eq!(
+                    desk.store.dismissed(J, &g, &i, &shared),
+                    shared.dismissed(&i),
+                    "seed {seed}, {n}: desk {k}\n{}",
+                    trace.join("\n")
+                );
+                assert_eq!(in_file(&desk.dir).len(), 0, "seed {seed}: desk {k}'s file");
+            }
+            if owner(n) != b'e' {
+                let end = want.get(&i).copied().unwrap_or(false);
+                assert_eq!(shared.dismissed(&i), end, "seed {seed}, {n}: the last wish\n{}", trace.join("\n"));
             }
         }
     }

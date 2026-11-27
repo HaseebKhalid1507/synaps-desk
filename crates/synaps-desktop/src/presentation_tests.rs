@@ -1,7 +1,8 @@
 //! The presentation (blocks.md §3.5's Pin and Slot, §5.2's soft
 //! dismissals, §1.8's `blocks.json` row) against B2's fold: pins and slot
 //! moves outrank the agent's `move` and `slot`, the order within a slot,
-//! groups, compaction, the file's caps, two desks on one file, the sweep.
+//! groups, compaction, the file's caps, one writer (a second process in
+//! memory only), whole snapshots (a removal persists), the sweep.
 
 use cards_spec::block::{Ref, Slot};
 use cards_spec::board::Place;
@@ -14,10 +15,25 @@ fn r(s: &str) -> Ref {
     Ref::parse(s).unwrap()
 }
 
-/// The presentation in `d`'s file, the launch's sweep run.
+/// The presentation in `d`'s file, the launch's sweep run, as its owner
+/// (as [`crate::desires::tests::desires`]).
 fn presentation(d: &std::path::Path) -> Presentation {
-    let mut p = Presentation::load(Some(d.join(FILE)));
-    flush(&mut p);
+    let t = std::time::Instant::now();
+    loop {
+        let mut p = Presentation::load(Some(d.join(FILE)));
+        if p.owner.is_some() || t.elapsed() > std::time::Duration::from_secs(10) {
+            flush(&mut p);
+            return p;
+        }
+        drop(p);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The file as a restart would read it, while `d`'s owner lives on.
+fn reread(d: &std::path::Path) -> Presentation {
+    let mut p = Presentation::load(None);
+    p.book = crate::blockfiles::peek::<Book>(&d.join(FILE)).0;
     p
 }
 
@@ -67,7 +83,7 @@ fn a_pin_outranks_the_agents_move() {
     assert_eq!(at(&p, &h, "plan"), Placed { place: Place::Rail(Slot::Upper), by_user: true, agent_moved: true }, "the pin outranks it");
     assert_eq!(p.order(J, &h.state(), Slot::Upper), [r("plan")]);
     assert!(p.order(J, &h.state(), Slot::End).is_empty());
-    assert_eq!(presentation(&d).placed(J, h.state().block(&r("plan")).unwrap()).place, Place::Rail(Slot::Upper), "persisted");
+    assert_eq!(reread(&d).placed(J, h.state().block(&r("plan")).unwrap()).place, Place::Rail(Slot::Upper), "persisted");
     assert_eq!(
         pin(&mut p, &h, "plan").unwrap(),
         Placed { place: Place::Rail(Slot::End), by_user: false, agent_moved: false },
@@ -169,6 +185,7 @@ fn compaction_carries_pins_and_soft_dismissals() {
     p.compacted(J, J2, &[id("tests")]);
     p.compacted(J, J2, &[id("tests")]);
     flush(&mut p);
+    drop(p);
     let p = presentation(&d);
     let s = h.state();
     let plan = s.block(&r("plan")).unwrap();
@@ -177,12 +194,12 @@ fn compaction_carries_pins_and_soft_dismissals() {
     let mut p = p;
     assert!(p.unsoft(J2, &id("tests")));
     flush(&mut p);
-    assert!(!presentation(&d).soft(J2, &id("tests")));
+    assert!(!reread(&d).soft(J2, &id("tests")));
     // Soft ones carry on through the next compaction.
     p.compacted(J2, "j3", &[id("notes")]);
     p.compacted("j3", "j4", &[]);
     flush(&mut p);
-    assert!(presentation(&d).soft("j4", &id("notes")));
+    assert!(reread(&d).soft("j4", &id("notes")));
 }
 
 /// The caps: past 64 entries in a conversation the oldest goes; past 256
@@ -197,7 +214,7 @@ fn the_files_caps_drop_the_oldest() {
     let soft: Vec<_> = (0..ENTRIES_MAX).map(|i| id(&format!("s{i}"))).collect();
     p.compacted("before", J, &soft);
     flush(&mut p);
-    let q = presentation(&d);
+    let q = reread(&d);
     assert!(!q.placed(J, h.state().block(&r("plan")).unwrap()).by_user, "the oldest went");
     assert!(soft.iter().all(|i| q.soft(J, i)), "the 64 newer stay");
 
@@ -209,9 +226,10 @@ fn the_files_caps_drop_the_oldest() {
         p.pin(&format!("c{c}"), b).unwrap();
     }
     flush(&mut p);
-    let q = presentation(&d);
+    let q = reread(&d);
     assert!(!q.placed("c0", b).by_user, "the least recently touched went");
     assert!(q.placed("c1", b).by_user && q.placed(&format!("c{CONVERSATIONS_MAX}"), b).by_user);
+    drop(desires);
     assert_eq!(crate::desires::tests::desires(&d).waiting(), [("c0".to_string(), 1)], "its desires stay");
 
     let mut book = Book::default();
@@ -237,29 +255,38 @@ fn the_files_caps_drop_the_oldest() {
     assert!(!book.conversations.contains_key("k000") && book.conversations.contains_key(&format!("k{:03}", CONVERSATIONS_MAX - 1)));
 }
 
-/// Two desks on one file: each write replaces the conversations it
-/// changed, and keeps the others'.
+/// One writer: a second store of the file (another process, here another
+/// in this one) doesn't get its lock, and keeps its placements in memory
+/// only: drawn at once, never written, the file untouched; said. Once the
+/// owner is gone, the next launch owns it.
 #[test]
-fn two_desks_on_one_file_keep_each_others_conversations() {
+fn a_second_desk_keeps_its_placements_in_memory_only() {
     let d = dir("two");
     let h = H::with(&["plan"]);
     let s = h.state();
     let b = s.block(&r("plan")).unwrap();
-    let (mut x, mut y) = (presentation(&d), presentation(&d));
+    let mut x = presentation(&d);
     x.pin("jx", b).unwrap();
     flush(&mut x);
-    y.pin("jy", b).unwrap();
+    let before = std::fs::read(d.join(FILE)).unwrap();
+    let mut y = Presentation::load(Some(d.join(FILE)));
     flush(&mut y);
+    assert!(y.trouble.as_deref().is_some_and(|t| t.contains("memory only")), "{:?}", y.trouble);
+    assert!(!y.placed("jx", b).by_user, "the file isn't read");
+    assert!(y.pin("jy", b).unwrap().by_user && y.placed("jy", b).by_user, "drawn at once");
+    assert!(y.next_write().is_none() && !y.writing(), "never written");
+    assert_eq!(std::fs::read(d.join(FILE)).unwrap(), before);
     x.pin("jx2", b).unwrap();
     flush(&mut x);
+    drop((x, y));
     let z = presentation(&d);
-    assert!(z.placed("jx", b).by_user && z.placed("jy", b).by_user && z.placed("jx2", b).by_user);
+    assert!(z.trouble.is_none() && z.placed("jx", b).by_user && z.placed("jx2", b).by_user && !z.placed("jy", b).by_user);
 }
 
-/// A pin draws at once, and its write runs off the UI thread: with the
-/// file's lock held, the call returns at once and touches no disk. A write
-/// that fails is said, memory keeps the change, and the next write carries
-/// it; one landing keeps what memory changed after it.
+/// A pin draws at once, and its write runs off the UI thread: the call
+/// touches no disk. A write that fails is said, memory keeps the change,
+/// and the next change's write carries it all; one landing keeps what
+/// memory changed after it.
 #[test]
 fn a_pin_draws_at_once_and_is_written_off_the_ui_thread() {
     let d = dir("p-background");
@@ -267,27 +294,26 @@ fn a_pin_draws_at_once_and_is_written_off_the_ui_thread() {
     let s = h.state();
     let b = s.block(&r("plan")).unwrap();
     let mut p = presentation(&d);
-    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(d.join(format!("{FILE}.lock"))).unwrap();
-    held.try_lock().unwrap();
+    // The disk refuses: a folder where the file goes.
+    std::fs::create_dir(d.join(FILE)).unwrap();
     let disk = crate::blockfiles::on_this_thread();
-    let t = std::time::Instant::now();
     assert_eq!(p.pin(J, b).unwrap().place, Place::Rail(Slot::Upper), "drawn at once");
     assert!(p.writing());
     let w = p.next_write().unwrap();
-    assert!(t.elapsed() < crate::blockfiles::LOCK_WAIT / 2, "{:?}", t.elapsed());
-    assert_eq!(crate::blockfiles::on_this_thread(), disk, "no wait and no write on the UI thread");
+    assert!(p.next_write().is_none(), "one out at a time");
+    assert_eq!(crate::blockfiles::on_this_thread(), disk, "no write on the UI thread");
     let l = std::thread::spawn(move || w.run()).join().unwrap();
-    assert!(p.landed(l).is_err() && p.failed.as_deref().is_some_and(|f| f.contains("not locked")), "{:?}", p.failed);
-    assert!(p.placed(J, b).by_user && !p.writing(), "memory keeps it");
-    held.unlock().unwrap();
-    assert!(!presentation(&d).placed(J, b).by_user, "not written yet");
+    assert!(p.landed(l).is_err() && p.failed.as_deref().is_some_and(|f| f.contains(FILE)), "{:?}", p.failed);
+    assert!(p.placed(J, b).by_user && !p.writing(), "memory keeps it, and tries again at the next change");
+    std::fs::remove_dir(d.join(FILE)).unwrap();
     p.pin("other", b).unwrap();
     let w = p.next_write().unwrap();
     p.pin("third", b).unwrap();
     assert!(p.landed(w.run()).is_ok() && p.failed.is_none());
     assert!(p.placed("third", b).by_user, "changed after the write: memory's kept");
+    assert!(!reread(&d).placed("third", b).by_user && p.writing(), "not in that write: the next");
     flush(&mut p);
-    let q = presentation(&d);
+    let q = reread(&d);
     assert!(q.placed(J, b).by_user && q.placed("other", b).by_user && q.placed("third", b).by_user, "the next writes carried all");
 }
 
@@ -307,29 +333,79 @@ fn a_transcript_placement_stays_where_the_user_put_it() {
     let moved = h.state().block(&r("r")).unwrap().place;
     assert!(matches!(moved, Place::Transcript(at) if at != a0), "{moved:?}");
     assert_eq!(at(&p, &h, "r"), Placed { place: Place::Transcript(a0), by_user: true, agent_moved: true });
-    assert_eq!(at(&presentation(&d), &h, "r").place, Place::Transcript(a0), "a restart keeps it");
+    assert_eq!(at(&reread(&d), &h, "r").place, Place::Transcript(a0), "a restart keeps it");
     assert!(p.reset(J, &r("r")));
     assert_eq!(at(&p, &h, "r"), Placed { place: moved, by_user: false, agent_moved: false }, "reset: the agent's");
 }
 
-/// Writes that keep failing keep bounded bookkeeping: the conversations
-/// waiting to be written never outgrow the store's caps (P2-5).
+/// Writes that keep failing keep nothing but memory: no backlog (one
+/// write at a time, of memory whole, tried again at the next change), so
+/// nothing outgrows the store's caps (P2-5); the disk back, one write
+/// carries it all.
 #[test]
-fn failing_writes_keep_bounded_bookkeeping() {
+fn failing_writes_keep_no_backlog() {
     let d = dir("p-failing");
-    std::fs::write(d.join("not-a-folder"), "x").unwrap();
     let h = H::with(&["plan"]);
     let s = h.state();
     let b = s.block(&r("plan")).unwrap();
-    let mut p = Presentation::load(Some(d.join("not-a-folder").join(FILE)));
-    flush(&mut p);
+    let mut p = presentation(&d);
+    std::fs::create_dir(d.join(FILE)).unwrap();
     for c in 0..CONVERSATIONS_MAX * 3 {
         p.pin(&format!("c{c}"), b).unwrap();
-        flush(&mut p);
-        assert!(p.unwritten() <= CONVERSATIONS_MAX, "{c}: {}", p.unwritten());
+        let w = p.next_write().expect("one write");
+        assert!(p.next_write().is_none());
+        assert!(p.landed(w.run()).is_err());
+        assert!(!p.writing() && p.next_write().is_none(), "{c}: nothing waits");
     }
-    assert!(p.failed.is_some());
+    assert!(p.failed.is_some() && p.book.conversations.len() == CONVERSATIONS_MAX);
     assert!(p.placed(&format!("c{}", CONVERSATIONS_MAX * 3 - 1), b).by_user, "memory keeps the newest");
+    std::fs::remove_dir(d.join(FILE)).unwrap();
+    p.pin("again", b).unwrap();
+    flush(&mut p);
+    assert!(p.failed.is_none() && reread(&d).book == p.book, "one write, memory whole");
+}
+
+/// Removing the last entry persists (Shady R2-P2-4): the only pin unpinned,
+/// or its placement reset, the only soft dismissal ended, and one
+/// removed while the write adding it is still out. Each stays undone once
+/// its write lands, and after a restart (at 22921cf the deletion was never
+/// written, and the landing brought the entry back).
+#[test]
+fn removing_the_last_entry_persists() {
+    let h = H::with(&["plan"]);
+    let s = h.state();
+    let b = s.block(&r("plan")).unwrap();
+    for how in ["unpin", "reset", "unsoft", "while-out"] {
+        let d = dir(&format!("p-last-{how}"));
+        let mut p = presentation(&d);
+        match how {
+            "unsoft" => p.compacted("before", J, &[id("plan")]),
+            _ => {
+                p.pin(J, b).unwrap();
+            }
+        }
+        let mut out = p.next_write();
+        assert!(out.is_some(), "its write");
+        if how != "while-out" {
+            assert!(p.landed(out.take().unwrap().run()).is_ok());
+            assert!(reread(&d).placed(J, b).by_user || reread(&d).soft(J, &id("plan")), "{how}: written");
+        }
+        match how {
+            "unpin" | "while-out" => assert!(!p.pin(J, b).unwrap().by_user),
+            "reset" => assert!(p.reset(J, &r("plan"))),
+            _ => assert!(p.unsoft(J, &id("plan"))),
+        }
+        if let Some(out) = out {
+            assert!(p.landed(out.run()).is_ok());
+            assert!(!p.placed(J, b).by_user, "the landing of the pin's write brings nothing back");
+        }
+        flush(&mut p);
+        let gone = |p: &Presentation| !p.placed(J, b).by_user && !p.soft(J, &id("plan"));
+        assert!(gone(&p) && !p.writing(), "{how}: after its write landed");
+        assert!(gone(&reread(&d)) && reread(&d).book.conversations.is_empty(), "{how}: in the file");
+        drop(p);
+        assert!(gone(&presentation(&d)), "{how}: after a restart");
+    }
 }
 
 /// Both files sit next to `settings.json`.

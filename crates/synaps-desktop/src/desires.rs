@@ -17,43 +17,35 @@
 //! decides the fold's admission. Nothing here reads a notice from a
 //! history: the fold does.
 //!
-//! **The file decides; memory draws what it decided.** Every change is a
-//! transaction on the file as it is, under its lock ([`crate::blockfiles`]),
-//! never on what this process last read of it: two desk processes share
-//! it, and either may have sent, superseded, cancelled or settled since.
-//! The transactions run off the UI thread, one at a time, in the order
-//! they were made ([`Desires::next_write`], [`Write::run`],
-//! [`Desires::landed`]); nothing else here touches the disk but
-//! [`Desires::load`]'s one read.
+//! **One writer: memory is the truth.** The process that owns the file
+//! ([`crate::blockfiles`]) decides every change in memory, at once, and
+//! writes whole snapshots of it, one at a time, in order, off the UI
+//! thread ([`Desires::next_write`], [`Write::run`], [`Desires::landed`]).
+//! Another desk process on the machine keeps its desires in memory only
+//! (its writes go nowhere): what desks share is the history.
 //!
-//! - **A wish** ([`Desires::dismiss`], [`Desires::show`]) is checked in
-//!   memory first (its caps: refused at once, said, [`Refused`]), then
-//!   decided against the file: already so (unchanged); cancelled, when the
-//!   desire it undoes is one no notice of the id may have gone for and
-//!   what every desk draws is the wish; else a new desire at one more than
-//!   every version seen (the board's `highest`, and the highest the file
-//!   ever minted in that generation, settled desires' included), which
-//!   inherits the old one's sent mark. What the click's board drew decides
-//!   a cancel (or that nothing changes) only if that board had seen every
-//!   settled history the file knows of; a wish made on an older board is a
-//!   notice, whatever it drew. The caps are
-//!   checked there too, on the file as the wish leaves it: a new id past
-//!   [`PER_CONVERSATION`] or [`PER_DESK`], or the file past [`RESERVE`]
-//!   bytes as written or with every version at its widest (so a desire
-//!   admitted can always be superseded), is refused. Until it lands the id
-//!   draws as it did ([`Desires::pending`]: a pending look), rides
-//!   nothing, and a next wish on it is decided against this one. Landed,
-//!   it draws; refused or failed (the lock not had in
-//!   [`blockfiles::LOCK_WAIT`], the disk), nothing drew, and the id says
-//!   why ([`Desires::refused`]). So a restart never loses a wish the user
-//!   saw drawn.
-//! - **Sent means marked first** ([`Desires::ride`]): a message carrying
-//!   notices waits for its transaction, which marks each in the file as
-//!   sent if the file still has it so, and only those ride. A notice so
-//!   marked stays an obligation through every supersession of its id: an
-//!   older copy may still land, so the other wish over it is a new version,
-//!   never a cancel. The mark goes only with the desire, at its settling,
-//!   where every older copy is stale.
+//! - **A wish** ([`Desires::dismiss`], [`Desires::show`]): already drawn so,
+//!   nothing to do. Over a desire **no notice of which may have gone** (it
+//!   and every desire it replaced unsent) whose undoing every board this
+//!   desk has (the click's, and its last settled history's) draws, the
+//!   desire is cancelled: nothing is sent. Otherwise a new desire, at one
+//!   more than every version this desk knows in the generation (the
+//!   board's `highest`, every board's it settled or clicked on, every one
+//!   it minted, its desires'), keeping the sent mark of the one it
+//!   replaces: **a desire that may have been sent is never cancelled**, an
+//!   opposite click supersedes it. A new id past [`PER_CONVERSATION`] or
+//!   [`PER_DESK`] is refused, as is any change leaving the file past
+//!   [`RESERVE`] (as written, or with every version at its widest: a
+//!   desire admitted can always be superseded). Until the snapshot with
+//!   the wish lands, the id draws as before ([`Desires::pending`]) and
+//!   rides nothing; landed, it draws; failed, memory goes back to what
+//!   drew and the id says why ([`Desires::refused`]). So a restart never
+//!   loses a wish the user saw drawn.
+//! - **Sent means written first** ([`Desires::ride`]): a message carrying
+//!   notices goes once the snapshot with their sent marks has landed (at
+//!   once, if the file already has everything), with those still so; a
+//!   failed write sends it plain. Messages leave in the order they were
+//!   made.
 //! - **Riding**: at every send of typed text (a `Submit` when idle, a
 //!   `Steer` while a turn runs) or a hand-back, each desire above
 //!   `effective_version(id)` that isn't in flight, kept back or pending is
@@ -61,45 +53,36 @@
 //!   dismissals first, the oldest versions first; the rest ride the next
 //!   message. **Never on its own** (an empty body carries nothing) and
 //!   **never on a card answer** ([`Carry::Answer`]). A body whose own last
-//!   line would read as a notice beside the trailer carries nothing: no
-//!   message is ever built whose trailer isn't exactly this desk's. Every
-//!   send builds its trailer from the desires at that moment, a Resend
-//!   included. Messages leave in the order they were made: one made while
-//!   another waits for its mark waits behind it.
+//!   line would read as a notice beside the trailer carries nothing.
 //! - **Settling** ([`Desires::settle`], on a settled history's board): a
-//!   desire at or below `effective_version(id)` is done and dropped (now,
-//!   and from the file at its transaction: whichever desk's it is); if the
-//!   shared state differs, the block says why ([`Feedback`], bounded, until
-//!   seen or the next wish). A carrier the caller no longer has in flight
-//!   (a dropped steer, a refused send, a rollback: [`Desires::lost`] too)
-//!   is cleared, and the desire rides the next message at the same version.
-//! - **Generations are fenced.** Versions count within a generation: every
-//!   transaction touches only the generation it names. One is dropped only
-//!   by a process that saw its journal's history move past it (its settle
-//!   of another generation after one of it), or at its first settle of the
-//!   conversation (the attach: the history it was handed is the daemon's
-//!   now), and only that generation's entry, as it is then.
-//! - **A restart** ([`Desires::load`]) keeps the desires and their marks,
-//!   and loses the carriers; the first settle against the attached history
-//!   drops what it shows, and the rest ride again. A copy still queued in
-//!   the daemon may land as well: the second of two equal versions is
-//!   stale.
+//!   desire at or below `effective_version(id)` is done and dropped; if the
+//!   shared state differs, the block says why ([`Feedback`], bounded,
+//!   until seen or the next wish). A carrier the caller no longer has in
+//!   flight (a dropped steer, a refused send, a rollback: [`Desires::lost`]
+//!   too) is cleared, and the desire rides the next message at the same
+//!   version. Every other generation of the conversation is dropped then
+//!   (the history moved on), with its wishes not yet written; a wish on
+//!   one of them since is refused.
+//! - **A restart** ([`Desires::load`]) keeps the desires and their sent
+//!   marks, and loses the carriers; the first settle against the attached
+//!   history drops what it shows, and the rest ride again.
 //! - **A compaction** ([`Desires::compacted`]) drops the generation's
 //!   desires, and hands back the ids this desk drew dismissed: the
 //!   successor's soft dismissals ([`crate::presentation`]).
+//! - **Discard** ([`Desires::discard`]) drops a conversation's unsent
+//!   desires. One that may have been sent stays until it settles: an
+//!   obligation (an older copy may still land), never evicted.
+//!
+//! **Bounds.** Wishes and messages waiting for a write: [`QUEUE_MAX`] in
+//! all (and [`QUEUE_BYTES_MAX`] of messages); past it the newest is
+//! refused, said, and nothing is dropped. Settles and the rest only change
+//! memory, and the next snapshot carries them. What this process knows of
+//! a conversation's history ([`Known`]) is kept for [`KNOWN_MAX`]
+//! conversations without desires, and for every one with desires.
 //!
 //! **The file**, `block-desires.json` next to `settings.json`: per
 //! conversation, per generation (the first 16 hex digits), its desires,
-//! ≤ [`ENTRY_MAX`] bytes each, and the generation's marks: the highest
-//! version minted there, the highest a settled history had, and whether a
-//! discarded notice may still land ([`Book`]). A generation whose desires
-//! all went keeps only its marks, the latest [`SETTLED_MAX`] of them,
-//! which give way to a desire when the reserve is short. **No cap evicts a
-//! desire**, and a file over one (another writer's) is read whole: new ids
-//! are refused until it is under again. A desire leaves only when it
-//! settles, when the user cancels or discards it, at a compaction, or with
-//! its generation. A discard drops desires, never a generation's marks: a
-//! notice it dropped may have gone, so no later wish there cancels.
+//! ≤ [`ENTRY_MAX`] bytes each, and nothing else. **No cap evicts a desire**.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -124,24 +107,26 @@ pub(crate) const RESERVE: usize = 64 * 1024;
 pub(crate) const ENTRY_MAX: usize = 64;
 /// A conversation's key (its journal id), bytes at most.
 pub(crate) const KEY_MAX: usize = 128;
-/// Writes waiting at most: past it a wish is refused (the disk is slow).
+/// Wishes and messages waiting for a write, at most (module docs).
 pub(crate) const QUEUE_MAX: usize = 64;
+/// Bytes of messages waiting for a write, at most.
+pub(crate) const QUEUE_BYTES_MAX: usize = 1 << 20;
 /// Settled feedback kept per conversation, and in all, at most: the
 /// oldest goes first (an explanation, not a wish).
 pub(crate) const FEEDBACK_PER_CONVERSATION: usize = PER_CONVERSATION;
 pub(crate) const FEEDBACK_MAX: usize = PER_DESK;
-/// Conversations whose last settled generation this process keeps.
-const SEEN_MAX: usize = 256;
-/// Settled marks kept at most ([`Book`]).
-const SETTLED_MAX: usize = 64;
+/// Conversations without desires whose history this process knows
+/// ([`Known`]), at most.
+pub(crate) const KNOWN_MAX: usize = 256;
 /// The file's format.
-const FORMAT: u64 = 2;
+const FORMAT: u64 = 3;
 
 /// The refusals' words (§1.8).
 pub(crate) const FULL_HERE: &str = "64 changes waiting · send a message first";
 pub(crate) const FULL_DESK: &str = "512 changes waiting · send in another conversation, or discard";
 pub(crate) const BUSY: &str = "still saving earlier changes · try again";
-pub(crate) const MOVED: &str = "changed meanwhile · try again";
+pub(crate) const MOVED_ON: &str = "this conversation moved on · try again";
+pub(crate) const TOO_MANY: &str = "too many changes in this conversation";
 
 /// The file next to `settings.json` (`None`: no config folder).
 pub(crate) fn path() -> Option<PathBuf> {
@@ -165,8 +150,7 @@ pub(crate) struct Desire {
     pub(crate) dismissed: bool,
     pub(crate) version: u32,
     /// A notice of this id may have been sent, at this version or one it
-    /// superseded, and may still land: the other wish over it is a new
-    /// version, never a cancel (module docs).
+    /// superseded, and may still land: never cancelled (module docs).
     pub(crate) sent: bool,
     /// The message it rides now (memory only): in flight.
     carrier: Option<u64>,
@@ -188,147 +172,70 @@ impl Desire {
     }
 }
 
+/// The same wish: both none, or the same state at the same version.
+fn same(a: Option<&Desire>, b: Option<&Desire>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a.dismissed, a.version) == (b.dismissed, b.version),
+        _ => false,
+    }
+}
+
 /// One generation's desires.
 type Slot = BTreeMap<BlockId, Desire>;
 
-/// One generation of a conversation in the file: its desires; the
-/// highest version this file ever minted there (`top`), kept as desires
-/// settle or are discarded, so a wish made on a board older than a settle
-/// still mints above every desk's notice of that generation; the highest
-/// version a settled history had (`landed`): a wish whose board had seen
-/// less was made on a stale board, and isn't decided by what that board
-/// drew; and whether the user discarded a notice that may have been sent
-/// (`owed`): one may still land, so no wish of the generation cancels.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Gen {
-    top: u32,
-    landed: u32,
-    owed: bool,
-    desires: Slot,
-}
-
-/// A generation whose desires all went: what it keeps.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Mark {
-    conv: String,
-    generation: String,
-    top: u32,
-    landed: u32,
-    owed: bool,
-}
-
-/// Every conversation's desires, per generation: the file's content, and
-/// memory's.
+/// Every conversation's desires, per generation: memory's, and the file's
+/// content.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Book {
-    conversations: BTreeMap<String, BTreeMap<String, Gen>>,
-    /// The `top` of generations whose desires all settled: the latest
-    /// [`SETTLED_MAX`], oldest first. Evictable (a click on a board older
-    /// than that settle is all they guard): they give way to a desire.
-    settled: VecDeque<Mark>,
+    conversations: BTreeMap<String, BTreeMap<String, Slot>>,
 }
 
 impl Book {
     fn len(&self) -> usize {
-        self.conversations.keys().map(|c| self.conversation_len(c)).sum()
+        self.conversations.values().flat_map(BTreeMap::values).map(BTreeMap::len).sum()
     }
 
     fn conversation_len(&self, conv: &str) -> usize {
-        self.conversations.get(conv).map_or(0, |g| g.values().map(|x| x.desires.len()).sum())
-    }
-
-    fn generations(&self, conv: &str) -> Vec<String> {
-        self.conversations.get(conv).map(|g| g.keys().cloned().collect()).unwrap_or_default()
+        self.conversations.get(conv).map_or(0, |g| g.values().map(BTreeMap::len).sum())
     }
 
     fn slot(&self, conv: &str, generation: &str) -> Option<&Slot> {
-        Some(&self.conversations.get(conv)?.get(generation)?.desires)
+        self.conversations.get(conv)?.get(generation)
     }
 
     fn slot_mut(&mut self, conv: &str, generation: &str) -> Option<&mut Slot> {
-        Some(&mut self.conversations.get_mut(conv)?.get_mut(generation)?.desires)
+        self.conversations.get_mut(conv)?.get_mut(generation)
     }
 
-    /// `generation` of `conv`, made if none (its `top` back from the
-    /// settled marks).
-    fn generation_mut(&mut self, conv: &str, generation: &str) -> &mut Gen {
-        let (top, landed, owed) = (self.top(conv, generation), self.landed(conv, generation), self.owed(conv, generation));
-        self.settled.retain(|m| !(m.conv == conv && m.generation == generation));
-        let here = self.conversations.entry(conv.to_string()).or_default().entry(generation.to_string()).or_default();
-        here.top = here.top.max(top);
-        here.landed = here.landed.max(landed);
-        here.owed |= owed;
-        here
+    fn get(&self, conv: &str, generation: &str, id: &BlockId) -> Option<&Desire> {
+        self.slot(conv, generation)?.get(id)
     }
 
-    /// A notice of `generation` the user discarded may still land.
-    fn owed(&self, conv: &str, generation: &str) -> bool {
-        let live = self.conversations.get(conv).and_then(|g| g.get(generation)).is_some_and(|x| x.owed);
-        live || self.mark(conv, generation).is_some_and(|m| m.owed)
-    }
-
-    /// The user's discard of `gens` of `conv`: their desires go, what they
-    /// minted and owe stays.
-    fn discard(&mut self, conv: &str, gens: &[String]) {
-        for (_, x) in self.conversations.get_mut(conv).into_iter().flatten().filter(|(g, _)| gens.contains(g)) {
-            x.owed |= x.desires.values().any(|d| d.sent);
-            x.desires.clear();
-        }
-        self.tidy();
-    }
-
-    fn mark(&self, conv: &str, generation: &str) -> Option<&Mark> {
-        self.settled.iter().find(|m| m.conv == conv && m.generation == generation)
-    }
-
-    /// The highest version minted in `generation` of `conv`.
-    fn top(&self, conv: &str, generation: &str) -> u32 {
-        let live = self.conversations.get(conv).and_then(|g| g.get(generation)).map_or(0, |x| x.top);
-        live.max(self.mark(conv, generation).map_or(0, |m| m.top))
-    }
-
-    /// The highest version a settled history of `generation` had.
-    fn landed(&self, conv: &str, generation: &str) -> u32 {
-        let live = self.conversations.get(conv).and_then(|g| g.get(generation)).map_or(0, |x| x.landed);
-        live.max(self.mark(conv, generation).map_or(0, |m| m.landed))
-    }
-
-    /// A settled history of `generation` had `highest`.
-    fn note_landed(&mut self, conv: &str, generation: &str, highest: u32) {
-        if let Some(x) = self.conversations.get_mut(conv).and_then(|g| g.get_mut(generation)) {
-            x.landed = x.landed.max(highest);
-        } else if let Some(m) = self.settled.iter_mut().find(|m| m.conv == conv && m.generation == generation) {
-            m.landed = m.landed.max(highest);
+    /// `id`'s desire in `generation` of `conv` made `d` (`None`: none).
+    fn set(&mut self, conv: &str, generation: &str, id: &BlockId, d: Option<Desire>) {
+        match d {
+            Some(d) => {
+                self.conversations.entry(conv.to_string()).or_default().entry(generation.to_string()).or_default().insert(id.clone(), d);
+            }
+            None => {
+                if let Some(s) = self.slot_mut(conv, generation) {
+                    s.remove(id);
+                }
+            }
         }
     }
 
     fn desires_mut(&mut self) -> impl Iterator<Item = &mut Desire> {
-        self.conversations.values_mut().flat_map(|g| g.values_mut()).flat_map(|x| x.desires.values_mut())
+        self.conversations.values_mut().flat_map(|g| g.values_mut()).flat_map(|s| s.values_mut())
     }
 
-    /// `gens` of `conv` gone, their settled marks too.
-    fn drop_generations(&mut self, conv: &str, gens: &[String]) {
-        if let Some(g) = self.conversations.get_mut(conv) {
-            g.retain(|k, _| !gens.contains(k));
-        }
-        self.settled.retain(|m| !(m.conv == conv && gens.contains(&m.generation)));
-        self.tidy();
-    }
-
-    /// A generation whose desires all went keeps only its settled mark; no
-    /// empty conversation kept; at most [`SETTLED_MAX`] marks.
+    /// No empty generation nor conversation kept.
     fn tidy(&mut self) {
-        for (conv, gens) in &mut self.conversations {
-            for (g, x) in gens.iter().filter(|(_, x)| x.desires.is_empty()) {
-                self.settled.retain(|m| !(m.conv == *conv && m.generation == *g));
-                self.settled.push_back(Mark { conv: conv.clone(), generation: g.clone(), top: x.top, landed: x.landed, owed: x.owed });
-            }
-            gens.retain(|_, x| !x.desires.is_empty());
+        for gens in self.conversations.values_mut() {
+            gens.retain(|_, s| !s.is_empty());
         }
         self.conversations.retain(|_, g| !g.is_empty());
-        while self.settled.len() > SETTLED_MAX {
-            self.settled.pop_front();
-        }
     }
 
     /// The file's bytes with every version at its widest: what the desires
@@ -336,8 +243,6 @@ impl Book {
     fn widest_bytes(&self) -> usize {
         let mut wide = self.clone();
         wide.desires_mut().for_each(|d| d.version = VERSION_MAX);
-        wide.conversations.values_mut().flat_map(|g| g.values_mut()).for_each(|x| (x.top, x.landed) = (VERSION_MAX, VERSION_MAX));
-        wide.settled.iter_mut().for_each(|m| (m.top, m.landed) = (VERSION_MAX, VERSION_MAX));
         wide.text().len()
     }
 }
@@ -350,44 +255,25 @@ impl Stored for Book {
         }
         let convs = v["conversations"].as_object().ok_or("no conversations")?;
         let gen_ok = |g: &str| g.len() == 16 && g.bytes().all(|b| b.is_ascii_hexdigit());
-        let version = |x: &Value| x.as_u64().filter(|v| (1..=u64::from(VERSION_MAX)).contains(v)).map(|v| v as u32);
         let (mut book, mut bad) = (Book::default(), 0);
         for (key, gens) in convs {
             let Some(gens) = gens.as_object().filter(|_| key_ok(key)) else {
                 bad += 1;
                 continue;
             };
-            for (g, x) in gens {
-                let landed = x["landed"].as_u64().filter(|v| *v <= u64::from(VERSION_MAX)).map(|v| v as u32);
-                let owed = x["owed"].as_u64().filter(|b| *b <= 1).map(|b| b == 1);
-                let (Some(top), Some(landed), Some(owed), Some(ds), true) =
-                    (version(&x["top"]), landed, owed, x["desires"].as_object(), gen_ok(g))
-                else {
+            for (g, ds) in gens {
+                let Some(ds) = ds.as_object().filter(|_| gen_ok(g)) else {
                     bad += 1;
                     continue;
                 };
-                let mut desires = Slot::new();
                 for (id, d) in ds {
                     let bit = |k: &str| d[k].as_u64().filter(|b| *b <= 1).map(|b| b == 1);
-                    match (BlockId::parse(id), bit("d"), version(&d["v"]), bit("s")) {
-                        (Some(id), Some(dismissed), Some(v), Some(sent)) => {
-                            desires.insert(id, Desire::new(dismissed, v, sent));
-                        }
+                    let version = d["v"].as_u64().filter(|v| (1..=u64::from(VERSION_MAX)).contains(v)).map(|v| v as u32);
+                    match (BlockId::parse(id), bit("d"), version, bit("s")) {
+                        (Some(id), Some(dismissed), Some(v), Some(sent)) => book.set(key, g, &id, Some(Desire::new(dismissed, v, sent))),
                         _ => bad += 1,
                     }
                 }
-                let top = desires.values().map(|d| d.version).fold(top, u32::max);
-                book.conversations.entry(key.clone()).or_default().insert(g.clone(), Gen { top, landed, owed, desires });
-            }
-        }
-        for m in v["settled"].as_array().map(Vec::as_slice).unwrap_or_default() {
-            let landed = m[3].as_u64().filter(|v| *v <= u64::from(VERSION_MAX)).map(|v| v as u32);
-            let owed = m[4].as_u64().filter(|b| *b <= 1).map(|b| b == 1);
-            match (m[0].as_str().filter(|k| key_ok(k)), m[1].as_str().filter(|g| gen_ok(g)), version(&m[2]), landed, owed) {
-                (Some(c), Some(g), Some(top), Some(landed), Some(owed)) => {
-                    book.settled.push_back(Mark { conv: c.to_string(), generation: g.to_string(), top, landed, owed });
-                }
-                _ => bad += 1,
             }
         }
         book.tidy();
@@ -401,172 +287,31 @@ impl Stored for Book {
             .map(|(key, gens)| {
                 let gens: serde_json::Map<String, Value> = gens
                     .iter()
-                    .map(|(g, x)| {
-                        let ds: serde_json::Map<String, Value> = x
-                            .desires
+                    .map(|(g, s)| {
+                        let ds: serde_json::Map<String, Value> = s
                             .iter()
                             .map(|(id, d)| (id.to_string(), json!({"d": u8::from(d.dismissed), "v": d.version, "s": u8::from(d.sent)})))
                             .collect();
-                        (g.clone(), json!({"top": x.top, "landed": x.landed, "owed": u8::from(x.owed), "desires": ds}))
+                        (g.clone(), Value::Object(ds))
                     })
                     .collect();
                 (key.clone(), Value::Object(gens))
             })
             .collect();
-        let settled: Vec<Value> = self.settled.iter().map(|m| json!([m.conv, m.generation, m.top, m.landed, u8::from(m.owed)])).collect();
-        json!({"version": FORMAT, "conversations": convs, "settled": settled}).to_string()
+        json!({"version": FORMAT, "conversations": convs}).to_string()
     }
 }
 
-/// A wish as the user made it, with what the board drew then: decided
-/// against the file ([`decide`]).
+/// What this process knows of a conversation's history: its generation
+/// (the last settled, else the first clicked), the highest version it has
+/// seen there (on any board it was given) or minted, and its last settled
+/// history's board.
 #[derive(Clone, Debug)]
-struct Wish {
-    conv: String,
+struct Known {
     generation: String,
-    id: BlockId,
-    dismiss: bool,
-    /// The shared record's state, on the board as drawn.
-    shared_dismissed: bool,
-    /// The board's highest version seen.
-    highest: u32,
-    /// The desk drew a desire of the id at the click (its memory).
-    had: bool,
-}
-
-/// `w` decided against `book` (the file as it is), and made in it: what it
-/// did, or why it was refused (`book` then left to be dropped unwritten).
-fn decide(book: &mut Book, w: &Wish) -> Result<Done, String> {
-    let cur = book.slot(&w.conv, &w.generation).and_then(|s| s.get(&w.id)).cloned();
-    if cur.as_ref().is_some_and(|d| d.dismissed == w.dismiss) {
-        return Ok(Done::Unchanged);
-    }
-    // The click's board had seen less than a settled history, or a notice
-    // the user discarded may still land: what the board drew decides
-    // nothing, and the wish is a notice.
-    let stale = w.highest < book.landed(&w.conv, &w.generation) || book.owed(&w.conv, &w.generation);
-    if let Some(d) = &cur
-        && !d.sent
-        && !stale
-        && w.shared_dismissed == w.dismiss
-    {
-        // No notice of it may have gone, and what every desk draws is the
-        // wish: nothing to tell.
-        if let Some(s) = book.slot_mut(&w.conv, &w.generation) {
-            s.remove(&w.id);
-        }
-        book.tidy();
-        return Ok(Done::Cancelled);
-    }
-    if cur.is_none() && !w.had && !stale && w.shared_dismissed == w.dismiss {
-        // Nothing of it here, nor in the memory the click saw: what every
-        // desk draws is the wish (an earlier wish of this desk refused).
-        return Ok(Done::Unchanged);
-    }
-    // Above every notice of the generation this file minted, settled ones
-    // included, and every one the board had seen.
-    let version = w.highest.max(book.top(&w.conv, &w.generation)).saturating_add(1);
-    if version > VERSION_MAX {
-        return Err("too many changes in this conversation".into());
-    }
-    // An older notice may still land: the obligation goes on.
-    let sent = cur.as_ref().is_some_and(|d| d.sent);
-    let here = book.generation_mut(&w.conv, &w.generation);
-    here.top = version;
-    here.desires.insert(w.id.clone(), Desire::new(w.dismiss, version, sent));
-    if cur.is_none() {
-        if book.conversation_len(&w.conv) > PER_CONVERSATION {
-            return Err(FULL_HERE.into());
-        }
-        if book.len() > PER_DESK {
-            return Err(FULL_DESK.into());
-        }
-        // Settled marks give way to a desire; past them, refused.
-        while book.widest_bytes() > RESERVE && book.settled.pop_front().is_some() {}
-        let n = book.widest_bytes();
-        if n > RESERVE {
-            return Err(format!("{FULL_DESK} ({n} bytes at the widest, over {RESERVE})"));
-        }
-    }
-    while book.text().len() > RESERVE && book.settled.pop_front().is_some() {}
-    let n = book.text().len();
-    if n > RESERVE {
-        return Err(format!("{FULL_DESK} ({n} bytes, over {RESERVE})"));
-    }
-    Ok(Done::Wished(version))
-}
-
-/// `picks` (id, state, version) marked sent in `book` where it still has
-/// them so: those, which alone may ride.
-fn mark_sent(book: &mut Book, conv: &str, generation: &str, picks: &[(BlockId, Seen, u32)]) -> Vec<(BlockId, Seen, u32)> {
-    let Some(slot) = book.slot_mut(conv, generation) else { return Vec::new() };
-    let mut out = Vec::new();
-    for (id, seen, version) in picks {
-        if let Some(d) = slot.get_mut(id).filter(|d| d.version == *version && d.seen() == *seen) {
-            d.sent = true;
-            out.push((id.clone(), *seen, *version));
-        }
-    }
-    out
-}
-
-/// `generation`'s desires of `conv` settled by `shared` dropped, and the
-/// generations `gone` (only those) of `conv` dropped whole.
-fn settle_in(book: &mut Book, conv: &str, generation: &str, shared: &Visibility, gone: &[String]) {
-    book.drop_generations(conv, gone);
-    book.note_landed(conv, generation, shared.highest());
-    if let Some(slot) = book.slot_mut(conv, generation) {
-        slot.retain(|id, d| shared.effective_version(id) < d.version);
-    }
-    book.tidy();
-}
-
-/// The generations `gens` (only those) of `conv` dropped; or, the user's
-/// discard, their desires.
-fn drop_in(book: &mut Book, conv: &str, gens: &[String], discard: bool) {
-    if discard {
-        book.discard(conv, gens);
-    } else {
-        book.drop_generations(conv, gens);
-    }
-}
-
-/// A transaction on the file ([`Write::run`]).
-#[derive(Clone, Debug)]
-enum Work {
-    /// The launch's: what crashes left beside the file swept, and the file
-    /// read again under its lock.
-    Sweep,
-    Wish(Wish),
-    /// The notices of a message marked sent: those the file still has so.
-    Send {
-        conv: String,
-        generation: String,
-        picks: Vec<(BlockId, Seen, u32)>,
-    },
-    /// What a settled history shows done, and the generations seen gone.
-    Settle {
-        conv: String,
-        generation: String,
-        shared: Visibility,
-        gone: Vec<String>,
-    },
-    /// Generations dropped (a compaction, another history), or their
-    /// desires (the user's discard).
-    Drop {
-        conv: String,
-        gens: Vec<String>,
-        discard: bool,
-    },
-}
-
-/// What a transaction did.
-#[derive(Debug)]
-enum Ran {
-    Read,
-    Wish(Result<Done, Refused>),
-    Sent(Result<Vec<(BlockId, Seen, u32)>, String>),
-    Dropped(Result<(), String>),
+    high: u32,
+    settled: Option<Visibility>,
+    touched: u64,
 }
 
 /// A write of the file, to run off the UI thread ([`Write::run`]); what it
@@ -574,80 +319,42 @@ enum Ran {
 #[derive(Debug)]
 pub(crate) struct Write {
     ticket: u64,
-    path: PathBuf,
+    /// Memory's change count the snapshot has.
+    seq: u64,
+    /// The file (`None`: memory only, nothing written).
+    path: Option<PathBuf>,
     work: Work,
+}
+
+#[derive(Debug)]
+enum Work {
+    /// The owner's first: what crashes left beside the file swept, an
+    /// unreadable one set aside.
+    Sweep,
+    /// Memory, whole: the file's text.
+    Snapshot(String),
 }
 
 /// A [`Write`] as it ran.
 #[derive(Debug)]
 pub(crate) struct Landing {
     ticket: u64,
-    /// The file as the write left it (or found it, refused): memory's now.
-    file: Option<Book>,
-    ran: Ran,
-    /// Why the file read as empty, or what the sweep couldn't remove.
-    trouble: Option<String>,
+    seq: u64,
+    sweep: bool,
+    /// Written (and what the sweep said, if anything), or why not.
+    done: Result<Option<String>, String>,
 }
 
 impl Write {
-    /// The transaction, on whatever thread runs it: the file's lock (waited
-    /// for up to [`blockfiles::LOCK_WAIT`]), the file as it is now, the
-    /// change decided against it, the sync and the rename.
+    /// The write, on whatever thread runs it ([`crate::blockfiles`]).
     pub(crate) fn run(self) -> Landing {
-        let path = &self.path;
-        let mut out = Landing { ticket: self.ticket, file: None, ran: Ran::Read, trouble: None };
-        match self.work {
-            Work::Sweep => {
-                let (book, why, swept) = blockfiles::load::<Book>(path);
-                out.file = Some(book);
-                out.trouble = why.or(swept.err().map(|e| e.to_string()));
-            }
-            // Nothing to mark: it only waits its turn.
-            Work::Send { picks, .. } if picks.is_empty() => out.ran = Ran::Sent(Ok(Vec::new())),
-            Work::Send { conv, generation, picks } => {
-                let mut rode = Vec::new();
-                let done = blockfiles::update::<Book>(path, |b| {
-                    rode = mark_sent(b, &conv, &generation, &picks);
-                    Ok(())
-                });
-                out.ran = Ran::Sent(done.as_ref().map(|_| rode).map_err(ToString::to_string));
-                out.file = done.ok();
-            }
-            Work::Wish(w) => {
-                let (mut did, mut found) = (None, None);
-                let done = blockfiles::update::<Book>(path, |b| {
-                    let was = b.clone();
-                    let r = decide(b, &w);
-                    if r.is_err() {
-                        found = Some(was);
-                    }
-                    did = r.as_ref().ok().copied();
-                    r.map(|_| ())
-                });
-                out.ran = Ran::Wish(match &done {
-                    Ok(_) => Ok(did.expect("decided")),
-                    Err(e) => Err(Refused(e.to_string())),
-                });
-                out.file = done.ok().or(found);
-            }
-            Work::Settle { conv, generation, shared, gone } => {
-                let done = blockfiles::update::<Book>(path, |b| {
-                    settle_in(b, &conv, &generation, &shared, &gone);
-                    Ok(())
-                });
-                out.ran = Ran::Dropped(done.as_ref().map(|_| ()).map_err(ToString::to_string));
-                out.file = done.ok();
-            }
-            Work::Drop { conv, gens, discard } => {
-                let done = blockfiles::update::<Book>(path, |b| {
-                    drop_in(b, &conv, &gens, discard);
-                    Ok(())
-                });
-                out.ran = Ran::Dropped(done.as_ref().map(|_| ()).map_err(ToString::to_string));
-                out.file = done.ok();
-            }
-        }
-        out
+        let sweep = matches!(self.work, Work::Sweep);
+        let done = match (&self.path, self.work) {
+            (None, _) => Ok(None),
+            (Some(p), Work::Sweep) => Ok(blockfiles::sweep::<Book>(p)),
+            (Some(p), Work::Snapshot(text)) => blockfiles::write(p, &text).map(|()| None),
+        };
+        Landing { ticket: self.ticket, seq: self.seq, sweep, done }
     }
 }
 
@@ -667,24 +374,22 @@ pub(crate) enum Carry {
 /// What a dismiss or a show asked, at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ask {
-    /// This desk already draws it so (or a wish not landed will).
+    /// This desk already draws it so.
     Unchanged,
-    /// Its transaction queued: it draws when that lands.
+    /// Decided; it draws when its write lands ([`Landed::Wish`]).
     Saving,
 }
 
-/// What a wish did, decided against the file and drawn ([`Landed`]).
+/// What a wish did, written and drawn ([`Landed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Done {
-    /// The file had it so already.
-    Unchanged,
     /// A desire no notice went for, cancelled: nothing will be sent.
     Cancelled,
     /// A new desire at this version: it rides the next message.
     Wished(u32),
 }
 
-/// A wish refused before it drew: why, in the user's words.
+/// A wish or a message refused: why, in the user's words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Refused(pub(crate) String);
 
@@ -715,221 +420,234 @@ pub(crate) struct Ride {
     pub(crate) notices: Vec<(BlockId, Seen, u32)>,
 }
 
-/// A message asked of [`Desires::ride`]: to go now, or once its notices
-/// are marked sent ([`Landed::Send`] with this ticket).
+/// A message asked of [`Desires::ride`]: to go now, or once what it
+/// marked is written ([`Landed::Send`] with this ticket).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Riding {
     Go(Ride),
     Wait(u64),
 }
 
-/// A transaction landed ([`Desires::landed`]).
+/// A write landed ([`Desires::landed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Landed {
-    /// A wish: what it did, drawn now; or why it was refused, nothing drawn.
+    /// A wish: what it did, drawn now; or why it wasn't kept, what drew
+    /// before drawn again.
     Wish { conv: String, id: BlockId, done: Result<Done, Refused> },
     /// A message to send now, in this order: [`Riding::Wait`]'s.
     Send { ticket: u64, ride: Ride },
 }
 
-/// A transaction queued, the first out once [`Desires::next_write`] gave it.
-#[derive(Clone, Debug)]
-struct Queued {
-    ticket: u64,
-    work: Work,
-}
-
-/// The user's latest wish for an id, its transaction not landed: what a
-/// next wish is decided against. `wish`: the desire it likely makes
-/// (`None`: a cancel; its version is the file's to mint).
+/// The user's wishes on an id not written yet: what drew before the first
+/// (drawn until they land), and memory's now, from the change `at`.
 #[derive(Clone, Debug)]
 struct Asked {
-    ticket: u64,
-    generation: String,
-    wish: Option<Desire>,
+    at: u64,
+    before: Option<Desire>,
+    after: Option<Desire>,
 }
 
-/// A message waiting for its notices' mark.
+/// A message waiting for its marks to be written, or for one ahead of it.
 #[derive(Clone, Debug)]
 struct Sending {
+    ticket: u64,
+    /// Memory's change count with its marks (0: it marked nothing).
+    at: u64,
     body: String,
     carrier: Option<u64>,
     conv: String,
     generation: String,
+    picks: Vec<(BlockId, Seen, u32)>,
 }
+
+/// An asked wish's key: conversation, generation, id.
+type Key = (String, String, BlockId);
 
 /// This desk's desires, every conversation's (module docs).
 pub(crate) struct Desires {
     path: Option<PathBuf>,
-    /// What draws: the file as it last landed, what memory dropped since
-    /// (settled, discarded) applied.
+    /// The file's lock, held for the store's life (`None`: memory only).
+    owner: Option<std::fs::File>,
+    /// The truth: every change decided, written or not.
     book: Book,
+    known: BTreeMap<String, Known>,
     next_carrier: u64,
     /// Settled feedback per (conversation, generation, id), with its order:
     /// bounded ([`FEEDBACK_PER_CONVERSATION`], [`FEEDBACK_MAX`]).
     feedback: BTreeMap<(String, String, BlockId), (u64, Feedback)>,
-    /// Why a wish's transaction refused it, until the next wish on the id:
-    /// bounded as the feedback.
+    /// Why a wish wasn't kept, until the next wish on the id: bounded as
+    /// the feedback.
     refusals: BTreeMap<(String, BlockId), (u64, String)>,
     next_note: u64,
-    /// Wishes not yet landed, per id: the latest.
-    asked: BTreeMap<(String, BlockId), Asked>,
-    /// Messages waiting for their mark, by ticket.
-    sending: BTreeMap<u64, Sending>,
-    /// Per conversation, the generation of the last history this process
-    /// settled ([`SEEN_MAX`] at most).
-    seen: BTreeMap<String, String>,
-    /// Transactions not yet landed, in order; the first is out when `out`.
-    queue: VecDeque<Queued>,
-    out: bool,
+    /// Wishes not written yet, per id.
+    asked: BTreeMap<Key, Asked>,
+    /// Messages waiting, in order.
+    sending: VecDeque<Sending>,
+    next_send: u64,
+    /// Memory's changes to the file's content, counted.
+    seq: u64,
+    /// The count the file has (the last snapshot landed).
+    written: u64,
+    /// The last snapshot that failed: not tried again until memory changes,
+    /// a message waits for it, or a settle.
+    failed_at: Option<u64>,
+    /// The write out, by ticket.
+    out: Option<u64>,
     next_ticket: u64,
-    /// Why the file read as empty at the load, or what its sweep couldn't
-    /// remove (Settings says it).
+    /// The sweep still to run (the owner's first write).
+    sweep: bool,
+    /// Why the file read as empty at the load, what its sweep said, or that
+    /// it is another process's (Settings says it).
     pub(crate) trouble: Option<String>,
 }
 
 impl Desires {
-    /// The desires in the file at `path`, read now, without its lock (a
-    /// rename is atomic); the sweep of what crashes left beside it is the
-    /// first write. `None`: no config folder, and every wish is refused: it
-    /// couldn't be kept.
+    /// The desires in the file at `path`, owned by this process (its lock
+    /// taken, without waiting) and read now; its sweep is the first write.
+    /// Another process's: memory only, the file untouched. `None`: no
+    /// config folder, and every wish is refused: it couldn't be kept.
     pub(crate) fn load(path: Option<PathBuf>) -> Self {
-        let (book, trouble) = match &path {
-            Some(p) => blockfiles::peek::<Book>(p),
-            None => (Book::default(), None),
+        let owner = path.as_deref().map(blockfiles::own);
+        let (book, trouble) = match (&path, &owner) {
+            (Some(p), Some(Ok(_))) => blockfiles::peek::<Book>(p),
+            (_, Some(Err(why))) => {
+                (Book::default(), Some(format!("{FILE} is another desk's: changes here are kept in memory only ({why})")))
+            }
+            _ => (Book::default(), None),
         };
-        let mut d = Desires {
+        let owner = owner.and_then(Result::ok);
+        Desires {
             path,
+            sweep: owner.is_some(),
+            owner,
             book,
+            known: BTreeMap::new(),
             next_carrier: 0,
             feedback: BTreeMap::new(),
             refusals: BTreeMap::new(),
             next_note: 0,
             asked: BTreeMap::new(),
-            sending: BTreeMap::new(),
-            seen: BTreeMap::new(),
-            queue: VecDeque::new(),
-            out: false,
+            sending: VecDeque::new(),
+            next_send: 0,
+            seq: 0,
+            written: 0,
+            failed_at: None,
+            out: None,
             next_ticket: 0,
             trouble,
-        };
-        if d.path.is_some() {
-            d.queue_write(Work::Sweep);
         }
-        d
     }
 
     pub(crate) fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
-    fn queue_write(&mut self, work: Work) -> u64 {
-        // A settle or a drop not yet out takes the next of its conversation:
-        // effective versions only grow, so the later settle drops a superset.
-        let waiting = self.queue.len() > usize::from(self.out);
-        if let (Some(back), true) = (self.queue.back_mut(), waiting) {
-            match (&mut back.work, &work) {
-                (Work::Settle { conv: c, generation: g, shared: s, gone: gone_then }, Work::Settle { conv, generation, shared, gone })
-                    if c == conv && g == generation =>
-                {
-                    s.clone_from(shared);
-                    gone_then.extend(gone.iter().filter(|x| !gone_then.contains(x)).cloned().collect::<Vec<_>>());
-                    return back.ticket;
-                }
-                (Work::Drop { conv: c, gens: then, discard: was }, Work::Drop { conv, gens, discard }) if c == conv && was == discard => {
-                    then.extend(gens.iter().filter(|x| !then.contains(x)).cloned().collect::<Vec<_>>());
-                    return back.ticket;
-                }
-                _ => {}
-            }
-        }
-        self.next_ticket += 1;
-        self.queue.push_back(Queued { ticket: self.next_ticket, work });
-        self.next_ticket
+    /// Whether this process owns the file (else memory only).
+    pub(crate) fn owns_file(&self) -> bool {
+        self.owner.is_some()
     }
 
-    /// The next transaction to run off the UI thread, once the one out
-    /// landed: one at a time, in the order they were made. `None`: nothing
-    /// to write, or one is out.
+    /// The next write to run off the UI thread, once the one out landed: the
+    /// sweep first, then memory whole whenever it changed since the file.
     pub(crate) fn next_write(&mut self) -> Option<Write> {
-        let path = self.path.clone()?;
-        if self.out {
+        if self.out.is_some() {
             return None;
         }
-        let q = self.queue.front()?;
-        self.out = true;
-        Some(Write { ticket: q.ticket, path, work: q.work.clone() })
+        let path = self.owner.as_ref().and(self.path.clone());
+        let work = if std::mem::take(&mut self.sweep) {
+            Work::Sweep
+        } else if self.seq > self.written && self.failed_at != Some(self.seq) {
+            Work::Snapshot(if path.is_some() { self.book.text() } else { String::new() })
+        } else {
+            return None;
+        };
+        self.next_ticket += 1;
+        self.out = Some(self.next_ticket);
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, work })
     }
 
-    /// Whether a transaction is queued or out.
+    /// Whether a write is out or to make.
     pub(crate) fn writing(&self) -> bool {
-        !self.queue.is_empty()
+        self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq))
     }
 
-    /// A transaction as it ran ([`Write::run`]): memory takes the file as
-    /// it left it (another process's desires too), what memory dropped
-    /// since still dropped; a wish draws now, or is refused (said, nothing
-    /// drawn); a message goes, with the notices marked.
+    /// A write as it ran ([`Write::run`]): the wishes it carried draw (or,
+    /// failed, are refused, what drew before drawn again), and the messages
+    /// whose turn came go.
     pub(crate) fn landed(&mut self, l: Landing) -> Vec<Landed> {
-        if !self.out || self.queue.front().is_none_or(|q| q.ticket != l.ticket) {
+        if self.out != Some(l.ticket) {
             return Vec::new();
         }
-        let q = self.queue.pop_front().expect("the one out");
-        self.out = false;
-        if let Some(file) = l.file {
-            self.adopt(file);
-        }
-        match (q.work, l.ran) {
-            (Work::Sweep, _) => {
-                self.trouble = l.trouble.or(self.trouble.take());
-                Vec::new()
-            }
-            (Work::Wish(w), Ran::Wish(done)) => {
-                let key = (w.conv.clone(), w.id.clone());
-                if self.asked.get(&key).is_some_and(|a| a.ticket == q.ticket) {
-                    self.asked.remove(&key);
+        self.out = None;
+        let mut out = Vec::new();
+        match l.done {
+            Ok(said) if l.sweep => self.trouble = said.or(self.trouble.take()),
+            Ok(_) => {
+                self.written = l.seq;
+                for (k, a) in self.take_asked(l.seq) {
+                    out.push(Landed::Wish { conv: k.0, id: k.2, done: Ok(a.after.map_or(Done::Cancelled, |d| Done::Wished(d.version))) });
                 }
-                let done = done.and_then(|d| self.drawn(&w, d));
-                if let Err(Refused(why)) = &done {
-                    self.note_refusal(key, why.clone());
-                }
-                vec![Landed::Wish { conv: w.conv, id: w.id, done }]
             }
-            (Work::Send { picks, .. }, Ran::Sent(rode)) => {
-                let s = self.sending.remove(&q.ticket).expect("a message waits for it");
-                let rode = rode.unwrap_or_else(|e| {
-                    log::warn!(target: "synaps_desktop::blocks", "notices kept for a later message: {e}");
-                    Vec::new()
-                });
-                let ride = self.build(&s, &rode);
-                // What doesn't ride (the file had it otherwise, the write
-                // failed, the trailer didn't fit) isn't in flight.
-                let gone: Vec<&BlockId> =
-                    picks.iter().map(|(id, ..)| id).filter(|id| !ride.notices.iter().any(|(i, ..)| i == *id)).collect();
-                if let Some(slot) = self.book.slot_mut(&s.conv, &s.generation) {
-                    for id in gone {
-                        if let Some(d) = slot.get_mut(id).filter(|d| d.carrier == s.carrier) {
-                            d.carrier = None;
-                        }
+            Err(e) => {
+                log::warn!(target: "synaps_desktop::blocks", "{FILE} not written: {e}");
+                self.failed_at = Some(l.seq);
+                let why = format!("not saved · {e}");
+                for ((conv, g, id), a) in self.take_asked(l.seq) {
+                    if same(self.book.get(&conv, &g, &id), a.after.as_ref()) {
+                        // What drew, again (a revert that no longer fits
+                        // keeps memory's).
+                        let _ = self.commit(|b| b.set(&conv, &g, &id, a.before.clone()));
                     }
+                    self.note_refusal((conv.clone(), id.clone()), why.clone());
+                    out.push(Landed::Wish { conv, id, done: Err(Refused(why.clone())) });
                 }
-                vec![Landed::Send { ticket: q.ticket, ride }]
             }
-            (_, Ran::Dropped(Err(e))) => {
-                // Memory dropped them already: the file keeps them, and a
-                // later settle drops them again.
-                log::warn!(target: "synaps_desktop::blocks", "dropped desires not written: {e}");
-                Vec::new()
-            }
-            _ => Vec::new(),
         }
+        out.extend(self.go());
+        out
     }
 
-    /// The message `s` with the notices that were marked: its trailer, or
-    /// the body alone.
-    fn build(&self, s: &Sending, rode: &[(BlockId, Seen, u32)]) -> Ride {
-        let plain = Ride { text: s.body.clone(), carrier: None, notices: Vec::new() };
-        let Some(carrier) = s.carrier.filter(|_| !rode.is_empty()) else { return plain };
+    /// The wishes a snapshot of change `seq` carried, taken.
+    fn take_asked(&mut self, seq: u64) -> Vec<(Key, Asked)> {
+        let keys: Vec<Key> = self.asked.iter().filter(|(_, a)| a.at <= seq).map(|(k, _)| k.clone()).collect();
+        keys.into_iter().map(|k| (k.clone(), self.asked.remove(&k).expect("listed"))).collect()
+    }
+
+    /// The messages whose turn came, in order: each once what it marked is
+    /// written, with the notices memory still has so; plain once its write
+    /// failed.
+    fn go(&mut self) -> Vec<Landed> {
+        let mut out = Vec::new();
+        while let Some(s) = self.sending.front() {
+            let written = s.at <= self.written;
+            if !written && self.failed_at.is_none_or(|f| s.at > f) {
+                break;
+            }
+            let s = self.sending.pop_front().expect("the first");
+            let book = &self.book;
+            let still = |(id, seen, v): &&(BlockId, Seen, u32)| {
+                book.get(&s.conv, &s.generation, id).is_some_and(|d| d.version == *v && d.seen() == *seen && d.sent)
+            };
+            let rode: Vec<_> = if written { s.picks.iter().filter(still).cloned().collect() } else { Vec::new() };
+            let ride = self.build(&s.body, s.carrier, &rode);
+            // What doesn't ride isn't in flight.
+            if let Some(slot) = self.book.slot_mut(&s.conv, &s.generation) {
+                for (id, ..) in s.picks.iter().filter(|(id, ..)| !ride.notices.iter().any(|(i, ..)| i == id)) {
+                    if let Some(d) = slot.get_mut(id).filter(|d| d.carrier == s.carrier) {
+                        d.carrier = None;
+                    }
+                }
+            }
+            out.push(Landed::Send { ticket: s.ticket, ride });
+        }
+        out
+    }
+
+    /// `body` with the notices `rode` on `carrier`: its trailer, or the
+    /// body alone.
+    fn build(&self, body: &str, carrier: Option<u64>, rode: &[(BlockId, Seen, u32)]) -> Ride {
+        let plain = Ride { text: body.to_string(), carrier: None, notices: Vec::new() };
+        let Some(carrier) = carrier.filter(|_| !rode.is_empty()) else { return plain };
         let line = |kind: Seen| {
             let notices: Vec<Notice> =
                 rode.iter().filter(|(_, k, _)| *k == kind).map(|(id, _, version)| Notice { id: id.clone(), version: *version }).collect();
@@ -937,68 +655,54 @@ impl Desires {
         };
         let lines: Vec<NoticeLine> = [line(Seen::Dismissed), line(Seen::Shown)].into_iter().flatten().collect();
         let trailer = Trailer::new(lines).expect("one line of each kind, an id in one");
-        let text = format!("{}{}", s.body, trailer.text());
-        if message::split(&text) != (s.body.as_str(), trailer) {
+        let text = format!("{body}{}", trailer.text());
+        if message::split(&text) != (body, trailer) {
             return plain;
         }
         Ride { text, carrier: Some(carrier), notices: rode.to_vec() }
     }
 
-    /// What a landed wish draws: what the file decided, or why not.
-    fn drawn(&self, w: &Wish, done: Done) -> Result<Done, Refused> {
-        let now = self.book.slot(&w.conv, &w.generation).and_then(|s| s.get(&w.id));
-        let ok = match done {
-            Done::Wished(v) => now.is_some_and(|d| d.dismissed == w.dismiss && d.version == v),
-            Done::Cancelled => now.is_none(),
-            Done::Unchanged => now.map_or(w.shared_dismissed, |d| d.dismissed) == w.dismiss,
-        };
-        if ok { Ok(done) } else { Err(Refused(MOVED.into())) }
-    }
-
-    /// `file` (the file as a transaction left it) is memory's now: what
-    /// memory dropped and hasn't written yet stays dropped, and a desire
-    /// that didn't change keeps its carrier and hold.
-    fn adopt(&mut self, mut file: Book) {
-        for q in &self.queue {
-            match &q.work {
-                Work::Settle { conv, generation, shared, gone } => settle_in(&mut file, conv, generation, shared, gone),
-                Work::Drop { conv, gens, discard } => drop_in(&mut file, conv, gens, *discard),
-                _ => {}
-            }
+    /// `change` made to memory if what it leaves fits: the reserve's one
+    /// check, every change's. A change that doesn't grow the file (as
+    /// written, and with every version at its widest) always fits; one
+    /// that does is refused past [`RESERVE`]. A change to the file's text
+    /// is one more to write.
+    fn commit(&mut self, change: impl FnOnce(&mut Book)) -> Result<(), Refused> {
+        let mut next = self.book.clone();
+        change(&mut next);
+        next.tidy();
+        let (was, now) = (self.book.text(), next.text());
+        if now.len() > was.len() && now.len() > RESERVE {
+            return Err(Refused(format!("{FULL_DESK} ({} bytes, over {RESERVE})", now.len())));
         }
-        for (key, gens) in &mut file.conversations {
-            for (g, x) in gens {
-                for (id, d) in &mut x.desires {
-                    if let Some(w) =
-                        self.book.slot(key, g).and_then(|s| s.get(id)).filter(|w| w.version == d.version && w.dismissed == d.dismissed)
-                    {
-                        (d.carrier, d.held) = (w.carrier, w.held);
-                    }
-                }
-            }
+        let wide = next.widest_bytes();
+        if wide > RESERVE && wide > self.book.widest_bytes() {
+            return Err(Refused(format!("{FULL_DESK} ({wide} bytes at the widest, over {RESERVE})")));
         }
-        self.book = file;
+        if now != was {
+            self.seq += 1;
+        }
+        self.book = next;
+        Ok(())
     }
 
-    fn slot(&self, conv: &str, generation: &Generation) -> Option<&Slot> {
-        self.book.slot(conv, &generation_key(generation))
+    fn key(conv: &str, generation: &Generation, id: &BlockId) -> Key {
+        (conv.to_string(), generation_key(generation), id.clone())
     }
 
-    /// `id`'s desire in `conv` (of `generation`'s history), as drawn.
+    /// `id`'s desire in `conv` (of `generation`'s history), as drawn: a
+    /// wish not written yet draws what was before it.
     pub(crate) fn desire(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<&Desire> {
-        self.slot(conv, generation)?.get(id)
+        match self.asked.get(&Self::key(conv, generation, id)) {
+            Some(a) => a.before.as_ref(),
+            None => self.book.get(conv, &generation_key(generation), id),
+        }
     }
 
-    /// `id`'s wish not yet landed, if any: `Some(None)` a cancel.
-    fn asked(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<Option<&Desire>> {
-        let a = self.asked.get(&(conv.to_string(), id.clone()))?;
-        (a.generation == generation_key(generation)).then_some(a.wish.as_ref())
-    }
-
-    /// Whether `id` has a wish whose transaction hasn't landed: it draws as
-    /// before meanwhile (a pending look) and rides nothing.
+    /// Whether `id` has a wish not written yet: it draws as before
+    /// meanwhile (a pending look) and rides nothing.
     pub(crate) fn pending(&self, conv: &str, generation: &Generation, id: &BlockId) -> bool {
-        self.asked(conv, generation, id).is_some()
+        self.asked.contains_key(&Self::key(conv, generation, id))
     }
 
     /// Why `id`'s last wish wasn't kept, until its next wish.
@@ -1016,12 +720,12 @@ impl Desires {
     /// ([`Desires::feedback_seen`]), the id's next wish, or its generation
     /// or conversation goes.
     pub(crate) fn feedback(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<Feedback> {
-        self.feedback.get(&(conv.to_string(), generation_key(generation), id.clone())).map(|(_, f)| *f)
+        self.feedback.get(&Self::key(conv, generation, id)).map(|(_, f)| *f)
     }
 
     /// `id`'s feedback was shown: it goes.
     pub(crate) fn feedback_seen(&mut self, conv: &str, generation: &Generation, id: &BlockId) {
-        self.feedback.remove(&(conv.to_string(), generation_key(generation), id.clone()));
+        self.feedback.remove(&Self::key(conv, generation, id));
     }
 
     /// The side tables' sizes: feedback and refusals kept (tests; Settings).
@@ -1029,10 +733,15 @@ impl Desires {
         (self.feedback.len(), self.refusals.len())
     }
 
+    /// Wishes and messages waiting for a write (≤ [`QUEUE_MAX`]).
+    pub(crate) fn waiting_actions(&self) -> usize {
+        self.asked.len() + self.sending.len()
+    }
+
     fn note_feedback(&mut self, conv: &str, generation: &str, id: BlockId, f: Feedback) {
         self.next_note += 1;
         self.feedback.insert((conv.to_string(), generation.to_string(), id), (self.next_note, f));
-        let oldest = |m: &BTreeMap<(String, String, BlockId), (u64, Feedback)>, here: bool| {
+        let oldest = |m: &BTreeMap<Key, (u64, Feedback)>, here: bool| {
             m.iter().filter(|((c, ..), _)| !here || c == conv).min_by_key(|(_, (n, _))| *n).map(|(k, _)| k.clone())
         };
         while self.feedback.keys().filter(|(c, ..)| c == conv).count() > FEEDBACK_PER_CONVERSATION {
@@ -1064,9 +773,68 @@ impl Desires {
         self.book.len()
     }
 
+    /// `highest`, seen on a board of `generation` of `conv` (or minted
+    /// there).
+    fn saw(&mut self, conv: &str, generation: &str, highest: u32) {
+        self.next_note += 1;
+        match self.known.get_mut(conv) {
+            Some(k) if k.generation == generation => (k.high, k.touched) = (k.high.max(highest), self.next_note),
+            // Not the settled history's generation: nothing of it is kept.
+            Some(k) if k.settled.is_some() => {}
+            _ => {
+                let k = Known { generation: generation.to_string(), high: highest, settled: None, touched: self.next_note };
+                self.known.insert(conv.to_string(), k);
+                self.bound_known(conv);
+            }
+        }
+    }
+
+    /// `conv`'s settled history, at `generation` (another: the history
+    /// moved on).
+    fn know(&mut self, conv: &str, generation: &str, settled: &Visibility) {
+        self.next_note += 1;
+        let high = self.known.get(conv).filter(|k| k.generation == generation).map_or(0, |k| k.high);
+        let k = Known {
+            generation: generation.to_string(),
+            high: high.max(settled.highest()),
+            settled: Some(settled.clone()),
+            touched: self.next_note,
+        };
+        self.known.insert(conv.to_string(), k);
+        self.bound_known(conv);
+    }
+
+    /// What's known of a conversation without desires goes past
+    /// [`KNOWN_MAX`], the least recently used first: nothing of this desk's
+    /// may still land there, and a later board has the rest.
+    fn bound_known(&mut self, conv: &str) {
+        while self.known.len() > KNOWN_MAX {
+            let book = &self.book;
+            let Some(gone) = self
+                .known
+                .iter()
+                .filter(|(c, _)| *c != conv && book.conversation_len(c) == 0)
+                .min_by_key(|(_, k)| k.touched)
+                .map(|(c, _)| c.clone())
+            else {
+                break;
+            };
+            self.known.remove(&gone);
+        }
+    }
+
+    /// One more than every version this desk knows in `generation` of
+    /// `conv`: `shared`'s highest, what it settled, saw and minted there,
+    /// its desires'.
+    fn mint(&self, conv: &str, generation: &str, shared: &Visibility) -> u32 {
+        let own = self.book.slot(conv, generation).into_iter().flat_map(BTreeMap::values).map(|d| d.version).max().unwrap_or(0);
+        let known = self.known.get(conv).filter(|k| k.generation == generation).map_or(0, |k| k.high);
+        shared.highest().max(own).max(known).saturating_add(1)
+    }
+
     /// Dismiss `id` in `conv` (§3.5). `shared`: the board as drawn, the
-    /// live turn included. Refused at once, or its transaction queued: it
-    /// draws when that lands (module docs).
+    /// live turn included. Refused at once, or decided: it draws when its
+    /// write lands (module docs).
     pub(crate) fn dismiss(&mut self, conv: &str, generation: &Generation, id: &BlockId, shared: &Visibility) -> Result<Ask, Refused> {
         self.want(conv, generation, id, true, shared)
     }
@@ -1083,49 +851,51 @@ impl Desires {
         if !key_ok(conv) {
             return Err(Refused("this conversation has no journal yet".into()));
         }
-        let g = generation_key(generation);
-        self.feedback.remove(&(conv.to_string(), g.clone(), id.clone()));
+        let key = Self::key(conv, generation, id);
+        let g = key.1.clone();
+        if self.known.get(conv).is_some_and(|k| k.settled.is_some() && k.generation != g) {
+            return Err(Refused(MOVED_ON.into()));
+        }
+        self.feedback.remove(&key);
         self.refusals.remove(&(conv.to_string(), id.clone()));
-        // What the user asked last: a wish not landed yet, else what draws.
-        // A preflight: the file decides.
-        let cur = match self.asked(conv, generation, id) {
-            Some(a) => a.cloned(),
-            None => self.desire(conv, generation, id).cloned(),
-        };
+        self.saw(conv, &g, shared.highest());
+        // Memory's: the last wish, written or not.
+        let cur = self.book.get(conv, &g, id).cloned();
         if cur.as_ref().map_or_else(|| shared.dismissed(id), |d| d.dismissed) == dismiss {
             return Ok(Ask::Unchanged);
         }
-        if self.queue.len() >= QUEUE_MAX {
+        if !self.asked.contains_key(&key) && self.waiting_actions() >= QUEUE_MAX {
             return Err(Refused(BUSY.into()));
         }
-        let cancel = cur.as_ref().is_some_and(|d| !d.sent && shared.dismissed(id) == dismiss);
+        let settled = self.known.get(conv).and_then(|k| k.settled.as_ref());
+        let agrees = |v: &Visibility| v.dismissed(id) == dismiss;
+        let after = match &cur {
+            // No notice of it may have gone, and every board this desk has
+            // draws the wish: nothing to tell.
+            Some(d) if !d.sent && agrees(shared) && settled.is_none_or(agrees) => None,
+            _ => {
+                let version = self.mint(conv, &g, shared);
+                if version > VERSION_MAX {
+                    return Err(Refused(TOO_MANY.into()));
+                }
+                Some(Desire::new(dismiss, version, cur.as_ref().is_some_and(|d| d.sent)))
+            }
+        };
         if cur.is_none() {
-            // The caps, in memory: refused at once, before the disk. Wishes
-            // not landed count as the desires they'll be.
-            let new = |(c, i): &(String, BlockId), a: &Asked| {
-                a.wish.is_some() && self.book.slot(c, &a.generation).is_none_or(|s| !s.contains_key(i))
-            };
-            let more_here = self.asked.iter().filter(|(k, a)| k.0 == conv && new(k, a)).count();
-            if self.book.conversation_len(conv) + more_here >= PER_CONVERSATION {
+            if self.book.conversation_len(conv) >= PER_CONVERSATION {
                 return Err(Refused(FULL_HERE.into()));
             }
-            let more = self.asked.iter().filter(|(k, a)| new(k, a)).count();
-            if self.len() + more >= PER_DESK {
+            if self.book.len() >= PER_DESK {
                 return Err(Refused(FULL_DESK.into()));
             }
         }
-        let wish = Wish {
-            conv: conv.into(),
-            generation: g.clone(),
-            id: id.clone(),
-            dismiss,
-            shared_dismissed: shared.dismissed(id),
-            highest: shared.highest(),
-            had: self.desire(conv, generation, id).is_some(),
-        };
-        let ticket = self.queue_write(Work::Wish(wish));
-        let likely = (!cancel).then(|| Desire::new(dismiss, 0, cur.as_ref().is_some_and(|d| d.sent)));
-        self.asked.insert((conv.to_string(), id.clone()), Asked { ticket, generation: g, wish: likely });
+        let made = after.clone();
+        self.commit(|b| b.set(conv, &g, id, made))?;
+        if let Some(d) = &after {
+            self.saw(conv, &g, d.version);
+        }
+        let before = self.asked.remove(&key).map_or(cur, |a| a.before);
+        self.asked.insert(key, Asked { at: self.seq, before, after });
         Ok(Ask::Saving)
     }
 
@@ -1134,7 +904,7 @@ impl Desires {
     /// not kept back, no wish of its id pending; at most 8 of each kind,
     /// the oldest versions first.
     pub(crate) fn riding(&self, conv: &str, generation: &Generation, shared: &Visibility) -> Vec<(BlockId, Seen, u32)> {
-        let Some(c) = self.slot(conv, generation) else { return Vec::new() };
+        let Some(c) = self.book.slot(conv, &generation_key(generation)) else { return Vec::new() };
         let mut all: Vec<(BlockId, Seen, u32)> = c
             .iter()
             .filter(|(id, d)| !d.held && d.carrier.is_none() && d.version > shared.effective_version(id))
@@ -1163,31 +933,38 @@ impl Desires {
     }
 
     /// `body`, as it goes `how` on `conv`, with the notices that ride it
-    /// (module docs). `Go`: nothing rides, nor waits ahead of it. `Wait`:
-    /// it goes when [`Landed::Send`] of the ticket lands, with the notices
-    /// the file still had so, marked sent; in flight on its carrier until
-    /// then. `shared`: the board as drawn.
-    pub(crate) fn ride(&mut self, conv: &str, generation: &Generation, shared: &Visibility, body: &str, how: Carry) -> Riding {
+    /// (module docs). `Go`: now. `Wait`: when [`Landed::Send`] of the
+    /// ticket lands, with the notices still so then; in flight on its
+    /// carrier until then. Refused, nothing changed, when it would wait
+    /// past the bounds ([`QUEUE_MAX`], [`QUEUE_BYTES_MAX`]): the composer
+    /// keeps the text. `shared`: the board as drawn.
+    pub(crate) fn ride(
+        &mut self,
+        conv: &str,
+        generation: &Generation,
+        shared: &Visibility,
+        body: &str,
+        how: Carry,
+    ) -> Result<Riding, Refused> {
         let g = generation_key(generation);
-        let mut picked = Vec::new();
-        if how != Carry::Answer && !body.trim().is_empty() {
-            picked = self.riding(conv, generation, shared);
+        self.saw(conv, &g, shared.highest());
+        let typed = how != Carry::Answer && !body.trim().is_empty();
+        let mut picked = if typed { self.riding(conv, generation, shared) } else { Vec::new() };
+        if !picked.is_empty() && self.build(body, Some(0), &picked).notices.is_empty() {
+            // The body's own last line reads as a notice beside these: they
+            // wait for the next message.
+            picked.clear();
+        }
+        let marked = picked.iter().all(|(id, ..)| self.book.get(conv, &g, id).is_some_and(|d| d.sent));
+        let wait = !self.sending.is_empty() || (!picked.is_empty() && (!marked || self.written < self.seq));
+        let bytes: usize = self.sending.iter().map(|s| s.body.len()).sum();
+        if wait && (self.waiting_actions() >= QUEUE_MAX || bytes + body.len() > QUEUE_BYTES_MAX) {
+            return Err(Refused(BUSY.into()));
+        }
+        if typed && let Some(c) = self.book.slot_mut(conv, &g) {
             // What the chip kept back was kept from this message: the next
             // carries it.
-            if let Some(c) = self.book.slot_mut(conv, &g) {
-                c.values_mut().for_each(|d| d.held = false);
-            }
-        }
-        if !picked.is_empty() {
-            let probe = Sending { body: body.to_string(), carrier: Some(0), conv: conv.into(), generation: g.clone() };
-            if self.build(&probe, &picked).notices.is_empty() {
-                // The body's own last line reads as a notice beside these:
-                // they wait for the next message.
-                picked.clear();
-            }
-        }
-        if picked.is_empty() && self.sending.is_empty() {
-            return Riding::Go(Ride { text: body.to_string(), carrier: None, notices: Vec::new() });
+            c.values_mut().for_each(|d| d.held = false);
         }
         let carrier = (!picked.is_empty()).then(|| {
             self.next_carrier += 1;
@@ -1200,11 +977,35 @@ impl Desires {
                 }
             }
         }
-        self.next_ticket += 1;
-        let ticket = self.next_ticket;
-        self.queue.push_back(Queued { ticket, work: Work::Send { conv: conv.into(), generation: g.clone(), picks: picked } });
-        self.sending.insert(ticket, Sending { body: body.to_string(), carrier, conv: conv.into(), generation: g });
-        Riding::Wait(ticket)
+        if !wait {
+            return Ok(Riding::Go(self.build(body, carrier, &picked)));
+        }
+        let marks = picked.clone();
+        self.commit(|b| {
+            for (id, ..) in &marks {
+                if let Some(d) = b.slot_mut(conv, &g).and_then(|s| s.get_mut(id)) {
+                    d.sent = true;
+                }
+            }
+        })
+        .expect("a sent mark doesn't grow the file");
+        self.next_send += 1;
+        let at = if picked.is_empty() { 0 } else { self.seq };
+        if at > self.written && self.failed_at == Some(self.seq) {
+            // The file failed at this very state: a message waiting for it
+            // tries it again (and goes plain if it fails again).
+            self.failed_at = None;
+        }
+        self.sending.push_back(Sending {
+            ticket: self.next_send,
+            at,
+            body: body.to_string(),
+            carrier,
+            conv: conv.into(),
+            generation: g,
+            picks: picked,
+        });
+        Ok(Riding::Wait(self.next_send))
     }
 
     /// `carrier` won't land (a refused send): what it carried rides the
@@ -1219,11 +1020,11 @@ impl Desires {
 
     /// `conv`'s desires against a settled history's board (`shared`), the
     /// carriers still in flight (`in_flight`: sent, and not yet shown by a
-    /// settled history nor lost) given: what's done is dropped now (its
-    /// transaction queued), with why it draws otherwise if it does; a
-    /// carrier no longer in flight is cleared, its desires re-armed. The
-    /// generation this process settled before, if another, is dropped; at
-    /// its first settle of `conv`, every other generation it knows of.
+    /// settled history nor lost) given: what's done is dropped, with why it
+    /// draws otherwise if it does; a carrier no longer in flight is
+    /// cleared, its desires re-armed. Every other generation of `conv` is
+    /// dropped, its wishes not written retired (never reported). A write
+    /// that failed is tried again.
     pub(crate) fn settle(
         &mut self,
         conv: &str,
@@ -1232,21 +1033,16 @@ impl Desires {
         in_flight: &[u64],
     ) -> Vec<(BlockId, Feedback)> {
         let g = generation_key(generation);
-        let gone: Vec<String> = match self.seen.insert(conv.to_string(), g.clone()) {
-            None => self.book.generations(conv).into_iter().filter(|k| *k != g).collect(),
-            Some(before) if before != g => vec![before],
-            Some(_) => Vec::new(),
-        };
-        while self.seen.len() > SEEN_MAX {
-            let k = self.seen.keys().find(|k| *k != conv).cloned().expect("over the cap");
-            self.seen.remove(&k);
-        }
-        self.feedback.retain(|(c, fg, _), _| c != conv || !gone.contains(fg));
-        let waiting: BTreeSet<u64> = self.sending.values().filter_map(|s| s.carrier).collect();
+        self.know(conv, &g, shared);
+        self.asked.retain(|(c, ag, _), _| c != conv || *ag == g);
+        self.feedback.retain(|(c, fg, _), _| c != conv || *fg == g);
+        let waiting: BTreeSet<u64> = self.sending.iter().filter_map(|s| s.carrier).collect();
         let mut out = Vec::new();
-        let known = self.book.generations(conv);
-        let mut dropped = gone.iter().any(|x| known.contains(x));
-        if let Some(slot) = self.book.slot_mut(conv, &g) {
+        let _ = self.commit(|b| {
+            if let Some(gens) = b.conversations.get_mut(conv) {
+                gens.retain(|k, _| *k == g);
+            }
+            let Some(slot) = b.slot_mut(conv, &g) else { return };
             slot.retain(|id, d| {
                 if shared.effective_version(id) >= d.version {
                     let why = match shared.record(id) {
@@ -1255,7 +1051,6 @@ impl Desires {
                         _ => None,
                     };
                     out.extend(why.map(|f| (id.clone(), f)));
-                    dropped = true;
                     return false;
                 }
                 if d.carrier.is_some_and(|k| !in_flight.contains(&k) && !waiting.contains(&k)) {
@@ -1263,14 +1058,12 @@ impl Desires {
                 }
                 true
             });
-        }
-        self.book.drop_generations(conv, &gone);
+        });
         for (id, f) in &out {
             self.note_feedback(conv, &g, id.clone(), *f);
         }
-        if dropped && self.path.is_some() {
-            self.queue_write(Work::Settle { conv: conv.into(), generation: g, shared: shared.clone(), gone });
-        }
+        // A write that failed is tried again (the disk may be back).
+        self.failed_at = None;
         out
     }
 
@@ -1283,40 +1076,38 @@ impl Desires {
     pub(crate) fn compacted(&mut self, conv: &str, state: &State) -> Vec<BlockId> {
         let generation = state.generation();
         let shared = state.visibility();
+        let g = generation_key(&generation);
         let mut ids: BTreeSet<BlockId> = shared.records().filter(|(_, r)| r.dismissed).map(|(id, _)| id.clone()).collect();
-        if let Some(c) = self.slot(conv, &generation) {
-            ids.extend(c.keys().cloned());
-        }
+        ids.extend(self.book.slot(conv, &g).into_iter().flat_map(BTreeMap::keys).cloned());
+        ids.extend(self.asked.keys().filter(|(c, ag, _)| c == conv && *ag == g).map(|(.., id)| id.clone()));
         let out: Vec<BlockId> = ids.into_iter().filter(|id| self.dismissed(conv, &generation, id, shared)).collect();
-        // The file's too, whichever process's: the generation is over.
-        self.drop_generations(conv, vec![generation_key(&generation)], true);
+        self.asked.retain(|(c, ag, _), _| !(c == conv && *ag == g));
+        self.feedback.retain(|(c, ..), _| c != conv);
+        self.refusals.retain(|(c, _), _| c != conv);
+        let _ = self.commit(|b| {
+            if let Some(gens) = b.conversations.get_mut(conv) {
+                gens.remove(&g);
+            }
+        });
         out
     }
 
-    /// Every desire of `conv` the user sees listed dropped (the user's
-    /// discard: every generation this process knows of it): how many.
+    /// The user's discard: `conv`'s unsent desires dropped, every
+    /// generation's (a desire that may have been sent stays until it
+    /// settles); how many.
     pub(crate) fn discard(&mut self, conv: &str) -> usize {
-        let gens = self.book.generations(conv);
-        let n = self.book.conversation_len(conv);
+        let before = self.book.conversation_len(conv);
         self.feedback.retain(|(c, ..), _| c != conv);
         self.refusals.retain(|(c, _), _| c != conv);
-        self.book.discard(conv, &gens);
-        if n > 0 && self.path.is_some() {
-            self.queue_write(Work::Drop { conv: conv.into(), gens, discard: true });
-        }
-        n
-    }
-
-    /// `gens` of `conv` dropped now, its transaction queued (only those
-    /// generations, as the file has them then); `conv`'s notes go.
-    fn drop_generations(&mut self, conv: &str, gens: Vec<String>, always: bool) {
-        self.feedback.retain(|(c, ..), _| c != conv);
-        self.refusals.retain(|(c, _), _| c != conv);
-        let had = self.book.generations(conv).iter().any(|x| gens.contains(x));
-        drop_in(&mut self.book, conv, &gens, false);
-        if (had || always) && self.path.is_some() {
-            self.queue_write(Work::Drop { conv: conv.into(), gens, discard: false });
-        }
+        let _ = self.commit(|b| {
+            for s in b.conversations.get_mut(conv).into_iter().flat_map(BTreeMap::values_mut) {
+                s.retain(|_, d| d.sent);
+            }
+        });
+        // A wish whose desire went is retired.
+        let book = &self.book;
+        self.asked.retain(|(c, g, id), a| c != conv || same(book.get(c, g, id), a.after.as_ref()));
+        before - self.book.conversation_len(conv)
     }
 }
 

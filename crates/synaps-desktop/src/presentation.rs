@@ -26,22 +26,23 @@
 //!   over by id, as preferences.
 //!
 //! **The file**, `blocks.json` next to `settings.json`, through
-//! [`crate::blockfiles`] (atomic, this user's only, swept, merged under a
-//! lock): per conversation (journal id) at most [`ENTRIES_MAX`] entries
-//! and [`CONVERSATION_BYTES_MAX`] bytes, the oldest entry going first; at
-//! most [`CONVERSATIONS_MAX`] conversations and [`FILE_BYTES_MAX`] bytes,
-//! the least recently touched conversation going first. It's
-//! presentation: no wish is lost. Two processes merge by conversation:
-//! a write replaces the conversations it changed and keeps the others.
-//! **Drawn at once, written off the UI thread:** a change draws now, and
-//! its write is queued ([`Presentation::next_write`]), run on a background
-//! task ([`Write::run`]) and handed back ([`Presentation::landed`]), one
-//! at a time, in order. A write that fails is said; memory keeps the
-//! change, and the next write carries it. (A pin is a preference: one a
-//! crash takes before its write lands is placed again; a desire is never
-//! drawn before it is written, [`crate::desires`].)
+//! [`crate::blockfiles`] (atomic, this user's only, swept; owned by one
+//! process, another keeping its presentation in memory only): per
+//! conversation (journal id) at most [`ENTRIES_MAX`] entries and
+//! [`CONVERSATION_BYTES_MAX`] bytes, the oldest entry going first; at most
+//! [`CONVERSATIONS_MAX`] conversations and [`FILE_BYTES_MAX`] bytes, the
+//! least recently touched conversation going first. It's presentation: no
+//! wish is lost.
+//! **Drawn at once, written off the UI thread:** memory is the truth. A
+//! change draws now, and a snapshot of memory, whole, is written
+//! ([`Presentation::next_write`], run on a background task, [`Write::run`],
+//! handed back, [`Presentation::landed`]), one at a time: what memory
+//! removed is gone from the file too. A write that fails is said; memory
+//! keeps the change, and the next change's write carries it. (A pin is a
+//! preference: one a crash takes before its write lands is placed again; a
+//! desire is never drawn before it is written, [`crate::desires`].)
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use cards_spec::block::{BlockId, Ref, Slot};
@@ -254,146 +255,130 @@ pub(crate) struct Placed {
 #[derive(Debug)]
 pub(crate) struct Write {
     ticket: u64,
+    /// Memory's change count the snapshot has.
+    seq: u64,
     path: PathBuf,
-    work: Work,
-}
-
-#[derive(Clone, Debug)]
-enum Work {
-    /// The launch's: what crashes left beside the file swept, the file
-    /// read again under its lock.
-    Sweep,
-    /// These conversations as memory has them (`None`: gone), each
-    /// replacing the file's.
-    Put(Vec<(String, Option<Conversation>)>),
+    /// `None`: the sweep (the first write); else memory, whole.
+    text: Option<String>,
 }
 
 /// A [`Write`] as it ran.
 #[derive(Debug)]
 pub(crate) struct Landing {
     ticket: u64,
-    done: Result<Book, blockfiles::Failed>,
-    trouble: Option<String>,
+    seq: u64,
+    sweep: bool,
+    /// Written (and what the sweep said, if anything), or why not.
+    done: Result<Option<String>, String>,
 }
 
 impl Write {
     /// The write, on whatever thread runs it ([`crate::blockfiles`]).
     pub(crate) fn run(self) -> Landing {
-        let (done, trouble) = match self.work {
-            Work::Sweep => {
-                let (book, why, swept) = blockfiles::load::<Book>(&self.path);
-                (Ok(book), why.or(swept.err().map(|e| e.to_string())))
-            }
-            Work::Put(mine) => {
-                let done = blockfiles::update::<Book>(&self.path, |b| {
-                    for (k, c) in mine {
-                        match c {
-                            Some(c) => b.conversations.insert(k, c),
-                            None => b.conversations.remove(&k),
-                        };
-                    }
-                    b.fit();
-                    Ok(())
-                });
-                (done, None)
-            }
+        let done = match &self.text {
+            None => Ok(blockfiles::sweep::<Book>(&self.path)),
+            Some(text) => blockfiles::write(&self.path, text).map(|()| None),
         };
-        Landing { ticket: self.ticket, done, trouble }
+        Landing { ticket: self.ticket, seq: self.seq, sweep: self.text.is_none(), done }
     }
 }
 
 /// This desk's presentation, every conversation's (module docs).
 pub(crate) struct Presentation {
     path: Option<PathBuf>,
+    /// The file's lock, held for the store's life (`None`: memory only).
+    owner: Option<std::fs::File>,
     book: Book,
-    /// Conversations changed and not in a queued write (one that failed).
-    dirty: BTreeSet<String>,
-    /// Writes not yet landed, in order; the first is out when `out`.
-    queue: VecDeque<(u64, Work)>,
-    out: bool,
+    /// Memory's changes, counted; the count the file has; the last that
+    /// failed (not tried again until memory changes).
+    seq: u64,
+    written: u64,
+    failed_at: Option<u64>,
+    /// The write out, by ticket.
+    out: Option<u64>,
     next_ticket: u64,
+    sweep: bool,
     /// Why the last write failed, until one lands.
     pub(crate) failed: Option<String>,
-    /// Why the file read as empty at the load, or what its sweep couldn't
-    /// remove.
+    /// Why the file read as empty at the load, what its sweep said, or that
+    /// it is another process's.
     pub(crate) trouble: Option<String>,
 }
 
 impl Presentation {
-    /// The presentation in the file at `path`, read now, without its lock
-    /// (a rename is atomic); the sweep of what crashes left beside it is
-    /// the first write. `None`: no config folder, memory only.
+    /// The presentation in the file at `path`, owned by this process (its
+    /// lock taken, without waiting) and read now; its sweep is the first
+    /// write. Another process's, or `None` (no config folder): memory only.
     pub(crate) fn load(path: Option<PathBuf>) -> Self {
-        let (book, trouble) = match &path {
-            Some(p) => blockfiles::peek::<Book>(p),
-            None => (Book::default(), None),
+        let owner = path.as_deref().map(blockfiles::own);
+        let (book, trouble) = match (&path, &owner) {
+            (Some(p), Some(Ok(_))) => blockfiles::peek::<Book>(p),
+            (_, Some(Err(why))) => {
+                (Book::default(), Some(format!("{FILE} is another desk's: placements here are kept in memory only ({why})")))
+            }
+            _ => (Book::default(), None),
         };
-        let mut p =
-            Presentation { path, book, dirty: BTreeSet::new(), queue: VecDeque::new(), out: false, next_ticket: 0, failed: None, trouble };
-        if p.path.is_some() {
-            p.next_ticket += 1;
-            p.queue.push_back((p.next_ticket, Work::Sweep));
+        let owner = owner.and_then(Result::ok);
+        Presentation {
+            path,
+            sweep: owner.is_some(),
+            owner,
+            book,
+            seq: 0,
+            written: 0,
+            failed_at: None,
+            out: None,
+            next_ticket: 0,
+            failed: None,
+            trouble,
         }
-        p
     }
 
-    /// The next write to run off the UI thread, once the one out landed.
+    /// The next write to run off the UI thread, once the one out landed:
+    /// the sweep first, then memory whole whenever it changed since the
+    /// file. Memory only: none.
     pub(crate) fn next_write(&mut self) -> Option<Write> {
-        let path = self.path.clone()?;
-        if self.out {
+        let path = self.owner.as_ref().and(self.path.clone())?;
+        if self.out.is_some() {
             return None;
         }
-        let (ticket, work) = self.queue.front()?.clone();
-        self.out = true;
-        Some(Write { ticket, path, work })
+        let text = if std::mem::take(&mut self.sweep) {
+            None
+        } else if self.seq > self.written && self.failed_at != Some(self.seq) {
+            Some(self.book.text())
+        } else {
+            return None;
+        };
+        self.next_ticket += 1;
+        self.out = Some(self.next_ticket);
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, text })
     }
 
-    /// Whether a write is queued or out.
+    /// Whether a write is out or to make.
     pub(crate) fn writing(&self) -> bool {
-        !self.queue.is_empty()
+        self.owner.is_some() && (self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq)))
     }
 
-    /// A write as it ran: memory takes the file it wrote or read (another
-    /// process's conversations), keeping its own of what it changed since.
-    /// A write that failed: its conversations go with the next.
+    /// A write as it ran. Failed: said, and memory keeps it all.
     pub(crate) fn landed(&mut self, l: Landing) -> Result<(), String> {
-        if !self.out || self.queue.front().is_none_or(|(t, _)| *t != l.ticket) {
+        if self.out != Some(l.ticket) {
             return Ok(());
         }
-        let (_, work) = self.queue.pop_front().expect("the one out");
-        self.out = false;
-        if let Work::Sweep = work {
-            self.trouble = l.trouble.or(self.trouble.take());
-        }
+        self.out = None;
         match l.done {
-            Ok(mut merged) => {
-                let ahead: BTreeSet<String> = self
-                    .queue
-                    .iter()
-                    .flat_map(|(_, w)| match w {
-                        Work::Put(mine) => mine.iter().map(|(k, _)| k.clone()).collect(),
-                        Work::Sweep => Vec::new(),
-                    })
-                    .chain(self.dirty.iter().cloned())
-                    .collect();
-                for k in ahead {
-                    match self.book.conversations.remove(&k) {
-                        Some(c) => merged.conversations.insert(k, c),
-                        None => merged.conversations.remove(&k),
-                    };
-                }
-                merged.fit();
-                self.book = merged;
+            Ok(said) if l.sweep => {
+                self.trouble = said.or(self.trouble.take());
+                Ok(())
+            }
+            Ok(_) => {
+                self.written = l.seq;
                 self.failed = None;
                 Ok(())
             }
             Err(e) => {
-                if let Work::Put(mine) = work {
-                    self.dirty.extend(mine.into_iter().map(|(k, _)| k));
-                    self.prune();
-                }
                 let why = format!("blocks.json not written: {e}");
                 log::warn!(target: "synaps_desktop::blocks", "{why}");
+                self.failed_at = Some(l.seq);
                 self.failed = Some(why.clone());
                 Err(why)
             }
@@ -570,67 +555,16 @@ impl Presentation {
         self.touch(to);
     }
 
-    /// `conv` changed: its touch time, and the write (merged, module docs).
+    /// `conv` changed: its touch time, the caps, and one more change to
+    /// write.
     fn touch(&mut self, conv: &str) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let newest = self.book.conversations.values().map(|c| c.touched).max().unwrap_or(0);
         if let Some(c) = self.book.conversations.get_mut(conv) {
             c.touched = now.max(newest + 1);
         }
-        self.dirty.insert(conv.to_string());
         self.book.fit();
-        self.prune();
-        self.queue_put();
-    }
-
-    /// The bookkeeping of writes bounded by the store's caps: a
-    /// conversation the caps dropped from memory leaves the conversations
-    /// to write (the file's own fit drops it there), so a disk that keeps
-    /// failing never grows them past [`CONVERSATIONS_MAX`].
-    fn prune(&mut self) {
-        let book = &self.book.conversations;
-        self.dirty.retain(|k| book.contains_key(k));
-        let waiting = self.queue.len() > usize::from(self.out);
-        if let (true, Some((_, Work::Put(queued)))) = (waiting, self.queue.back_mut()) {
-            queued.retain(|(k, _)| book.contains_key(k));
-        }
-    }
-
-    /// The conversations waiting to be written (tests: bounded).
-    pub(crate) fn unwritten(&self) -> usize {
-        let queued: BTreeSet<&String> = self
-            .queue
-            .iter()
-            .flat_map(|(_, w)| match w {
-                Work::Put(mine) => mine.iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                Work::Sweep => Vec::new(),
-            })
-            .chain(self.dirty.iter())
-            .collect();
-        queued.len()
-    }
-
-    /// The conversations changed, a write queued: each replaces the
-    /// file's, the others' kept. A queued write not yet out takes them.
-    fn queue_put(&mut self) {
-        if self.path.is_none() {
-            self.dirty.clear();
-            return;
-        }
-        let mine: Vec<(String, Option<Conversation>)> =
-            std::mem::take(&mut self.dirty).into_iter().map(|k| (k.clone(), self.book.conversations.get(&k).cloned())).collect();
-        let waiting = self.queue.len() > usize::from(self.out);
-        if let (true, Some((_, Work::Put(queued)))) = (waiting, self.queue.back_mut()) {
-            for (k, c) in mine {
-                match queued.iter_mut().find(|(q, _)| *q == k) {
-                    Some(was) => was.1 = c,
-                    None => queued.push((k, c)),
-                }
-            }
-            return;
-        }
-        self.next_ticket += 1;
-        self.queue.push_back((self.next_ticket, Work::Put(mine)));
+        self.seq += 1;
     }
 }
 
