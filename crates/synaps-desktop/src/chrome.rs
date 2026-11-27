@@ -2641,6 +2641,7 @@ impl AppView {
         self.rail_frame();
         let upper = self.render_agent(cards_spec::block::Slot::Upper, width, p, cx);
         let end = self.render_agent(cards_spec::block::Slot::End, width, p, cx);
+        self.rail_retire();
         let panel = v_flex()
             .id("right")
             .w(px(width))

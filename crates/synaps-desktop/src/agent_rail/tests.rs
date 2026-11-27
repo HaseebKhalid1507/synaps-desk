@@ -56,6 +56,13 @@ fn r(id: &str) -> Ref {
     Ref::parse(id).expect("an id")
 }
 
+/// A note's lines as laid out, standing in for the window's text system
+/// (40 characters a line): the layout's rules take the count as given.
+/// The window's tests lay the text out (`agent_rail_tests.rs`).
+fn est(text: &str) -> usize {
+    crate::blocks::note_lines(text, 40.)
+}
+
 /// The names in each slot as drawn, each with its state.
 fn drawn_names(l: &Layout) -> [Vec<String>; 2] {
     l.slots.clone().map(|s| {
@@ -216,13 +223,17 @@ fn hidden_sections_go_and_tombstones_take_no_place() {
     let l = layout(&d, &vis, &Local::default());
     assert_eq!(drawn_names(&l), [vec!["u2:open", "u3:open"], vec!["e1:open", "e2:open", "e3:over"]]);
     assert_eq!((l.sections, l.dismissed), (5, 1), "N sections · M dismissed");
-    struct Tomb;
-    impl RailVisibility for Tomb {
+    struct Soft;
+    impl RailVisibility for Soft {
         fn seen(&self, id: &Ref) -> Seen {
-            if id.to_string() == "u2" { Seen::Tombstone("dismissed before compaction · u show".into()) } else { Seen::Shown }
+            if id.to_string() == "u2" {
+                Seen::Tombstone(Tomb { text: "dismissed before compaction · u show".into(), token: 1 })
+            } else {
+                Seen::Shown
+            }
         }
     }
-    let l = layout(&d, &Tomb, &Local::default());
+    let l = layout(&d, &Soft, &Local::default());
     assert_eq!(drawn_names(&l), [vec!["u1:open", "u2:tomb", "u3:open"], vec!["e1:open", "e2:open", "e3:over"]]);
     assert_eq!(l.sections, 5, "a tombstone is not a section");
 }
@@ -244,7 +255,7 @@ fn a_group_sits_in_one_slot_with_its_members_folded_until_opened() {
     click(&d, &mut local, "g");
     let l = layout(&d, &AllShown, &local);
     assert_eq!(drawn_names(&l), [vec!["u1:open"], vec!["g:open"]]);
-    assert_eq!(lines(&l.section(&r("g")).expect("g").s, &State::Open, &local, 40., None), 2, "a line a member");
+    assert_eq!(lines(&l.section(&r("g")).expect("g").s, &State::Open, &local, &est, None), 2, "a line a member");
 }
 
 #[test]
@@ -290,12 +301,12 @@ fn overflow_per_kind_keeps_to_twelve_lines() {
     assert_eq!(plan_window(&pl.steps, None), (4, 11, Some((9, 4))));
     assert_eq!(plan_window(&pl.steps, Some(9)), (9, 11, Some((9, 6))), "the wheel moved it; all six done are above");
     assert_eq!(plan_window(&pl.steps, Some(30)), (9, 11, Some((9, 6))), "never past its end");
-    assert_eq!(lines(&sec("plan"), &State::Open, &local, 40., None), 12);
+    assert_eq!(lines(&sec("plan"), &State::Open, &local, &est, None), 12);
     // A 12-step plan shows whole.
     assert_eq!(plan_window(&pl.steps[..12], None), (0, 12, None));
-    assert_eq!(lines(&sec("now"), &State::Open, &local, 40., None), 2, "status");
-    assert_eq!(lines(&sec("rot"), &State::Open, &local, 40., None), 3, "metric, with its series");
-    assert_eq!(lines(&sec("file"), &State::Open, &local, 40., None), 1, "file");
+    assert_eq!(lines(&sec("now"), &State::Open, &local, &est, None), 2, "status");
+    assert_eq!(lines(&sec("rot"), &State::Open, &local, &est, None), 3, "metric, with its series");
+    assert_eq!(lines(&sec("file"), &State::Open, &local, &est, None), 1, "file");
     // A diff of 3 hunks (14 lines with their `@@`): 10, `+4 lines`, its foot.
     assert_eq!(
         diff_lines(
@@ -308,24 +319,24 @@ fn overflow_per_kind_keeps_to_twelve_lines() {
         (14, true)
     );
     assert_eq!(diff_shown(14, true), (10, true, 12));
-    assert_eq!(lines(&sec("retry"), &State::Open, &local, 40., None), 12);
+    assert_eq!(lines(&sec("retry"), &State::Open, &local, &est, None), 12);
     // A long note: 11 lines and `more`; opened, whole.
     let (n, cut) = match &sec("cause").block.body {
-        Body::Note(x) => note_shown(&x.text, 40., false),
+        Body::Note(x) => note_shown(est(&x.text), false),
         _ => panic!("a note"),
     };
     assert_eq!((n, cut), (NOTE_LINES, true));
-    assert_eq!(lines(&sec("cause"), &State::Open, &local, 40., None), 12);
+    assert_eq!(lines(&sec("cause"), &State::Open, &local, &est, None), 12);
     let mut opened = Local::default();
     opened.more.insert(r("cause"));
-    assert!(lines(&sec("cause"), &State::Open, &opened, 40., None) > 12, "`more` is the user's own resize");
+    assert!(lines(&sec("cause"), &State::Open, &opened, &est, None) > 12, "`more` is the user's own resize");
     // Folded: the summary line; leftovers: nothing.
-    assert_eq!(lines(&sec("plan"), &State::Summary, &local, 40., None), 1);
+    assert_eq!(lines(&sec("plan"), &State::Summary, &local, &est, None), 1);
     assert_eq!(summary(&sec("plan")), "6/20 done");
     assert_eq!(summary(&sec("rot")), "1.0 · was 2.0");
     assert_eq!(summary(&sec("now")), "Running the regression test");
     for id in ["plan", "now", "cause", "file", "rot", "retry", "findings"] {
-        assert!(lines(&sec(id), &State::Open, &local, 40., None) <= LINES || id == "never", "{id} keeps to {LINES}");
+        assert!(lines(&sec(id), &State::Open, &local, &est, None) <= LINES || id == "never", "{id} keeps to {LINES}");
     }
 }
 
@@ -405,4 +416,71 @@ fn nows_label_stays_on_the_earliest_started_call_while_it_runs() {
     assert!(seen.iter().all(|s| s.starts_with("read src/b.rs")), "no flicker while b runs: {seen:?}");
     turn(&mut t, &[("b", "result")]);
     assert_eq!(now(&t, None, false), "read src/d.rs", "then the earliest-started still running");
+}
+
+/// D6b's soft dismissal of a group's member (Shady #104 P2-5): the member
+/// keeps its place in the group as its tombstone; a hidden one leaves the
+/// list; the structure says which are which, and an agent change to a
+/// tombstone's content changes nothing drawn.
+#[test]
+fn a_members_tombstone_keeps_its_place_in_the_group_as_a_tombstone() {
+    let ops = |text: &str| {
+        json!([
+            note("m1", "upper"),
+            {"op": "put", "id": "m2", "kind": "note", "title": "m2", "target": "rail", "slot": "upper", "body": {"text": text}},
+            note("m3", "upper"),
+            {"op": "merge", "into": "g", "title": "Group", "ids": ["m1", "m2", "m3"]}
+        ])
+    };
+    struct Soft;
+    impl RailVisibility for Soft {
+        fn seen(&self, id: &Ref) -> Seen {
+            match id.to_string().as_str() {
+                "m2" => Seen::Tombstone(Tomb { text: "dismissed before compaction · u show".into(), token: 3 }),
+                "m3" => Seen::Hidden,
+                _ => Seen::Shown,
+            }
+        }
+    }
+    let d = drawn(&[ops("m2's text")]);
+    let l = layout(&d, &Soft, &Local::default());
+    let g = l.section(&r("g")).expect("g");
+    let ids: Vec<String> = g.s.members.iter().map(|m| m.block.id.to_string()).collect();
+    assert_eq!(ids, ["m1", "m2"], "m3 hidden: out of the list");
+    assert_eq!(g.tombs, vec![None, Some(Tomb { text: "dismissed before compaction · u show".into(), token: 3 })]);
+    assert_eq!(lines(&g.s, &State::Open, &Local::default(), &est, None), 2, "a tombstone is one line");
+    // Its structure: a member shown or a tombstone differs.
+    let shown = layout(&d, &AllShown, &Local::default());
+    let sh = |l: &Layout| shape(l, &Local::default(), &est, &|_| None);
+    let hide3 = {
+        struct Hide;
+        impl RailVisibility for Hide {
+            fn seen(&self, id: &Ref) -> Seen {
+                if id.to_string() == "m3" { Seen::Hidden } else { Seen::Shown }
+            }
+        }
+        layout(&d, &Hide, &Local::default())
+    };
+    assert_ne!(sh(&l), sh(&hide3), "a tombstone's place in the structure");
+    assert_ne!(sh(&shown), sh(&hide3));
+    // The agent's change under the tombstone: the same structure.
+    let d2 = drawn(&[ops("m2's text"), json!([{"op": "patch", "id": "m2", "set": {"text": "changed"}}])]);
+    assert_eq!(sh(&layout(&d2, &Soft, &Local::default())), sh(&l));
+}
+
+/// The structure the rail's lease compares (Shady #104 P2-2, D5's rule): a
+/// note open and whole is as tall as its text lays out, so its text is in
+/// it (a patch of the same length can wrap longer); a note cut is its
+/// fixed lines whatever its text.
+#[test]
+fn a_whole_notes_text_is_in_the_structure_a_cut_ones_is_not() {
+    let put = |id: &str, text: &str| json!({"op": "put", "id": id, "kind": "note", "title": id, "target": "rail", "slot": "upper", "body": {"text": text}});
+    let long = "x".repeat(40 * 14);
+    let d = |a: &str, b: &str| {
+        drawn(&[json!([put("short", a), put("long", &long)]), json!([{"op": "patch", "id": "long", "set": {"text": b}}])])
+    };
+    let sh = |d: &Drawn| shape(&layout(d, &AllShown, &Local::default()), &Local::default(), &est, &|_| None);
+    let other = "y".repeat(40 * 14);
+    assert_ne!(sh(&d("aaaa bbbb", &long)), sh(&d("aaaabbbb", &long)), "whole: its text (a space out: the same lines)");
+    assert_eq!(sh(&d("aaaa bbbb", &long)), sh(&d("aaaa bbbb", &other)), "cut: its fixed lines");
 }

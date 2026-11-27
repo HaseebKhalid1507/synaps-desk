@@ -459,3 +459,381 @@ fn a_section_arriving_glides_open_and_one_leaving_glides_shut(cx: &mut TestAppCo
     assert!(!has_sec(cx, w, "file"), "Reduced: file gone at once");
     assert!(glide(cx, w, "extra2") > 0., "and extra2 there at once");
 }
+
+// -- Shady #104 round 2 --------------------------------------------------------
+
+/// P2-1: the rail's renderer state keeps to what it draws. A thousand
+/// sections come and go in one session (a constant board: each round
+/// removes the last one and puts the next): its painted targets and the
+/// chrome's reveals stay where they began, a section leaving keeps its
+/// own until its glide is over, and none outlive the session on screen.
+#[gpui_kit::test]
+fn the_rails_caches_keep_to_what_it_draws(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let kept = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.rail_retained());
+    let put = |k: usize| {
+        let mut o = vec![
+            json!({"op": "put", "id": format!("c{k}"), "kind": "status", "title": "C", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": format!("round {k}")}}),
+        ];
+        if k > 0 {
+            o.insert(0, json!({"op": "remove", "id": format!("c{}", k - 1)}));
+        }
+        Value::Array(o)
+    };
+    // Full: one round in, its glides over.
+    ops(cx, w, &view, "toolu_c0", put(0));
+    wait(cx, w, &view, 1000);
+    let base = kept(cx);
+    assert!(base.0 > 0 && base.1 > 0, "the rail's targets and reveals: {base:?}");
+    // Leaving, c0 keeps its records while it glides shut, then gives them up.
+    ops(cx, w, &view, "toolu_c1", put(1));
+    wait(cx, w, &view, 80);
+    assert!(has_sec(cx, w, "c0"), "c0 glides shut");
+    wait(cx, w, &view, 1000);
+    assert!(!has_sec(cx, w, "c0"));
+    assert_eq!(kept(cx), base, "c0's records went with its glide");
+    // Reduced: a thousand rounds at once (the records are made the same way).
+    super::motion_level(cx, &view, crate::motion::Level::Reduced);
+    for k in 2..1002 {
+        ops(cx, w, &view, &format!("toolu_c{k}"), put(k));
+        let now = kept(cx);
+        assert!(now.0 <= base.0 && now.1 <= base.1, "round {k}: {now:?}, began at {base:?}");
+    }
+    // The last one removed: file has its place back, and the upper slot's
+    // `+N` row goes.
+    ops(cx, w, &view, "toolu_cz", json!([{"op": "remove", "id": "c1001"}]));
+    let end = kept(cx);
+    assert!(end.0 < base.0 && end.1 <= base.1, "retired: {end:?} of {base:?}");
+    // Another session on screen: none of this one's.
+    open_session(cx, w, &view, crate::demo::SID, Place::Current);
+    wait(cx, w, &view, 1000);
+    assert_eq!(kept(cx), (0, 0), "the session's rail state went with it");
+}
+
+/// The panel at its 296 px floor (1600 px wide: the right panel's default).
+fn floor(cx: &mut TestAppContext) -> W {
+    let (w, view) = rail_at(cx, 1600., TALL);
+    let zone = f32::from(drawn(cx, w, "agent-zone 0".into()).size.width);
+    assert!((zone - crate::app::FLOORS.1).abs() <= 1., "the floor: {zone}");
+    (w, view)
+}
+
+fn note_h(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str) -> f32 {
+    f32::from(drawn(cx, w, format!("agent-note {}", row(name))).size.height)
+}
+
+/// P2-2: a note's height is its text as laid out, not an estimate. At the
+/// floor its text has 226 px: two texts of 56 characters, one 2 lines as
+/// laid out and the other 3 (the same count, other words). The patch from
+/// one to the other moves what is under the pointer, so it waits.
+#[gpui_kit::test]
+fn a_patch_of_the_same_length_that_wraps_longer_waits_under_the_pointer(cx: &mut TestAppContext) {
+    let (w, view) = floor(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let two = format!("{} {}", "x".repeat(27), "x".repeat(28));
+    let three = format!("{} {} {}", "x".repeat(20), "x".repeat(20), "x".repeat(14));
+    assert_eq!(two.len(), three.len());
+    let put = json!([{"op": "put", "id": "wrap", "kind": "note", "title": "Wrap", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": two}}]);
+    ops(cx, w, &view, "toolu_w1", put);
+    wait(cx, w, &view, 1000);
+    assert_eq!(note_h(cx, w, "wrap"), 40., "two lines as laid out");
+    let laid = view.read_with(cx, |v, _| v.rail_text_w());
+    let nw = f32::from(drawn(cx, w, format!("agent-note {}", row("wrap"))).size.width);
+    assert_eq!(nw, laid, "the text is as wide as the rail lays it out");
+    let at = head(cx, w, "cause");
+    let y0 = sec(cx, w, "cause").top();
+    mouse(cx, w, at, "move");
+    ops(cx, w, &view, "toolu_w2", json!([{"op": "patch", "id": "wrap", "set": {"text": three}}]));
+    assert!(waiting(cx, &view), "a patch that lays out a line longer waits");
+    assert_eq!(sec(cx, w, "cause").top(), y0, "cause stays under the pointer");
+    away(cx, w);
+    wait(cx, w, &view, 1000);
+    assert!(!waiting(cx, &view));
+    assert_eq!(note_h(cx, w, "wrap"), 60., "then it lands: three lines");
+}
+
+/// P2-2: a note longer than its lines as laid out is cut there, with
+/// `more`, at the floor and wide: seven lines that each wrap to two (244
+/// bytes at the floor) are fourteen, not seven.
+#[gpui_kit::test]
+fn a_note_past_its_lines_as_laid_out_is_cut_with_more_at_296_and_520(cx: &mut TestAppContext) {
+    let (w, view) = floor(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let lines = |each: usize| vec!["W ".repeat(each); 7].join("\n");
+    let narrow = lines(17);
+    assert_eq!(narrow.len(), 244);
+    let put = json!([{"op": "put", "id": "tall", "kind": "note", "title": "Tall", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": narrow}}]);
+    ops(cx, w, &view, "toolu_t1", put);
+    wait(cx, w, &view, 1000);
+    let cut = 20. * crate::agent_rail::NOTE_LINES as f32;
+    let more = |cx: &mut TestAppContext, word: &str| has(cx, w, format!("agent-note-more {} {word}", row("tall")));
+    assert_eq!(note_h(cx, w, "tall"), cut, "296: fourteen lines as laid out, cut");
+    assert!(more(cx, "more"), "296: `more`");
+    // Opened: all fourteen.
+    let at = drawn(cx, w, format!("agent-note-more {} more", row("tall"))).center();
+    click(cx, w, at);
+    wait(cx, w, &view, 1000);
+    assert_eq!(note_h(cx, w, "tall"), 280., "opened whole");
+    assert!(more(cx, "less"));
+    let at = drawn(cx, w, format!("agent-note-more {} less", row("tall"))).center();
+    click(cx, w, at);
+    wait(cx, w, &view, 1000);
+    // Wide (520 px: 450 px of text): the same text is seven lines, whole.
+    away(cx, w);
+    view.update(cx, |v, cx| {
+        let p = crate::theme::Panels { right_width: Some(520), ..v.panels };
+        v.set_panels_pub(p, cx);
+    });
+    wait(cx, w, &view, 1500);
+    assert_eq!(note_h(cx, w, "tall"), 140., "520: seven lines");
+    assert!(!more(cx, "more") && !more(cx, "less"), "520: no `more`");
+    // Seven lines of 60 characters: fourteen at 520, cut.
+    ops(cx, w, &view, "toolu_t2", json!([{"op": "patch", "id": "tall", "set": {"text": lines(30)}}]));
+    wait(cx, w, &view, 1000);
+    assert_eq!(note_h(cx, w, "tall"), cut, "520: fourteen lines as laid out, cut");
+    assert!(more(cx, "more"), "520: `more`");
+}
+
+fn head_y(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str) -> f32 {
+    f32::from(drawn(cx, w, format!("agent-head {}", row(name))).top())
+}
+
+/// An agent op `ops` that glides moves `target`'s header. Full: pressed
+/// mid-glide, the pointer holds the glide (its header stays where the
+/// pointer found it) and the press does nothing, once; the glide lands
+/// once the pointer leaves, and a press just after does nothing once too
+/// (the window runs from the motion's end); 700 ms on, a click acts.
+/// Reduced and Off: it moves at once, and a press just after does nothing
+/// once.
+fn moved_by(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool: &str, o: Value, target: &str, fluid: bool) {
+    away(cx, w);
+    let y = head_y(cx, w, target);
+    ops(cx, w, view, tool, o);
+    let was = open(cx, w, target);
+    if fluid {
+        wait(cx, w, view, 80);
+        let at = head(cx, w, target);
+        mouse(cx, w, at, "move");
+        let y0 = head_y(cx, w, target);
+        assert!((y0 - y).abs() > 0.5, "{tool}: mid-glide, {target} on its way ({y} → {y0})");
+        for k in 0..6 {
+            wait(cx, w, view, 40);
+            mouse(cx, w, at, "move");
+            assert_eq!(head_y(cx, w, target), y0, "{tool}: held under the pointer ({k})");
+        }
+        mouse(cx, w, at, "down");
+        mouse(cx, w, at, "up");
+        assert_eq!(says(cx, view), Some((row(target), crate::lease::MOVED)), "{tool}: pressed mid-glide, nothing");
+        assert_eq!(open(cx, w, target), was, "{tool}: nothing folded");
+        away(cx, w);
+        wait(cx, w, view, 1000);
+    }
+    assert!((head_y(cx, w, target) - y).abs() > 0.5, "{tool}: {target} moved");
+    let at = head(cx, w, target);
+    click(cx, w, at);
+    assert_eq!(says(cx, view), Some((row(target), crate::lease::MOVED)), "{tool}: just after the glide, nothing");
+    assert_eq!(open(cx, w, target), was, "{tool}: nothing folded");
+    away(cx, w);
+    wait(cx, w, view, 700);
+    let at = head(cx, w, target);
+    click(cx, w, at);
+    wait(cx, w, view, 1000);
+    assert_eq!(open(cx, w, target), !was, "{tool}: 700 ms on, the click acts");
+    // Back as it was.
+    let at = head(cx, w, target);
+    click(cx, w, at);
+    wait(cx, w, view, 1000);
+    away(cx, w);
+}
+
+/// P2-3: an agent op's glides keep their provenance to their end: a
+/// section arriving above, one leaving, one folding (the agent's
+/// collapse), each moving `cause` below it.
+#[gpui_kit::test]
+fn what_an_agent_glide_moves_is_just_moved_to_its_end_and_held_under_the_pointer(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    let arrive = json!([{"op": "put", "id": "extra", "kind": "status", "title": "Extra", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": "one more"}}]);
+    moved_by(cx, w, &view, "toolu_p1", arrive, "cause", true);
+    moved_by(cx, w, &view, "toolu_p2", json!([{"op": "collapse", "id": "plan"}]), "cause", true);
+    moved_by(cx, w, &view, "toolu_p3", json!([{"op": "remove", "id": "extra"}]), "cause", true);
+    assert_eq!(settle(cx, w, 8), 0, "at rest");
+}
+
+#[gpui_kit::test]
+fn what_an_agent_op_moves_at_once_is_just_moved_reduced_and_off(cx: &mut TestAppContext) {
+    for (k, level) in [crate::motion::Level::Reduced, crate::motion::Level::Off].into_iter().enumerate() {
+        let (w, view) = rail(cx);
+        super::motion_level(cx, &view, level);
+        go(cx, w, &view);
+        let arrive = json!([{"op": "put", "id": "extra", "kind": "status", "title": "Extra", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": "one more"}}]);
+        moved_by(cx, w, &view, &format!("toolu_q{k}1"), arrive, "cause", false);
+        moved_by(cx, w, &view, &format!("toolu_q{k}2"), json!([{"op": "collapse", "id": "plan"}]), "cause", false);
+        moved_by(cx, w, &view, &format!("toolu_q{k}3"), json!([{"op": "remove", "id": "extra"}]), "cause", false);
+    }
+}
+
+/// No control, bidi or invisible character, nor a line break.
+fn clean(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control() || cards_spec::sanitize::is_invisible(c) || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+/// P2-4: NOW draws the agent's strings as the desk's sanitizer has them:
+/// a read's path, a search's pattern, an extension tool's name and a
+/// prompt's scope, each with bidi overrides and isolates, C0 and C1
+/// controls and line breaks; its own counts whole.
+#[gpui_kit::test]
+fn now_draws_tool_and_prompt_strings_sanitized(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    go(cx, w, &view);
+    let call = |id: &str, name: &str, input: Value| {
+        vec![
+            llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": name, "tool_id": id})),
+            llm(json!({"kind": "llm", "llm": "tool_use", "tool_name": name, "tool_id": id, "input": input})),
+            llm(json!({"kind": "llm", "llm": "tool_started", "tool_id": id})),
+        ]
+    };
+    let mut evs = vec![llm(json!({"kind": "llm", "llm": "response_start"}))];
+    evs.extend(call("toolu_s1", "read", json!({"path": "src/\u{202E}evil\u{202C}.rs\nmore"})));
+    evs.extend(call("toolu_s2", "grep", json!({"pattern": "a\u{0007}b\u{2066}c\u{2069}\td", "path": "."})));
+    evs.extend(call("toolu_s3", "ext\u{0085}scan\u{200F}\u{001B}[2J", json!({"q": "x\u{2028}y"})));
+    heard(cx, w, &view, evs);
+    settle(cx, w, 8);
+    let now = |cx: &mut TestAppContext| {
+        let text = view.read_with(cx, |v, _| v.rail_now().text());
+        assert!(clean(&text), "NOW sanitized: {text:?}");
+        assert!(has(cx, w, format!("agent-now {text}")), "drawn as {text:?}");
+        text
+    };
+    let first = now(cx);
+    assert!(first.starts_with("read src/evil.rs") && first.ends_with("  +2 running"), "{first:?}");
+    let done = |id: &str| llm(json!({"kind": "llm", "llm": "tool_result", "tool_id": id, "result": "ok"}));
+    heard(cx, w, &view, vec![done("toolu_s1")]);
+    let second = now(cx);
+    assert!(second.starts_with("grep") && second.ends_with("  +1 running"), "{second:?}");
+    heard(cx, w, &view, vec![done("toolu_s2")]);
+    let third = now(cx);
+    assert!(third.starts_with("extscan"), "{third:?}");
+    heard(cx, w, &view, vec![done("toolu_s3")]);
+    let prompt = json!({"ev": "prompt", "request": {"id": 9, "kind": "confirm", "title": "Confirm tool call", "prompt": "p",
+        "confirm_scope": {"extensions": ["guard"], "tool": "ed\u{2066}it\u{0000}\u{009B}"}}});
+    heard(cx, w, &view, vec![prompt]);
+    assert_eq!(now(cx), "waiting for you · allow edit");
+}
+
+/// A visibility of D6b's (the seam): `n1` softly dismissed (its
+/// tombstone), `n3` dismissed.
+struct Soft;
+
+impl crate::agent_rail::RailVisibility for Soft {
+    fn seen(&self, id: &Ref) -> crate::agent_rail::Seen {
+        match id.to_string().as_str() {
+            "n1" => crate::agent_rail::Seen::Tombstone(crate::agent_rail::Tomb {
+                text: "dismissed before compaction · u show".into(),
+                token: 7,
+            }),
+            "n3" => crate::agent_rail::Seen::Hidden,
+            _ => crate::agent_rail::Seen::Shown,
+        }
+    }
+}
+
+/// P2-5: a group's member the visibility says is a tombstone draws as
+/// its tombstone, never its content (an agent change to it included); a
+/// hidden member leaves the group; a shown one draws as itself.
+#[gpui_kit::test]
+fn a_group_members_tombstone_draws_as_one_never_its_content(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    view.update(cx, |v, cx| {
+        v.agent_rail.vis = Some(std::rc::Rc::new(Soft));
+        cx.notify();
+    });
+    go(cx, w, &view);
+    away(cx, w);
+    let add = json!([
+        {"op": "put", "id": "n3", "kind": "note", "title": "Hidden", "target": "rail", "slot": "end", "body": {"text": "not drawn"}},
+        {"op": "merge", "into": "findings", "ids": ["n3"]}
+    ]);
+    ops(cx, w, &view, "toolu_v1", add);
+    let at = head(cx, w, "findings");
+    click(cx, w, at);
+    wait(cx, w, &view, 1000);
+    assert!(open(cx, w, "findings"), "the group open");
+    let g = row("findings");
+    let tomb = format!("agent-member-tomb {g} {} dismissed before compaction · u show", row("n1"));
+    let member = |cx: &mut TestAppContext, n: &str| has(cx, w, format!("agent-member {g} {}", row(n)));
+    assert!(has(cx, w, tomb.clone()), "n1 draws as its tombstone");
+    assert!(!member(cx, "n1"), "never its content");
+    assert!(member(cx, "n2"), "n2 as itself");
+    assert!(!member(cx, "n3") && !has(cx, w, format!("agent-member-tomb {g} {}", row("n3"))), "n3 hidden");
+    // The agent changes n1: still its tombstone.
+    away(cx, w);
+    ops(cx, w, &view, "toolu_v2", json!([{"op": "patch", "id": "n1", "set": {"text": "Changed under the tombstone"}}]));
+    wait(cx, w, &view, 1000);
+    assert!(has(cx, w, tomb), "n1 still its tombstone");
+    assert!(!member(cx, "n1"));
+    let layout = view.read_with(cx, |v, _| v.rail_layout().map(|(_, l)| l.section(&Ref::parse("findings").expect("an id")).cloned()));
+    let sec = layout.flatten().expect("findings");
+    let ids: Vec<String> = sec.s.members.iter().map(|m| m.block.id.to_string()).collect();
+    assert_eq!(ids, ["n1", "n2"], "n3 left the group's list");
+    assert_eq!(
+        sec.tombs.iter().map(|t| t.as_ref().map(|t| (t.text.to_string(), t.token))).collect::<Vec<_>>(),
+        vec![Some(("dismissed before compaction · u show".to_string(), 7)), None]
+    );
+}
+
+/// P3: a header's controls keep their place at the floor and wide: a
+/// replaced block past a thousand revisions keeps its chip, its revision
+/// (cut, whole in its tooltip) and its chevron inside the header.
+#[gpui_kit::test]
+fn a_long_revision_keeps_the_headers_controls_inside_at_296_and_520(cx: &mut TestAppContext) {
+    let (w, view) = floor(cx);
+    go(cx, w, &view);
+    away(cx, w);
+    let put = json!([{"op": "put", "id": "big", "kind": "status", "title": "A long title for a status", "target": "rail", "slot": "upper", "at": {"after": "plan"}, "body": {"text": "r0"}}]);
+    ops(cx, w, &view, "toolu_b0", put);
+    let again = json!([{"op": "replace", "id": "big", "kind": "status", "why": "again", "body": {"text": "again"}}]);
+    ops(cx, w, &view, "toolu_b1", again);
+    let calls: Vec<(String, Value)> = (0..63)
+        .map(|k| {
+            let o: Vec<Value> = (0..16).map(|j| json!({"op": "patch", "id": "big", "set": {"text": format!("{k}.{j}")}})).collect();
+            (format!("toolu_bp{k}"), Value::Array(o))
+        })
+        .collect();
+    let calls: Vec<(&str, Value, bool)> = calls.iter().map(|(t, o)| (t.as_str(), o.clone(), true)).collect();
+    round(cx, w, &view, &calls);
+    wait(cx, w, &view, 1000);
+    let rev = view.read_with(cx, |v, _| {
+        v.rail_layout()
+            .and_then(|(_, l)| l.section(&Ref::parse("big").expect("an id")).map(|s| (s.s.block.rev, s.s.block.replaced.is_some())))
+    });
+    let (n, replaced) = rev.expect("big");
+    assert!(n >= 1000 && replaced, "r{n}, replaced {replaced}");
+    let b = row("big");
+    let inside = |cx: &mut TestAppContext, at: &str| {
+        let h = drawn(cx, w, format!("agent-head {b}"));
+        let chip = drawn(cx, w, format!("agent-chip {b}"));
+        let chev = drawn(cx, w, format!("agent-chevron {b}"));
+        let rev = drawn(cx, w, format!("agent-rev {b} r{n} · replaced"));
+        for (what, r) in [("chip", chip), ("revision", rev), ("chevron", chev)] {
+            assert!(
+                r.left() >= h.left() - px(0.5) && r.right() <= h.right() + px(0.5),
+                "{at}: the {what} inside the header: {r:?} in {h:?}"
+            );
+        }
+        assert!((f32::from(chev.size.width) - 10.).abs() <= 0.5, "{at}: the chevron's 10 px");
+        assert!(f32::from(chip.size.width) >= 40., "{at}: the chip whole: {chip:?}");
+        assert!(chip.right() <= rev.left() && rev.right() <= chev.left() + px(0.5), "{at}: in order");
+    };
+    inside(cx, "296");
+    view.update(cx, |v, cx| {
+        let p = crate::theme::Panels { right_width: Some(520), ..v.panels };
+        v.set_panels_pub(p, cx);
+    });
+    wait(cx, w, &view, 1500);
+    inside(cx, "520");
+}

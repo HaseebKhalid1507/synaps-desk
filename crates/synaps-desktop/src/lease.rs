@@ -389,6 +389,10 @@ impl AppView {
     /// The lease's end, the pointer gone or a key: a board that waited
     /// draws, unless a lease still holds it.
     pub(crate) fn lease_release(&mut self, cx: &mut Context<Self>) {
+        // The rail's glides held under its lease go on.
+        if self.rail_gliding() {
+            cx.notify();
+        }
         for live in self.model.lives.ids() {
             if let Some(d) = self.model.lives[live].board.waiting.take()
                 && d.epoch == self.model.lives[live].transcript.blocks_epoch()

@@ -9903,6 +9903,10 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        // The rail lays its notes out as the window's text system does.
+        if self.agent_rail.text.as_ref().is_none_or(|t| !Rc::ptr_eq(t, window.text_system())) {
+            self.agent_rail.text = Some(window.text_system().clone());
+        }
         self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);

@@ -21,6 +21,11 @@
 //!   structure ([`crate::agent_rail::shape`]: a cap change, a section
 //!   added, removed, reordered, replaced or changing height) waits, the
 //!   whole board with it (the transcript's rule: one coherent board).
+//!   A note's height is its text as laid out by the window's text system
+//!   at the rail's face, size and width ([`AppView::rail_note_lines`]),
+//!   never an estimate: its cut and `more`, and the structure, follow it.
+//!   An agent op's glides already in flight hold where they are while the
+//!   lease holds, and go on from there once it ends ([`AppView::rail_reveal`]).
 //!   A user's own click applies at once, the fold it causes included,
 //!   and the header clicked keeps its screen y: a section folding above
 //!   it scrolls the panel instead, as far as the panel can ([`KeepY`]).
@@ -29,7 +34,15 @@
 //!   target and holds the lease; up acts only if the bound board still
 //!   holds it, else `this block changed · look again`. A target an agent
 //!   op moved in the last 600 ms does nothing, once (`this moved just
-//!   now`). The rail's frames are counted like a pane's.
+//!   now`): its glides' frames are the agent op's until they land, so the
+//!   window runs from the motion's end. The rail's frames are counted like
+//!   a pane's.
+//! - **What it keeps** keeps to what it draws ([`AppView::rail_retire`]):
+//!   its painted targets and its glides go with their rows (one leaving
+//!   once its glide is over), bounded by the board's caps for the
+//!   session's life.
+//! - **NOW** draws a call's verb and target and a prompt's scope through
+//!   the desk's sanitizer (`Now::text`).
 //! - **Motion.** A section's body opens and folds on the glide, the panel
 //!   chrome's motion ([`crate::motion::Motion::chrome`]); a section that
 //!   arrives glides open from nothing, and one that goes (past the cap, a
@@ -86,9 +99,22 @@ const GAP: f32 = 8.;
 /// A section's margin above it, inside its arrival's glide: [`KeepY`]
 /// keeps the section's own top, not its glide's.
 const ABOVE: f32 = 8.;
-/// A section's left and right padding in the panel (its sections'): 248
-/// px of content at the panel's 296 px floor (§4).
+/// A section's left and right padding in the panel (its sections'): 247
+/// px of content at the panel's 296 px floor (§4), inside its border.
 pub(crate) const INSET: f32 = 24.;
+/// The panel's left border (`render_right`'s `border_l_1`): its content is
+/// this much narrower than the panel.
+const EDGE: f32 = 1.;
+/// A header's title keeps this much before its revision is cut.
+const TITLE_MIN: f32 = 48.;
+/// A revision cut keeps at least this much (`r12…`).
+const REV_MIN: f32 = 24.;
+/// The `AGENT` chip's padding, each side.
+const CHIP_PAD: f32 = 4.;
+/// The chevron's box.
+const CHEVRON: f32 = 10.;
+/// The flexible space before the revision, at least.
+const SPACER: f32 = 4.;
 
 /// What a press in the rail acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,8 +155,23 @@ pub(crate) struct RailState {
     /// The sections the rail drew last frame and this one: one not drawn
     /// last frame arrives ([`RailState::arrives`]).
     seen: RefCell<Seen>,
-    /// The sections' content width as last drawn (the lease's note wrap).
+    /// The panel's content width inside its insets, as last drawn (a
+    /// note's wrap, a header's budget, for the lease too).
     pub(crate) inner: Cell<f32>,
+    /// The rows the rail draws this frame, either slot: its sections, those
+    /// leaving and its `+N` rows. Its records keep to them
+    /// ([`AppView::rail_retire`]).
+    drew_rows: RefCell<HashSet<u64>>,
+    /// Its glides ([`AppView::rail_reveal`]).
+    glides: RefCell<Glides>,
+    /// The rail frame that draws the last board published (an agent op's).
+    landed: Cell<Option<u64>>,
+    /// The window's text system, as the window last drew: a note's lines
+    /// as laid out ([`AppView::rail_note_lines`]).
+    pub(crate) text: Option<Rc<WindowTextSystem>>,
+    /// Tests: a visibility in place of D6a's [`AllShown`] (D6b's seam).
+    #[cfg(test)]
+    pub(crate) vis: Option<Rc<dyn RailVisibility>>,
 }
 
 /// The sections drawn, by rail frame ([`RailState::drew`]).
@@ -151,6 +192,27 @@ struct Drew {
     at: usize,
     listed: bool,
     sec: Section,
+}
+
+/// The rail's glides (its sections' arrivals, leavings and bodies: reveals
+/// in the chrome's motion), by key: each one's target as last drawn, and
+/// those an agent op started that still move ([`Flight`]).
+#[derive(Default)]
+struct Glides {
+    to: HashMap<u64, bool>,
+    agent: HashMap<u64, Flight>,
+    /// An agent op's glides moved as the last rail frame ended.
+    flight: bool,
+    /// One was held this frame (the rail's lease).
+    held: bool,
+}
+
+/// An agent op's glide in flight: the fraction it showed last (NaN: not
+/// stepped yet), its height's cell, and since when it is held.
+struct Flight {
+    k: f32,
+    sink: Rc<Cell<f32>>,
+    held: Option<Instant>,
 }
 
 /// How a section's frame comes: there, arriving or leaving.
@@ -252,7 +314,18 @@ impl AppView {
     /// its dismissals, pins and slot moves; D6a shows everything where the
     /// board places it).
     pub(crate) fn rail_visibility(&self, _live: LiveId) -> &dyn RailVisibility {
+        #[cfg(test)]
+        if let Some(v) = self.agent_rail.vis.as_deref() {
+            return v;
+        }
         &ALL_SHOWN
+    }
+
+    /// Tests: what the rail retains of its renderer state: its painted
+    /// targets and the chrome's reveals.
+    #[cfg(test)]
+    pub(crate) fn rail_retained(&self) -> (usize, usize) {
+        (self.agent_rail.lease.painted.borrow().len(), self.fx.chrome().reveal_count())
     }
 
     /// The agent zone's footer (D6b's seam: `1 dismissed · show`). D6a has
@@ -286,11 +359,51 @@ impl AppView {
         self.rail_layout().map_or(0, |(_, l)| l.sections)
     }
 
-    /// A note's characters a line in the rail.
-    fn rail_cpl(&self) -> f32 {
+    /// A section's content width in the rail (a header's, a note's text's):
+    /// the panel's content as last drawn, less the spine and the padding.
+    pub(crate) fn rail_text_w(&self) -> f32 {
         let inner = self.agent_rail.inner.get();
-        let inner = if inner > 0. { inner } else { 248. };
-        (inner - SPINE - 2. * PAD) / (size::TITLE * 0.5)
+        let inner = if inner > 0. { inner } else { crate::app::FLOORS.1 - EDGE - 2. * INSET };
+        (inner - SPINE - 2. * PAD).max(1.)
+    }
+
+    /// A note's lines as laid out in the rail: its text as drawn, at its
+    /// face, size and width, wrapped by the window's text system as its
+    /// text element wraps it (the same call, cached for the frame: the
+    /// layout reuses it). The renderer's cut and `more`, and the lease's
+    /// shape, are this count. No window drawn yet: the estimate.
+    pub(crate) fn rail_note_lines(&self, text: &str) -> usize {
+        let shown = crate::ask::shown(text, cards_spec::Lines::Multi);
+        let w = self.rail_text_w();
+        let Some(ts) = self.agent_rail.text.as_ref() else { return crate::blocks::note_lines(&shown, w / (size::TITLE * 0.5)) };
+        let run = TextRun {
+            len: shown.len(),
+            font: font(fonts::SANS),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let est = crate::blocks::note_lines(&shown, w / (size::TITLE * 0.5));
+        match ts.shape_text(shown.into(), px(size::TITLE), &[run], Some(px(w)), None) {
+            Ok(lines) => lines.iter().map(|l| l.wrap_boundaries().len() + 1).sum::<usize>().max(1),
+            Err(_) => est,
+        }
+    }
+
+    /// `text`'s width in the mono face at `size`, as drawn (no window drawn
+    /// yet: its 0.6 em columns).
+    fn rail_mono_w(&self, text: &str, size: f32) -> f32 {
+        let Some(ts) = self.agent_rail.text.as_ref() else { return text.chars().count() as f32 * size * 0.6 };
+        let run = TextRun {
+            len: text.len(),
+            font: font(fonts::MONO),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(ts.shape_line(text.to_string().into(), px(size), &[run], None).width).ceil()
     }
 
     /// A diff's lines and foot as the rail draws them, for store `live`.
@@ -304,7 +417,7 @@ impl AppView {
     fn rail_shape(&self, live: LiveId, d: &Drawn) -> u64 {
         let l = self.rail_of(live, d);
         let local = self.model.lives[live].active.as_ref().map_or(&*EMPTY, |a| self.agent_rail.local(&a.session_id));
-        ar::shape(&l, local, self.rail_cpl(), &|s| self.rail_diff(live, s))
+        ar::shape(&l, local, &|t| self.rail_note_lines(t), &|s| self.rail_diff(live, s))
     }
 
     /// Whether board `new` for store `live` would change the rail under the
@@ -337,6 +450,7 @@ impl AppView {
         if self.panes.cur.live == live {
             let l = &self.agent_rail.lease;
             l.agent_frame.set(Some(l.frame.get() + 1));
+            self.agent_rail.landed.set(Some(l.frame.get() + 1));
         }
     }
 
@@ -390,12 +504,97 @@ impl AppView {
     pub(crate) fn rail_frame(&self) {
         let f = &self.agent_rail.lease.frame;
         f.set(f.get() + 1);
+        self.agent_rail.drew_rows.borrow_mut().clear();
         let s = self.rail_sid();
         let mut of = self.agent_rail.painted_of.borrow_mut();
         if of.as_deref() != s {
             self.agent_rail.lease.painted.borrow_mut().clear();
             *of = s.map(str::to_string);
         }
+    }
+
+    /// Key `key`'s glide toward `open` (the chrome's reveal), and where it
+    /// came from: a target changed in the frame that draws a board
+    /// published is an agent op's, in any other the user's (their fold, a
+    /// `+N` list, a resize: never held, never marked). One of an agent op's
+    /// still moving holds where it was drawn while the rail's lease holds
+    /// (§6.2: the geometry under the pointer stays, the glide in flight
+    /// too), and goes on from there once it ends.
+    fn rail_reveal(&self, key: u64, open: bool) -> (Option<f32>, Rc<Cell<f32>>) {
+        let r = &self.agent_rail;
+        let (frame, now) = (r.lease.frame.get(), self.fx.now());
+        let chrome = self.fx.chrome();
+        let mut g = r.glides.borrow_mut();
+        let g = &mut *g;
+        if g.to.insert(key, open) != Some(open) {
+            if r.landed.get() == Some(frame) {
+                g.agent.insert(key, Flight { k: f32::NAN, sink: Rc::default(), held: None });
+            } else {
+                g.agent.remove(&key);
+            }
+        }
+        if let Some(e) = g.agent.get_mut(&key).filter(|e| !e.k.is_nan()) {
+            if r.lease.active(now) {
+                e.held.get_or_insert(now);
+                g.held = true;
+                chrome.hold_reveal(key);
+                return (Some(e.k), e.sink.clone());
+            }
+            if let Some(since) = e.held.take() {
+                chrome.resume_reveal(key, now.saturating_duration_since(since));
+            }
+        }
+        let (shown, sink) = chrome.reveal(key, open, Duration::ZERO, 0);
+        match shown {
+            Some(k) => {
+                if let Some(e) = g.agent.get_mut(&key) {
+                    (e.k, e.sink) = (k, sink.clone());
+                }
+            }
+            None => {
+                g.agent.remove(&key);
+            }
+        }
+        (shown, sink)
+    }
+
+    /// The rail's frame drawn (both slots). What it keeps of its renderer
+    /// state keeps to what it drew: its painted targets and its glides in
+    /// the chrome's motion go with their rows (a section leaving keeps its
+    /// own until its glide is over; none of another session's, a new
+    /// generation's gone blocks or a rail no longer drawn), so they are
+    /// bounded by the board's caps for the session's life. While an agent
+    /// op's glides move, and in the frame they land in, the rail's frames
+    /// draw an agent op: what they move is just moved, from the motion's
+    /// end. A glide held asks one frame, at the lease's end.
+    pub(crate) fn rail_retire(&self) {
+        let r = &self.agent_rail;
+        let drew = r.drew_rows.borrow();
+        r.lease.painted.borrow_mut().retain(|row, _| drew.contains(row));
+        let keys: HashSet<u64> = drew.iter().flat_map(|row| [motion::key(ARRIVE, *row), motion::key(BODY, *row)]).collect();
+        let mut g = r.glides.borrow_mut();
+        let gone: Vec<u64> = g.to.keys().filter(|k| !keys.contains(k)).copied().collect();
+        for k in &gone {
+            g.to.remove(k);
+            g.agent.remove(k);
+        }
+        self.fx.chrome().forget_reveals(&gone);
+        let flight = !g.agent.is_empty();
+        if flight || g.flight {
+            r.lease.agent_frame.set(Some(r.lease.frame.get()));
+        }
+        g.flight = flight;
+        if std::mem::take(&mut g.held)
+            && !r.lease.pressed
+            && let Some(t) = r.lease.moved
+        {
+            self.fx.want_at(t + crate::lease::LEASE);
+        }
+    }
+
+    /// An agent op's glides in flight in the rail (moving, or held).
+    pub(crate) fn rail_gliding(&self) -> bool {
+        self.agent_rail.glides.borrow().flight
     }
 
     /// Slot `slot`'s zone in the panel `width` px wide, if the rail has one:
@@ -413,7 +612,7 @@ impl AppView {
         let session = self.rail_sid()?.to_string();
         let live = self.panes.cur.live;
         let local = self.agent_rail.local(&session);
-        let inner = (width - 2. * INSET).max(0.);
+        let inner = (width - EDGE - 2. * INSET).max(0.);
         self.agent_rail.inner.set(inner);
         let streaming = self.model.lives[live].transcript.busy();
         let frame = self.agent_rail.lease.frame.get();
@@ -472,10 +671,9 @@ impl AppView {
             let come = self.agent_rail.drew(&session, frame, d.clone());
             draw.push((d, come));
         }
-        let chrome = self.fx.chrome();
         for d in gone {
             let row = crate::blocks::row_id(&d.sec.s.block.id);
-            if chrome.reveal(motion::key(ARRIVE, row), false, Duration::ZERO, 0).0.is_none() {
+            if self.rail_reveal(motion::key(ARRIVE, row), false).0.is_none() {
                 continue;
             }
             // After the last still drawn that came before it.
@@ -486,6 +684,13 @@ impl AppView {
                 .map_or_else(|| draw.iter().position(|(x, _)| x.listed == d.listed).unwrap_or(draw.len()), |i| i + 1);
             self.agent_rail.still(d.clone());
             draw.insert(at, (d, Come::Leave));
+        }
+        {
+            let mut drew = self.agent_rail.drew_rows.borrow_mut();
+            drew.extend(draw.iter().map(|(d, _)| crate::blocks::row_id(&d.sec.s.block.id)));
+            if l.more[k].is_some() {
+                drew.insert(MORE_ROW | k as u64);
+            }
         }
         for (d, come) in draw.iter().filter(|(d, _)| !d.listed) {
             zone = zone.child(self.rail_section(&d.sec, local, live, streaming, *come, p, cx));
@@ -585,7 +790,7 @@ impl AppView {
         let row = crate::blocks::row_id(&s.block.id);
         let tag = s.block.tag;
         if let State::Tombstone(t) = &sec.state {
-            let t = t.to_string();
+            let t = crate::ask::shown(&t.text, cards_spec::Lines::Single);
             return h_flex()
                 .mt(px(8.))
                 .h(px(24.))
@@ -597,12 +802,11 @@ impl AppView {
         }
         let open = sec.state == State::Open;
         let head = self.rail_head(sec, open, streaming, p, cx);
-        let chrome = self.fx.chrome();
         // The body opens and folds on the glide; one listed or folded has
         // its summary line, or nothing.
-        let (shown, sink) = chrome.reveal(motion::key(BODY, row), open, Duration::ZERO, 0);
+        let (shown, sink) = self.rail_reveal(motion::key(BODY, row), open);
         let body = (open || shown.is_some()).then(|| {
-            let b = self.rail_body(s, local, live, streaming, p, cx);
+            let b = self.rail_body(s, &sec.tombs, local, live, streaming, p, cx);
             crate::turns::revealed(b, shown, sink).debug_selector(move || format!("agent-body {row}"))
         });
         let summary = (sec.state == State::Summary).then(|| {
@@ -639,9 +843,9 @@ impl AppView {
         // and Reduced, at once); shut first in its first frame, then open.
         // Leaving: to nothing, the same way.
         if come == Come::Arrive {
-            let _ = chrome.reveal(motion::key(ARRIVE, row), false, Duration::ZERO, 0);
+            let _ = self.rail_reveal(motion::key(ARRIVE, row), false);
         }
-        let (grow, gsink) = chrome.reveal(motion::key(ARRIVE, row), come != Come::Leave, Duration::ZERO, 0);
+        let (grow, gsink) = self.rail_reveal(motion::key(ARRIVE, row), come != Come::Leave);
         let el = crate::turns::revealed(el.into_any_element(), grow, gsink)
             .debug_selector(move || format!("agent-glide {row}"))
             .into_any_element();
@@ -670,6 +874,13 @@ impl AppView {
         let says = self.agent_rail.lease.note.filter(|n| n.0 == row).map(|n| n.1);
         let press = RailPress { at: Target { row, tag }, act: RailAct::Fold };
         let turn = self.fx.chrome().turn(motion::key(TURN, row), open);
+        // The header's fixed chrome (its glyph, the AGENT chip, the
+        // chevron, the gaps) holds its width: the title gives way first,
+        // down to TITLE_MIN, then the revision is cut (whole in its
+        // tooltip).
+        let chip = self.rail_mono_w("AGENT", size::META) + 2. * CHIP_PAD;
+        let fixed = glyph::LIFE + chip + SPACER + CHEVRON + 5. * GAP;
+        let rev_max = (self.rail_text_w() - fixed - TITLE_MIN).max(REV_MIN);
         h_flex()
             .id(("agent-head", row))
             .h(px(HEAD))
@@ -700,7 +911,7 @@ impl AppView {
             .child(
                 div()
                     .flex_none()
-                    .px(px(4.))
+                    .px(px(CHIP_PAD))
                     .bg(p.well_d)
                     .font_family(fonts::MONO)
                     .text_px(size::META)
@@ -708,27 +919,58 @@ impl AppView {
                     .debug_selector(move || format!("agent-chip {row}"))
                     .child("AGENT"),
             )
-            .child(div().flex_1().min_w(px(4.)))
+            .child(div().flex_1().min_w(px(SPACER)))
             .child(match says {
                 Some(n) => mono(n, size::META, p.acc)
                     .flex_shrink(1.)
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .debug_selector(move || format!("agent-says {row} {n}")),
-                None => mono(rev.clone(), size::META, p.dim_t).flex_none().debug_selector({
-                    let t = format!("agent-rev {row} {rev}");
-                    move || t.clone()
-                }),
+                    .debug_selector(move || format!("agent-says {row} {n}"))
+                    .into_any_element(),
+                None => {
+                    let whole = rev.clone();
+                    mono(rev.clone(), size::META, p.dim_t)
+                        .id(("agent-rev", row))
+                        .flex_none()
+                        .max_w(px(rev_max))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .debug_selector({
+                            let t = format!("agent-rev {row} {rev}");
+                            move || t.clone()
+                        })
+                        .tooltip(move |window, cx| crate::overlay::tip(whole.clone(), window, cx))
+                        .into_any_element()
+                }
             })
-            .child(div().flex_none().w(px(10.)).flex().items_center().justify_end().child(glyph::turn(turn, p.dim_t)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(CHEVRON))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .debug_selector(move || format!("agent-chevron {row}"))
+                    .child(glyph::turn(turn, p.dim_t)),
+            )
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.rail_down(press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.rail_up(row, RailAct::Fold, cx)))
     }
 
     /// A section's body in its kind's layout, in 20 px lines, at most
     /// [`ar::LINES`] (§4's overflow per kind).
-    fn rail_body(&self, s: &Shown, local: &Local, live: LiveId, streaming: bool, p: &Palette, cx: &Context<Self>) -> AnyElement {
+    #[allow(clippy::too_many_arguments)]
+    fn rail_body(
+        &self,
+        s: &Shown,
+        tombs: &[Option<ar::Tomb>],
+        local: &Local,
+        live: LiveId,
+        streaming: bool,
+        p: &Palette,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let b = &s.block;
         let row = crate::blocks::row_id(&b.id);
         let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(crate::blocks::GLOW_KEYS, row ^ field.rotate_left(13)), v, c);
@@ -875,9 +1117,11 @@ impl AppView {
                 }
             }
             Body::Note(n) => {
-                let open = local.more.contains(&b.id);
-                let (_, cut) = ar::note_shown(&n.text, self.rail_cpl(), open);
-                let tall = crate::blocks::note_lines(&n.text, self.rail_cpl()) > ar::NOTE_LINES;
+                // Its lines as laid out: cut past them at a fixed height,
+                // with `more` (§4), whatever its alphabet.
+                let laid = self.rail_note_lines(&n.text);
+                let (_, cut) = ar::note_shown(laid, local.more.contains(&b.id));
+                let tall = laid > ar::NOTE_LINES;
                 let text_c =
                     glow(6, crate::blocks::bound_value(s, |b| if let Body::Note(x) = b { Some(x.text.clone()) } else { None }), p.prose_t);
                 col = col.child(
@@ -885,10 +1129,11 @@ impl AppView {
                         .w_full()
                         .font_family(fonts::SANS)
                         .text_px(size::TITLE)
+                        .font_weight(FontWeight::NORMAL)
                         .line_height(px(LINE))
                         .text_color(text_c)
                         .whitespace_normal()
-                        .when(cut, |d| d.max_h(px(LINE * ar::NOTE_LINES as f32)).overflow_hidden())
+                        .when(cut, |d| d.h(px(LINE * ar::NOTE_LINES as f32)).overflow_hidden())
                         .debug_selector(move || format!("agent-note {row}"))
                         .child(crate::ask::shown(&n.text, cards_spec::Lines::Multi)),
                 );
@@ -911,9 +1156,23 @@ impl AppView {
                 }
             }
             Body::Group(_) => {
-                for m in &s.members {
-                    let (life, _) = crate::blocks::life_of(&m.block.body, streaming);
+                for (j, m) in s.members.iter().enumerate() {
                     let mrow = crate::blocks::row_id(&m.block.id);
+                    // A member that is a tombstone (D6b's soft dismissal)
+                    // draws as its tombstone: nothing of its content.
+                    if let Some(Some(tomb)) = tombs.get(j) {
+                        let t = crate::ask::shown(&tomb.text, cards_spec::Lines::Single);
+                        col = col.child(
+                            line()
+                                .debug_selector({
+                                    let s = format!("agent-member-tomb {row} {mrow} {t}");
+                                    move || s.clone()
+                                })
+                                .child(text(t, p.dim_ch)),
+                        );
+                        continue;
+                    }
+                    let (life, _) = crate::blocks::life_of(&m.block.body, streaming);
                     col = col.child(
                         line()
                             .debug_selector(move || format!("agent-member {row} {mrow}"))

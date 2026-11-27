@@ -81,12 +81,30 @@ pub(crate) enum Seen {
     Shown,
     /// Not drawn (dismissed): it counts in the header's `M dismissed`
     /// only through [`RailVisibility::dismissed`].
+    #[cfg_attr(not(test), expect(dead_code, reason = "D6b's dismissals make it"))]
     Hidden,
-    /// Drawn as a fixed one-line tombstone saying this (e.g. `dismissed
-    /// before compaction · u show`): it takes no place under the cap.
+    /// Drawn as a fixed one-line tombstone ([`Tomb`]): it takes no place
+    /// under the cap. A group's member too: its line in the group is the
+    /// tombstone's, never the member's content.
     #[cfg_attr(not(test), expect(dead_code, reason = "D6b's soft dismissals make it; D6a draws it"))]
-    Tombstone(Arc<str>),
+    Tombstone(Tomb),
 }
+
+/// A soft dismissal's tombstone (D6b's, §3.5): what it says (e.g.
+/// `dismissed before compaction · u show`), and D6b's own token for the
+/// action it offers (the visibility version it was drawn at). D6a keeps
+/// the token with its tombstone through the layout to the section drawn
+/// ([`Section::tombs`], [`State::Tombstone`]) for D6b's action there, and
+/// in the structure (another token is a change under the lease); it never
+/// makes one from the text.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Tomb {
+    pub text: Arc<str>,
+    pub token: u64,
+}
+
+/// A section's block with its group's members' tombstones ([`layout`]).
+type Trimmed = (Shown, Vec<Option<Tomb>>);
 
 /// What this desk shows of the agent's rail sections and where: D6b's
 /// dismissals, pins and slot moves (`blocks.md` §3.5) live behind it. D6a
@@ -221,7 +239,7 @@ pub(crate) enum State {
     /// A leftover its slot's `+N` lists: its header alone.
     Listed,
     /// A tombstone ([`Seen::Tombstone`]): one line.
-    Tombstone(Arc<str>),
+    Tombstone(Tomb),
 }
 
 /// One section in its slot.
@@ -234,6 +252,9 @@ pub(crate) struct Section {
     pub state: State,
     /// An expansion the user made holds its place.
     pub expanded_by_user: bool,
+    /// A group's members' tombstones, in `s.members`' order (none: drawn
+    /// as itself). A hidden member is in neither.
+    pub tombs: Vec<Option<Tomb>>,
 }
 
 /// A slot's leftovers' row: `+2 more · plan, tests`.
@@ -288,14 +309,26 @@ fn top_level<'a>(d: &'a Drawn, id: &Ref) -> Option<&'a Shown> {
 pub(crate) fn layout(d: &Drawn, vis: &dyn RailVisibility, local: &Local) -> Layout {
     let placed = vis.placed();
     let mut out = Layout { dismissed: vis.dismissed(), ..Layout::default() };
-    // A member hidden leaves its group's list.
-    let trim =
-        |s: &Shown| Shown { members: s.members.iter().filter(|m| vis.seen(&m.block.id) != Seen::Hidden).cloned().collect(), ..s.clone() };
+    // A member hidden leaves its group's list; one a tombstone keeps its
+    // place there, as its tombstone.
+    let trim = |s: &Shown| {
+        let mut members = Vec::new();
+        let mut tombs = Vec::new();
+        for m in &s.members {
+            match vis.seen(&m.block.id) {
+                Seen::Hidden => continue,
+                Seen::Tombstone(t) => tombs.push(Some(t)),
+                Seen::Shown => tombs.push(None),
+            }
+            members.push(m.clone());
+        }
+        (Shown { members, ..s.clone() }, tombs)
+    };
     for slot in SLOTS {
         let k = slot_ix(slot);
-        let mut list: Vec<(Shown, bool)> = Vec::new();
+        let mut list: Vec<(Trimmed, bool)> = Vec::new();
         for (id, _) in placed.iter().filter(|(_, s)| *s == slot) {
-            if let Some(s) = top_level(d, id).filter(|_| !list.iter().any(|(x, _)| &x.block.id == id)) {
+            if let Some(s) = top_level(d, id).filter(|_| !list.iter().any(|((x, _), _)| &x.block.id == id)) {
                 list.push((trim(s), true));
             }
         }
@@ -304,13 +337,13 @@ pub(crate) fn layout(d: &Drawn, vis: &dyn RailVisibility, local: &Local) -> Layo
                 list.push((trim(s), false));
             }
         }
-        for (s, user) in list {
+        for ((s, tombs), user) in list {
             let state = match vis.seen(&s.block.id) {
                 Seen::Hidden => continue,
                 Seen::Tombstone(t) => State::Tombstone(t),
                 Seen::Shown => State::Over,
             };
-            out.slots[k].push(Section { s, slot, user, state, expanded_by_user: false });
+            out.slots[k].push(Section { s, slot, user, state, expanded_by_user: false, tombs });
         }
     }
     // The cap, in drawing order: the user's expansions first (their
@@ -397,20 +430,22 @@ pub(crate) fn diff_shown(n: usize, foot: bool) -> (usize, bool, usize) {
     (shown, n > DIFF_LINES, shown + usize::from(n > DIFF_LINES) + usize::from(foot))
 }
 
-/// A note's lines at `cpl` characters a line (the renderer's estimate,
-/// [`crate::blocks::note_lines`]), and whether it is cut at
-/// [`NOTE_LINES`] (`more`), unless opened.
-pub(crate) fn note_shown(text: &str, cpl: f32, open: bool) -> (usize, bool) {
-    let n = crate::blocks::note_lines(text, cpl);
+/// A note's text's lines as laid out in the rail (the window's text
+/// system, at the rail's face, size and width: what the renderer draws).
+pub(crate) type NoteLines<'a> = &'a dyn Fn(&str) -> usize;
+
+/// A note of `n` lines as laid out: the lines it shows, and whether it is
+/// cut at [`NOTE_LINES`] (`more`), unless opened.
+pub(crate) fn note_shown(n: usize, open: bool) -> (usize, bool) {
     if n > NOTE_LINES && !open { (NOTE_LINES, true) } else { (n, false) }
 }
 
 /// The body lines a section draws in its state (20 px each): what its
 /// height follows, the renderer's and the lease's (§6.2: structure and
 /// bounded line counts). `diff`: a diff's lines and foot as drawn (an edit
-/// preview's come from its session's edits); `cpl`: a note's characters a
-/// line.
-pub(crate) fn lines(s: &Shown, state: &State, local: &Local, cpl: f32, diff: Option<(usize, bool)>) -> usize {
+/// preview's come from its session's edits); `note`: a note's lines as
+/// laid out.
+pub(crate) fn lines(s: &Shown, state: &State, local: &Local, note: NoteLines, diff: Option<(usize, bool)>) -> usize {
     match state {
         State::Open => {}
         State::Summary => return 1,
@@ -429,7 +464,7 @@ pub(crate) fn lines(s: &Shown, state: &State, local: &Local, cpl: f32, diff: Opt
             diff_shown(n, foot).2
         }
         Body::Note(n) => {
-            let (k, cut) = note_shown(&n.text, cpl, local.more.contains(&s.block.id));
+            let (k, cut) = note_shown(note(&n.text), local.more.contains(&s.block.id));
             k + usize::from(cut)
         }
         Body::Group(_) => s.members.len().max(1),
@@ -487,11 +522,14 @@ fn hash(v: impl Hash) -> u64 {
 }
 
 /// The rail's structure as drawn (§6.2, §4): each slot's sections, their
-/// incarnations, states and heights, a group's members, the `+N` rows.
-/// Under the rail's lease, a board that changes it waits: a cap change,
-/// a section added, removed or reordered, one replaced or changing
-/// height. One that keeps it (a tick, a label) draws in place.
-pub(crate) fn shape(l: &Layout, local: &Local, cpl: f32, diff: &dyn Fn(&Shown) -> Option<(usize, bool)>) -> u64 {
+/// incarnations, states and heights, a group's members (and which are
+/// tombstones), the `+N` rows. Under the rail's lease, a board that changes
+/// it waits: a cap change, a section added, removed or reordered, one
+/// replaced or changing height. One that keeps it (a tick, a label) draws
+/// in place. A note open and whole is as tall as its text lays out: its
+/// text then (D5's rule, `lease::shape`: the safe side, never an estimate
+/// of its wrap); cut, it is [`NOTE_LINES`] tall whatever its text.
+pub(crate) fn shape(l: &Layout, local: &Local, note: NoteLines, diff: &dyn Fn(&Shown) -> Option<(usize, bool)>) -> u64 {
     let mut parts = Vec::new();
     for (k, slot) in l.slots.iter().enumerate() {
         for sec in slot {
@@ -502,14 +540,22 @@ pub(crate) fn shape(l: &Layout, local: &Local, cpl: f32, diff: &dyn Fn(&Shown) -
                 State::Listed => 3,
                 State::Tombstone(_) => 4,
             };
-            let members: Vec<u64> = sec.s.members.iter().map(|m| hash((m.block.id.to_string(), m.block.tag))).collect();
+            let members: Vec<u64> =
+                sec.s.members.iter().zip(&sec.tombs).map(|(m, t)| hash((m.block.id.to_string(), m.block.tag, t))).collect();
+            let text = match &sec.s.block.body {
+                Body::Note(n) if sec.state == State::Open && !note_shown(note(&n.text), local.more.contains(&sec.s.block.id)).1 => {
+                    Some(&n.text)
+                }
+                _ => None,
+            };
             parts.push(hash((
                 k,
                 sec.s.block.id.to_string(),
                 sec.s.block.tag,
                 st,
-                lines(&sec.s, &sec.state, local, cpl, diff(&sec.s)),
+                lines(&sec.s, &sec.state, local, note, diff(&sec.s)),
                 members,
+                text,
             )));
         }
         parts.push(hash(l.more[k].as_ref().map(|m| (m.ids.iter().map(|r| r.to_string()).collect::<Vec<_>>(), m.open))));
@@ -541,13 +587,19 @@ pub(crate) enum Now {
 }
 
 impl Now {
-    /// Its line.
+    /// Its line. What came from the agent or a tool (a call's verb and
+    /// target, what a prompt asks to allow) goes through the desk's
+    /// sanitizer ([`crate::ask::shown`], one line: no control, bidi or
+    /// invisible character, no line break); its own words and counts are
+    /// put around it after.
     pub(crate) fn text(&self) -> String {
+        let clean = |s: &str| crate::ask::shown(s, cards_spec::Lines::Single);
         match self {
-            Now::Prompt(what) => format!("waiting for you · {what}"),
+            Now::Prompt(what) => format!("waiting for you · {}", clean(what)),
             Now::Card => "waiting for your answer".to_string(),
             Now::Running { verb, target, more, queued } => {
-                let mut s = if target.is_empty() { verb.clone() } else { format!("{verb} {target}") };
+                let (verb, target) = (clean(verb), clean(target));
+                let mut s = if target.is_empty() { verb } else { format!("{verb} {target}") };
                 let tail: Vec<String> = [(*more, "running"), (*queued, "queued")]
                     .iter()
                     .filter(|(n, _)| *n > 0)
