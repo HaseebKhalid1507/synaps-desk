@@ -122,7 +122,7 @@ impl Stores {
 
     /// Tests: every session's last board forgotten, as a window that
     /// never drew them.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn forget_boards(&mut self) {
         self.track.clear();
     }

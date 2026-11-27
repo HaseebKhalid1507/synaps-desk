@@ -10,7 +10,9 @@ use gpui_kit::{AnyWindowHandle, Entity, TestAppContext, point, px};
 use serde_json::json;
 use synaps_client::blocks::Ref;
 
-use super::answer_tests::{attachment, has, heard, land};
+#[cfg(unix)]
+use super::answer_tests::land;
+use super::answer_tests::{attachment, has, heard};
 use super::blocks_ui_tests::{board, click, drawn, mouse, open_session};
 use super::{open_at, wait};
 use crate::app::AppView;
@@ -49,6 +51,7 @@ fn desires(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
     view.read_with(cx, |v, _| v.wishes.desires.len())
 }
 
+#[cfg(unix)]
 fn outbox(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
     view.read_with(cx, |v, _| v.wishes.outbox.clone())
 }
