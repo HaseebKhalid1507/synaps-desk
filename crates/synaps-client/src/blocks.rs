@@ -73,11 +73,14 @@
 //! log replaced or gone, its rounds with its store; a store when its last
 //! job lets go) is handed in O(1) to its bin, the app's own disposer's
 //! (one thread, owned, shut down and joined with the app), charged with
-//! its facts' inputs until the disposer has dropped the last of it. Past
-//! the disposer's cap ([`dispose::MAX_ITEMS`] items, [`dispose::MAX_BYTES`]
-//! bytes), closed or never started, whoever lets go drops it in place
-//! (counted): overload costs a rare stall, never unbounded memory, and
-//! nothing waits on the disposer. Everything counted is counted with its heap ([`event_bytes`])
+//! all it keeps, inputs included, until the disposer has dropped the last
+//! of it. Into an empty queue any unit is admitted. With the queue
+//! saturated ([`dispose::MAX_ITEMS`] items, or [`dispose::MAX_BYTES`]
+//! bytes with an item queued), closed or never started, whoever lets go
+//! drops it in place (counted), the contract: one unit's destruction on
+//! that event, never unbounded memory, never a wait on the disposer, and
+//! never under the store's lock (what is let go under it is dropped once
+//! it is released). Everything counted is counted with its heap ([`event_bytes`])
 //! and its room as allocated: staged, journal, the live log, the overlay,
 //! the card folds (the board's and the overlay's, each its own: read again
 //! after whatever can change them, a card call or, with a card in them, a
@@ -712,8 +715,10 @@ struct Store {
     charge: Option<dispose::Charge>,
 }
 
-/// A log's store, locked: what it touched counted when it lets go.
-struct Held<'a>(std::sync::MutexGuard<'a, Store>);
+/// A log's store, locked: what it touched counted when it lets go. What
+/// is dropped in place meanwhile ([`dispose::locking`], a field after the
+/// guard: it goes once the lock is released) is dropped after.
+struct Held<'a>(std::sync::MutexGuard<'a, Store>, dispose::Locked);
 
 impl std::ops::Deref for Held<'_> {
     type Target = Store;
@@ -738,7 +743,8 @@ impl Drop for Held<'_> {
 }
 
 fn hold(store: &Mutex<Store>) -> Held<'_> {
-    Held(store.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    let locking = dispose::locking();
+    Held(store.lock().unwrap_or_else(std::sync::PoisonError::into_inner), locking)
 }
 
 impl Store {
@@ -989,6 +995,9 @@ struct Round {
     /// Its strings' room (its calls' tool ids and names, its ids' keys),
     /// kept as they come.
     strs: usize,
+    /// Its calls' inputs' bytes ([`LiveCall::size`]), kept as they come:
+    /// what it is charged with besides when it is retired.
+    inputs: usize,
     /// Where it goes ([`dispose`]): its log's.
     bin: dispose::Bin,
 }
@@ -1021,12 +1030,21 @@ impl Round {
             + table::<u64, usize>(self.rows.capacity())
     }
 
-    /// The same, its strings walked one by one (tests).
+    /// What it is charged with retired (bytes): all it keeps, its calls'
+    /// inputs too (a row, a fact may keep one as well: counted again,
+    /// never under). O(1).
+    fn retired(&self) -> usize {
+        self.bytes() + self.inputs
+    }
+
+    /// The same, its strings and inputs walked one by one (tests).
     fn walk(&self) -> usize {
         let strs: usize = self.calls.iter().map(|c| c.tool_id.capacity() + c.name.capacity()).sum::<usize>()
             + self.ids.keys().map(String::capacity).sum::<usize>();
+        let inputs: usize = self.calls.iter().filter_map(|c| c.input.as_deref()).map(input_size).sum();
         self.calls.capacity() * std::mem::size_of::<LiveCall>()
             + strs
+            + inputs
             + table::<String, usize>(self.ids.capacity())
             + table::<u64, usize>(self.rows.capacity())
     }
@@ -1044,6 +1062,7 @@ impl Round {
     fn push(&mut self, c: LiveCall, row: u64) -> usize {
         let k = self.calls.len();
         self.strs += c.tool_id.capacity() + c.name.capacity();
+        self.inputs += c.size;
         self.id(c.tool_id.clone(), k);
         self.rows.insert(row, k);
         self.calls.push(c);
@@ -1070,14 +1089,30 @@ impl Round {
             self.strs = self.strs + self.calls[k].name.capacity() - old.capacity();
         }
     }
+
+    /// Call `k`'s input is `input`, of `size` bytes: the one before, given
+    /// back (its caller drops it after the store's lock).
+    fn reinput(&mut self, k: usize, input: Option<Arc<Value>>, size: usize) -> Option<Arc<Value>> {
+        let c = &mut self.calls[k];
+        self.inputs = self.inputs + size - c.size;
+        c.size = size;
+        std::mem::replace(&mut c.input, input)
+    }
+}
+
+/// What a call's input keeps, heap included (bytes).
+fn input_size(v: &Value) -> usize {
+    std::mem::size_of::<Value>() + value_bytes(v)
 }
 
 /// A round's calls, ids and rows go off the frame ([`dispose`]): whatever
-/// lets go of a round alone (a seal, a user message) does in O(1). A
-/// reset's round goes with its facts, a log's with its log ([`LiveLog`]).
+/// lets go of a round alone (a seal, a user message) does in O(1), the
+/// round charged with its calls' inputs (it keeps them whatever else
+/// goes). A reset's round goes with its facts, a log's with its log
+/// ([`LiveLog`]).
 impl Drop for Round {
     fn drop(&mut self) {
-        let (elements, bytes) = (self.elements(), self.bytes());
+        let (elements, bytes) = (self.elements(), self.retired());
         let parts = (std::mem::take(&mut self.calls), std::mem::take(&mut self.ids), std::mem::take(&mut self.rows));
         self.bin.retire(parts, elements, bytes);
     }
@@ -1137,6 +1172,8 @@ struct LiveCall {
     name: String,
     /// A card's or block's input, whole ([`keeps_input`]): its row's.
     input: Option<Arc<Value>>,
+    /// Its input's bytes, heap included ([`input_size`]; none, 0).
+    size: usize,
     /// Its input is whole (`ToolUse`).
     whole: bool,
     /// Its final result came.
@@ -1200,23 +1237,25 @@ impl Clone for LiveLog {
     }
 }
 
-/// A log goes as one unit ([`dispose`]): its rounds and the head's ids,
-/// with its store when no job reads it (none can start now), so no owner
-/// of a call's input outlives the charge that covers it. A store a job
-/// still reads stays the job's, charged from now on ([`dispose::Bin::charge`],
-/// what [`Store::moved`] counts) until its last reader lets go of it.
+/// A log goes as one unit ([`dispose`]): its rounds (with their calls'
+/// inputs) and the head's ids, with its store when no job reads it (none
+/// can start now), moved into the unit (its field left an empty store's:
+/// no handle to it outlives the unit), so no owner of a call's input
+/// outlives the charge that covers it. A store a job still reads stays the
+/// job's, charged from now on ([`dispose::Bin::charge`], what
+/// [`Store::moved`] counts) until its last reader lets go of it.
 impl Drop for LiveLog {
     fn drop(&mut self) {
         let (open, sealed, head) = (self.open.take(), self.sealed.take(), std::mem::take(&mut self.head_answered));
         let (mut elements, mut bytes) = (head.len(), head.bytes());
         for r in [&open, &sealed].into_iter().flatten() {
-            (elements, bytes) = (elements + r.elements(), bytes + r.bytes());
+            (elements, bytes) = (elements + r.elements(), bytes + r.retired());
         }
         let store = if Arc::strong_count(&self.store) == 1 {
             let s = self.lock();
             (elements, bytes) = (elements + s.elements(), bytes + s.moved());
             drop(s);
-            Some(self.store.clone())
+            Some(std::mem::take(&mut self.store))
         } else {
             let mut s = self.lock();
             if s.charge.is_none() {
@@ -1231,6 +1270,19 @@ impl Drop for LiveLog {
 /// What a log's drop hands over, with its store (tests).
 type LogUnit = (Option<Arc<Mutex<Store>>>, Option<Round>, Option<Round>, Ids);
 
+/// Tests: a log's store's lock, probed ([`LiveLog::lock_probe`]).
+#[cfg(any(test, feature = "test-support"))]
+pub struct LockProbe(std::sync::Weak<Mutex<Store>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl LockProbe {
+    /// Its lock is held now, by this thread or another (the store gone,
+    /// or going: no one holds it).
+    pub fn held(&self) -> bool {
+        self.0.upgrade().is_some_and(|s| matches!(s.try_lock(), Err(std::sync::TryLockError::WouldBlock)))
+    }
+}
+
 impl LiveLog {
     /// Tests: what its drop hands over now, its store with it (no job
     /// reading it): the charge it takes (O(1), kept as the log grows), and
@@ -1239,9 +1291,15 @@ impl LiveLog {
         let s = self.lock();
         let unit = std::mem::size_of::<LogUnit>();
         let rounds = || [&self.open, &self.sealed].into_iter().flatten();
-        let charge = unit + s.moved() + rounds().map(Round::bytes).sum::<usize>() + self.head_answered.bytes();
+        let charge = unit + s.moved() + rounds().map(Round::retired).sum::<usize>() + self.head_answered.bytes();
         let walk = unit + s.walk() + rounds().map(Round::walk).sum::<usize>() + self.head_answered.walk();
         (charge, walk)
+    }
+
+    /// Tests: a probe of its store's lock, held or not ([`LockProbe`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn lock_probe(&self) -> LockProbe {
+        LockProbe(Arc::downgrade(&self.store))
     }
 
     /// A block call among its calls.
@@ -1439,7 +1497,7 @@ impl LiveLog {
         // ([`dispose`]), charged with the facts' inputs (their rows went
         // with the response) until the last of them is dropped.
         let open = self.open.take();
-        let (re, rb) = open.as_ref().map_or((0, 0), |r| (r.elements(), r.bytes()));
+        let (re, rb) = open.as_ref().map_or((0, 0), |r| (r.elements(), r.retired()));
         let elements = re + calls.slots.len() + results.slots.len();
         let bytes = rb + calls.charge() + results.charge();
         self.bin.retire((open, calls, results), elements, bytes);
@@ -1470,7 +1528,7 @@ impl LiveLog {
         let mut moved = self.opened(s) | (was != self.blocks);
         let r = self.open.as_mut().expect("opened");
         if !r.rows.contains_key(&row) {
-            r.push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: None, whole: false, answered: false }, row);
+            r.push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: None, size: 0, whole: false, answered: false }, row);
             // Its slot, in model order: empty until its input is whole.
             s.calls.push(None, &s.touched);
             moved |= self.sync_end(s);
@@ -1490,12 +1548,13 @@ impl LiveLog {
         self.init(history);
         let was = self.blocks;
         self.blocks |= is_block_tool(name);
+        let mut was_input = None;
         let store = self.store.clone();
-        let mut s = hold(&store);
-        let s = &mut *s;
+        let mut held = hold(&store);
+        let s = &mut *held;
         let mut moved = self.opened(s) | (was != self.blocks);
         let r = self.open.as_mut().expect("opened");
-        let size = input.as_deref().map_or(0, |v| std::mem::size_of::<Value>() + value_bytes(v));
+        let size = input.as_deref().map_or(0, input_size);
         let fact = |input: &Option<Arc<Value>>| Fact::Call { tool_id: tool_id.into(), name: name.into(), input: input.clone(), row, size };
         let mut kept = input.clone();
         match r.rows.get(&row).copied() {
@@ -1514,7 +1573,7 @@ impl LiveLog {
                     kept = c.input.clone();
                 } else {
                     r.rename(k, tool_id, name);
-                    r.calls[k].input = input.clone();
+                    was_input = r.reinput(k, input.clone(), size);
                 }
                 let c = &mut r.calls[k];
                 if !std::mem::replace(&mut c.whole, true) {
@@ -1547,8 +1606,10 @@ impl LiveLog {
                 }
             }
             None => {
-                let k = r
-                    .push(LiveCall { tool_id: tool_id.into(), name: name.into(), input: input.clone(), whole: true, answered: false }, row);
+                let k = r.push(
+                    LiveCall { tool_id: tool_id.into(), name: name.into(), input: input.clone(), size, whole: true, answered: false },
+                    row,
+                );
                 r.last_whole = Some(k);
                 if s.results.len > 0 || s.end {
                     s.cut(s.calls_at() + s.calls.len);
@@ -1562,6 +1623,9 @@ impl LiveLog {
         if moved {
             self.changed();
         }
+        // An input replaced goes after the store's lock.
+        drop(held);
+        drop(was_input);
         kept
     }
 

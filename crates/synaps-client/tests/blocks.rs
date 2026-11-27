@@ -1543,6 +1543,320 @@ fn a_log_is_retired_charged_as_it_is_allocated() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// `n` block calls in the open response, whose inputs carry `pad` (a
+/// note's text), and their results. Its tool ids are `toolu_{tag}{k}`.
+fn fat_calls(d: &mut Desk, tag: &str, n: usize, pad: &str) {
+    for k in 0..n {
+        let id = format!("toolu_{tag}{k}");
+        let ops = json!([{"op":"put","id":format!("{tag}{k}"),"kind":"note","body":{"text":pad}}]);
+        d.apply(&llm(json!({"kind": "llm", "llm": "tool_use_start", "tool_name": "cards_block", "tool_id": id})));
+        d.apply(&tool_use(&id, "cards_block", block_input(ops)));
+    }
+    for k in 0..n {
+        d.apply(&tool_result(&format!("toolu_{tag}{k}"), "cards_block: refused (a test)"));
+    }
+}
+
+/// A history landing on [`plain`]'s: the turn's prompt and an answer.
+fn landing() -> HistoryUpdate {
+    HistoryUpdate::Append {
+        base_len: 1,
+        messages: vec![json!({"role": "user", "content": "go"}), json!({"role": "assistant", "content": "done"})],
+    }
+}
+
+/// Haseeb's #101 round 7 (Shady R6-1): one unit past the byte cap is
+/// admitted into an empty queue. A 96 MiB round goes four ways: retired
+/// alone at a steer, its reset (its round, facts and results), its log
+/// replaced by a history landing, its log dropped (the tab gone). The
+/// disposer's thread held, each is queued, charged with all it keeps (the
+/// round alone with its calls' inputs, though its rows keep them too), and
+/// the frame destroys none of it (a hand-over is one element). The hold
+/// gone, all of it goes.
+#[test]
+fn a_unit_past_the_byte_cap_is_admitted_into_an_empty_queue() {
+    use synaps_client::blocks::dispose::{self, Disposer, MAX_BYTES};
+    let (n, pad) = (384, "u".repeat(256 * 1024));
+    let mut wrong = Vec::new();
+    for case in ["steer", "reset", "history landed", "tab gone"] {
+        let disposer = Disposer::start();
+        let _in = disposer.install();
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        fat_round(&mut d, "u", n, &pad);
+        let inputs = inputs_of(&d, "u");
+        let total: usize = inputs.iter().map(|(_, b)| b).sum();
+        assert!(inputs.len() == n && total > MAX_BYTES + (16 << 20), "{case}: {} inputs, {total} bytes", inputs.len());
+        let hold = disposer.hold();
+        let before = dispose::destroyed();
+        let desk = match case {
+            "steer" => {
+                d.apply(&steer("more"));
+                Some(d)
+            }
+            "reset" => {
+                d.apply(&reset());
+                Some(d)
+            }
+            "history landed" => {
+                d.t.apply_update(&landing()).unwrap();
+                Some(d)
+            }
+            _ => {
+                drop(d);
+                None
+            }
+        };
+        let (b, frame) = (disposer.backlog(), dispose::destroyed() - before);
+        if b.in_place > 0 || frame > 8 {
+            wrong.push(format!("{case}: {} refused, the frame destroyed {frame} elements", b.in_place));
+        }
+        if b.items == 0 || b.bytes < total {
+            wrong.push(format!("{case}: {} items queued, {} bytes charged for {total} bytes of inputs", b.items, b.bytes));
+        }
+        drop(hold);
+        disposer.flush();
+        drop(desk);
+        disposer.flush();
+        let b = disposer.backlog();
+        if alive_bytes(&inputs) > 0 || (b.items, b.bytes, b.in_place) != (0, 0, 0) {
+            wrong.push(format!("{case}: drained, {} bytes of inputs alive, it holds {b:?}", alive_bytes(&inputs)));
+        }
+    }
+    assert!(wrong.is_empty(), "a unit past the cap refused into an empty queue: {wrong:#?}");
+}
+
+/// Elements dropped in place as a probe saw them, each with its store's
+/// lock held or not ([`a_unit_refused_under_saturation_is_dropped_outside_the_stores_lock`]).
+type Seen = std::rc::Rc<std::cell::RefCell<Vec<(usize, bool)>>>;
+
+/// What `seen` saw at `what`, taken: something dropped in place, none of
+/// it under the store's lock. Its most elements in one drop.
+fn in_place_at(what: &str, seen: &Seen, wrong: &mut Vec<String>) -> usize {
+    let s = std::mem::take(&mut *seen.borrow_mut());
+    if s.is_empty() {
+        wrong.push(format!("{what}: nothing dropped in place"));
+    }
+    let locked: usize = s.iter().filter(|(_, l)| *l).map(|(e, _)| e).sum();
+    if locked > 0 {
+        wrong.push(format!("{what}: {locked} elements dropped under the store's lock"));
+    }
+    s.iter().map(|(e, _)| *e).max().unwrap_or(0)
+}
+
+/// Haseeb's #101 round 7 (Shady R6-1), the overload contract: with the
+/// queue saturated, by its items (`MAX_ITEMS` queued) or its bytes (a
+/// store a job still reads charged past `MAX_BYTES`, an item queued), a
+/// unit let go is refused and dropped where it is let go, and never under
+/// the log's store lock. The disposer's thread held, a large round goes
+/// at each boundary (a steer, the next response, a reset, a history
+/// landing, the tab gone), at 255, 256, 257 and 3,000 calls (and 12,000,
+/// its bytes full): each is dropped in place (its whole unit, the
+/// contract), and a probe trying the store's lock as each drop starts
+/// finds it free.
+#[test]
+fn a_unit_refused_under_saturation_is_dropped_outside_the_stores_lock() {
+    use synaps_client::blocks::dispose::{self, Disposer, MAX_BYTES, MAX_ITEMS};
+    let pad = "p".repeat(64);
+    let mut wrong = Vec::new();
+    let mut sizes = Vec::new();
+    let runs = [
+        ("items", 255),
+        ("items", 256),
+        ("items", 257),
+        ("items", 3_000),
+        ("bytes", 255),
+        ("bytes", 256),
+        ("bytes", 257),
+        ("bytes", 3_000),
+        ("bytes", 12_000),
+    ];
+    for (cap, n) in runs {
+        let disposer = Disposer::start();
+        let _in = disposer.install();
+        let hold = disposer.hold();
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        let mut job = None;
+        if cap == "items" {
+            let mut k = 0;
+            while disposer.backlog().items < MAX_ITEMS {
+                d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+                for e in live_pair(k) {
+                    d.apply(&e);
+                }
+                d.apply(&reset());
+                k += 1;
+            }
+        } else {
+            let mut full = Desk::of(attach(&plain()));
+            for e in live_start() {
+                full.apply(&e);
+            }
+            fat_round(&mut full, "full", 72, &"s".repeat(1 << 20));
+            job = Some(full.t.blocks_input().expect("blocks"));
+            drop(full);
+            assert!(disposer.backlog().bytes > MAX_BYTES, "{cap}: a job's store charged past the cap");
+        }
+        let seen = Seen::default();
+        let lock = std::rc::Rc::new(std::cell::RefCell::new(d.t.blocks_live().lock_probe()));
+        let probe = {
+            let (seen, lock) = (seen.clone(), lock.clone());
+            dispose::on_in_place(move |elements| {
+                if elements > 0 {
+                    seen.borrow_mut().push((elements, lock.borrow().held()));
+                }
+            })
+        };
+        let at = |what: &str| format!("{cap} full, {n} calls, {what}");
+        // A steer: the open round retired alone.
+        fat_round(&mut d, "a", n, &pad);
+        seen.borrow_mut().clear();
+        d.apply(&steer("more"));
+        let steer = in_place_at(&at("a steer"), &seen, &mut wrong);
+        // The next response: the round before the open one goes as the
+        // open one is sealed.
+        fat_round(&mut d, "b", n, &pad);
+        fat_round(&mut d, "c", n, &pad);
+        seen.borrow_mut().clear();
+        d.apply(&llm(json!({"kind": "llm", "llm": "response_start"})));
+        d.apply(&llm(json!({"kind": "llm", "llm": "text", "text": "and"})));
+        let next = in_place_at(&at("the next response"), &seen, &mut wrong);
+        // A reset of the open response, its calls in.
+        fat_calls(&mut d, "r", n, &pad);
+        seen.borrow_mut().clear();
+        d.apply(&reset());
+        let reset = in_place_at(&at("a reset"), &seen, &mut wrong);
+        // A history landing: the log replaced.
+        fat_round(&mut d, "e", n, &pad);
+        seen.borrow_mut().clear();
+        d.t.apply_update(&landing()).unwrap();
+        let landed = in_place_at(&at("a history landing"), &seen, &mut wrong);
+        *lock.borrow_mut() = d.t.blocks_live().lock_probe();
+        // The tab gone: its log with it.
+        fat_round(&mut d, "f", n, &pad);
+        seen.borrow_mut().clear();
+        drop(d);
+        let gone = in_place_at(&at("the tab gone"), &seen, &mut wrong);
+        sizes.push(format!("{cap} {n}: steer {steer}, next {next}, reset {reset}, landed {landed}, gone {gone}"));
+        drop(probe);
+        drop(job);
+        drop(hold);
+        disposer.flush();
+        let b = disposer.backlog();
+        if (b.items, b.bytes) != (0, 0) {
+            wrong.push(format!("{cap} {n}: drained, it holds {b:?}"));
+        }
+    }
+    eprintln!("dropped in place, the most elements in one drop: {sizes:#?}");
+    assert!(wrong.is_empty(), "refused units dropped under the store's lock: {wrong:#?}");
+}
+
+/// Haseeb's #101 round 7 (Shady R6-2 A): a round retired on its own (at a
+/// steer) is charged with the inputs it keeps. So when a later owner of
+/// the same inputs is refused, the round still queued keeps them charged:
+/// the log's store (over 64 MiB, the round queued) refused as its tab
+/// goes, or the store a job read, refused as the job lets go. Checked
+/// before any drain and after each.
+#[test]
+fn a_round_queued_alone_keeps_its_inputs_charged_when_a_later_owner_is_refused() {
+    use synaps_client::blocks::dispose::{Disposer, MAX_BYTES};
+    let (n, pad) = (288, "q".repeat(256 * 1024));
+    let mut wrong = Vec::new();
+    for case in ["its store refused", "a job's store refused"] {
+        let disposer = Disposer::start();
+        let _in = disposer.install();
+        let mut d = Desk::of(attach(&plain()));
+        for e in live_start() {
+            d.apply(&e);
+        }
+        fat_round(&mut d, "q", n, &pad);
+        let inputs = inputs_of(&d, "q");
+        let total: usize = inputs.iter().map(|(_, b)| b).sum();
+        assert!(inputs.len() == n && total > MAX_BYTES, "{case}: {} inputs, {total} bytes", inputs.len());
+        let hold = disposer.hold();
+        d.apply(&steer("more"));
+        let job = (case == "a job's store refused").then(|| d.t.blocks_input().expect("blocks"));
+        drop(d);
+        drop(job);
+        if disposer.backlog().in_place == 0 {
+            wrong.push(format!("{case}: the store was not refused"));
+        }
+        let mut drains = 0;
+        loop {
+            let (alive, b) = (alive_bytes(&inputs), disposer.backlog());
+            if alive > b.bytes {
+                wrong.push(format!(
+                    "{case}: after {drains} drains, {alive} bytes of inputs alive, {} charged ({} items queued)",
+                    b.bytes, b.items
+                ));
+            }
+            if b.items == 0 {
+                break;
+            }
+            hold.step(1);
+            drains += 1;
+        }
+        drop(hold);
+        disposer.flush();
+        let b = disposer.backlog();
+        if alive_bytes(&inputs) > 0 || (b.items, b.bytes) != (0, 0) {
+            wrong.push(format!("{case}: drained, {} bytes of inputs alive, it holds {b:?}", alive_bytes(&inputs)));
+        }
+    }
+    assert!(wrong.is_empty(), "a queued round's inputs alive past its charge: {wrong:#?}");
+}
+
+/// Haseeb's #101 round 7 (Shady R6-2 B): a log dropped with no job reading
+/// its store moves the store into its unit, so the disposer dropping the
+/// unit drops the store, whenever it runs. Here it runs right after the
+/// hand-over, the dropping thread paused there (a probe), before the log's
+/// own fields go: nothing of the store's outlives the unit's charge.
+#[test]
+fn a_logs_store_goes_with_its_unit_before_the_log_is_gone() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use synaps_client::blocks::dispose::{self, Backlog, Disposer};
+    let disposer = Disposer::start();
+    let _in = disposer.install();
+    let mut d = Desk::of(attach(&plain()));
+    for e in live_start() {
+        d.apply(&e);
+    }
+    fat_round(&mut d, "w", 60, &"w".repeat(64 * 1024));
+    let inputs = inputs_of(&d, "w");
+    assert_eq!(inputs.len(), 60);
+    let hold = Rc::new(disposer.hold());
+    let seen: Rc<RefCell<Option<(usize, Backlog)>>> = Rc::default();
+    let probe = {
+        let (hold, seen, inputs, bin) = (hold.clone(), seen.clone(), inputs.clone(), disposer.bin());
+        dispose::on_handed(move || {
+            if seen.borrow().is_some() {
+                return;
+            }
+            // The unit just handed over, dropped now: the consumer first.
+            hold.step(bin.backlog().items);
+            *seen.borrow_mut() = Some((alive_bytes(&inputs), bin.backlog()));
+        })
+    };
+    drop(d);
+    drop(probe);
+    let (alive, b) = seen.take().expect("the log handed over");
+    assert!(
+        alive <= b.bytes,
+        "its unit dropped before the log's fields went: {alive} bytes of its store's inputs alive, {} charged ({b:?})",
+        b.bytes
+    );
+    drop(hold);
+    disposer.flush();
+    let b = disposer.backlog();
+    assert_eq!((alive_bytes(&inputs), b.items, b.bytes), (0, 0, 0), "drained: {b:?}");
+}
+
 fn card(k: usize) -> Value {
     json!({"question": format!("Card {k}?"), "detail": "d".repeat(600), "options": ["Yes", "No", "Later"]})
 }

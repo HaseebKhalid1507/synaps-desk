@@ -70,3 +70,5 @@ windows-sys = { version = "0.61", features = [
 # GPUI's headless test window (`TestAppContext`) for the UI tests
 # (`src/ui_tests.rs`), tests only: the GPUI the Kit pins, its feature on.
 gpui-pre = { version = "=0.3.12", features = ["test-support"] }
+# The disposer's test controls (`synaps_client::blocks::dispose`), tests only.
+synaps-client = { workspace = true, features = ["test-support"] }
