@@ -8,14 +8,25 @@ use cards_spec::board::Place;
 use serde_json::json;
 
 use super::*;
-use crate::desires::tests::{H, J, dir, id, note};
+use crate::desires::tests::{Flushed as _, H, J, dir, id, note};
 
 fn r(s: &str) -> Ref {
     Ref::parse(s).unwrap()
 }
 
+/// The presentation in `d`'s file, the launch's sweep run.
 fn presentation(d: &std::path::Path) -> Presentation {
-    Presentation::load(Some(d.join(FILE)))
+    let mut p = Presentation::load(Some(d.join(FILE)));
+    flush(&mut p);
+    p
+}
+
+/// Every queued write run, here (a test's thread stands for the
+/// background task).
+fn flush(p: &mut Presentation) {
+    while let Some(w) = p.next_write() {
+        let _ = p.landed(w.run());
+    }
 }
 
 /// Where `id` draws on this desk, against `h`'s board.
@@ -24,14 +35,20 @@ fn at(p: &Presentation, h: &H, id: &str) -> Placed {
     p.placed(J, s.block(&r(id)).expect("live"))
 }
 
+/// `p` on `id`, its write landed.
 fn pin(p: &mut Presentation, h: &H, id: &str) -> Result<Placed, String> {
     let s = h.state();
-    p.pin(J, s.block(&r(id)).expect("live"))
+    let out = p.pin(J, s.block(&r(id)).expect("live"));
+    flush(p);
+    out
 }
 
+/// `m` on `id`, its write landed.
 fn slot(p: &mut Presentation, h: &H, id: &str) -> Result<Placed, String> {
     let s = h.state();
-    p.slot(J, s.block(&r(id)).expect("live"))
+    let out = p.slot(J, s.block(&r(id)).expect("live"));
+    flush(p);
+    out
 }
 
 /// A pin outranks the agent's `move`: the block stays in the upper slot,
@@ -151,6 +168,7 @@ fn compaction_carries_pins_and_soft_dismissals() {
     const J2: &str = "20261127-020304-beef";
     p.compacted(J, J2, &[id("tests")]);
     p.compacted(J, J2, &[id("tests")]);
+    flush(&mut p);
     let p = presentation(&d);
     let s = h.state();
     let plan = s.block(&r("plan")).unwrap();
@@ -158,10 +176,12 @@ fn compaction_carries_pins_and_soft_dismissals() {
     assert!(p.soft(J2, &id("tests")) && !p.soft(J, &id("tests")));
     let mut p = p;
     assert!(p.unsoft(J2, &id("tests")));
+    flush(&mut p);
     assert!(!presentation(&d).soft(J2, &id("tests")));
     // Soft ones carry on through the next compaction.
     p.compacted(J2, "j3", &[id("notes")]);
     p.compacted("j3", "j4", &[]);
+    flush(&mut p);
     assert!(presentation(&d).soft("j4", &id("notes")));
 }
 
@@ -176,17 +196,19 @@ fn the_files_caps_drop_the_oldest() {
     pin(&mut p, &h, "plan").unwrap();
     let soft: Vec<_> = (0..ENTRIES_MAX).map(|i| id(&format!("s{i}"))).collect();
     p.compacted("before", J, &soft);
+    flush(&mut p);
     let q = presentation(&d);
     assert!(!q.placed(J, h.state().block(&r("plan")).unwrap()).by_user, "the oldest went");
     assert!(soft.iter().all(|i| q.soft(J, i)), "the 64 newer stay");
 
     let mut desires = crate::desires::tests::desires(&d);
-    desires.dismiss("c0", &crate::desires::tests::generation(), &id("tests"), &h.vis()).unwrap();
+    desires.dismiss_now("c0", &crate::desires::tests::generation(), &id("tests"), &h.vis()).unwrap();
     let s = h.state();
     let b = s.block(&r("b1")).unwrap();
     for c in 0..=CONVERSATIONS_MAX {
         p.pin(&format!("c{c}"), b).unwrap();
     }
+    flush(&mut p);
     let q = presentation(&d);
     assert!(!q.placed("c0", b).by_user, "the least recently touched went");
     assert!(q.placed("c1", b).by_user && q.placed(&format!("c{CONVERSATIONS_MAX}"), b).by_user);
@@ -225,10 +247,89 @@ fn two_desks_on_one_file_keep_each_others_conversations() {
     let b = s.block(&r("plan")).unwrap();
     let (mut x, mut y) = (presentation(&d), presentation(&d));
     x.pin("jx", b).unwrap();
+    flush(&mut x);
     y.pin("jy", b).unwrap();
+    flush(&mut y);
     x.pin("jx2", b).unwrap();
+    flush(&mut x);
     let z = presentation(&d);
     assert!(z.placed("jx", b).by_user && z.placed("jy", b).by_user && z.placed("jx2", b).by_user);
+}
+
+/// A pin draws at once, and its write runs off the UI thread: with the
+/// file's lock held, the call returns at once and touches no disk. A write
+/// that fails is said, memory keeps the change, and the next write carries
+/// it; one landing keeps what memory changed after it.
+#[test]
+fn a_pin_draws_at_once_and_is_written_off_the_ui_thread() {
+    let d = dir("p-background");
+    let h = H::with(&["plan"]);
+    let s = h.state();
+    let b = s.block(&r("plan")).unwrap();
+    let mut p = presentation(&d);
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(d.join(format!("{FILE}.lock"))).unwrap();
+    held.try_lock().unwrap();
+    let disk = crate::blockfiles::on_this_thread();
+    let t = std::time::Instant::now();
+    assert_eq!(p.pin(J, b).unwrap().place, Place::Rail(Slot::Upper), "drawn at once");
+    assert!(p.writing());
+    let w = p.next_write().unwrap();
+    assert!(t.elapsed() < crate::blockfiles::LOCK_WAIT / 2, "{:?}", t.elapsed());
+    assert_eq!(crate::blockfiles::on_this_thread(), disk, "no wait and no write on the UI thread");
+    let l = std::thread::spawn(move || w.run()).join().unwrap();
+    assert!(p.landed(l).is_err() && p.failed.as_deref().is_some_and(|f| f.contains("not locked")), "{:?}", p.failed);
+    assert!(p.placed(J, b).by_user && !p.writing(), "memory keeps it");
+    held.unlock().unwrap();
+    assert!(!presentation(&d).placed(J, b).by_user, "not written yet");
+    p.pin("other", b).unwrap();
+    let w = p.next_write().unwrap();
+    p.pin("third", b).unwrap();
+    assert!(p.landed(w.run()).is_ok() && p.failed.is_none());
+    assert!(p.placed("third", b).by_user, "changed after the write: memory's kept");
+    flush(&mut p);
+    let q = presentation(&d);
+    assert!(q.placed(J, b).by_user && q.placed("other", b).by_user && q.placed("third", b).by_user, "the next writes carried all");
+}
+
+/// `p` on a rail section puts it in the transcript at the call that
+/// created it, and there it stays when the agent moves it elsewhere in the
+/// transcript; a restart keeps it, and reset placement takes the agent's
+/// (P2-6).
+#[test]
+fn a_transcript_placement_stays_where_the_user_put_it() {
+    let d = dir("p-anchor");
+    let mut h = H::default();
+    let a0 = h.ops(json!([{"op":"put","id":"r","kind":"note","target":"rail","body":{"text":"r"}}]));
+    let mut p = presentation(&d);
+    assert_eq!(pin(&mut p, &h, "r").unwrap().place, Place::Transcript(a0));
+    h.ops(json!([note("other", "x")]));
+    h.ops(json!([{"op":"move","id":"r","target":"transcript"}]));
+    let moved = h.state().block(&r("r")).unwrap().place;
+    assert!(matches!(moved, Place::Transcript(at) if at != a0), "{moved:?}");
+    assert_eq!(at(&p, &h, "r"), Placed { place: Place::Transcript(a0), by_user: true, agent_moved: true });
+    assert_eq!(at(&presentation(&d), &h, "r").place, Place::Transcript(a0), "a restart keeps it");
+    assert!(p.reset(J, &r("r")));
+    assert_eq!(at(&p, &h, "r"), Placed { place: moved, by_user: false, agent_moved: false }, "reset: the agent's");
+}
+
+/// Writes that keep failing keep bounded bookkeeping: the conversations
+/// waiting to be written never outgrow the store's caps (P2-5).
+#[test]
+fn failing_writes_keep_bounded_bookkeeping() {
+    let d = dir("p-failing");
+    std::fs::write(d.join("not-a-folder"), "x").unwrap();
+    let h = H::with(&["plan"]);
+    let s = h.state();
+    let b = s.block(&r("plan")).unwrap();
+    let mut p = Presentation::load(Some(d.join("not-a-folder").join(FILE)));
+    flush(&mut p);
+    for c in 0..CONVERSATIONS_MAX * 3 {
+        p.pin(&format!("c{c}"), b).unwrap();
+        flush(&mut p);
+        assert!(p.unwritten() <= CONVERSATIONS_MAX, "{c}: {}", p.unwritten());
+    }
+    assert!(p.failed.is_some());
+    assert!(p.placed(&format!("c{}", CONVERSATIONS_MAX * 3 - 1), b).by_user, "memory keeps the newest");
 }
 
 /// Both files sit next to `settings.json`.

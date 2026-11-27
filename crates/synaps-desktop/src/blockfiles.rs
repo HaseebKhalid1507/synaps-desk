@@ -22,8 +22,15 @@
 //! write (nothing is ever written unlocked): a holder stopped mid-write
 //! never freezes this one, and never loses what it wrote.
 //!
-//! **A file that doesn't parse** is copied aside to `<file>.bad` and read
-//! as empty; the next write goes on from there, and the log says so.
+//! **Off the UI thread.** [`load`] and [`update`] wait for the lock, and
+//! write: the stores run them on a background task, one at a time, and
+//! take what they return ([`crate::desires::Write`],
+//! [`crate::presentation::Write`]). At a launch the UI thread only reads
+//! the file once ([`peek`]: no lock, a rename being atomic).
+//!
+//! **A file that doesn't parse** is copied aside to `<file>.bad` (at a
+//! load or a write, under the lock) and read as empty; the next write goes
+//! on from there, and the log says so.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +85,7 @@ fn name(path: &Path) -> String {
 
 /// The file as it is: missing is empty; one that doesn't parse is set
 /// aside (`<file>.bad`) and read as empty, why said.
-fn read<S: Stored>(path: &Path) -> Result<(S, Option<String>), String> {
+fn read<S: Stored>(path: &Path, set_aside: bool) -> Result<(S, Option<String>), String> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((S::default(), None)),
@@ -91,6 +98,7 @@ fn read<S: Stored>(path: &Path) -> Result<(S, Option<String>), String> {
             log::warn!(target: "synaps_desktop::blocks", "{}: {bad} unreadable entries left out", path.display());
             Ok((s, None))
         }
+        Err(why) if !set_aside => Ok((S::default(), Some(why))),
         Err(why) => {
             let bad = path.with_file_name(format!("{}.bad", name(path)));
             let kept = std::fs::copy(path, &bad).map(|_| ()).map_err(|e| e.to_string());
@@ -100,19 +108,45 @@ fn read<S: Stored>(path: &Path) -> Result<(S, Option<String>), String> {
     }
 }
 
+/// The store at `path` as it is, read without the lock or a write (a
+/// launch's first read, on the UI thread: a rename is atomic): missing is
+/// empty, and one that doesn't parse reads as empty, why said (set aside
+/// by the next [`load`] or [`update`]).
+pub(crate) fn peek<S: Stored>(path: &Path) -> (S, Option<String>) {
+    read::<S>(path, false).unwrap_or_else(|why| (S::default(), Some(why)))
+}
+
+/// The disk's waits and writes made on this thread (tests: none on the UI
+/// thread).
+#[cfg(test)]
+pub(crate) fn on_this_thread() -> usize {
+    ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn counted() {
+    #[cfg(test)]
+    ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
+}
+
 /// The store at `path`, read at a load (a launch): what crashes left beside
 /// it swept first, under the lock. A lock not had in [`LOCK_WAIT`] reads it
 /// anyway (a rename is atomic) and leaves the sweep for the next load.
 /// Also: why the file was unreadable (read as empty), and the sweep's
 /// count of leftovers removed, or its first failure.
 pub(crate) fn load<S: Stored>(path: &Path) -> (S, Option<String>, std::io::Result<usize>) {
+    counted();
     let _one = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
     let lock = crate::theme::lock_settings(&lock_file(path), LOCK_WAIT);
     let swept = match &lock {
         Ok(_) => recall::sweep(path),
         Err(why) => Err(std::io::Error::other(why.clone())),
     };
-    match read::<S>(path) {
+    match read::<S>(path, true) {
         Ok((s, why)) => (s, why, swept),
         Err(why) => {
             log::warn!(target: "synaps_desktop::blocks", "{why}; read as empty");
@@ -136,12 +170,13 @@ pub(crate) fn update_then<S: Stored>(
     between: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<S, Failed> {
     use std::io::Write as _;
+    counted();
     let _one = WRITER.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Failed::Io(format!("{}: {e}", dir.display())))?;
     }
     let _lock = crate::theme::lock_settings(&lock_file(path), LOCK_WAIT).map_err(Failed::Io)?;
-    let (mut s, _) = read::<S>(path).map_err(Failed::Io)?;
+    let (mut s, _) = read::<S>(path, true).map_err(Failed::Io)?;
     change(&mut s).map_err(Failed::Refused)?;
     let text = s.text();
     let tmp = recall::tmp_of(path, NEXT.fetch_add(1, Ordering::Relaxed));
