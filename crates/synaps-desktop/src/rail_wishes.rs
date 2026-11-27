@@ -120,6 +120,13 @@ impl Stores {
         }
     }
 
+    /// Tests: every session's last board forgotten, as a window that
+    /// never drew them.
+    #[cfg(test)]
+    pub(crate) fn forget_boards(&mut self) {
+        self.track.clear();
+    }
+
     /// What this desk draws of board `d` of conversation `conv` (module
     /// docs).
     pub(crate) fn vis(&self, conv: &str, d: &Drawn) -> DeskVis {
@@ -203,6 +210,8 @@ impl AppView {
     /// crash left beside them swept.
     pub(crate) fn start_wishes(&mut self, cx: &mut Context<Self>) {
         self.wishes = Stores::with(crate::desires::path(), crate::presentation::path());
+        // Another desk's files (memory only here), or one set aside: said.
+        self.wishes.said = self.wishes.desires.trouble.clone().or_else(|| self.wishes.pres.trouble.clone());
         self.pump_wishes(cx);
     }
 

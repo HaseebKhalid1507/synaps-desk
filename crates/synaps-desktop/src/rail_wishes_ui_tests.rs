@@ -152,7 +152,8 @@ fn the_notice_rides_the_next_message_and_settles(cx: &mut TestAppContext) {
     assert!(has(cx, w, "composer-tells + tells the agent: plan shown ×".into()));
 }
 
-/// A turn running: the notice rides a `Steer`.
+/// A turn running: the notice rides a `Steer`, and stays in flight
+/// while the turn runs.
 #[cfg(unix)]
 #[gpui_kit::test]
 fn the_notice_rides_a_steer(cx: &mut TestAppContext) {
@@ -164,6 +165,15 @@ fn the_notice_rides_a_steer(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| assert!(v.enter("and this".into(), cx)));
     board(cx, w, &view);
     assert_eq!(outbox(cx, &view), ["and this\n[block plan v1 dismissed]"]);
+    // A settle while the turn runs (the session's first board seen): the
+    // steer not delivered yet, its carrier still in flight. The next steer
+    // carries nothing again.
+    view.update(cx, |v, _| v.wishes.forget_boards());
+    let same = json!([{"op": "patch", "id": "now", "set": {"text": "Running it again"}}]);
+    super::blocks_ui_tests::round(cx, w, &view, &[("toolu_w2", same, true)]);
+    view.update(cx, |v, cx| assert!(v.enter("more".into(), cx)));
+    board(cx, w, &view);
+    assert_eq!(outbox(cx, &view).last().map(String::as_str), Some("more"), "in flight: not again");
 }
 
 /// A compaction carries the dismissal into the successor softly: the
@@ -198,4 +208,100 @@ fn a_compaction_carries_a_dismissal_as_a_tombstone(cx: &mut TestAppContext) {
     click(cx, w, at);
     away(cx, w, &view);
     assert!(!has(cx, w, tomb) && has_sec(cx, &view, "plan"), "u: shown");
+}
+
+/// Another desk owns this user's files: this one keeps its changes in
+/// memory only, and its rail says so.
+#[gpui_kit::test]
+fn a_second_desk_says_its_changes_stay_in_memory(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let path = crate::desires::path().expect("the test home");
+    std::fs::create_dir_all(path.parent().expect("its folder")).expect("the folder");
+    let _other = crate::blockfiles::own(&path).expect("the other desk's lock");
+    view.update(cx, |v, cx| v.start_wishes(cx));
+    away(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| !v.wishes.desires.owns_file()));
+    let said = view.read_with(cx, |v, _| v.wishes.said.clone()).expect("said");
+    assert!(said.contains("another desk's"), "{said}");
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
+}
+
+/// A notice in flight stays so until its history lands: the turn that
+/// carried it ends first, and the desire neither settles on the turn's
+/// board (only the history's records settle) nor rides again.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_notice_in_flight_waits_for_its_history(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    view.update(cx, |v, cx| assert!(v.enter("go".into(), cx)));
+    board(cx, w, &view);
+    let sent = "go\n[block plan v1 dismissed]";
+    assert_eq!(outbox(cx, &view), [sent]);
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": sent}),
+            super::answer_tests::llm(json!({"kind": "llm", "llm": "response_start"})),
+        ],
+    );
+    board(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.busy()));
+    heard(
+        cx,
+        w,
+        &view,
+        vec![
+            super::answer_tests::llm(json!({"kind": "llm", "llm": "text", "text": "noted"})),
+            super::answer_tests::llm(json!({"kind": "session", "session": "done"})),
+            json!({"ev": "idle"}),
+        ],
+    );
+    board(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| !v.model.lives[v.panes.cur.live].transcript.busy()), "the turn is over");
+    assert_eq!(desires(cx, &view), 1, "not settled by the turn's board");
+    assert!(!has(cx, w, "composer-tells + tells the agent: plan dismissed ×".into()), "still in flight: it rides nothing");
+    land(
+        cx,
+        w,
+        &view,
+        vec![json!({"role": "user", "content": sent}), json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})],
+    );
+    board(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "its history: settled");
+    assert!(!has_sec(cx, &view, "plan"));
+}
+
+/// A settle mid-turn (the session's first board seen while its turn
+/// runs): the turn's board has the notice, the history doesn't. Only the
+/// history's records settle, and the carrier is still in flight: kept,
+/// and it rides nothing.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_settle_mid_turn_reads_the_history_and_keeps_the_carrier(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    view.update(cx, |v, cx| assert!(v.enter("go".into(), cx)));
+    board(cx, w, &view);
+    let sent = "go\n[block plan v1 dismissed]";
+    heard(cx, w, &view, vec![json!({"ev": "turn_started", "turn_baseline": 6, "trigger": "user", "user_text": sent})]);
+    board(cx, w, &view);
+    // What this window knew of the session goes (its tab opened again).
+    view.update(cx, |v, _| v.wishes.forget_boards());
+    let same = json!([{"op": "patch", "id": "now", "set": {"text": "Running it again"}}]);
+    super::blocks_ui_tests::round(cx, w, &view, &[("toolu_w1", same, true)]);
+    let p = cards_spec::block::BlockId::parse("plan").expect("an id");
+    let (live, history) = view.read_with(cx, |v, _| {
+        let d = v.model.lives[v.panes.cur.live].transcript.drawn().expect("a board");
+        (d.visibility.dismissed(&p), d.settled.dismissed(&p))
+    });
+    assert!(live && !history, "the turn's board has it, the history doesn't");
+    assert_eq!(desires(cx, &view), 1, "not settled");
+    assert!(!has(cx, w, "composer-tells + tells the agent: plan dismissed ×".into()), "in flight: it rides nothing");
 }
