@@ -149,7 +149,8 @@ struct Track {
 
 impl Stores {
     /// Before the launch reads the files ([`AppView::start_wishes`]):
-    /// nothing kept. Tests: a folder of the window's own.
+    /// nothing kept. Tests: a folder of the window's own, new (nothing a
+    /// crash left there to sweep: no write until a change asks for one).
     pub(crate) fn at_launch() -> Self {
         #[cfg(test)]
         {
@@ -157,7 +158,10 @@ impl Stores {
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir = crate::theme::test_home::root().join(format!("wishes-{n}"));
             let _ = std::fs::create_dir_all(&dir);
-            Self::open(Home::take(Some(dir.join(crate::desires::FILE)), Some(dir.join(crate::presentation::FILE))))
+            let mut s = Self::open(Home::take(Some(dir.join(crate::desires::FILE)), Some(dir.join(crate::presentation::FILE))));
+            s.desires.swept();
+            s.pres.swept();
+            s
         }
         #[cfg(not(test))]
         Self::open(Home::none())
@@ -291,7 +295,7 @@ impl AppView {
     /// its session).
     pub(crate) fn conversation(&self, live: LiveId) -> String {
         let l = &self.model.lives[live];
-        match l.transcript.journal_id() {
+        match l.transcript.journal() {
             "" => l.active.as_ref().map(|a| a.session_id.clone()).unwrap_or_default(),
             j => j.to_string(),
         }

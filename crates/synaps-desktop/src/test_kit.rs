@@ -48,6 +48,8 @@ mod remember_tests;
 mod reveal_tests;
 #[path = "send_tests.rs"]
 mod send_tests;
+#[path = "walk_tests.rs"]
+mod walk_tests;
 
 /// The `--offline` demo's window, `size` px at text step `text`, a client
 /// whose daemon is nowhere ([`open_with`], the beat on the layer).

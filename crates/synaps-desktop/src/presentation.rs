@@ -426,6 +426,12 @@ impl Presentation {
         self.owner.is_ok() && (self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq)))
     }
 
+    /// Tests: nothing to sweep (a folder of its own, new).
+    #[cfg(test)]
+    pub(crate) fn swept(&mut self) {
+        self.sweep = false;
+    }
+
     /// A write as it ran. Failed: said, and memory keeps it all.
     pub(crate) fn landed(&mut self, l: Landing) -> Result<(), String> {
         if self.out != Some(l.ticket) {

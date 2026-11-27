@@ -38,12 +38,14 @@ fn has_sec(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> bool 
     view.read_with(cx, |v, _| v.rail_layout().is_some_and(|(_, l)| l.section(&r).is_some()))
 }
 
-/// Section `name`'s hover action `act` (`agent-x`, `agent-slot`),
-/// clicked: the pointer over its header first, so it draws.
+/// Section `name`'s hover action `act` (`agent-x`: its `×`,
+/// `agent-slot`: its `⇅`, in D7's hover row), clicked: the pointer over
+/// its header first, so it draws.
 fn action(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str, act: &str) {
     let head = drawn(cx, w, format!("agent-head {}", row(name))).center();
     mouse(cx, w, head, "move");
-    let at = drawn(cx, w, format!("{act} {}", row(name))).center();
+    let mark = if act == "agent-x" { "×" } else { "⇅" };
+    let at = drawn(cx, w, format!("hover-act {} {mark}", row(name))).center();
     click(cx, w, at);
 }
 
@@ -208,7 +210,7 @@ fn a_compaction_carries_a_dismissal_as_a_tombstone(cx: &mut TestAppContext) {
     action(cx, w, "plan", "agent-x");
     away(cx, w, &view);
     heard(cx, w, &view, vec![json!({"ev": "compaction_started", "source": "manual", "disclosure": ""})]);
-    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal_id().to_string());
+    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string());
     heard(
         cx,
         w,
@@ -224,7 +226,7 @@ fn a_compaction_carries_a_dismissal_as_a_tombstone(cx: &mut TestAppContext) {
     compacted.extend(synaps_client::synthetic::rail_history());
     replace(cx, w, &view, compacted);
     board(cx, w, &view);
-    assert_eq!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal_id().to_string()), "j-next");
+    assert_eq!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string()), "j-next");
     let tomb = format!("agent-tomb {}", row("plan"));
     assert!(has(cx, w, tomb.clone()), "the block put again: its tombstone");
     assert!(!has(cx, w, "composer-tells + tells the agent: plan dismissed ×".into()), "soft: nothing told");
@@ -452,7 +454,7 @@ fn a_settle_and_a_compactions_carry_are_written_with_no_click_after(cx: &mut Tes
     let (d, _) = on_disk(cx, &view);
     assert!(!d.contains("\"plan\""), "the settle's deletion, written: {d}");
     heard(cx, w, &view, vec![json!({"ev": "compaction_started", "source": "manual", "disclosure": ""})]);
-    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal_id().to_string());
+    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string());
     heard(
         cx,
         w,
@@ -624,7 +626,7 @@ fn a_tombstone_pressed_across_a_replacement_does_nothing(cx: &mut TestAppContext
     action(cx, w, "plan", "agent-x");
     away(cx, w, &view);
     heard(cx, w, &view, vec![json!({"ev": "compaction_started", "source": "manual", "disclosure": ""})]);
-    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal_id().to_string());
+    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string());
     heard(
         cx,
         w,

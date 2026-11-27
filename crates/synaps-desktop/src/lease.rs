@@ -91,6 +91,8 @@ pub(crate) enum Act {
     Fold,
     /// A note's `more` / `less`.
     More,
+    /// A header's hover action (D7, [`crate::walk::Hover`]).
+    Hover(crate::walk::Hover),
 }
 
 /// A press's painted target: the block row it was painted as (a group's
@@ -134,6 +136,9 @@ pub(crate) struct Lease {
     pub hover: Option<Target>,
     /// The group member under the pointer (its group is `hover`).
     pub member: Option<Target>,
+    /// The block row whose header is under the pointer, and since when:
+    /// its hover actions show (D7, [`crate::walk`]).
+    pub head: Option<(u64, Instant)>,
     pub down: Option<Press>,
     /// A block's note until the next input.
     pub note: Option<(u64, &'static str)>,
@@ -168,6 +173,7 @@ impl Lease {
     /// or pill. Its frame count and the list's anchoring go on.
     pub(crate) fn clear(&mut self) {
         (self.moved, self.over, self.pressed, self.hover, self.member, self.down, self.note) = (None, false, false, None, None, None, None);
+        self.head = None;
         self.painted.borrow_mut().clear();
         self.agent_frame.set(None);
         self.above.borrow_mut().clear();
@@ -568,12 +574,23 @@ impl AppView {
             match shown {
                 Some((ix, s)) if held => {
                     match act {
-                        Act::Fold => this.panes.cur.block_folds.toggle(row, &s),
+                        Act::Fold => {
+                            let (before, after) = this.panes.cur.block_folds.toggle(row, &s);
+                            // A top-level block's fold: its undo (D7), what
+                            // it set and what was before.
+                            if this.block_shown(row).is_some() {
+                                let act = crate::walk::Undid::Fold { before, after };
+                                let u = crate::walk::Undo { at: crate::walk::At::Block(row), tag: s.block.tag, act };
+                                this.panes.cur.walk.push(u);
+                            }
+                        }
                         Act::More => {
                             if !this.panes.cur.block_more.remove(&row) {
                                 this.panes.cur.block_more.insert(row);
                             }
                         }
+                        // Its own up ([`AppView::hover_up`]).
+                        Act::Hover(_) => {}
                     }
                     this.panes.cur.list.remeasure_items(ix..ix + 1);
                 }

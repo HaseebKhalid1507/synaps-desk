@@ -104,12 +104,10 @@ impl Work {
 
 /// A re-fold step's budget in visits ([`Refold::step`]): small, so the
 /// 30 ms clock is checked often.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const REFOLD_STEP: usize = 2_048;
 
 /// What a re-fold read (module docs): the input it holds for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Read {
     /// History `epoch`'s first `len` events, the target's batch committed
     /// in them: every longer history of the epoch reads the same there.
@@ -118,7 +116,6 @@ pub(crate) enum Read {
     Whole { rev: u64 },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Read {
     /// What a re-fold of `target` reads of `input` (revision `rev`).
     fn of(target: Target, input: &Input, rev: u64) -> Self {
@@ -142,7 +139,6 @@ impl Read {
 
 /// The re-fold slot (module docs): one running, the next request waiting.
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Refolds {
     running: Option<Running>,
     /// The next request, run once the running one has ended.
@@ -153,7 +149,6 @@ pub(crate) struct Refolds {
     pub(crate) started: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Running {
     live: LiveId,
     target: Target,
@@ -167,19 +162,18 @@ struct Running {
 /// read (`read`). `Ok(None)`: the target never took effect (its call
 /// didn't bind, or it is pending).
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Refolded {
     pub(crate) live: LiveId,
     pub(crate) target: Target,
     pub(crate) read: Read,
     pub(crate) state: Result<Option<Arc<State>>, TooFar>,
-    /// Its work, in visits ([`Refold::visited`]).
+    /// Its work, in visits ([`Refold::visited`]): the tests' measure.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) visited: usize,
 }
 
 /// What one turn of a re-fold came to, `budget` of the clock spent.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Chunk {
     Done(Result<Option<Box<State>>, TooFar>),
     Paused,
@@ -188,7 +182,6 @@ pub(crate) enum Chunk {
 
 /// Steps of [`REFOLD_STEP`] visits until it is done, stopped or `budget`
 /// is up (one step at least).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn chunk(rf: &mut Refold, stop: &AtomicBool, budget: Duration) -> Chunk {
     let start = Instant::now();
     loop {
@@ -212,7 +205,6 @@ type Folded = (Result<Option<Box<State>>, TooFar>, usize);
 
 /// A re-fold of `events` to `target`, run to its end or its stop, the
 /// executor given a turn each time the clock is up.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn refold(
     events: Arc<Vec<Event>>,
     generation: cards_spec::block::Generation,
@@ -234,7 +226,6 @@ async fn refold(
 
 /// One turn given back to the executor (every platform: `futures-lite`
 /// is the desk's on Linux only).
-#[cfg_attr(not(test), allow(dead_code))]
 async fn yield_now() {
     let mut once = false;
     std::future::poll_fn(|cx| {
@@ -357,7 +348,6 @@ impl AppView {
     /// Store `live`'s board at `target` (module docs): a re-fold, run when
     /// the slot is free; the one running for another request is stopped.
     /// Asked again while it runs or once done, nothing new.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refold(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
         let t = &self.model.lives[live].transcript;
         let now = (t.blocks_epoch(), t.blocks_len(), t.blocks_rev());
@@ -381,7 +371,6 @@ impl AppView {
 
     /// The re-fold's request withdrawn (its view closed): stopped, and
     /// nothing kept.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refold_cancel(&mut self) {
         let r = &mut self.refolds;
         r.running.as_ref().inspect(|j| j.stop.store(true, Ordering::Relaxed));
@@ -389,7 +378,6 @@ impl AppView {
         r.done = None;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn refold_start(&mut self, live: LiveId, target: Target, cx: &mut Context<Self>) {
         let t = &self.model.lives[live].transcript;
         let rev = t.blocks_rev();
@@ -428,7 +416,6 @@ impl AppView {
 
     /// A re-fold ended: kept if it finished, and its request stands and its
     /// input still holds (module docs); then the request that waited runs.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn refold_ended(&mut self, live: LiveId, target: Target, read: Read, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));

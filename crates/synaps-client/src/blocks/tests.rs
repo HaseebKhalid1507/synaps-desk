@@ -551,3 +551,78 @@ fn the_visibility_maps_are_counted() {
     assert!(!Arc::ptr_eq(&dl.visibility, &dl.settled) && dl.visibility.dismissed(&z) && !dl.settled.dismissed(&z));
     assert!(dl.bytes >= dn.bytes + h64, "both maps: {} vs {} + {h64}", dl.bytes, dn.bytes);
 }
+
+/// One block call of `ops` as the history holds it: its message, then
+/// its result (a receipt).
+fn call_of(id: &str, ops: Value) -> [Value; 2] {
+    [
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": block_receipt(&ops)}]}),
+    ]
+}
+
+/// History `h`'s board, a tool row each call (rows 1, 2, … in order).
+fn drawn_with_rows(h: &[Value]) -> Drawn {
+    let mut hb = HistoryBlocks::default();
+    let mut row = 0u64;
+    for m in h {
+        let rows: Vec<Item> = m["content"]
+            .as_array()
+            .map(|b| b.iter().filter(|b| b["type"] == "tool_use").map(|b| tool_row(&mut row, b["id"].as_str().unwrap())).collect())
+            .unwrap_or_default();
+        hb.message(m, &rows);
+    }
+    Worker::default().run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).expect("done")
+}
+
+/// Shady #105 R2-1: a board's marks keep a call's id once, one allocation
+/// shared by its lines and records whatever its ops; an id past
+/// [`CALL_ID_MAX`] is not kept (its time unknown, its row kept); and a
+/// board keeps [`CALL_IDS_MAX`] bytes of ids at most, the newest lines'
+/// first, then the newest records', counted in its bytes.
+#[test]
+fn a_boards_marks_share_their_calls_ids_within_a_budget() {
+    let marks = |d: &Drawn| d.log.iter().map(|(_, m)| m.clone()).chain(d.records.iter().map(|(_, m)| m.clone())).collect::<Vec<Mark>>();
+    // One call of 16 ops, its id as long as is kept; one of 8, longer.
+    let kept = format!("toolu_{}", "k".repeat(CALL_ID_MAX - 6));
+    let over = format!("toolu_{}", "o".repeat(CALL_ID_MAX - 5));
+    let puts = |p: &str, n: usize| {
+        Value::Array((0..n).map(|k| json!({"op":"put","id":format!("{p}{k}"),"kind":"note","body":{"text":"x"}})).collect())
+    };
+    let mut h = vec![json!({"role": "user", "content": "go"})];
+    h.extend(call_of(&kept, puts("a", 16)));
+    h.extend(call_of(&over, puts("b", 8)));
+    let d = drawn_with_rows(&h);
+    let all = marks(&d);
+    let first: Vec<&Mark> = all.iter().filter(|m| m.row == Some(1)).collect();
+    let second: Vec<&Mark> = all.iter().filter(|m| m.row == Some(2)).collect();
+    assert_eq!((first.len(), second.len()), (32, 16), "a line and a record an op");
+    let one = first[0].call.clone().expect("its id kept");
+    assert_eq!(&*one, kept.as_str());
+    let shared = first.iter().filter(|m| m.call.as_ref().is_some_and(|c| Arc::ptr_eq(c, &one))).count();
+    assert_eq!(shared, 32, "one allocation for the call's 32 marks");
+    assert!(second.iter().all(|m| m.call.is_none()), "an id past {CALL_ID_MAX} bytes: not kept");
+    // Six hundred calls, ids 120 bytes long, a revision each (of twenty
+    // plans, within B2's records a block): past the budget.
+    let id = |k: usize| format!("toolu_{k:0>114}");
+    let mut h = vec![json!({"role": "user", "content": "go"})];
+    for half in [0..10, 10..20] {
+        let plans =
+            half.map(|j| json!({"op":"put","id":format!("p{j}"),"kind":"plan","body":{"steps":[{"id":"a","label":"A","state":"todo"}]}}));
+        h.extend(call_of("toolu_plans", Value::Array(plans.collect())));
+    }
+    for k in 0..600 {
+        let state = if (k / 20) % 2 == 0 { "doing" } else { "done" };
+        h.extend(call_of(&id(k), json!([{"op":"patch","id":format!("p{}", k % 20),"state":{"a": state}}])));
+    }
+    let d = drawn_with_rows(&h);
+    assert!(d.records.len() >= 600 && d.log.len() == cards_spec::board::LOG_MAX, "{} records, {} lines", d.records.len(), d.log.len());
+    let mut seen = HashSet::new();
+    let ids: usize =
+        marks(&d).iter().filter_map(|m| m.call.as_ref()).filter(|c| seen.insert(Arc::as_ptr(c).cast::<u8>())).map(|c| c.len() + ARC).sum();
+    assert!(ids <= CALL_IDS_MAX, "{ids} bytes of ids kept");
+    assert!(d.log.iter().all(|(_, m)| m.call.is_some()), "every line keeps its call's id: the newest first");
+    let without = d.records.iter().position(|(_, m)| m.call.is_none()).expect("a record past the budget");
+    assert!(d.records[without].1.row.is_some(), "its row kept");
+    assert!(d.records.iter().rev().take(256).all(|(_, m)| m.call.is_some()), "the newest records keep theirs");
+}

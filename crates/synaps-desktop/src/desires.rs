@@ -642,6 +642,12 @@ impl Desires {
         self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq))
     }
 
+    /// Tests: nothing to sweep (a folder of its own, new).
+    #[cfg(test)]
+    pub(crate) fn swept(&mut self) {
+        self.sweep = false;
+    }
+
     /// A write as it ran ([`Write::run`]): the wishes it carried draw (or,
     /// failed, are refused, what drew before drawn again), and the messages
     /// whose turn came go.
