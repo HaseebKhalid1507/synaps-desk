@@ -75,10 +75,14 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
         let (o, room) = outer(l).expect("a block allocated");
-        let Some(grown) = size.checked_add(room) else { return std::ptr::null_mut() };
+        // The block it grows to, room added, must be a layout too: if not,
+        // none, and `p` is left as it was.
+        let Some((grown, _)) = Layout::from_size_align(size, l.align()).ok().and_then(outer) else {
+            return std::ptr::null_mut();
+        };
         let base = unsafe { p.sub(room) };
         let account = unsafe { (base as *const usize).read() };
-        let q = unsafe { System.realloc(base, o, grown) };
+        let q = unsafe { System.realloc(base, o, grown.size()) };
         if q.is_null() {
             return q;
         }
@@ -293,6 +297,35 @@ fn a_block_freed_on_another_thread_leaves_the_account_it_was_charged_to() {
     }
     assert_eq!(held() - base, 0, "freed there");
     other.join().unwrap();
+}
+
+/// A block grown to a size the caller may ask for (it fits rounded up to
+/// the block's alignment) but too big for a layout once the room before
+/// it is added is refused: null, the block left as it was, and its
+/// account and this thread's count with it. At each alignment's boundary:
+/// the largest size whose block (room added) is a layout, and one more.
+#[test]
+fn a_block_grown_past_the_largest_layout_is_refused_and_kept() {
+    mine();
+    for align in [8, 32] {
+        let room = align;
+        let largest = isize::MAX as usize - (room - 1) - room;
+        let fits = |size| outer(Layout::from_size_align(size, align).unwrap()).map(|(o, _)| o.size());
+        assert_eq!(fits(largest), Some(largest + room), "align {align}: the largest, room added");
+        assert_eq!(fits(largest + 1), None, "align {align}: one more");
+        let l = Layout::from_size_align(64, align).unwrap();
+        unsafe {
+            let p = COUNTING.alloc(l);
+            assert!(!p.is_null());
+            p.write_bytes(7, l.size());
+            let (base, there) = (held(), here());
+            assert!(COUNTING.realloc(p, l, largest + 1).is_null(), "align {align}: refused");
+            assert_eq!((held(), here()), (base, there), "align {align}: counted as it was");
+            assert!(std::slice::from_raw_parts(p, l.size()).iter().all(|&b| b == 7), "align {align}: kept");
+            COUNTING.dealloc(p, l);
+            assert_eq!((held(), here()), (base - 64, there - 64), "align {align}: freed whole");
+        }
+    }
 }
 
 /// A card of the most its schema lets an input say, more or less.
