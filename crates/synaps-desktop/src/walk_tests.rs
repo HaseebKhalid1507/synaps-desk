@@ -1122,6 +1122,85 @@ fn a_late_undo_puts_both_stores_back_together(cx: &mut TestAppContext) {
     assert_eq!(desires(cx, &view), 0);
 }
 
+/// The pane's conversation's presentation entries.
+fn entries(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
+    view.read_with(cx, |v, _| {
+        let conv = v.conversation(v.panes.cur.live);
+        (0..=crate::presentation::ENTRIES_MAX)
+            .filter(|i| v.wishes.pres.soft(&conv, &cards_spec::block::BlockId::parse(&format!("s{i}")).expect("an id")))
+            .count()
+            + v.wishes.pres.user_rail(&conv).len()
+    })
+}
+
+/// Shady #106 P2-3: Ctrl+Z puts back what it says, or nothing. At the
+/// conversation's cap (64 entries), `c`'s pin the oldest: pane 1 unpins
+/// it, pane 2 (the same conversation) pins `b` into the room, and pane
+/// 1's Ctrl+Z would put back an entry the cap drops at once. Refused, and
+/// said why: nothing changed.
+#[gpui_kit::test]
+fn an_undo_the_caps_would_drop_is_refused_and_changes_nothing(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX, "at the cap, c's pin the oldest");
+    walk_on(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "unpinned");
+    // Pane 2, on the same conversation: `b` pinned into the room.
+    press(cx, w, "escape");
+    let first = view.read_with(cx, |v, _| v.panes.focused);
+    split(cx, w, &view);
+    tail(cx, w, &view);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("b")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b pinned");
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX);
+    // Pane 1's Ctrl+Z.
+    let c1 = view.read_with(cx, |v, _| v.panes.iter().find(|p| p.id == first).map(|p| p.composer.clone()).expect("pane 1"));
+    cx.update_window(w, |_, window, cx| c1.update(cx, |s, cx| s.focus(window, cx))).expect("the window");
+    settle(cx, w, 8);
+    wait(cx, w, &view, 100);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), first, "pane 1");
+    enter(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "not pinned again");
+    assert!(said(cx, &view).contains("no room to put it back"), "refused, said: {}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b as it was");
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX, "every entry as it was");
+}
+
+/// Shady #106 P2-3: an undo of both stores at the cap (`x` on a soft
+/// tombstone, its soft entry the oldest, a carry filling the room since)
+/// is refused before either store changes: the dismissal stays.
+#[gpui_kit::test]
+fn an_undo_of_both_stores_the_caps_would_drop_changes_neither(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    softly(cx, w, &view, &["r1".into()]);
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert!(sec(cx, &view, "r1").is_none() && desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "dismissed");
+    softly(cx, w, &view, &[format!("s{}", crate::presentation::ENTRIES_MAX)]);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 1, "the dismissal stays");
+    assert!(sec(cx, &view, "r1").is_none() && !is_soft(cx, &view, "r1"), "neither store changed");
+    assert!(said(cx, &view).contains("no room to put it back"), "refused, said: {}", said(cx, &view));
+}
+
 // ── the op log ────────────────────────────────────────────────────────
 
 fn oplog_lines(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {

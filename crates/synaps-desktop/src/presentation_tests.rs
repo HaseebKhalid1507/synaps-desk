@@ -255,6 +255,71 @@ fn the_files_caps_drop_the_oldest() {
     assert!(!book.conversations.contains_key("k000") && book.conversations.contains_key(&format!("k{:03}", CONVERSATIONS_MAX - 1)));
 }
 
+/// Shady #106 P2-3: D7's undo puts back exactly what it says, or changes
+/// nothing. At the entry cap the entry put back would be the oldest: the
+/// book as it was. Over the file's bytes, the least recently touched
+/// conversation goes, not this one: put back as it was.
+#[test]
+fn putting_back_keeps_what_it_puts_back_or_changes_nothing() {
+    let d = dir("putback");
+    let mut p = presentation(&d);
+    let h = H::with(&["plan"]);
+    pin(&mut p, &h, "plan").unwrap();
+    let was = p.mark(J, &r("plan"));
+    let soft: Vec<_> = (0..ENTRIES_MAX).map(|i| id(&format!("s{i}"))).collect();
+    p.compacted("before", J, &soft[..ENTRIES_MAX - 1]);
+    pin(&mut p, &h, "plan").unwrap();
+    assert_eq!(p.mark(J, &r("plan")), Mark::default(), "unpinned");
+    p.compacted("before", J, &soft);
+    assert_eq!(p.book.conversations[J].entries.len(), ENTRIES_MAX, "the room filled since");
+    let book = p.book.clone();
+    assert_eq!(p.put_back(J, &r("plan"), &was), Err(NO_ROOM.into()), "it would be the oldest");
+    assert_eq!(p.book, book, "nothing changed");
+
+    // The file's bytes: other conversations filling it to within less
+    // than J's entry once it is back.
+    p.book = Book::default();
+    let full = |n: usize| Conversation {
+        touched: n as u64,
+        seq: ENTRIES_MAX as u64,
+        entries: (0..ENTRIES_MAX)
+            .map(|i| Kept {
+                entry: Entry::Placed {
+                    r: r(&format!("card:c{i:06}")),
+                    to: UserPlace::Transcript,
+                    pinned: true,
+                    agent: Some(Place::Transcript(usize::MAX)),
+                },
+                seq: i as u64,
+            })
+            .collect(),
+    };
+    let one = {
+        let mut b = Book::default();
+        b.conversations.insert("k000".into(), full(0));
+        b.text().len() - Book::default().text().len() + 1
+    };
+    let n = (FILE_BYTES_MAX - 4096) / one;
+    for c in 0..n {
+        p.book.conversations.insert(format!("k{c:03}"), full(c));
+    }
+    let entry = full(0).entries;
+    for i in 0..2 * ENTRIES_MAX {
+        let k = n + i / ENTRIES_MAX;
+        let c = p.book.conversations.entry(format!("k{k:03}")).or_insert(Conversation { entries: Vec::new(), ..full(k) });
+        c.entries.push(entry[i % ENTRIES_MAX].clone());
+        if p.book.text().len() > FILE_BYTES_MAX - 100 {
+            break;
+        }
+    }
+    let before = p.book.text().len();
+    assert!(before <= FILE_BYTES_MAX && before > FILE_BYTES_MAX - 200, "{before}");
+    p.put_back(J, &r("plan"), &was).unwrap();
+    assert_eq!(p.mark(J, &r("plan")), was, "put back as it was");
+    assert!(p.book.text().len() <= FILE_BYTES_MAX);
+    assert!(!p.book.conversations.contains_key("k000"), "the least recently touched went");
+}
+
 /// One writer: a second store of the file (another process, here another
 /// in this one) doesn't get its lock, and keeps its placements in memory
 /// only: drawn at once, never written, the file untouched; said. Once the

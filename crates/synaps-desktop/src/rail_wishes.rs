@@ -25,7 +25,9 @@
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
 //!   tombstone ended; and only where its key is offered now (a block the
-//!   agent moved since is refused, [`MOVED_SINCE`]). An undo whose desire
+//!   agent moved since is refused, [`MOVED_SINCE`]), and where the caps
+//!   would drop what it puts back at once (refused before either store
+//!   changes, `presentation::NO_ROOM`). An undo whose desire
 //!   is a write away puts its presentation back at once (the desire draws
 //!   as before until it is written); that write failing puts both back as
 //!   the key left them ([`Stores::undo_landed`]). A key's token names its
@@ -483,6 +485,15 @@ impl BlockDesires for Stores {
             self.said = Some(format!("{}: {why}", u.r));
             return Asked::Refused(why.into());
         }
+        // The presentation's half, fitted to the caps first: none of it if
+        // it wouldn't keep what it puts back.
+        let restored = match self.pres.restored(&u.conv, &u.r, &u.pres.0) {
+            Ok(b) => b,
+            Err(why) => {
+                self.said = Some(format!("{}: {why}", u.r));
+                return Asked::Refused(why);
+            }
+        };
         if let Some((g, id, left)) = &u.desire {
             let shared = &aim.drawn.visibility;
             // The opposite wish: over one no notice went for, a cancel.
@@ -506,8 +517,8 @@ impl BlockDesires for Stores {
                 Ok(_) => {}
             }
         }
-        let (_, u) = self.undos.remove(k).expect("found");
-        self.pres.put_back(&u.conv, &u.r, &u.pres.0);
+        self.undos.remove(k);
+        self.pres.install(restored);
         Asked::Done(token)
     }
 }
@@ -524,8 +535,11 @@ impl Stores {
             return;
         }
         for u in mine.into_iter().rev() {
-            if same(self.desires.wish(&u.conv, &u.generation, &u.id), u.left.as_ref()) && self.pres.mark(&u.conv, &u.r) == u.pres.0 {
-                self.pres.put_back(&u.conv, &u.r, &u.pres.1);
+            if same(self.desires.wish(&u.conv, &u.generation, &u.id), u.left.as_ref())
+                && self.pres.mark(&u.conv, &u.r) == u.pres.0
+                && let Err(why) = self.pres.put_back(&u.conv, &u.r, &u.pres.1)
+            {
+                log::warn!(target: "synaps_desktop::blocks", "{}: not put back as its key left it: {why}", u.r);
             }
         }
     }
