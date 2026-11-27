@@ -2,14 +2,18 @@
 //! §3.5 and §1.8): `blocks.json` ([`crate::presentation`]) and
 //! `block-desires.json` ([`crate::desires`]), next to `settings.json`.
 //!
-//! **One writer per file: the desk process that owns it.** At its launch a
-//! store takes the file's lock (`<file>.lock`, [`own`]) and holds it for
-//! the process's life; only that process reads, writes or decides on the
-//! file. Its memory is the truth, and each write is a whole snapshot of it.
-//! A second desk process on the machine (another build, another launch)
-//! doesn't get the lock: it keeps its desires and presentation in memory
-//! only, never touches the file, and says so. Nothing is merged between
-//! processes: the history is what desks share (§3.5).
+//! **One writer per file: the desk process that owns it.** At its launch,
+//! before any window, the app takes each file's lock (`<file>.lock`,
+//! [`own`]) once ([`crate::rail_wishes::Home`]); only that process reads,
+//! writes or decides on the file. The lock is an [`Owned`]: the app holds
+//! it until it shuts down, its window's store a clone, and every write
+//! issued another until it ran, so the lock outlives every write that can
+//! still touch the file. Memory is the truth, and each write is a whole
+//! snapshot of it. A second desk process on the machine (another build,
+//! another launch) doesn't get the lock: it keeps its desires and
+//! presentation in memory only, never touches the file, and says so for as
+//! long as it runs. Nothing is merged between processes: the history is
+//! what desks share (§3.5).
 //!
 //! **recall's writer** (`recall.rs`, #93): the whole file written to a new
 //! temporary file of this process beside it (`<file>.tmp.<pid>.<n>`,
@@ -20,10 +24,15 @@
 //! swept by the owner's first write ([`sweep`]: regular files of exactly
 //! that pattern, nothing else, no link followed).
 //!
-//! **Off the UI thread.** [`sweep`] and [`write`] touch the disk: the
-//! stores run them on a background task, one at a time, in order, and take
-//! back what they return. At a launch the UI thread only takes the lock
-//! (never waiting for it) and reads the file once ([`peek`]).
+//! **Off the UI thread, on the process's writer.** [`sweep`] and [`write`]
+//! touch the disk: the stores hand them to the [`Writer`], one thread that
+//! runs them in order, and take back what they return. A window closing or
+//! the app quitting hands it the last snapshot of each file memory has
+//! changed since ([`crate::rail_wishes`]); the app's shutdown waits for it
+//! [`JOIN`] at most, as D5's disposer does, then lets go of its locks
+//! (a write still running keeps its own until it ends). At a launch the UI
+//! thread only takes the lock (never waiting for it) and reads the file
+//! once ([`peek`]).
 //!
 //! **A file that doesn't parse** reads as empty, and the sweep copies it
 //! aside to `<file>.bad` before anything is written over it; the log says
@@ -31,6 +40,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::recall;
 
@@ -54,15 +67,206 @@ fn name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
+/// This process's ownership of a file (module docs): its lock, held while
+/// any clone of it stands.
+#[derive(Clone, Debug)]
+pub(crate) struct Owned(#[allow(dead_code, reason = "held: the lock")] Arc<std::fs::File>);
+
+/// Why a file isn't this process's: its store keeps to memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NotOwned {
+    /// Another process holds its lock: another desk.
+    Held,
+    /// No lock to take: no folder for it, or its lock couldn't be opened
+    /// or taken (why).
+    Failed(String),
+}
+
 /// The file at `path` owned by this process: its lock, taken now without
-/// waiting, held until the returned file is dropped (the store's life).
-/// `Err`: why not (another process holds it, or the folder can't be
-/// made): the store keeps to memory.
-pub(crate) fn own(path: &Path) -> Result<std::fs::File, String> {
+/// waiting, held while the returned [`Owned`] (or a clone) stands.
+pub(crate) fn own(path: &Path) -> Result<Owned, NotOwned> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| NotOwned::Failed(format!("{}: {e}", dir.display())))?;
     }
-    crate::theme::lock_settings(&lock_file(path), std::time::Duration::ZERO)
+    let lock = lock_file(path);
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .map_err(|e| NotOwned::Failed(format!("{} not opened ({e})", lock.display())))?;
+    match f.try_lock() {
+        Ok(()) => Ok(Owned(Arc::new(f))),
+        Err(std::fs::TryLockError::WouldBlock) => Err(NotOwned::Held),
+        Err(std::fs::TryLockError::Error(e)) => Err(NotOwned::Failed(format!("{} not locked ({e})", lock.display()))),
+    }
+}
+
+/// How long the app's shutdown waits for the writer's last writes
+/// ([`Writer::shutdown`]): D5's disposer's wait.
+pub(crate) const JOIN: Duration = Duration::from_secs(2);
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The process's one writer of the block stores' files (module docs): a
+/// thread that runs each write handed to it, in order. Shut down (or
+/// dropped): its queue closed, what it holds run, waited for [`JOIN`] at
+/// most (then it ends alone, detached: each write it still holds keeps
+/// its file's lock until it ran). One whose thread didn't start, or shut
+/// down, runs what it is handed where it is (a degraded mode, said once).
+///
+/// Tests' windows have one that queues ([`Writer::queued`]): what it is
+/// handed runs, in order, when [`Writer::drain`] is called (by the
+/// window's own executor, deterministic, on the test's thread: GPUI's test
+/// scheduler forbids another thread waking its tasks), none while held.
+pub(crate) struct Writer {
+    tx: Mutex<Option<Sender<Job>>>,
+    thread: Mutex<Option<(JoinHandle<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    queued: Option<Mutex<Queued>>,
+}
+
+/// Tests: a queuing writer's jobs, and its holds.
+#[cfg(test)]
+#[derive(Default)]
+struct Queued {
+    jobs: std::collections::VecDeque<Job>,
+    holds: usize,
+}
+
+/// Tests: a queuing writer held ([`Writer::hold`]) until this goes.
+#[cfg(test)]
+pub(crate) struct Hold(Arc<Writer>);
+
+#[cfg(test)]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if let Some(q) = &self.0.queued {
+            locked(q).holds -= 1;
+        }
+    }
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Writer {
+    /// A writer and its thread.
+    pub(crate) fn start() -> Arc<Writer> {
+        let (tx, rx) = channel::<Job>();
+        let (done_tx, done) = sync_channel(1);
+        let spawned = std::thread::Builder::new().name("synaps-blockfiles".into()).spawn(move || {
+            for job in rx {
+                job();
+            }
+            let _ = done_tx.send(());
+        });
+        match spawned {
+            Ok(t) => Arc::new(Writer {
+                tx: Mutex::new(Some(tx)),
+                thread: Mutex::new(Some((t, done))),
+                #[cfg(test)]
+                queued: None,
+            }),
+            Err(e) => {
+                eprintln!("synaps-desktop: the block stores' writer did not start ({e}): their writes run in place");
+                Writer::closed()
+            }
+        }
+    }
+
+    /// One with no thread: what it is handed runs in place (a store with
+    /// no file: its writes touch nothing).
+    pub(crate) fn closed() -> Arc<Writer> {
+        Arc::new(Writer {
+            tx: Mutex::new(None),
+            thread: Mutex::new(None),
+            #[cfg(test)]
+            queued: None,
+        })
+    }
+
+    /// Tests: one that queues (type docs).
+    #[cfg(test)]
+    pub(crate) fn queued() -> Arc<Writer> {
+        Arc::new(Writer { tx: Mutex::new(None), thread: Mutex::new(None), queued: Some(Mutex::default()) })
+    }
+
+    /// Tests: a queuing writer's jobs run here, in order, until none is
+    /// left or it is held. Any other: nothing.
+    #[cfg(test)]
+    pub(crate) fn drain(&self) {
+        let Some(q) = &self.queued else { return };
+        loop {
+            let job = {
+                let mut q = locked(q);
+                if q.holds > 0 {
+                    return;
+                }
+                q.jobs.pop_front()
+            };
+            match job {
+                Some(job) => job(),
+                None => return,
+            }
+        }
+    }
+
+    /// Tests: a queuing writer runs nothing until the hold goes (then
+    /// [`Writer::drain`] runs what it holds).
+    #[cfg(test)]
+    pub(crate) fn hold(self: &Arc<Self>) -> Hold {
+        if let Some(q) = &self.queued {
+            locked(q).holds += 1;
+        }
+        Hold(self.clone())
+    }
+
+    /// `job` run after everything handed over before it, on the writer's
+    /// thread; what it returns, once it ran.
+    pub(crate) fn run<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> async_channel::Receiver<R> {
+        let (tx, rx) = async_channel::bounded(1);
+        let job: Job = Box::new(move || {
+            let _ = tx.try_send(job());
+        });
+        #[cfg(test)]
+        if let Some(q) = &self.queued {
+            locked(q).jobs.push_back(job);
+            return rx;
+        }
+        let left = match &*locked(&self.tx) {
+            Some(q) => q.send(job).err().map(|e| e.0),
+            None => Some(job),
+        };
+        if let Some(job) = left {
+            job();
+        }
+        rx
+    }
+
+    /// Its queue closed, and waited for [`JOIN`] at most while its thread
+    /// runs what it holds: `true` if it ended (joined).
+    pub(crate) fn shutdown(&self) -> bool {
+        #[cfg(test)]
+        if let Some(q) = &self.queued {
+            let jobs = std::mem::take(&mut locked(q).jobs);
+            jobs.into_iter().for_each(|job| job());
+            return true;
+        }
+        drop(locked(&self.tx).take());
+        let Some((thread, done)) = locked(&self.thread).take() else { return true };
+        match done.recv_timeout(JOIN) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => thread.join().is_ok(),
+            Err(RecvTimeoutError::Timeout) => false,
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// The file as it is: missing is empty; one that doesn't parse reads as
@@ -104,6 +308,20 @@ thread_local! {
 fn counted() {
     #[cfg(test)]
     ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
+}
+
+/// Tests: the file at `path` owned once it's free, within 10 s. (A lock
+/// just let go may still be held a moment: a process another test spawns
+/// holds a copy of it until it execs.)
+#[cfg(test)]
+pub(crate) fn own_once_free(path: &Path) -> Result<Owned, NotOwned> {
+    let t = std::time::Instant::now();
+    loop {
+        match own(path) {
+            Err(NotOwned::Held) if t.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(5)),
+            o => return o,
+        }
+    }
 }
 
 /// The owner's first write: what crashes left beside the file removed, and
@@ -161,4 +379,69 @@ pub(crate) fn write_then(path: &Path, text: &str, between: impl FnOnce() -> std:
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer's thread runs what it is handed in order, off the
+    /// caller's thread; its shutdown runs what it holds and joins; handed
+    /// anything after, it runs it in place.
+    #[test]
+    fn the_writer_runs_in_order_and_its_shutdown_drains_it() {
+        let w = Writer::start();
+        let here = std::thread::current().id();
+        let (go, wait) = channel::<()>();
+        let first = w.run(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            std::thread::current().id()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let after: Vec<_> = (0..8)
+            .map(|k| {
+                let seen = seen.clone();
+                w.run(move || locked(&seen).push(k))
+            })
+            .collect();
+        assert!(locked(&seen).is_empty(), "behind the first");
+        go.send(()).unwrap();
+        assert_ne!(first.recv_blocking().unwrap(), here, "off the caller's thread");
+        assert!(w.shutdown(), "drained and joined within JOIN");
+        assert!(after.iter().all(|r| r.recv_blocking().is_ok()));
+        assert_eq!(*locked(&seen), (0..8).collect::<Vec<_>>(), "in order");
+        let late = w.run(|| std::thread::current().id());
+        assert_eq!(late.recv_blocking().unwrap(), here, "shut down: in place");
+    }
+
+    /// A write's ownership outlives its store's: the lock stays taken while
+    /// the writer still holds a job carrying it (Shady #103 R3-P2-3), and
+    /// a shutdown that waits [`JOIN`] in vain leaves it to the job.
+    #[test]
+    fn a_job_holding_the_lock_keeps_it_until_it_ran() {
+        let d = std::env::temp_dir().join(format!("synaps-desktop-blockfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("x.json");
+        let owned = own_once_free(&path).expect("free");
+        let w = Writer::start();
+        let (go, wait) = channel::<()>();
+        let job = {
+            let owned = owned.clone();
+            let path = path.clone();
+            w.run(move || {
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+                let done = write(&path, "{}");
+                drop(owned);
+                done
+            })
+        };
+        drop(owned);
+        assert_eq!(own(&path).err(), Some(NotOwned::Held), "the job out holds it");
+        go.send(()).unwrap();
+        assert_eq!(job.recv_blocking().unwrap(), Ok(()));
+        assert!(w.shutdown());
+        let free = own_once_free(&path);
+        assert!(free.is_ok(), "the job ran: free ({:?})", free.err());
+    }
 }

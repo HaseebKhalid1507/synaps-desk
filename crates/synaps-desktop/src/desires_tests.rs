@@ -1082,6 +1082,8 @@ fn child() {
             std::fs::write(d.join("done"), "").unwrap();
         }
         "crash" => {
+            // The owner (its lock held), killed mid-write.
+            let _owner = blockfiles::own(&d.join(FILE)).expect("the lock: no other desk");
             let _ = blockfiles::write_then(&d.join(FILE), "{}", || -> std::io::Result<()> { std::process::abort() });
             unreachable!("aborted between the temporary file and the rename");
         }
@@ -1124,8 +1126,9 @@ fn a_second_desk_keeps_its_desires_in_memory_only() {
     assert_eq!(c.waiting(), [("parent".to_string(), 2)]);
 }
 
-/// A desk killed between writing its temporary file and the rename: the
-/// file is as it was, and the next launch sweeps the leftover.
+/// The owner killed between writing its temporary file and the rename,
+/// its lock held: the file is as it was, its lock went with it, and the
+/// next launch owns the file and sweeps the leftover.
 #[test]
 fn a_crash_mid_write_keeps_the_file_and_the_next_load_sweeps() {
     let d = dir("crash");
@@ -1142,8 +1145,49 @@ fn a_crash_mid_write_keeps_the_file_and_the_next_load_sweeps() {
             .count()
     };
     assert_eq!(left(), 1, "the dead writer's temporary file");
+    let b = Desires::load(Some(d.join(FILE)));
+    assert!(b.owns_file(), "the dead owner's lock is gone");
+    drop(b);
     let b = desires(&d);
     assert_eq!((left(), b.waiting()), (0, vec![(J.to_string(), 1)]));
+}
+
+/// Shady #103 R3-P2-3: a write issued holds the file's lock until it ran,
+/// its store dropped or not: no other store owns the file meanwhile. The
+/// last write (a window's end) carries what memory changed behind the one
+/// out; once both ran, the lock is free and the file has both.
+#[test]
+fn a_write_out_holds_the_lock_past_its_store() {
+    let d = dir("lock-outlives");
+    let h = H::with(&["a1", "a2"]);
+    let g = generation();
+    let mut a = desires(&d);
+    assert_eq!(a.dismiss(J, &g, &id("a1"), &h.vis()), Ok(Ask::Saving));
+    let w = a.next_write().expect("a1's");
+    assert_eq!(a.dismiss(J, &g, &id("a2"), &h.vis()), Ok(Ask::Saving));
+    assert!(a.next_write().is_none(), "one out: a2 behind it");
+    let last = a.last_write().expect("memory whole");
+    drop(a);
+    let b = Desires::load(Some(d.join(FILE)));
+    assert!(!b.owns_file(), "the writes out hold the lock");
+    drop(b);
+    drop(w.run());
+    let b = Desires::load(Some(d.join(FILE)));
+    assert!(!b.owns_file(), "the last write out alone holds it");
+    drop(b);
+    drop(last.run());
+    let mut c = desires(&d);
+    assert!(c.owns_file());
+    assert_eq!(c.waiting(), [(J.to_string(), 2)], "both written");
+    // A write out alone (no last one) holds it too.
+    assert_eq!(c.show(J, &g, &id("a1"), &h.vis()), Ok(Ask::Saving));
+    let w = c.next_write().expect("a1's show");
+    drop(c);
+    let b = Desires::load(Some(d.join(FILE)));
+    assert!(!b.owns_file(), "the write out alone holds the lock");
+    drop(b);
+    drop(w.run());
+    assert!(desires(&d).owns_file());
 }
 
 // Shady's review of #103, round 1 (bba9546).

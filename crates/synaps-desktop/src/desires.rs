@@ -19,10 +19,13 @@
 //!
 //! **One writer: memory is the truth.** The process that owns the file
 //! ([`crate::blockfiles`]) decides every change in memory, at once, and
-//! writes whole snapshots of it, one at a time, in order, off the UI
-//! thread ([`Desires::next_write`], [`Write::run`], [`Desires::landed`]).
+//! writes whole snapshots of it, one at a time, in order, on the
+//! process's writer ([`Desires::next_write`], [`Write::run`],
+//! [`Desires::landed`]); each write holds the file's lock until it ran,
+//! and a window's end hands it the last ([`Desires::last_write`]).
 //! Another desk process on the machine keeps its desires in memory only
-//! (its writes go nowhere): what desks share is the history.
+//! (its writes go nowhere), and says so for as long as it runs: what
+//! desks share is the history.
 //!
 //! - **A wish** ([`Desires::dismiss`], [`Desires::show`]): already drawn so,
 //!   nothing to do. Over a desire **no notice of which may have gone** (it
@@ -92,7 +95,7 @@ use cards_spec::block::{BlockId, Generation};
 use cards_spec::board::Visibility;
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, Stored};
+use crate::blockfiles::{self, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "block-desires.json";
@@ -323,8 +326,10 @@ pub(crate) struct Write {
     ticket: u64,
     /// Memory's change count the snapshot has.
     seq: u64,
-    /// The file (`None`: memory only, nothing written).
+    /// The file (`None`: memory only, nothing written), and its lock, held
+    /// until the write ran ([`blockfiles::Owned`]).
     path: Option<PathBuf>,
+    owner: Option<Owned>,
     work: Work,
 }
 
@@ -356,6 +361,7 @@ impl Write {
             (Some(p), Work::Sweep) => Ok(blockfiles::sweep::<Book>(p)),
             (Some(p), Work::Snapshot(text)) => blockfiles::write(p, &text).map(|()| None),
         };
+        drop(self.owner);
         Landing { ticket: self.ticket, seq: self.seq, sweep, done }
     }
 }
@@ -469,8 +475,9 @@ type Key = (String, String, BlockId);
 /// This desk's desires, every conversation's (module docs).
 pub(crate) struct Desires {
     path: Option<PathBuf>,
-    /// The file's lock, held for the store's life (`None`: memory only).
-    owner: Option<std::fs::File>,
+    /// The file's lock, the app's ([`blockfiles::Owned`]), or why not:
+    /// memory only.
+    owner: Result<Owned, NotOwned>,
     /// The truth: every change decided, written or not.
     book: Book,
     known: BTreeMap<String, Known>,
@@ -505,23 +512,38 @@ pub(crate) struct Desires {
 }
 
 impl Desires {
-    /// The desires in the file at `path`, owned by this process (its lock
-    /// taken, without waiting) and read now; its sweep is the first write.
+    /// The desires in the file at `path`, its lock taken here, now
+    /// ([`Desires::open`]; tests: a launch).
+    #[cfg(test)]
+    pub(crate) fn load(path: Option<PathBuf>) -> Self {
+        Self::open(path.map(|p| {
+            let o = blockfiles::own(&p);
+            (p, o)
+        }))
+    }
+
+    /// The desires in the file at `path`, owned by this process (`file`'s
+    /// lock, the app's) and read now; its sweep is the first write.
     /// Another process's: memory only, the file untouched. `None`: no
     /// config folder, and every wish is refused: it couldn't be kept.
-    pub(crate) fn load(path: Option<PathBuf>) -> Self {
-        let owner = path.as_deref().map(blockfiles::own);
-        let (book, trouble) = match (&path, &owner) {
-            (Some(p), Some(Ok(_))) => blockfiles::peek::<Book>(p),
-            (_, Some(Err(why))) => {
-                (Book::default(), Some(format!("{FILE} is another desk's: changes here are kept in memory only ({why})")))
-            }
-            _ => (Book::default(), None),
+    pub(crate) fn open(file: Option<(PathBuf, Result<Owned, NotOwned>)>) -> Self {
+        let (path, owner) = match file {
+            Some((p, o)) => (Some(p), o),
+            None => (None, Err(NotOwned::Failed("no settings folder".into()))),
         };
-        let owner = owner.and_then(Result::ok);
+        let (book, trouble) = match (&path, &owner) {
+            (Some(p), Ok(_)) => blockfiles::peek::<Book>(p),
+            (Some(_), Err(NotOwned::Held)) => {
+                (Book::default(), Some(format!("{FILE} is another desk's: changes here are kept in memory only")))
+            }
+            (Some(_), Err(NotOwned::Failed(why))) => {
+                (Book::default(), Some(format!("{FILE}: {why}: changes here are kept in memory only")))
+            }
+            (None, _) => (Book::default(), None),
+        };
         Desires {
             path,
-            sweep: owner.is_some(),
+            sweep: owner.is_ok(),
             owner,
             book,
             known: BTreeMap::new(),
@@ -547,9 +569,13 @@ impl Desires {
     }
 
     /// Whether this process owns the file (else memory only).
-    #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn owns_file(&self) -> bool {
-        self.owner.is_some()
+        self.owner.is_ok()
+    }
+
+    /// Why the file isn't this process's (memory only), if it isn't.
+    pub(crate) fn not_owned(&self) -> Option<&NotOwned> {
+        self.owner.as_ref().err()
     }
 
     /// The next write to run off the UI thread, once the one out landed: the
@@ -558,7 +584,7 @@ impl Desires {
         if self.out.is_some() {
             return None;
         }
-        let path = self.owner.as_ref().and(self.path.clone());
+        let (path, owner) = self.file();
         let work = if std::mem::take(&mut self.sweep) {
             Work::Sweep
         } else if self.seq > self.written && self.failed_at != Some(self.seq) {
@@ -568,7 +594,46 @@ impl Desires {
         };
         self.next_ticket += 1;
         self.out = Some(self.next_ticket);
-        Some(Write { ticket: self.next_ticket, seq: self.seq, path, work })
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, work })
+    }
+
+    /// The file and its lock, owned; else neither (memory only).
+    fn file(&self) -> (Option<PathBuf>, Option<Owned>) {
+        match &self.owner {
+            Ok(o) => (self.path.clone(), Some(o.clone())),
+            Err(_) => (None, None),
+        }
+    }
+
+    /// The window's last write, or the app's (it closes, it quits): memory
+    /// whole if it changed since the file has, whatever write is out (the
+    /// writer runs this one after it). What it does is no one's to hear.
+    pub(crate) fn last_write(&mut self) -> Option<Write> {
+        let (Some(path), Some(owner)) = self.file() else { return None };
+        if self.seq <= self.written {
+            return None;
+        }
+        self.next_ticket += 1;
+        Some(Write {
+            ticket: self.next_ticket,
+            seq: self.seq,
+            path: Some(path),
+            owner: Some(owner),
+            work: Work::Snapshot(self.book.text()),
+        })
+    }
+
+    /// Tests: a write out (handed to the writer, not landed).
+    #[cfg(test)]
+    pub(crate) fn out(&self) -> bool {
+        self.out.is_some()
+    }
+
+    /// Tests: memory changed since the file, and no write out to carry it
+    /// (a change no write was asked for yet).
+    #[cfg(test)]
+    pub(crate) fn due(&self) -> bool {
+        self.out.is_none() && self.seq > self.written && self.failed_at != Some(self.seq)
     }
 
     /// Whether a write is out or to make.

@@ -2764,11 +2764,15 @@ impl AppView {
         // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
         // waits for Linux's bus task to close them, within GPUI's shutdown
         // allowance.
+        // The rail's stores (D6b): each file's last snapshot handed to the
+        // process's writer, which the app's shutdown waits for (quitting
+        // waits here too, within GPUI's allowance).
         subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            drop(this.flush_wishes());
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
@@ -2777,8 +2781,12 @@ impl AppView {
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            let wrote = this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
-            async move { gone.wait().await }
+            async move {
+                gone.wait().await;
+                let _ = wrote.recv().await;
+            }
         }));
         // The dash poll waits while the window is in the background.
         // And a card a notification landed on is entered as it comes up.
@@ -4872,9 +4880,10 @@ impl AppView {
         // already); refused, it stays.
         let body = text;
         let ride = match self.ride_notices(self.panes.cur.live, seq, busy, body.clone(), cx) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, body);
+            Ok(crate::desires::Riding::Go(r)) => r,
+            // In flight once it goes: its echo is the text as it goes then.
+            Ok(crate::desires::Riding::Wait(ticket)) => {
+                self.model.lives[self.panes.cur.live].waiting(self.panes.cur.id, body, ticket);
                 self.panes.cur.draft_note = None;
                 self.panes.cur.watch_note = None;
                 self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));
@@ -4895,7 +4904,9 @@ impl AppView {
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
-        self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, body);
+        // Its echo is the text sent (the notices' trailer too); a refusal
+        // or a detach gives the body back.
+        self.model.lives[self.panes.cur.live].sent_as(self.panes.cur.id, body, text);
         self.panes.cur.draft_note = None;
         self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
@@ -9947,6 +9958,10 @@ fn span(node: &crate::split::Node, rects: &[(PaneId, crate::split::Rect)]) -> (f
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        // Tests: every change to the rail's stores asked for its write
+        // (D6b, Shady #103 R3-P2-2: a settle's and a compaction's too).
+        #[cfg(test)]
+        assert!(!self.wishes.unscheduled(), "a rail store changed and no write was asked for");
         // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");

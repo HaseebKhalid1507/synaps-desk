@@ -2164,8 +2164,24 @@ pub struct Drawn {
     pub settled: Arc<Visibility>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
-    /// upper bound), its committed fates. A row's [`Arc`] of it is its.
+    /// upper bound), its committed fates, its visibility maps
+    /// ([`vis_owned`]: `settled`, which its worker holds too, counted in
+    /// both; `visibility` once more unless it is `settled`'s). A row's
+    /// [`Arc`] of it is its.
     pub bytes: usize,
+}
+
+/// A visibility map in its own [`Arc`], owned bytes (§1.8's model): the
+/// allocation (its counts and the map's inline part) and what the map
+/// owns, `heap` (B2's count of its records: [`State::owned_by_owner`]'s).
+fn vis_owned(heap: usize) -> usize {
+    ARC + std::mem::size_of::<Visibility>() + heap
+}
+
+/// What a state's visibility map owns past its inline part
+/// ([`State::owned_by_owner`]'s fourth owner).
+fn vis_heap(s: &State) -> usize {
+    s.owned_by_owner()[3]
 }
 
 /// What a [`Worker`] keeps, counted: the journal's events (and a row
@@ -2209,8 +2225,10 @@ pub struct Worker {
     /// events come and go.
     bytes: usize,
     board: Board,
-    /// The history's visibility records, as of the history read last.
+    /// The history's visibility records, as of the history read last, and
+    /// what their map owns ([`vis_heap`]).
     settled: Arc<Visibility>,
+    settled_heap: usize,
     /// The board's card fold's bytes ([`Board::card_fold_bytes`], an
     /// estimate that reads every card), as of its position then: read
     /// again when the history is read on, not per slice.
@@ -2259,6 +2277,7 @@ impl Default for Worker {
             bytes: 0,
             board: Board::new(block::Generation::of(&Value::Null)),
             settled: Arc::default(),
+            settled_heap: 0,
             cards: (0, 0),
             batch: Batch::default(),
             committed: VecDeque::new(),
@@ -2282,9 +2301,12 @@ impl Worker {
 
     /// What it keeps (bytes, heap included): its journal and rows as
     /// allocated, the committed fates not taken yet (their queue as
-    /// allocated), its board and the overlay's, each with its card fold.
+    /// allocated), its board and the overlay's, each with its card fold,
+    /// and the history's visibility map ([`vis_owned`]; the last
+    /// publication shares it, and counts it too).
     pub fn bytes(&self) -> usize {
         self.bytes
+            + vis_owned(self.settled_heap)
             + (self.journal.capacity() - self.journal.len()) * std::mem::size_of::<Event>()
             + self.rows.capacity() * std::mem::size_of::<Option<u64>>()
             + self.committed.capacity() * std::mem::size_of::<(u64, Fate)>()
@@ -2473,6 +2495,7 @@ impl Worker {
             let settled = self.board.view(&self.journal[..history]);
             if *settled.visibility() != *self.settled {
                 self.settled = Arc::new(settled.visibility().clone());
+                self.settled_heap = vis_heap(&settled);
             }
             // Its fold a copy of the board's, counted as copied (a copy
             // has no room to spare).
@@ -2619,7 +2642,12 @@ impl Worker {
             + (shown_n + bound_n) * ARC;
         let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
+        // The live view's records: the history's map when they are its
+        // (one allocation, shared), else a map of their own.
+        let visibility = if *view.visibility() == *self.settled { None } else { Some(Arc::new(view.visibility().clone())) };
         let bytes = std::mem::size_of::<Drawn>()
+            + vis_owned(self.settled_heap)
+            + visibility.as_ref().map_or(0, |_| vis_owned(vis_heap(view)))
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
             + rail.iter().map(Shown::list_bytes).sum::<usize>()
@@ -2636,7 +2664,7 @@ impl Worker {
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
-            visibility: if *view.visibility() == *self.settled { self.settled.clone() } else { Arc::new(view.visibility().clone()) },
+            visibility: visibility.unwrap_or_else(|| self.settled.clone()),
             settled: self.settled.clone(),
             bytes,
         }

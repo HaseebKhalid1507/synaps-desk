@@ -25,11 +25,18 @@
 //!   the turn not over with its history grown since). A journal that moved
 //!   by a compaction carries its dismissed ids into the successor as soft
 //!   dismissals.
-//! - **Writes** run off the UI thread, one at a time per file
-//!   ([`AppView::pump_wishes`]); what a refusal or a settle says shows in
-//!   the rail's footer.
+//! - **Writes** run on the process's writer, off the UI thread, one at a
+//!   time per file ([`AppView::pump_wishes`]), whatever changed memory: a
+//!   click, a message, a settle or a compaction's carry (each board drawn,
+//!   [`AppView::wishes_on_board`]). The files' locks are the app's, taken
+//!   once at its launch ([`Home`]); a window closing or the app quitting
+//!   hands the writer each file's last snapshot ([`AppView::flush_wishes`]).
+//! - **The rail's footer** says what a refusal or a settle said last, and,
+//!   for as long as this desk doesn't own its files, that it keeps its
+//!   changes in memory only ([`Stores::memory_only`]).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cards_spec::block::message::Visibility as Notice;
@@ -40,6 +47,7 @@ use synaps_client::blocks::{Drawn, Ref, Shown};
 
 use crate::agent_rail::{RailVisibility, Seen, Tomb};
 use crate::app::AppView;
+use crate::blockfiles::{NotOwned, Owned, Writer};
 use crate::desires::{Carry, Desires, Landed, Refused, Ride, Riding};
 use crate::live::LiveId;
 use crate::presentation::Presentation;
@@ -51,10 +59,58 @@ pub(crate) const SOFT: &str = "dismissed before compaction · u show";
 /// stale).
 const SENT_MAX: usize = 256;
 
+/// The footer's word while this desk doesn't own its files.
+pub(crate) const MEMORY_ONLY: &str = "this desk keeps rail changes in memory only";
+
+/// The process's hold on the rail's two files ([`crate::blockfiles`]):
+/// each one's lock, taken once at the launch (`main`, before any window)
+/// and held until the app shuts down ([`Home::shutdown`]), and the one
+/// writer. The window's stores hold a clone; every write they issue holds
+/// its file's lock until it ran.
+#[derive(Clone)]
+pub(crate) struct Home {
+    desires: Option<(PathBuf, Result<Owned, NotOwned>)>,
+    pres: Option<(PathBuf, Result<Owned, NotOwned>)>,
+    pub(crate) writer: Arc<Writer>,
+}
+
+impl Home {
+    /// Both files' locks, taken now without waiting, and the writer.
+    pub(crate) fn take(desires: Option<PathBuf>, pres: Option<PathBuf>) -> Home {
+        let own = |p: Option<PathBuf>| {
+            p.map(|p| {
+                let o = crate::blockfiles::own(&p);
+                (p, o)
+            })
+        };
+        // Tests: a writer that queues, run by the window's executor.
+        #[cfg(test)]
+        let writer = Writer::queued();
+        #[cfg(not(test))]
+        let writer = Writer::start();
+        Home { desires: own(desires), pres: own(pres), writer }
+    }
+
+    /// No file (before the launch's): nothing to write.
+    #[cfg(not(test))]
+    fn none() -> Home {
+        Home { desires: None, pres: None, writer: Writer::closed() }
+    }
+
+    /// The app's end: its queue closed, the last writes it holds run,
+    /// waited for [`crate::blockfiles::JOIN`] at most; then this hold on
+    /// the locks goes (a write still running keeps its own).
+    pub(crate) fn shutdown(self) -> bool {
+        self.writer.shutdown()
+    }
+}
+
 /// This desk's two stores, and what wiring them keeps.
 pub(crate) struct Stores {
     pub(crate) desires: Desires,
     pub(crate) pres: Presentation,
+    /// The files' locks and the writer, the app's.
+    pub(crate) home: Home,
     /// Messages waiting for their notices' marks: where each goes.
     waiting: HashMap<u64, Waiting>,
     /// Carriers sent, until a settled history no longer has them in flight.
@@ -101,16 +157,18 @@ impl Stores {
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir = crate::theme::test_home::root().join(format!("wishes-{n}"));
             let _ = std::fs::create_dir_all(&dir);
-            Self::with(Some(dir.join(crate::desires::FILE)), Some(dir.join(crate::presentation::FILE)))
+            Self::open(Home::take(Some(dir.join(crate::desires::FILE)), Some(dir.join(crate::presentation::FILE))))
         }
         #[cfg(not(test))]
-        Self::with(None, None)
+        Self::open(Home::none())
     }
 
-    pub(crate) fn with(desires: Option<std::path::PathBuf>, pres: Option<std::path::PathBuf>) -> Self {
+    /// The stores in `home`'s files, read now.
+    pub(crate) fn open(home: Home) -> Self {
         Stores {
-            desires: Desires::load(desires),
-            pres: Presentation::load(pres),
+            desires: Desires::open(home.desires.clone()),
+            pres: Presentation::open(home.pres.clone()),
+            home,
             waiting: HashMap::new(),
             sent: Vec::new(),
             track: HashMap::new(),
@@ -127,11 +185,35 @@ impl Stores {
         self.track.clear();
     }
 
+    /// While either file isn't this desk's: that it keeps its changes in
+    /// memory only, and why.
+    pub(crate) fn memory_only(&self) -> Option<String> {
+        let why = self.desires.not_owned().or(self.pres.not_owned())?;
+        Some(match why {
+            NotOwned::Held => format!("{MEMORY_ONLY} · another desk has its files"),
+            NotOwned::Failed(why) => format!("{MEMORY_ONLY} · {why}"),
+        })
+    }
+
+    /// Tests: a write out on either file.
+    #[cfg(test)]
+    pub(crate) fn out(&self) -> bool {
+        self.desires.out() || self.pres.out()
+    }
+
+    /// Whether a store changed with no write out or to come (tests: every
+    /// change schedules its write, [`AppView::pump_wishes`]).
+    #[cfg(test)]
+    pub(crate) fn unscheduled(&self) -> bool {
+        self.desires.due() || self.pres.due()
+    }
+
     /// What this desk draws of board `d` of conversation `conv` (module
     /// docs).
     pub(crate) fn vis(&self, conv: &str, d: &Drawn) -> DeskVis {
         let mut out = DeskVis { placed: self.pres.user_rail(conv), ..DeskVis::default() };
         let Some(g) = d.generation else { return out };
+        let mut hidden = Vec::new();
         let shared = &d.visibility;
         let rail = d.rail.iter().flatten().flat_map(|s| std::iter::once(s).chain(&s.members));
         let rows = d.rows.values().flat_map(|r| r.blocks.iter()).flat_map(|s| std::iter::once(s).chain(&s.members));
@@ -143,11 +225,22 @@ impl Stores {
             if self.desires.dismissed(conv, &g, id, shared) {
                 out.seen.insert(id.clone(), Seen::Hidden);
                 out.dismissed += usize::from(in_rail);
+                if in_rail {
+                    let wish = self.desires.desire(conv, &g, id).map(|w| (w.version, w.dismissed));
+                    hidden.push((id.to_string(), s.block.tag, wish, shared.effective_version(id)));
+                }
             } else if self.pres.soft(conv, id) {
                 let token = u64::from(shared.effective_version(id));
                 out.seen.insert(id.clone(), Seen::Tombstone(Tomb { text: SOFT.into(), token }));
             }
         }
+        hidden.sort();
+        out.hidden = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hidden.hash(&mut h);
+            h.finish()
+        };
         out
     }
 }
@@ -158,6 +251,8 @@ pub(crate) struct DeskVis {
     seen: HashMap<BlockId, Seen>,
     placed: Vec<(Ref, Slot)>,
     dismissed: usize,
+    /// The rail's hidden blocks, as one tag ([`RailVisibility::hidden`]).
+    hidden: u64,
 }
 
 impl RailVisibility for DeskVis {
@@ -174,6 +269,10 @@ impl RailVisibility for DeskVis {
 
     fn dismissed(&self) -> usize {
         self.dismissed
+    }
+
+    fn hidden(&self) -> u64 {
+        self.hidden
     }
 }
 
@@ -205,21 +304,54 @@ impl AppView {
         Some((self.conversation(live), d.generation?, d.visibility.clone()))
     }
 
-    /// The launch: both files next to `settings.json`, owned by this
-    /// process if no other desk has them (else memory only), and what a
-    /// crash left beside them swept.
-    pub(crate) fn start_wishes(&mut self, cx: &mut Context<Self>) {
-        self.wishes = Stores::with(crate::desires::path(), crate::presentation::path());
-        // Another desk's files (memory only here), or one set aside: said.
-        self.wishes.said = self.wishes.desires.trouble.clone().or_else(|| self.wishes.pres.trouble.clone());
+    /// The launch: both files next to `settings.json` (`home`'s: owned by
+    /// this process if no other desk has them, else memory only), and what
+    /// a crash left beside them swept.
+    pub(crate) fn start_wishes(&mut self, home: Home, cx: &mut Context<Self>) {
+        self.wishes = Stores::open(home);
+        // A file set aside: said (memory only is said for as long as it
+        // lasts, [`Stores::memory_only`]).
+        if self.wishes.desires.owns_file() {
+            self.wishes.said = self.wishes.desires.trouble.clone();
+        }
+        if self.wishes.pres.owns_file() && self.wishes.said.is_none() {
+            self.wishes.said = self.wishes.pres.trouble.clone();
+        }
         self.pump_wishes(cx);
     }
 
-    /// Writes to make, each file's next, off the UI thread.
+    /// The window's end, or the app's: each file's last snapshot (what
+    /// memory changed since the file has), handed to the writer after what
+    /// it holds. What to wait for: the writer having run them.
+    pub(crate) fn flush_wishes(&mut self) -> async_channel::Receiver<()> {
+        let writer = self.wishes.home.writer.clone();
+        if let Some(w) = self.wishes.desires.last_write() {
+            drop(writer.run(move || drop(w.run())));
+        }
+        if let Some(w) = self.wishes.pres.last_write() {
+            drop(writer.run(move || drop(w.run())));
+        }
+        writer.run(|| ())
+    }
+
+    /// `job` handed to the writer; what it returns, once it ran. (Tests:
+    /// the writer queues, and this window's executor runs what it holds.)
+    fn hand<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static, cx: &mut Context<Self>) -> async_channel::Receiver<R> {
+        let writer = self.wishes.home.writer.clone();
+        let done = writer.run(job);
+        #[cfg(test)]
+        cx.background_spawn(async move { writer.drain() }).detach();
+        #[cfg(not(test))]
+        let _ = cx;
+        done
+    }
+
+    /// Writes to make, each file's next, on the writer (off the UI thread).
     pub(crate) fn pump_wishes(&mut self, cx: &mut Context<Self>) {
         if let Some(w) = self.wishes.desires.next_write() {
+            let done = self.hand(move || w.run(), cx);
             cx.spawn(async move |this, cx| {
-                let l = cx.background_spawn(async move { w.run() }).await;
+                let Ok(l) = done.recv().await else { return };
                 let _ = this.update(cx, |v, cx| {
                     let landed = v.wishes.desires.landed(l);
                     v.wishes_landed(landed, cx);
@@ -230,8 +362,9 @@ impl AppView {
             .detach();
         }
         if let Some(w) = self.wishes.pres.next_write() {
+            let done = self.hand(move || w.run(), cx);
             cx.spawn(async move |this, cx| {
-                let l = cx.background_spawn(async move { w.run() }).await;
+                let Ok(l) = done.recv().await else { return };
                 let _ = this.update(cx, |v, cx| {
                     if let Err(why) = v.wishes.pres.landed(l) {
                         v.wishes.said = Some(why);
@@ -253,7 +386,7 @@ impl AppView {
                 Landed::Wish { .. } => {}
                 Landed::Send { ticket, ride } => {
                     if let Some(w) = self.wishes.waiting.remove(&ticket) {
-                        self.send_ride(w.seq, w.busy, ride);
+                        self.send_ride(ticket, w.seq, w.busy, ride);
                     }
                 }
             }
@@ -261,9 +394,11 @@ impl AppView {
         cx.notify();
     }
 
-    /// `ride` to the attachment `seq`: a steer while a turn runs there,
-    /// else a submit. Not sent: its notices ride the next message.
-    fn send_ride(&mut self, seq: u64, busy: bool, ride: Ride) {
+    /// `ride` (waiting on `ticket`) to the attachment `seq`: a steer while
+    /// a turn runs there, else a submit. Sent, its echo is its text as
+    /// sent; not sent, its notices ride the next message and its body goes
+    /// back to the pane's composer.
+    fn send_ride(&mut self, ticket: u64, seq: u64, busy: bool, ride: Ride) {
         let live = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].attachment() == Some(seq));
         let busy = live.map_or(busy, |l| self.model.lives[l].transcript.busy());
         let sent = match &self.client {
@@ -277,7 +412,14 @@ impl AppView {
             _ => false,
         };
         match live {
-            Some(l) => self.ride_went(l, &ride.text, ride.carrier, sent),
+            Some(l) => {
+                if let Some((crate::live::Target::Pane(p), body)) =
+                    self.model.lives[l].in_flight.went(ticket, sent.then(|| ride.text.clone()))
+                {
+                    self.effect(crate::model::Effect::Restore(p, body));
+                }
+                self.ride_went(l, &ride.text, ride.carrier, sent)
+            }
             None => {
                 if let Some(k) = ride.carrier {
                     self.wishes.desires.lost(k);
@@ -310,9 +452,10 @@ impl AppView {
     }
 
     /// The composer's `text` for store `live` (attachment `seq`), as it
-    /// goes `busy` or not, with the notices that ride it: `Ok(Some)` to
-    /// send now ([`AppView::ride_went`] after), `Ok(None)` sent once its
-    /// marks are written, `Err` kept in the composer, why.
+    /// goes `busy` or not, with the notices that ride it: `Go` to send now
+    /// ([`AppView::ride_went`] after), `Wait` sent once its marks are
+    /// written (its ticket: [`crate::live::InFlight::went`]), `Err` kept
+    /// in the composer, why.
     pub(crate) fn ride_notices(
         &mut self,
         live: LiveId,
@@ -320,16 +463,18 @@ impl AppView {
         busy: bool,
         text: String,
         cx: &mut Context<Self>,
-    ) -> Result<Option<Ride>, String> {
-        let Some((conv, g, shared)) = self.wish_board(live) else { return Ok(Some(Ride { text, carrier: None, notices: Vec::new() })) };
+    ) -> Result<Riding, String> {
+        let Some((conv, g, shared)) = self.wish_board(live) else {
+            return Ok(Riding::Go(Ride { text, carrier: None, notices: Vec::new() }));
+        };
         let how = if busy { Carry::Steer } else { Carry::Submit };
         match self.wishes.desires.ride(&conv, &g, &shared, &text, how) {
-            Ok(Riding::Go(ride)) => Ok(Some(ride)),
             Ok(Riding::Wait(ticket)) => {
                 self.wishes.waiting.insert(ticket, Waiting { seq, busy });
                 self.pump_wishes(cx);
-                Ok(None)
+                Ok(Riding::Wait(ticket))
             }
+            Ok(go) => Ok(go),
             Err(Refused(why)) => Err(why),
         }
     }
@@ -347,6 +492,7 @@ impl AppView {
         for (id, ..) in self.wishes.desires.riding(&conv, &g, &shared) {
             self.wishes.desires.hold(&conv, &g, &id, &shared);
         }
+        self.pump_wishes(cx);
         cx.notify();
     }
 

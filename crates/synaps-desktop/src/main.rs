@@ -349,6 +349,13 @@ fn main() {
     // handler: what it held then is memory only.
     let disposer = synaps_client::blocks::dispose::Disposer::start();
     let _disposing = disposer.install();
+    // The rail's two files (D6b, `rail_wishes::Home`): their locks taken
+    // once, now, for the process (another desk has them: memory only), and
+    // their writer. It shuts down as the disposer does, when `run`
+    // returns: what the window handed it last written, waited for
+    // `blockfiles::JOIN` at most, then the locks go.
+    let wishes = rail_wishes::Home::take(desires::path(), presentation::path());
+    let wishes_home = wishes.clone();
     diag::mark("before_application");
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
     gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
@@ -390,7 +397,7 @@ fn main() {
                 v.start_recall(remember, recall::path(), cx);
                 // The rail's dismissals and placements: this desk's files,
                 // read now (what a crash left swept off this thread).
-                v.start_wishes(cx);
+                v.start_wishes(wishes_home.clone(), cx);
                 v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
                 v.dash.socket = launch.endpoint.as_ref().map(|e| e.resolve());
                 v.dash.launch = launch;
@@ -423,6 +430,9 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Linux's and Windows' quit returns here (macOS exits within `run`:
+    // its quit hook waited for the writer, within GPUI's allowance).
+    wishes.shutdown();
 }
 
 /// The house look on a new app, the desk's window and the `--agent-surface`

@@ -21,7 +21,7 @@ fn presentation(d: &std::path::Path) -> Presentation {
     let t = std::time::Instant::now();
     loop {
         let mut p = Presentation::load(Some(d.join(FILE)));
-        if p.owner.is_some() || t.elapsed() > std::time::Duration::from_secs(10) {
+        if p.owner.is_ok() || t.elapsed() > std::time::Duration::from_secs(10) {
             flush(&mut p);
             return p;
         }
@@ -427,4 +427,40 @@ fn a_load_sweeps_and_sets_an_unreadable_file_aside() {
     assert!(p.trouble.is_some());
     assert!(!d.join(format!("{FILE}.tmp.77.1")).exists());
     assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), "[]");
+}
+
+/// Shady #103 R3-P2-3, the presentation's file too: a write issued holds
+/// its lock until it ran, its store dropped or not; the last write carries
+/// what memory changed behind the one out.
+#[test]
+fn a_write_out_holds_the_lock_past_its_store() {
+    let d = dir("p-lock-outlives");
+    let h = H::with(&["plan", "cause"]);
+    let s = h.state();
+    let mut x = presentation(&d);
+    x.pin("jx", s.block(&r("plan")).unwrap()).unwrap();
+    let w = x.next_write().expect("plan's");
+    x.pin("jx", s.block(&r("cause")).unwrap()).unwrap();
+    assert!(x.next_write().is_none(), "one out: cause behind it");
+    let last = x.last_write().expect("memory whole");
+    drop(x);
+    let y = Presentation::load(Some(d.join(FILE)));
+    assert!(!y.owns_file(), "the writes out hold the lock");
+    drop(y);
+    drop(w.run());
+    let y = Presentation::load(Some(d.join(FILE)));
+    assert!(!y.owns_file(), "the last write out alone holds it");
+    drop(y);
+    drop(last.run());
+    let mut z = presentation(&d);
+    assert!(z.owns_file() && z.placed("jx", s.block(&r("plan")).unwrap()).by_user && z.placed("jx", s.block(&r("cause")).unwrap()).by_user);
+    // A write out alone (no last one) holds it too.
+    assert!(z.reset("jx", &r("plan")));
+    let w = z.next_write().expect("the reset's");
+    drop(z);
+    let y = Presentation::load(Some(d.join(FILE)));
+    assert!(!y.owns_file(), "the write out alone holds the lock");
+    drop(y);
+    drop(w.run());
+    assert!(presentation(&d).owns_file());
 }

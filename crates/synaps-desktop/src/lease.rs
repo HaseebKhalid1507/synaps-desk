@@ -380,6 +380,8 @@ impl AppView {
         self.model.lives[live].transcript.set_drawn(Some(drawn.clone()));
         self.model.lives[live].board.published += 1;
         self.rail_landed(live, &drawn);
+        // What it settled or carried, written (D6b: not only a click's).
+        self.pump_wishes(cx);
         // The panes' caches keep only the blocks this board draws (§1.8:
         // renderer caches are bounded, per pane).
         let rows: std::collections::HashSet<u64> = drawn
