@@ -1078,6 +1078,11 @@ impl AppView {
     /// The window came to the front: a poll it missed runs now.
     pub(crate) fn window_activated(&mut self, active: bool, cx: &mut Context<Self>) {
         self.window_active = active;
+        // The window's focus gone: a block press ends (its release may
+        // never come here).
+        if !active {
+            self.lease_unpress(cx);
+        }
         if active && std::mem::take(&mut self.dash.missed_tick) {
             self.dash_tick(cx);
         }

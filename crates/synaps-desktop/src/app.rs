@@ -122,6 +122,8 @@ pub(crate) struct TabCache {
     metrics_gen: u64,
     /// Its worker views (the one focused comes back focused).
     pub(crate) watch: Watch,
+    /// Its list's block state ([`crate::blocks::Kept`]).
+    blocks: crate::blocks::Kept,
 }
 
 /// What the user unfolded or folded: the rows they flipped from their
@@ -186,21 +188,28 @@ pub(crate) struct Column {
     metrics_gen: u64,
     /// Its transcript's changes it has not synced ([`Pane::pending`]).
     pending: Option<Splice>,
+    /// Its block state ([`crate::blocks::Kept`]).
+    blocks: crate::blocks::Kept,
 }
 
 impl TabCache {
     /// What it keeps, roughly (bytes): the transcript's items (texts, tool
-    /// inputs and results), the rows' strings, the display rows, the files
-    /// ledger, and per item what the strings do not show (the list's
-    /// heights, maps, allocator slack: [`ITEM_OVERHEAD`]). Measured once,
-    /// when the tab is left.
-    fn bytes(&self) -> usize {
+    /// inputs and results, a card's or block's input kept whole, heap
+    /// included), the rows' strings, the display rows, the files ledger,
+    /// the board's input (its history's journal and the live turn's log,
+    /// heap included: `Transcript::blocks_bytes`), what the card sync
+    /// keeps (`Transcript::card_sync_bytes`: none, shed as the tab is left,
+    /// [`AppView::cache_list`]), and per item what the strings do not show
+    /// (the list's heights, maps, allocator slack: [`ITEM_OVERHEAD`]).
+    /// Measured once, when the tab is left.
+    pub(crate) fn bytes(&self) -> usize {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
                 + i.text.capacity()
                 + i.tool
                     .as_ref()
                     .map_or(0, |t| t.tool_id.capacity() + t.name.capacity() + t.input.capacity() + t.result.capacity() + t.tail.capacity())
+                + i.kept_bytes()
         };
         let row = |r: &RowCache| std::mem::size_of::<RowCache>() + r.text.len() + r.arg.len() + r.result.len() + r.card.bytes();
         self.transcript.items().iter().map(item).sum::<usize>()
@@ -210,6 +219,8 @@ impl TabCache {
             + self.stats.files.bytes()
             + self.stats.subagents.bytes()
             + self.watch.bytes()
+            + self.transcript.blocks_bytes()
+            + self.transcript.card_sync_bytes()
     }
 }
 
@@ -513,7 +524,8 @@ pub fn bind_keys(cx: &mut App) {
     // An entered agent card's Tab and Shift+Tab, on it or in its inputs:
     // no binding (not the kit's focus cycling, nor an input's indent), so
     // they come as keys, whose repeats are known (`ask_keys::ask_tab_key`).
-    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX] {
+    // The op log's Tab flips its tabs (D7), the same way.
+    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX, crate::oplog::LOG_CTX] {
         keys.push(KeyBinding::new("tab", gpui_kit::NoAction, Some(ctx)));
         keys.push(KeyBinding::new("shift-tab", gpui_kit::NoAction, Some(ctx)));
     }
@@ -1872,7 +1884,7 @@ pub(crate) fn input_of(input: &str) -> Option<serde_json::Value> {
     input.starts_with('{').then(|| serde_json::from_str::<serde_json::Value>(input).ok()).flatten()
 }
 
-fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn command_of(input: Option<&serde_json::Value>) -> Option<String> {
     match input?.get("command")? {
         serde_json::Value::String(c) => Some(c.clone()),
         _ => None,
@@ -2223,6 +2235,16 @@ pub struct AppView {
     once: Option<OnceKey>,
     /// The synthetic daemon's attach replies.
     pub(crate) attach_source: Option<AttachSource>,
+    /// The pointer lease's one wake, while a board waits ([`crate::lease`]).
+    pub(crate) lease_wake: Option<Task<()>>,
+    /// The agent's sections in the right panel: each session's local
+    /// state, the rail's lease and painted targets ([`crate::agent_rail_view`]).
+    pub(crate) agent_rail: crate::agent_rail_view::RailState,
+    /// This desk's dismissals, pins and slot moves, and the notices riding
+    /// its messages ([`crate::rail_wishes`]).
+    pub(crate) wishes: crate::rail_wishes::Stores,
+    /// The re-fold slot (`crate::board::Refolds`): one at a time, app-wide.
+    pub(crate) refolds: crate::board::Refolds,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
     /// they read, this app's own new settings, the gear's menu (and where
     /// the mouse-down that closed it from outside was), and the view on
@@ -2419,6 +2441,15 @@ pub struct AppView {
     /// Every key's presses: an entered card's keys act on new ones only
     /// ([`crate::ask_keys::Presses`]).
     pub(crate) ask_presses: crate::ask_keys::Presses,
+    /// D6b's side of the walk's shared and stored keys ([`crate::walk::BlockDesires`]):
+    /// nothing wired until D6b (#103) lands.
+    pub(crate) desires: Box<dyn crate::walk::BlockDesires>,
+    /// The op log, open ([`crate::oplog`], D7).
+    pub(crate) oplog: Option<crate::oplog::OpLog>,
+    /// The sessions' archives (D7, §5.2: [`crate::oplog::Archives`]), and
+    /// the captures a batch's compactions asked for, run after it.
+    pub(crate) archives: crate::oplog::Archives,
+    pub(crate) captures: Vec<crate::oplog::Capture>,
 
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
@@ -2572,7 +2603,7 @@ impl AppView {
             this.in_pane(id, |this| match ev {
                 InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
                     let text = input.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
+                    if !text.is_empty() && this.submit(text, cx) {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                 }
@@ -2752,11 +2783,15 @@ impl AppView {
         // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
         // waits for Linux's bus task to close them, within GPUI's shutdown
         // allowance.
+        // The rail's stores (D6b): each file's last snapshot handed to the
+        // process's writer, which the app's quit waits for, this window
+        // open or not (`rail_wishes::Home::on_quit`).
         subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
@@ -2765,6 +2800,7 @@ impl AppView {
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             async move { gone.wait().await }
         }));
@@ -2937,6 +2973,10 @@ impl AppView {
             dnd: Default::default(),
             once: None,
             attach_source: None,
+            lease_wake: None,
+            agent_rail: Default::default(),
+            wishes: crate::rail_wishes::Stores::at_launch(),
+            refolds: crate::board::Refolds::default(),
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
             dash: Default::default(),
@@ -3030,6 +3070,10 @@ impl AppView {
             card_tick: None,
             memo_seen: 0,
             ask_presses: Default::default(),
+            desires: Box::new(crate::walk::NoDesires),
+            oplog: None,
+            archives: Default::default(),
+            captures: Vec::new(),
 
             _tasks: Vec::new(),
             _subs: subs,
@@ -3076,6 +3120,8 @@ impl AppView {
             }
         }
         self.start_tabs();
+        // A compaction's archive, captured off the frame (D7).
+        self.archive_run(cx);
         // An attach may have named or merged a pane's visible tab.
         for id in self.panes.ids() {
             self.in_pane(id, |v| v.reconcile(None));
@@ -3135,8 +3181,31 @@ impl AppView {
                 self.panes.cur.watch_note = None;
                 self.model.view_dirty = true;
             }
+            // A compaction: the predecessor's final blocks and op log are the
+            // session's archive (blocks.md §5.2, D7), captured from its
+            // history as this boundary leaves it ([`crate::oplog`]).
+            if let Event::Session {
+                attach_seq,
+                event: synaps_client::protocol::SessionEvent::CompactionApplied { session_id: journal, .. },
+                ..
+            } = &ev
+                && let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].current(*attach_seq))
+            {
+                self.archive_boundary(live, journal);
+            }
+            // The store's attachment detached: what its panes held for its
+            // blocks goes (Shady #101 P2-4).
+            let detached = match &ev {
+                Event::Detached { attach_seq, .. } if self.model.lives[self.panes.cur.live].current(*attach_seq) => {
+                    Some(self.panes.cur.live)
+                }
+                _ => None,
+            };
             for fx in self.model.apply(ev) {
                 self.effect(fx);
+            }
+            if let Some(live) = detached.filter(|l| self.model.lives[*l].active.is_none()) {
+                self.panes.iter_mut().filter(|p| p.live == live).for_each(crate::pane::Pane::blocks_clear);
             }
         }
     }
@@ -3819,6 +3888,7 @@ impl AppView {
         pane.summaries = Default::default();
         pane.toggled = Default::default();
         pane.open_runs.clear();
+        drop(pane.blocks_out());
         pane.synced_busy = false;
         pane.files_gen = 0;
         pane.waiting_on = None;
@@ -3827,6 +3897,7 @@ impl AppView {
         pane.main_column = None;
         pane.column_of = None;
         pane.worker_columns.clear();
+        pane.blocks_clear();
     }
 
     /// The current tab's worker view. A worker tab: its worker, checked
@@ -3895,6 +3966,7 @@ impl AppView {
         self.list_out();
         let key = self.model.lives[self.panes.cur.live].transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out(self.panes.cur.live);
+        self.board_out(self.panes.cur.live);
         self.cache_list(key, transcript, stats, watch);
     }
 
@@ -3937,6 +4009,8 @@ impl AppView {
             let own = self.fresh_live();
             let c = &mut self.model.lives[own];
             (c.transcript, c.stats) = (transcript, stats);
+            // Its board is the one drawn: nothing folded for it.
+            c.board.settled(c.transcript.blocks_rev());
             self.panes.cur.live = own;
             return;
         }
@@ -3944,7 +4018,10 @@ impl AppView {
         self.sync_list();
         self.panes.cur.closing_key = self.model.lives[live].transcript.session_id().map(str::to_string);
         let (transcript, stats) = self.model.switch_out(live);
+        self.board_out(live);
         self.model.switch_in(live, transcript, stats);
+        let l = &mut self.model.lives[live];
+        l.board.settled(l.transcript.blocks_rev());
         if let (Some(c), Some(seq)) = (&self.client, self.model.lives[live].release()) {
             let _ = c.on(seq).detach();
         }
@@ -3962,6 +4039,7 @@ impl AppView {
             return;
         }
         self.list_out();
+        self.board_out(live);
         let l = &mut self.model.lives[live];
         let (transcript, stats, watch) = (std::mem::take(&mut l.transcript), std::mem::take(&mut l.stats), std::mem::take(&mut l.watch));
         self.cache_list(Some(key), transcript, stats, watch);
@@ -3969,8 +4047,10 @@ impl AppView {
 
     /// The pane's list and rows of `transcript` to the tab cache under
     /// `key` (with `stats` and its worker views, `watch`); a fresh, empty
-    /// list in their place.
-    fn cache_list(&mut self, key: Option<String>, transcript: Transcript, stats: Stats, watch: Watch) {
+    /// list in their place. The transcript keeps nothing of its card sync
+    /// but the cards: its attach, when it is shown again, reads them anew.
+    fn cache_list(&mut self, key: Option<String>, mut transcript: Transcript, stats: Stats, watch: Watch) {
+        transcript.shed_card_sync();
         self.panes.cur.card = None;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;
@@ -3993,7 +4073,9 @@ impl AppView {
             waiting_on: self.panes.cur.waiting_on.take(),
             metrics_gen: self.panes.cur.metrics_gen,
             watch,
+            blocks: self.panes.cur.blocks_out(),
         };
+        self.panes.cur.blocks_clear();
         self.panes.cur.rows_session = None;
         if let Some(k) = key {
             let tabs = &self.model.tabs;
@@ -4009,6 +4091,7 @@ impl AppView {
         // The last transcript's changes were synced as it left (`stash`).
         self.panes.cur.pending = None;
         self.disarm_halt();
+        self.panes.cur.blocks_clear();
         match session.as_ref().and_then(|s| self.tab_cache.take(s)) {
             Some(c) => {
                 self.model.switch_in(self.panes.cur.live, c.transcript, c.stats);
@@ -4022,6 +4105,7 @@ impl AppView {
                 self.panes.cur.synced_busy = c.synced_busy;
                 self.panes.cur.files_gen = c.files_gen;
                 self.panes.cur.waiting_on = c.waiting_on;
+                self.panes.cur.blocks_in(c.blocks);
                 if c.metrics_gen != self.panes.cur.metrics_gen {
                     // The text size changed while it was in the background.
                     self.panes.cur.list.remeasure();
@@ -4756,12 +4840,12 @@ impl AppView {
     /// The composer's Enter with `text` in it, as its subscription sends it
     /// (the view-level tests, `split_tests`, which need a unix socket).
     #[cfg(all(test, unix))]
-    pub(crate) fn enter(&mut self, text: String) -> bool {
-        self.submit(text)
+    pub(crate) fn enter(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        self.submit(text, cx)
     }
 
     /// Send the composer's text. `false` keeps it in the composer.
-    fn submit(&mut self, text: String) -> bool {
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         #[cfg(test)]
         self.submits.push((text.clone(), self.model.lives[self.panes.cur.live].watch.focus().is_some()));
         let Some(c) = &self.client else {
@@ -4836,13 +4920,38 @@ impl AppView {
             return true;
         }
         let busy = self.model.lives[self.panes.cur.live].transcript.busy();
+        // The notices that ride it (D6b, `crate::rail_wishes`): with it now,
+        // or it goes once their marks are written (out of the composer
+        // already); refused, it stays.
+        let body = text;
+        let ride = match self.ride_notices(self.panes.cur.live, self.panes.cur.id, seq, busy, body.clone(), cx) {
+            Ok(crate::desires::Riding::Go(r)) => r,
+            // In flight already (it may have gone): its echo is the text as
+            // it goes.
+            Ok(crate::desires::Riding::Wait(_)) => {
+                self.panes.cur.draft_note = None;
+                self.panes.cur.watch_note = None;
+                self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));
+                self.return_to_end();
+                return true;
+            }
+            Err(why) => {
+                self.model.lives[self.panes.cur.live].last_error = Some(why);
+                return false;
+            }
+        };
+        let text = ride.text;
+        let Some(c) = &self.client else { return false };
         let sent = if busy { c.on(seq).steer(text.clone()) } else { c.on(seq).submit(text.clone()) };
+        self.ride_went(self.panes.cur.live, &text, ride.carrier, sent.is_ok());
         if sent.is_err() {
             self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
-        self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, text);
+        // Its echo is the text sent (the notices' trailer too); a refusal
+        // or a detach gives the body back.
+        self.model.lives[self.panes.cur.live].sent_as(self.panes.cur.id, body, text);
         self.panes.cur.draft_note = None;
         self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
@@ -6770,6 +6879,7 @@ impl AppView {
                         self.panes.cur.summaries.clear();
                         self.panes.cur.toggled.clear();
                         self.panes.cur.open_runs.clear();
+                        self.panes.cur.blocks_clear();
                         self.took.borrow_mut().clear();
                         self.ran.borrow_mut().clear();
                     }
@@ -6904,6 +7014,8 @@ impl AppView {
         self.panes.cur.touch_kept.set(false);
         self.panes.cur.list_gen = self.panes.next_gen();
         self.panes.cur.texts.borrow_mut().clear();
+        // The pointer lease and the diff wells' scroll were this list's.
+        self.panes.cur.blocks_reset();
     }
 
     /// The list's state, handed out; a fresh, empty list in its place.
@@ -6927,6 +7039,7 @@ impl AppView {
             scroll_carry: self.panes.cur.scroll_carry.take(),
             metrics_gen: self.panes.cur.metrics_gen,
             pending: self.panes.cur.pending.take(),
+            blocks: self.panes.cur.blocks_out(),
         }
     }
 
@@ -6945,6 +7058,7 @@ impl AppView {
         self.panes.cur.rows_session = p.rows_session;
         self.panes.cur.scroll_carry = p.scroll_carry;
         self.panes.cur.pending = p.pending;
+        self.panes.cur.blocks_in(p.blocks);
     }
 
     /// Each transcript's changes since the last frame, to the list showing
@@ -7101,13 +7215,16 @@ impl AppView {
         let items = shown.items();
         let rows = &self.panes.cur.rows;
         let day = |i: usize| rows.get(i).and_then(|r| r.time.as_ref()).map(crate::times::Stamp::day);
-        let new = turns::build(
+        // The session's own transcript has a board (a worker's view has none).
+        let board = shown.has_blocks() && self.model.lives[self.panes.cur.live].watch.focused().is_none();
+        let new = turns::build_with(
             items,
             &day,
             start,
             shown.busy(),
             &self.panes.cur.open_runs,
             self.model.lives[self.panes.cur.live].shown_subagents(),
+            board,
         );
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
@@ -7167,13 +7284,14 @@ impl AppView {
             items.len() > 2_000
                 || self.panes.cur.disp
                     == crate::cards::mark_edges(crate::authorize::with_prompts(
-                        turns::build(
+                        turns::build_with(
                             items,
                             &day,
                             0,
                             shown.busy(),
                             &self.panes.cur.open_runs,
-                            self.model.lives[self.panes.cur.live].shown_subagents()
+                            self.model.lives[self.panes.cur.live].shown_subagents(),
+                            board
                         ),
                         &prompts,
                         0
@@ -8083,12 +8201,17 @@ impl AppView {
         // The cards waiting here, while none is entered (D2b): its click is
         // Ctrl+J. Not over a prompt's card, which Ctrl+J visits first.
         let chip: Option<SharedString> = (!to_card && worker.is_none()).then(|| self.ask_chip()).flatten().map(Into::into);
+        // What the next message tells the agent (D6b): its click keeps it
+        // back for a later one.
+        let tells: Option<SharedString> = (!to_card && worker.is_none()).then(|| self.tells_chip()).flatten().map(Into::into);
         let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
             Some((n.clone(), self.note_color(&n, p)))
         } else if self.client.is_none() && !self.synthetic {
             Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if let Some(c) = chip.clone() {
             Some((c, p.acc))
+        } else if let Some(t) = tells.clone() {
+            Some((t, p.acc))
         } else if self.client.is_none() {
             Some(("offline: synthetic transport, nothing is sent".into(), p.dim_u))
         } else if self.model.lives[self.panes.cur.live].switching() {
@@ -8201,7 +8324,7 @@ impl AppView {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 let text = this.panes.cur.composer.read(cx).value().trim().to_string();
-                if !text.is_empty() && this.submit(text) {
+                if !text.is_empty() && this.submit(text, cx) {
                     this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                 }
                 cx.notify();
@@ -8334,7 +8457,7 @@ impl AppView {
             let send = if short {
                 fbtn("send", label::STEER, can_send, Fill::Btn, p, m).on_click(cx.listener(|this, _, window, cx| {
                     let text = this.panes.cur.composer.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
+                    if !text.is_empty() && this.submit(text, cx) {
                         this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                     cx.notify();
@@ -8413,14 +8536,35 @@ impl AppView {
             // Cut short, its tooltip has it whole.
             let hint = hint.filter(|_| fit.hint).map(|(h, c)| {
                 let is_chip = chip.as_ref() == Some(&h);
+                let is_tells = !is_chip && tells.as_ref() == Some(&h);
                 let said = h.clone();
                 mono(h.clone(), m.meta, c)
-                    .id(if is_chip { "composer-chip" } else { "composer-note" })
-                    .debug_selector(move || if is_chip { format!("composer-chip {said}") } else { "composer-note".into() })
+                    .id(if is_chip {
+                        "composer-chip"
+                    } else if is_tells {
+                        "composer-tells"
+                    } else {
+                        "composer-note"
+                    })
+                    .debug_selector(move || {
+                        if is_chip {
+                            format!("composer-chip {said}")
+                        } else if is_tells {
+                            format!("composer-tells {said}")
+                        } else {
+                            "composer-note".into()
+                        }
+                    })
                     .when(is_chip, |d| {
                         let pane = self.panes.cur.id;
                         d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.in_pane(pane, |this| this.jump_to_card(window, cx));
+                        }))
+                    })
+                    .when(is_tells, |d| {
+                        let pane = self.panes.cur.id;
+                        d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(pane, |this| this.keep_back(cx));
                         }))
                     })
                     .ml(px(16.))
@@ -9137,6 +9281,16 @@ impl AppView {
         if over.is_none() {
             self.panes.cur.over_composer.set(f32::INFINITY);
         }
+        // A block's slide reads whether the list held still since the last
+        // frame (`crate::lease::SlideY`): not following its tail, not
+        // scrolled.
+        {
+            let (l, list) = (&self.panes.cur.lease, &self.panes.cur.list);
+            let off = f32::from(list.scroll_px_offset_for_scrollbar().y);
+            l.anchored.set(!list.is_following_tail() && l.scrolled.get() == Some(off));
+            l.scrolled.set(Some(off));
+            l.frame.set(l.frame.get() + 1);
+        }
         // The list, and right after its layout, reading it as it paints,
         // the top message's label pinned (P15). Revealed, both in the pane
         // as it lands, moved by the reveal's `shift`; the pane clips them.
@@ -9171,10 +9325,16 @@ impl AppView {
                 )
                 .child(
                     div()
+                        .id(("pane-list", id.index()))
                         .debug_selector(move || format!("pane-list {}", id.index()))
                         .flex_1()
                         .min_h_0()
                         .relative()
+                        // The pointer lease (blocks.md §6.2): a move asks for no frame.
+                        .on_mouse_move(
+                            cx.listener(move |this, ev: &MouseMoveEvent, _, cx| this.lease_move(id, ev.pressed_button.is_some(), cx)),
+                        )
+                        .on_hover(cx.listener(move |this, over: &bool, _, cx| this.lease_over(id, *over, cx)))
                         .when_some(layer, |d, (x, y, k)| crate::motion::lift(d.left(px(x)).top(px(y)), k))
                         // Held (a dropped row's flight), nothing drawn
                         // from the rows (finish gate #48 r2 N1): no list,
@@ -9188,7 +9348,10 @@ impl AppView {
                         .children(landing)
                         .children(hold_back.filter(|_| !hold))
                         .children(rehint.filter(|_| !hold))
-                        .children((!hold).then_some(transcript_bar)),
+                        .children((!hold).then_some(transcript_bar))
+                        .children((!hold).then(|| self.blocks_pill(&p, &m, cx)).flatten())
+                        // The walk's status line (D7): a layer at its foot.
+                        .children((!hold).then(|| self.walk_status(&p)).flatten()),
                 )
                 // The top of what is drawn over the composer (the stub, a
                 // notice, the chips), as laid out: the palette ends above it.
@@ -9204,8 +9367,9 @@ impl AppView {
                     window,
                     cx,
                 ))
-                // An agent card's keys (D2b).
+                // An agent card's keys (D2b), the block walk's (D7).
                 .map(|d| self.ask_hooks(d, cx))
+                .map(|d| self.walk_hooks(d, cx))
         }
     }
 
@@ -9296,12 +9460,16 @@ impl AppView {
                 self.find.clear();
             }
         }
+        // The board's work, if its input moved (off the frame: it lands as
+        // a later frame's change).
+        self.sync_board(self.panes.cur.live, cx);
         // The card first: its row in the list is its state's.
         self.read_list_view();
         self.sync_card(window, cx);
         self.sync_list();
         self.read_card_on_screen();
         self.sync_ask(window, cx);
+        self.sync_walk(window, cx);
         if self.panes.cur.stub_away.is_some()
             && (self.card_on_screen() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
         {
@@ -9830,6 +9998,10 @@ fn span(node: &crate::split::Node, rects: &[(PaneId, crate::split::Rect)]) -> (f
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        // Tests: every change to the rail's stores asked for its write
+        // (D6b, Shady #103 R3-P2-2: a settle's and a compaction's too).
+        #[cfg(test)]
+        assert!(!self.wishes.unscheduled(), "a rail store changed and no write was asked for");
         // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");
@@ -9838,6 +10010,10 @@ impl Render for AppView {
         self.fx.set_visible(self.visible);
         self.fx.begin_frame(crate::motion::Level::current(cx), low_power, self.fx.tick());
         self.fx.set_scale(window.scale_factor());
+        // The rail lays its notes out as the window's text system does.
+        if self.agent_rail.text.as_ref().is_none_or(|t| !Rc::ptr_eq(t, window.text_system())) {
+            self.agent_rail.text = Some(window.text_system().clone());
+        }
         self.scale = window.scale_factor();
         if let Some(layout) = self.restore_layout.take() {
             self.restore_layout_now(layout, window, cx);
@@ -10249,7 +10425,7 @@ impl Render for AppView {
         self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
-        h_flex()
+        let root = h_flex()
             .id("root")
             .track_focus(&self.focus)
             // A divider dragged: its resize cursor wherever the pointer
@@ -10296,6 +10472,22 @@ impl Render for AppView {
             .map(|d| crate::palette::capture_keys(d, cx))
             // A click opened a worker's tab: the rest of its double-click
             // is not the tab's (it would fold a row there, say).
+            // A release that isn't on its press's target, in the window or
+            // outside it, ends the press after the target's own up has
+            // acted (§6.2 "Down and up"; Shady #101 P2-7).
+            .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                if this.panes.iter().any(|p| p.lease.pressed) || this.agent_rail.lease.pressed {
+                    cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    if this.panes.iter().any(|p| p.lease.pressed) || this.agent_rail.lease.pressed {
+                        cx.defer_in(window, |this, _, cx| this.lease_unpress(cx));
+                    }
+                }),
+            )
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| match this.swallow_clicks {
                 Some(until) if ev.click_count > 1 && Instant::now() < until => cx.stop_propagation(),
                 Some(_) => this.swallow_clicks = None,
@@ -10311,6 +10503,14 @@ impl Render for AppView {
             // Esc closes the picker, wherever the focus is; in find it clears
             // it and leaves it.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // A key releases the pointer lease (blocks.md §6.2), after
+                // it acts.
+                if this.panes.iter().any(|p| p.lease.moved.is_some() || p.lease.note.is_some())
+                    || this.agent_rail.lease.moved.is_some()
+                    || this.agent_rail.lease.note.is_some()
+                {
+                    cx.defer_in(window, |this, _, cx| this.lease_key(cx));
+                }
                 // Esc while a tab or a row is dragged: the drag ends, and
                 // nothing drops (split.md §3); nothing else hears it.
                 if ev.keystroke.key == "escape" && this.cancel_drag(window, cx) {
@@ -10362,6 +10562,30 @@ impl Render for AppView {
                         this.close_palette(window, cx);
                     }
                     this.jump_to_card(window, cx);
+                    return;
+                }
+                // Ctrl+G (Cmd+G): block walk in the focused pane; Ctrl+O
+                // (Cmd+O): the op log (blocks.md §3.8, D7). New presses
+                // only (a held one, once), never mid IME composition.
+                let mac = cfg!(target_os = "macos");
+                if crate::walk::chord(&ev.keystroke, "g", mac) && !this.composing_now(window, cx) {
+                    cx.stop_propagation();
+                    if this.ask_presses.last {
+                        if this.oplog.is_some() {
+                            this.oplog_close(window, cx);
+                        }
+                        if this.palette.is_some() {
+                            this.close_palette(window, cx);
+                        }
+                        this.walk_enter(window, cx);
+                    }
+                    return;
+                }
+                if crate::walk::chord(&ev.keystroke, "o", mac) && !this.composing_now(window, cx) {
+                    cx.stop_propagation();
+                    if this.ask_presses.last {
+                        this.oplog_toggle(window, cx);
+                    }
                     return;
                 }
                 // A menu item picked from the keyboard: that key's repeats
@@ -10629,6 +10853,14 @@ impl Render for AppView {
                 &p,
                 cx,
             ))
+            // The op log (D7), over the focused pane.
+            .children(self.render_oplog(
+                crate::chrome::MARK + rail_w + self.panes.cur.rect.get().x,
+                if self.panes.split() { self.panes.cur.rect.get().w } else { pane },
+                self.panes.cur.composer_top.get().min(self.panes.cur.over_composer.get()),
+                &p,
+                cx,
+            ))
             .children(self.render_link(tear, &p, &theme::live_palette(cx)))
             .children(self.render_tracer(&p))
             // Painted last, after every row was rendered: what the frame's
@@ -10647,7 +10879,10 @@ impl Render for AppView {
                 .absolute()
                 .size_0()
             })
-            .children(self.draw_probe(cx))
+            .children(self.draw_probe(cx));
+        // A rail this frame did not draw keeps nothing (D6a).
+        self.rail_unseen();
+        root
     }
 }
 

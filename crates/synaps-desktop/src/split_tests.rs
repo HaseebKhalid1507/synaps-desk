@@ -245,11 +245,11 @@ fn the_views_allow_halt_and_message_reach_only_the_shown_stores_session(cx: &mut
         assert!(v.model.lives[b].may_answer(1), "B's prompt #1 is up in its store");
     });
     // Allow, HALT, a message: through the view.
-    view.update(cx, |v, _| {
+    view.update(cx, |v, cx| {
         let key = v.panes.cur.card.as_ref().map(|c| c.key).expect("A's card");
         assert!(v.answer(key, Some(crate::model::CONFIRM_YES.into())), "Allow went");
         v.halt();
-        assert!(v.enter("hello A".into()), "the message went");
+        assert!(v.enter("hello A".into(), cx), "the message went");
     });
     let names =
         |c: &mut Conn| c.cmds(Duration::from_millis(400)).iter().filter_map(|c| c["cmd"].as_str().map(str::to_string)).collect::<Vec<_>>();
@@ -604,10 +604,10 @@ fn two_panes_on_one_session_keep_their_own_worker_view(cx: &mut TestAppContext) 
     cx.run_until_parked();
     view.read_with(cx, |v, _| assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), Some("sa_2"), "the second pane on the worker"));
     key(cx, window, "alt-1");
-    view.update(cx, |v, _| {
+    view.update(cx, |v, cx| {
         assert_eq!(v.panes.focused, p0);
         assert_eq!(v.model.lives[v.panes.cur.live].watch.focus(), None, "the first pane on the thread");
-        assert!(v.enter("to the session".into()));
+        assert!(v.enter("to the session".into(), cx));
         assert_eq!(v.submits.last(), Some(&("to the session".to_string(), false)), "a message, not a steer");
     });
     // (The worker's view polls it: `query`.)

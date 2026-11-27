@@ -31,6 +31,8 @@
 // every test module builds, stays the authority on dead code.
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
+mod agent_rail;
+mod agent_rail_view;
 mod agent_surface;
 mod answer;
 mod app;
@@ -39,6 +41,9 @@ mod ask_keys;
 mod authorize;
 mod beat;
 mod bench;
+mod blockfiles;
+mod blocks;
+mod board;
 mod cards;
 mod chart;
 mod choice;
@@ -46,6 +51,7 @@ mod chrome;
 mod dash;
 mod deliver;
 mod demo;
+mod desires;
 mod detail;
 mod diag;
 mod dnd;
@@ -56,6 +62,7 @@ mod fit;
 mod fonts;
 mod glyph;
 mod lattice;
+mod lease;
 mod live;
 mod mem;
 mod menu;
@@ -64,15 +71,19 @@ mod model_list;
 mod motion;
 mod named;
 mod notify;
+mod oplog;
 mod overlay;
 mod palette;
 mod palettes;
 mod pane;
 mod presence;
+mod presentation;
 mod rail;
+mod rail_wishes;
 mod recall;
 #[cfg(test)]
 mod receipt_tests;
+mod revisions;
 mod scroll;
 mod scrollbar;
 mod settings;
@@ -104,6 +115,7 @@ mod usage;
 mod usage_view;
 mod views;
 mod waiting;
+mod walk;
 mod warm;
 mod watch;
 mod wtabs;
@@ -330,10 +342,28 @@ fn main() {
         theme::carry_favourites(p, k, &favs);
     }
 
+    // What live turns let go is dropped off the frame by the app's own
+    // disposer (`synaps_client::blocks::dispose`): the main thread's, so
+    // every transcript the app makes hands over to it. It shuts down (its
+    // queue closed, drained, its thread joined `JOIN` at most, `JOIN`
+    // being its wait for the thread's last drop) when `run` returns, as
+    // Linux's and Windows' do once the app quits. macOS exits from within
+    // `run`, and a Windows end-session may exit the process from its
+    // handler: what it held then is memory only.
+    let disposer = synaps_client::blocks::dispose::Disposer::start();
+    let _disposing = disposer.install();
+    // The rail's two files (D6b, `rail_wishes::Home`): their locks taken
+    // once, now, for the process (another desk has them: memory only), and
+    // their writer. The app's quit waits for what it holds, the windows'
+    // last snapshots included, a window open or not (`Home::on_quit`),
+    // `blockfiles::JOIN` at most; then the locks go.
+    let wishes = rail_wishes::Home::take(desires::path(), presentation::path());
+    let wishes_home = wishes.clone();
     diag::mark("before_application");
     // The assets: the stroked glyphs' sprites (`glyph::Sprites`).
     gpui_kit::application().with_assets(glyph::Sprites).run(move |cx| {
         diag::mark("app_run_callback");
+        wishes_home.on_quit(cx);
         house(motion_setting, choice, cx);
         app::bind_keys(cx);
         let mut options = window_options(window_size, bench, cx);
@@ -369,6 +399,9 @@ fn main() {
                 // (and what a crash left beside the file swept, off this thread).
                 let remember = recall::enabled(theme::settings_path().and_then(|p| theme::load_value(&p, recall::SETTING)).as_ref());
                 v.start_recall(remember, recall::path(), cx);
+                // The rail's dismissals and placements: this desk's files,
+                // read now (what a crash left swept off this thread).
+                v.start_wishes(wishes_home.clone(), cx);
                 v.usage = usage_view::UsageUi::new(v.app_settings.usage_host.clone(), v.app_settings.usage_range);
                 v.dash.socket = launch.endpoint.as_ref().map(|e| e.resolve());
                 v.dash.launch = launch;
@@ -401,6 +434,10 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Linux's and Windows' `run` returns here (macOS exits within it): the
+    // quit waited already (`Home::on_quit`); a `run` that ended without
+    // one waits now.
+    wishes.shutdown();
 }
 
 /// The house look on a new app, the desk's window and the `--agent-surface`

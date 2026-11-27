@@ -95,6 +95,8 @@ pub mod label {
     pub const CONTEXT: &str = "C O N T E X T";
     pub const TOKENS: &str = "T O K E N S";
     pub const FILES: &str = "F I L E S";
+    /// The rail's NOW line (blocks.md §4; its zone is [`AGENT`]'s).
+    pub const NOW: &str = "N O W";
     pub const VIA_SHELL: &str = "V I A   S H E L L";
     pub const IN: &str = "I N";
     pub const OUT: &str = "O U T";

@@ -906,6 +906,11 @@ pub(crate) struct Slide {
 }
 
 impl Slide {
+    /// At rest on `target` (its place), as of `now`.
+    pub(crate) fn rest(target: f32, now: Instant) -> Self {
+        Slide { target, x0: 0., v0: 0., at: now, frame: 0 }
+    }
+
     fn omega() -> f32 {
         std::f32::consts::TAU / SNAP_RESPONSE
     }
@@ -921,6 +926,11 @@ impl Slide {
     pub(crate) fn settled(&self, now: Instant) -> bool {
         let (x, v) = self.state(now);
         x.abs() < SNAP_EPSILON && v.abs() < SNAP_EPSILON * Self::omega()
+    }
+
+    /// Its place.
+    pub(crate) fn target(&self) -> f32 {
+        self.target
     }
 
     /// A new place: the offset keeps the row where it is (capped at
@@ -2750,6 +2760,42 @@ impl PaneFx<'_> {
         self.col.quiet.borrow_mut().clear();
         self.col.births.borrow_mut().clear();
         self.col.fold.set(None);
+    }
+
+    /// Bodies `keys` forgotten: their owner no longer draws them (the
+    /// rail's sections gone, their glides over: `AppView::rail_retire`).
+    /// Seen again, one comes up at rest, as a body first seen does.
+    pub(crate) fn forget_reveals(&self, keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut reveals = self.col.reveals.borrow_mut();
+        for k in keys {
+            reveals.remove(k);
+        }
+    }
+
+    /// Body `key` held where it is this frame (the rail's lease over a
+    /// glide in flight): it neither steps nor asks a frame, and stays this
+    /// frame's (not at rest, as a body not drawn last frame would come).
+    pub(crate) fn hold_reveal(&self, key: u64) {
+        if let Some(r) = self.col.reveals.borrow_mut().get_mut(&key) {
+            r.frame = self.frame.get();
+        }
+    }
+
+    /// Body `key` let go after being held `by`: it goes on from where it
+    /// was, its time from then on.
+    pub(crate) fn resume_reveal(&self, key: u64, by: Duration) {
+        if let Some(r) = self.col.reveals.borrow_mut().get_mut(&key) {
+            r.at = r.at.map(|a| a + by);
+        }
+    }
+
+    /// The bodies it keeps revealing or at rest (tests: what it retains).
+    #[cfg(test)]
+    pub(crate) fn reveal_count(&self) -> usize {
+        self.col.reveals.borrow().len()
     }
 
     /// Everything this column remembers, gone (its pane closed, and its id

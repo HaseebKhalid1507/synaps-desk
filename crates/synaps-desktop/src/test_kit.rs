@@ -10,10 +10,18 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext,
 
 use crate::app::AppView;
 
+#[path = "agent_rail_tests.rs"]
+mod agent_rail_tests;
 #[path = "answer_tests.rs"]
 mod answer_tests;
 #[path = "ask_tests.rs"]
 mod ask_tests;
+#[path = "blocks_tests.rs"]
+mod blocks_tests;
+#[path = "blocks_ui_tests.rs"]
+mod blocks_ui_tests;
+#[path = "card_sync_tab_tests.rs"]
+mod card_sync_tab_tests;
 #[path = "cards_d_tests.rs"]
 mod cards_d_tests;
 #[path = "change_tests.rs"]
@@ -32,12 +40,16 @@ mod key_clock_tests;
 mod keys_tests;
 #[path = "narrow_tests.rs"]
 mod narrow_tests;
+#[path = "rail_wishes_ui_tests.rs"]
+mod rail_wishes_ui_tests;
 #[path = "remember_tests.rs"]
 mod remember_tests;
 #[path = "reveal_tests.rs"]
 mod reveal_tests;
 #[path = "send_tests.rs"]
 mod send_tests;
+#[path = "walk_tests.rs"]
+mod walk_tests;
 
 /// The `--offline` demo's window, `size` px at text step `text`, a client
 /// whose daemon is nowhere ([`open_with`], the beat on the layer).

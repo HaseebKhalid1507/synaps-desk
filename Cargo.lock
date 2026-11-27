@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "cards-spec"
 version = "0.1.1"
-source = "git+https://github.com/HaseebKhalid1507/synaps-cards?rev=335e45621ef68ee2fb528501d3e76b5d1c22b871#335e45621ef68ee2fb528501d3e76b5d1c22b871"
+source = "git+https://github.com/HaseebKhalid1507/synaps-cards?rev=fb723587c849f82ff8ca2cbf0b5161291e6245aa#fb723587c849f82ff8ca2cbf0b5161291e6245aa"
 dependencies = [
  "serde",
  "serde_json",
@@ -6607,6 +6607,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "synaps-client",
  "tokio",
  "windows-sys 0.61.2",
 ]
