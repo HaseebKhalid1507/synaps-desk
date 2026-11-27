@@ -14,6 +14,8 @@ use crate::app::AppView;
 mod answer_tests;
 #[path = "ask_tests.rs"]
 mod ask_tests;
+#[path = "card_sync_tab_tests.rs"]
+mod card_sync_tab_tests;
 #[path = "cards_d_tests.rs"]
 mod cards_d_tests;
 #[path = "change_tests.rs"]
