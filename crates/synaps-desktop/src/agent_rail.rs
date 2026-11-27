@@ -81,12 +81,10 @@ pub(crate) enum Seen {
     Shown,
     /// Not drawn (dismissed): it counts in the header's `M dismissed`
     /// only through [`RailVisibility::dismissed`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "D6b's dismissals make it"))]
     Hidden,
     /// Drawn as a fixed one-line tombstone ([`Tomb`]): it takes no place
     /// under the cap. A group's member too: its line in the group is the
     /// tombstone's, never the member's content.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D6b's soft dismissals make it; D6a draws it"))]
     Tombstone(Tomb),
 }
 
@@ -134,11 +132,20 @@ pub(crate) trait RailVisibility {
     fn dismissed(&self) -> usize {
         0
     }
+
+    /// What those dismissed are, as one tag: their ids, incarnations and
+    /// visibility versions (what the footer's `show` acts on, checked
+    /// whole: never a count).
+    fn hidden(&self) -> u64 {
+        0
+    }
 }
 
-/// Everything shown, as the board places it: D6a's visibility.
+/// Everything shown, as the board places it (D6a's tests).
+#[cfg(test)]
 pub(crate) struct AllShown;
 
+#[cfg(test)]
 impl RailVisibility for AllShown {}
 
 // ---------------------------------------------------------------------------
@@ -329,8 +336,9 @@ pub(crate) struct Layout {
     pub more: [Option<More>; 2],
     /// The AGENT header's `N sections` (drawn or in a `+N` row).
     pub sections: usize,
-    /// Its `M dismissed`.
+    /// Its `M dismissed`, and what they are ([`RailVisibility::hidden`]).
     pub dismissed: usize,
+    pub hidden: u64,
 }
 
 impl Layout {
@@ -364,7 +372,7 @@ fn top_level<'a>(d: &'a Drawn, id: &Ref) -> Option<&'a Shown> {
 /// order, their states under the cap, the `+N` rows.
 pub(crate) fn layout(d: &Drawn, vis: &dyn RailVisibility, local: &Local) -> Layout {
     let placed = vis.placed();
-    let mut out = Layout { dismissed: vis.dismissed(), ..Layout::default() };
+    let mut out = Layout { dismissed: vis.dismissed(), hidden: vis.hidden(), ..Layout::default() };
     // A member hidden leaves its group's list; one a tombstone keeps its
     // place there, as its tombstone.
     let trim = |s: &Shown| {
@@ -623,6 +631,9 @@ pub(crate) fn shape(l: &Layout, local: &Local, note: NoteLines, diff: &dyn Fn(&S
         }
         parts.push(hash(l.more[k].as_ref().map(|m| (m.ids.iter().map(|r| r.to_string()).collect::<Vec<_>>(), m.open))));
     }
+    // The footer (D6b's `N dismissed · show`): there or not, a line of the
+    // upper slot's.
+    parts.push(hash(l.dismissed > 0));
     hash(parts)
 }
 

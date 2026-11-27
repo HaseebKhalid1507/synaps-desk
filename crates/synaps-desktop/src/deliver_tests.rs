@@ -1220,3 +1220,62 @@ fn an_answer_held_before_dropped_events_says_it_couldnt_be_confirmed_past_the_wa
         }
     }
 }
+
+/// Shady #103 R4-P2-1: a composer message waiting for its notices' marks
+/// takes its place in flight when it goes on the wire, not when it was
+/// typed. A card's answer that went first, overtaking it, is the one the
+/// next refusal is about: its memo hears it, the message isn't given back
+/// (it stays in flight), and its echo, the text as sent, confirms it.
+#[test]
+fn a_refusal_is_the_oldest_input_on_the_wire_not_the_oldest_typed() {
+    let mut m = one();
+    let wire = "Ship it.\n[block plan v1 dismissed]";
+    m.lives[LiveId::FIRST].waiting(PaneId::FIRST, "Ship it.".into(), 7);
+    let _ = press(&mut m, LiveId::FIRST, "Refactor the parser");
+    // Its marks written: it goes now, after the answer.
+    assert_eq!(m.lives[LiveId::FIRST].in_flight.went(7, Some(wire.into())), None);
+    let refused = synaps_client::Error::Refused { command: Some("submit".into()), reason: "input is owned by client #1".into() };
+    let fx = m.apply(Event::Error { attach_seq: Some(1), error: refused });
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Restore(..) | Effect::Unsent { .. })), "the message isn't given back: {fx:?}");
+    assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::NotSent), "the answer was refused");
+    assert_eq!(m.lives[LiveId::FIRST].in_flight.iter().cloned().collect::<Vec<_>>(), ["Ship it."], "the message is still out");
+    ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": wire}));
+    assert!(m.lives[LiveId::FIRST].in_flight.is_empty(), "its echo, as sent, confirmed it");
+}
+
+/// R4-P2-1 on an attachment a tab switch left: what it kept in flight is
+/// in wire order too. The overtaking answer's refusal is its card's, and
+/// the message that went after it is confirmed by its echo; nothing goes
+/// to a draft.
+#[test]
+fn a_left_attachments_refusal_is_the_oldest_input_on_the_wire() {
+    let mut m = one();
+    let wire = "Ship it.\n[block plan v1 dismissed]";
+    m.lives[LiveId::FIRST].waiting(PaneId::FIRST, "Ship it.".into(), 7);
+    let _ = press(&mut m, LiveId::FIRST, "Refactor the parser");
+    assert_eq!(m.lives[LiveId::FIRST].in_flight.went(7, Some(wire.into())), None);
+    let _ = m.switch_out(LiveId::FIRST);
+    attach(&mut m, LiveId::FIRST, 2, S2, &[]);
+    let refused = synaps_client::Error::Refused { command: Some("submit".into()), reason: "input is owned by client #1".into() };
+    let fx = m.apply(Event::Error { attach_seq: Some(1), error: refused.clone() });
+    assert!(fx.is_empty(), "no draft gets it: {fx:?}");
+    assert_eq!(m.memos.get_state(S, CARD), Some(State::NotSent), "the answer was refused");
+    let fx = ev(&mut m, 1, S, json!({"ev": "turn_started", "turn_baseline": 4, "trigger": "user", "user_text": wire}));
+    assert!(fx.is_empty(), "{fx:?}");
+    let fx = m.apply(Event::Error { attach_seq: Some(1), error: refused });
+    assert!(fx.is_empty(), "nothing left in flight there: {fx:?}");
+}
+
+/// A message still waiting for its marks when its tab was left can't go
+/// to that attachment: once they're written it isn't sent, and its text
+/// goes back to the pane that sent it (as a refusal there gives it).
+#[test]
+fn a_message_waiting_when_its_tab_was_left_comes_back_unsent() {
+    let mut m = one();
+    m.lives[LiveId::FIRST].waiting(PaneId::FIRST, "Ship it.".into(), 7);
+    let _ = m.switch_out(LiveId::FIRST);
+    attach(&mut m, LiveId::FIRST, 2, S2, &[]);
+    assert_eq!(m.left_went(1, 8), None, "not one of its");
+    assert_eq!(m.left_went(1, 7), Some(Effect::Unsent { pane: PaneId::FIRST, session: S.into(), text: "Ship it.".into() }));
+    assert_eq!(m.left_went(1, 7), None, "once");
+}

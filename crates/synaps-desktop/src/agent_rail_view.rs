@@ -69,7 +69,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use synaps_client::blocks::{Body, Drawn, Ref, Shown, Tag};
 
-use crate::agent_rail::{self as ar, AllShown, Layout, Local, Now, RailVisibility, Section, State};
+#[cfg(test)]
+use crate::agent_rail::RailVisibility;
+use crate::agent_rail::{self as ar, Layout, Local, Now, Section, State};
 use crate::app::{AppView, display, mono, section};
 use crate::fonts::{self, TextPx as _, label, size};
 use crate::glyph::{self, Life};
@@ -81,6 +83,8 @@ use crate::theme::Palette;
 /// A slot's `+N` row's id: its slot with this bit (a block row's is
 /// [`crate::blocks::BLOCK_ID`]'s).
 pub(crate) const MORE_ROW: u64 = 1 << 58;
+/// The agent zone's footer's `show` (D6b): its row.
+pub(crate) const FOOTER_ROW: u64 = MORE_ROW | 2;
 /// A section's keys in the chrome's motion, each its own space
 /// ([`motion::key`]): a row id keeps 59 bits of its hash, so no bit of it
 /// can tell two keys of one row apart. Its arrival's and leaving's glide,
@@ -130,6 +134,14 @@ pub(crate) enum RailAct {
     More,
     /// A slot's `+N` row: its leftovers' headers listed, or not.
     List,
+    /// A section header's `×` (D6b): dismissed.
+    Dismiss,
+    /// A section header's `⇅` (D6b): to the other slot, or the agent's.
+    Slot,
+    /// A soft tombstone's `u` (D6b), its token as drawn: it ends.
+    Unsoft(u64),
+    /// The footer's `show` (D6b): what the rail hides, shown.
+    Show,
     /// A header's hover action (D7, [`crate::walk::Hover`]): its own up,
     /// [`AppView::rail_hover_up`].
     Hover(crate::walk::Hover),
@@ -187,7 +199,7 @@ pub(crate) struct RailState {
     /// The window's text system, as the window last drew: a note's lines
     /// as laid out ([`AppView::rail_note_lines`]).
     pub(crate) text: Option<Rc<WindowTextSystem>>,
-    /// Tests: a visibility in place of D6a's [`AllShown`] (D6b's seam).
+    /// Tests: a visibility in place of D6b's ([`crate::rail_wishes`]).
     #[cfg(test)]
     pub(crate) vis: Option<Rc<dyn RailVisibility>>,
 }
@@ -261,7 +273,6 @@ enum Come {
 }
 
 static EMPTY: LazyLock<Local> = LazyLock::new(Local::default);
-static ALL_SHOWN: AllShown = AllShown;
 
 impl RailState {
     /// Session `s`'s local state (none kept: the empty one).
@@ -339,6 +350,29 @@ fn hash(v: impl Hash) -> u64 {
     h.finish()
 }
 
+/// The tombstone drawn at `row` with `token`, of the incarnation `tag` (a
+/// section's, or a group member's): its block. Another incarnation under
+/// the id, or another token, is another tombstone.
+fn tomb_of(l: &Layout, row: u64, token: u64, tag: Tag) -> Option<Ref> {
+    l.sections().find_map(|s| {
+        if crate::blocks::row_id(&s.s.block.id) == row {
+            return matches!(&s.state, State::Tombstone(t) if t.token == token && s.s.block.tag == tag).then(|| s.s.block.id.clone());
+        }
+        s.s.members
+            .iter()
+            .zip(&s.tombs)
+            .find(|(m, t)| crate::blocks::row_id(&m.block.id) == row && m.block.tag == tag && t.as_ref().is_some_and(|t| t.token == token))
+            .map(|(m, _)| m.block.id.clone())
+    })
+}
+
+/// The footer's `show`'s painted tag: what it shows ([`Layout::hidden`]:
+/// the hidden blocks' ids, incarnations and versions), never a count.
+fn footer_tag(hidden: u64) -> Tag {
+    let (a, b) = (hash(("footer", hidden)), hash(("footer", hidden, 1u8)));
+    Tag::parse(&format!("{a:016x}{b:016x}")).unwrap_or_else(|| Tag::parse(&"0".repeat(32)).expect("a tag"))
+}
+
 /// A past revision's header in the rail while its body isn't drawn (D7,
 /// §3.6): what it says (`loading r2…`, `r2 unavailable · why`) and its
 /// label. Nothing of the live block.
@@ -379,15 +413,10 @@ pub(crate) fn more_tag(m: &ar::More) -> Tag {
 }
 
 impl AppView {
-    /// What this desk shows of store `live`'s agent sections (D6b's seam:
-    /// its dismissals, pins and slot moves; D6a shows everything where the
-    /// board places it).
-    pub(crate) fn rail_visibility(&self, _live: LiveId) -> &dyn RailVisibility {
-        #[cfg(test)]
-        if let Some(v) = self.agent_rail.vis.as_deref() {
-            return v;
-        }
-        &ALL_SHOWN
+    /// What this desk shows of store `live`'s board `d` (D6b's: its
+    /// dismissals, soft dismissals, pins and slot moves).
+    pub(crate) fn rail_visibility(&self, live: LiveId, d: &Drawn) -> crate::rail_wishes::DeskVis {
+        self.wishes.vis(&self.conversation(live), d)
     }
 
     /// Tests: what the rail retains of its renderer state.
@@ -405,10 +434,58 @@ impl AppView {
         }
     }
 
-    /// The agent zone's footer (D6b's seam: `1 dismissed · show`). D6a has
-    /// none.
-    pub(crate) fn rail_footer(&self, _live: LiveId, _p: &Palette, _cx: &Context<Self>) -> Option<AnyElement> {
-        None
+    /// The agent zone's footer (D6b): `1 dismissed · show` (a painted
+    /// target: its probe, its note), what a refusal or a settle last said,
+    /// and, for as long as this desk doesn't own its files, that it keeps
+    /// its changes in memory only.
+    pub(crate) fn rail_footer(&self, l: &Layout, p: &Palette, cx: &Context<Self>) -> Option<AnyElement> {
+        let said = self.wishes.said.clone();
+        let memory = self.wishes.memory_only();
+        if l.dismissed == 0 && said.is_none() && memory.is_none() {
+            return None;
+        }
+        let row = FOOTER_ROW;
+        let tag = footer_tag(l.hidden);
+        let press = RailPress { at: Target { row, tag }, act: RailAct::Show };
+        let says = self.agent_rail.lease.note.filter(|n| n.0 == row).map(|n| n.1);
+        let show = (l.dismissed > 0).then(|| {
+            let text = format!("{} dismissed · show", l.dismissed);
+            mono(text.clone(), size::META, p.dim_ch)
+                .id("agent-footer-show")
+                .relative()
+                .flex_none()
+                .cursor_pointer()
+                .debug_selector(move || format!("agent-footer {text}"))
+                .child(crate::lease::probe(&self.agent_rail.lease, &self.fx, row, tag, row))
+                .on_hover(cx.listener(move |this, over: &bool, _, _| this.rail_hover(row, tag, *over)))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.rail_down(press, cx)))
+                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.rail_up(row, RailAct::Show, cx)))
+        });
+        let note = says.map(|n| mono(n, size::META, p.acc).flex_none().debug_selector(move || format!("agent-says {row} {n}")));
+        let said = said.map(|t| {
+            let t = crate::ask::shown(&t, cards_spec::Lines::Single);
+            mono(t.clone(), size::META, p.warn)
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .debug_selector(move || format!("agent-said {t}"))
+        });
+        let line = || h_flex().h(px(LINE)).w_full().gap(px(GAP)).items_center().whitespace_nowrap();
+        let first = (show.is_some() || note.is_some() || said.is_some()).then(|| line().children(show).children(note).children(said));
+        Some(v_flex().mt(px(12.)).w_full().children(first).children(memory.map(|m| self.memory_line(m, p))).into_any_element())
+    }
+
+    /// The footer's line while this desk keeps its rail changes in memory
+    /// only (D6b: another desk has its files, or they can't be kept).
+    fn memory_line(&self, text: String, p: &Palette) -> Div {
+        let t = crate::ask::shown(&text, cards_spec::Lines::Single);
+        h_flex().h(px(LINE)).w_full().items_center().whitespace_nowrap().child(
+            mono(t.clone(), size::META, p.warn)
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .debug_selector(move || format!("agent-memory {t}")),
+        )
     }
 
     /// The session the panel describes: the focused pane's.
@@ -419,7 +496,11 @@ impl AppView {
     /// The rail of board `d` for store `live`, with the panel's local state.
     pub(crate) fn rail_of(&self, live: LiveId, d: &Drawn) -> Layout {
         let local = self.model.lives[live].active.as_ref().map_or(&*EMPTY, |a| self.agent_rail.local(&a.session_id));
-        ar::layout(d, self.rail_visibility(live), local)
+        #[cfg(test)]
+        if let Some(v) = self.agent_rail.vis.as_deref() {
+            return ar::layout(d, v, local);
+        }
+        ar::layout(d, &self.rail_visibility(live, d), local)
     }
 
     /// The board the panel's rail draws (the focused pane's session's) and
@@ -514,6 +595,7 @@ impl AppView {
     /// Board `d` drawn for store `live`: its session's local state keeps
     /// what it still holds, and the rail's next frame draws an agent op.
     pub(crate) fn rail_landed(&mut self, live: LiveId, d: &Drawn) {
+        self.wishes_on_board(live, d);
         let Some(s) = self.model.lives[live].active.as_ref().map(|a| a.session_id.clone()) else { return };
         let refs: HashSet<Ref> = d
             .rail
@@ -726,10 +808,24 @@ impl AppView {
     /// the upper slot's header, NOW, its sections and `+N`; the end slot's
     /// divider and its own. `faded`: the panel shows last numbers seen.
     pub(crate) fn render_agent(&self, slot: Slot, width: f32, p: &Palette, cx: &Context<Self>) -> Option<AnyElement> {
-        let (_, l) = self.rail_layout()?;
-        if !l.any() {
-            return None;
-        }
+        let Some(l) = self.rail_layout().map(|(_, l)| l).filter(Layout::any) else {
+            // Nothing of the agent's: the upper slot still says what lasts
+            // (D6b: memory only).
+            let m = self.wishes.memory_only().filter(|_| slot == Slot::Upper)?;
+            return Some(
+                v_flex()
+                    .id(("agent-zone", 0usize))
+                    .debug_selector(|| "agent-zone 0".into())
+                    .w_full()
+                    .px(px(INSET))
+                    .pt(px(12.))
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(p.hair)
+                    .child(self.memory_line(m, p))
+                    .into_any_element(),
+            );
+        };
         let k = ar::slot_ix(slot);
         if slot == Slot::End && l.slots[k].is_empty() {
             return None;
@@ -814,16 +910,28 @@ impl AppView {
             let mut drew = self.agent_rail.drew_rows.borrow_mut();
             let mut order = self.agent_rail.order.borrow_mut();
             let row = |d: &Drew| crate::blocks::row_id(&d.sec.s.block.id);
-            // Down the slot: its own, its `+N` row, those listed under it.
+            // Down the slot: its own, its `+N` row, those listed under it,
+            // then (the upper slot's) the footer's `show`.
             order.extend(draw.iter().filter(|(d, _)| !d.listed).map(|(d, _)| row(d)));
             if l.more[k].is_some() {
                 order.push(MORE_ROW | k as u64);
             }
             order.extend(draw.iter().filter(|(d, _)| d.listed).map(|(d, _)| row(d)));
+            let footer = slot == Slot::Upper && l.dismissed > 0;
+            if footer {
+                order.push(FOOTER_ROW);
+            }
             draw.retain(|(_, come)| *come != Come::Gone);
             drew.extend(draw.iter().map(|(d, _)| row(d)));
+            // A group's members drawn as tombstones: targets of their own
+            // (they move with their group).
+            let tombs = draw.iter().flat_map(|(d, _)| d.sec.s.members.iter().zip(&d.sec.tombs));
+            drew.extend(tombs.filter(|(_, t)| t.is_some()).map(|(m, _)| crate::blocks::row_id(&m.block.id)));
             if l.more[k].is_some() {
                 drew.insert(MORE_ROW | k as u64);
+            }
+            if footer {
+                drew.insert(FOOTER_ROW);
             }
         }
         for (d, come) in draw.iter().filter(|(d, _)| !d.listed) {
@@ -836,7 +944,7 @@ impl AppView {
             zone = zone.child(self.rail_section(&d.sec, local, live, streaming, *come, p, cx));
         }
         if slot == Slot::Upper {
-            zone = zone.children(self.rail_footer(live, p, cx));
+            zone = zone.children(self.rail_footer(&l, p, cx));
         }
         Some(zone.into_any_element())
     }
@@ -925,18 +1033,29 @@ impl AppView {
         let tag = s.block.tag;
         if let State::Tombstone(t) = &sec.state {
             let token = t.token;
+            let act = RailAct::Unsoft(token);
+            let press = RailPress { at: Target { row, tag }, act };
             let t = crate::ask::shown(&t.text, cards_spec::Lines::Single);
+            let says = self.agent_rail.lease.note.filter(|n| n.0 == row).map(|n| n.1);
             return h_flex()
+                .id(("agent-tomb", row))
                 .relative()
                 .mt(px(8.))
                 .h(px(24.))
                 .w_full()
+                .gap(px(GAP))
                 .items_center()
+                .cursor_pointer()
                 .debug_selector(move || format!("agent-tomb {row}"))
                 .child(mono(t, size::META, p.dim_ch).min_w_0().overflow_hidden().text_ellipsis())
+                .children(says.map(|n| mono(n, size::META, p.acc).flex_none().debug_selector(move || format!("agent-says {row} {n}"))))
+                .child(crate::lease::probe(&self.agent_rail.lease, &self.fx, row, tag, row))
                 // The walk's ring (D7): a tombstone is walked to, its
                 // token painted with it (`u` acts on it as painted).
                 .children(self.walk_ring(crate::walk::At::Rail(row), tag, Some(token), p))
+                .on_hover(cx.listener(move |this, over: &bool, _, _| this.rail_hover(row, tag, *over)))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.rail_down(press, cx)))
+                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.rail_up(row, act, cx)))
                 .into_any_element();
         }
         let open = sec.state == State::Open;
@@ -1044,11 +1163,25 @@ impl AppView {
         let rev_max = (self.rail_text_w() - fixed - TITLE_MIN).max(REV_MIN);
         // Its hover actions (D7): over its right end, never reflowing it,
         // unless the lease's note is there or a past revision is in view.
+        // D6b's `⇅` and `×` among them, the rail's own presses
+        // ([`AppView::rail_up`]) until D7's seam is wired (its follow-up).
         let hovered = self.agent_rail.lease.head.filter(|h| h.0 == row && past.is_none() && says.is_none());
         let acts = hovered.map(|(_, since)| {
-            let offers = self.hover_offers(s, true);
+            use crate::walk::Hover;
+            let mut offers = self.hover_offers(s, true);
+            if !self.desires.wired() {
+                let fold = offers.iter().position(|o| o.0 == Hover::Fold).unwrap_or(offers.len());
+                offers.insert(fold, (Hover::Slot, "⇅"));
+                offers.push((Hover::Dismiss, "×"));
+            }
+            let wired = self.desires.wired();
             self.hover_actions(row, since, &offers, p.card_d, p, |act, el| {
-                let press = RailPress { at: Target { row, tag }, act: RailAct::Hover(act) };
+                let act = match act {
+                    Hover::Slot if !wired => RailAct::Slot,
+                    Hover::Dismiss if !wired => RailAct::Dismiss,
+                    a => RailAct::Hover(a),
+                };
+                let press = RailPress { at: Target { row, tag }, act };
                 el.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -1060,7 +1193,10 @@ impl AppView {
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseUpEvent, window, cx| {
                         cx.stop_propagation();
-                        this.rail_hover_up(row, act, window, cx);
+                        match act {
+                            RailAct::Hover(a) => this.rail_hover_up(row, a, window, cx),
+                            a => this.rail_up(row, a, cx),
+                        }
                     }),
                 )
             })
@@ -1349,14 +1485,35 @@ impl AppView {
                     // A member that is a tombstone (D6b's soft dismissal)
                     // draws as its tombstone: nothing of its content.
                     if let Some(Some(tomb)) = tombs.get(j) {
+                        let act = RailAct::Unsoft(tomb.token);
+                        let mtag = m.block.tag;
+                        let press = RailPress { at: Target { row: mrow, tag: mtag }, act };
                         let t = crate::ask::shown(&tomb.text, cards_spec::Lines::Single);
+                        let says = self.agent_rail.lease.note.filter(|n| n.0 == mrow).map(|n| n.1);
                         col = col.child(
                             line()
+                                .id(("agent-member-tomb", mrow))
+                                .relative()
+                                .cursor_pointer()
+                                // Its own target, moving with its group.
+                                .child(crate::lease::probe(&self.agent_rail.lease, &self.fx, mrow, mtag, row))
+                                .on_hover(cx.listener(move |this, over: &bool, _, _| this.rail_hover(mrow, mtag, *over)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| this.rail_down(press, cx)),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseUpEvent, _, cx| this.rail_up(mrow, act, cx)),
+                                )
                                 .debug_selector({
                                     let s = format!("agent-member-tomb {row} {mrow} {t}");
                                     move || s.clone()
                                 })
-                                .child(text(t, p.dim_ch)),
+                                .child(text(t, p.dim_ch))
+                                .children(says.map(|n| {
+                                    mono(n, size::META, p.acc).flex_none().debug_selector(move || format!("agent-says {mrow} {n}"))
+                                })),
                         );
                         continue;
                     }
@@ -1462,9 +1619,11 @@ impl AppView {
                 let k = (row & !MORE_ROW) as usize;
                 b.more.get(k).and_then(Option::as_ref).is_some_and(|m| more_tag(m) == down.at.tag)
             }
-            RailAct::Fold | RailAct::More | RailAct::Hover(_) => b
+            RailAct::Fold | RailAct::More | RailAct::Dismiss | RailAct::Slot | RailAct::Hover(_) => b
                 .sections()
                 .any(|s| crate::blocks::row_id(&s.s.block.id) == row && s.s.bound.as_ref().is_some_and(|x| x.tag == down.at.tag)),
+            RailAct::Unsoft(token) => tomb_of(b, row, token, down.at.tag).is_some(),
+            RailAct::Show => b.dismissed > 0 && footer_tag(b.hidden) == down.at.tag,
         });
         // Drawn now: the layout acted on.
         let drawn = self.rail_layout().map(|(_, l)| l);
@@ -1504,6 +1663,26 @@ impl AppView {
                     let k = (row & !MORE_ROW) as usize;
                     let listed = &mut self.agent_rail.local_mut(&session).listed[k];
                     *listed = !*listed;
+                }
+                RailAct::Dismiss | RailAct::Slot => {
+                    let Some(b) = lay.sections().find(|s| crate::blocks::row_id(&s.s.block.id) == row).map(|s| s.s.block.clone()) else {
+                        return;
+                    };
+                    if act == RailAct::Dismiss {
+                        self.dismiss_block(live, &b, cx);
+                    } else {
+                        self.slot_block(live, &b, cx);
+                    }
+                }
+                RailAct::Unsoft(token) => {
+                    if let Some(id) = tomb_of(&lay, row, token, down.at.tag) {
+                        self.unsoft_block(live, &id, cx);
+                    }
+                }
+                RailAct::Show => {
+                    if let Some(d) = newest {
+                        self.show_dismissed(live, &d, cx);
+                    }
                 }
             },
             None => self.agent_rail.lease.note = Some((row, CHANGED)),

@@ -114,7 +114,7 @@ pub struct Active {
 }
 
 /// An attachment a tab switch left, with its input in flight ([`Model::left`]).
-type Left = (u64, String, VecDeque<(crate::live::Target, String)>);
+type Left = (u64, String, VecDeque<crate::live::Input>);
 
 /// What the view must do after an event (it owns the client and composer).
 #[derive(Clone, Debug, PartialEq)]
@@ -1409,6 +1409,22 @@ impl Model {
         self.unread.retain(|k| sessions.iter().any(|s| s.is(k)) || n.saved.iter().chain(&n.recent).any(|v| v.id == *k));
     }
 
+    /// The input waiting on `ticket` in attachment `seq`, which a tab switch
+    /// left before it went: it can't go there now, so it isn't sent; its
+    /// text goes back to the pane that sent it (a card's: nothing to give).
+    pub(crate) fn left_went(&mut self, seq: u64, ticket: u64) -> Option<Effect> {
+        let i = self.left.iter().position(|l| l.0 == seq)?;
+        let (to, text) = crate::live::went(&mut self.left[i].2, ticket, None)?;
+        let session = self.left[i].1.clone();
+        if self.left[i].2.is_empty() {
+            self.left.remove(i);
+        }
+        match to {
+            crate::live::Target::Pane(pane) => Some(Effect::Unsent { pane, session, text }),
+            crate::live::Target::Card(_) => None,
+        }
+    }
+
     /// An event of an attachment a tab switch left, while it still has
     /// input unconfirmed: an echo confirms it, a refusal gives the oldest
     /// back, the end gives back the rest (to that tab's draft). `None`:
@@ -1425,28 +1441,33 @@ impl Model {
             Event::Session {
                 event: SessionEvent::TurnStarted { user_text: Some(t), .. } | SessionEvent::Steered { text: t, .. }, ..
             } => {
-                if let Some(k) = texts.iter().position(|(_, s)| s.trim() == t.trim()) {
+                if let Some(k) = texts.iter().position(|i| i.echoed(t)) {
                     // A card's answer, echoed: its memo hears it (a
                     // driver's echo can't be told here: no state of that
                     // session is kept).
-                    if let (Target::Card(_), s) = texts.remove(k).expect("found") {
-                        memos.on(session, cards_spec::memo::Event::Echo { text: &s, driver: false }, now);
+                    if let Some(crate::live::Input { to: Target::Card(_), body, .. }) = texts.remove(k) {
+                        memos.on(session, cards_spec::memo::Event::Echo { text: &body, driver: false }, now);
                     }
                 }
             }
-            Event::Error { error, .. } if refused_input(error) => match texts.pop_front() {
-                Some((Target::Pane(pane), text)) => effects.push(Effect::Unsent { pane, session: session.clone(), text }),
-                Some((Target::Card(_), _)) => {
-                    memos.on(session, cards_spec::memo::Event::Refused { reason: &error.to_string() }, now);
+            // The oldest sent (one waiting for its notices' marks wasn't).
+            Event::Error { error, .. } if refused_input(error) => {
+                match texts.iter().position(|i| i.wire.is_ok()).and_then(|k| texts.remove(k)) {
+                    Some(crate::live::Input { to: Target::Pane(pane), body: text, .. }) => {
+                        effects.push(Effect::Unsent { pane, session: session.clone(), text })
+                    }
+                    Some(crate::live::Input { to: Target::Card(_), .. }) => {
+                        memos.on(session, cards_spec::memo::Event::Refused { reason: &error.to_string() }, now);
+                    }
+                    None => {}
                 }
-                None => {}
-            },
+            }
             // The rest, one text for each pane that sent some. A card's
             // answer stays its card's: its memo checks it when the session
             // is attached again, or says it couldn't.
             Event::Detached { .. } if !texts.is_empty() => {
                 let mut by: Vec<(PaneId, Vec<String>)> = Vec::new();
-                for (p, t) in std::mem::take(texts) {
+                for crate::live::Input { to: p, body: t, .. } in std::mem::take(texts) {
                     let Target::Pane(p) = p else { continue };
                     match by.iter_mut().find(|(q, _)| *q == p) {
                         Some((_, ts)) => ts.push(t),

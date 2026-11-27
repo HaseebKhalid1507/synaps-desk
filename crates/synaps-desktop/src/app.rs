@@ -2236,6 +2236,9 @@ pub struct AppView {
     /// The agent's sections in the right panel: each session's local
     /// state, the rail's lease and painted targets ([`crate::agent_rail_view`]).
     pub(crate) agent_rail: crate::agent_rail_view::RailState,
+    /// This desk's dismissals, pins and slot moves, and the notices riding
+    /// its messages ([`crate::rail_wishes`]).
+    pub(crate) wishes: crate::rail_wishes::Stores,
     /// The re-fold slot (`crate::board::Refolds`): one at a time, app-wide.
     pub(crate) refolds: crate::board::Refolds,
     /// Settings and Usage ([`crate::views`]): their state, the dash channel
@@ -2591,7 +2594,7 @@ impl AppView {
             this.in_pane(id, |this| match ev {
                 InputEvent::PressEnter { shift: false, .. } if !this.enter_is_the_picks() => {
                     let text = input.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
+                    if !text.is_empty() && this.submit(text, cx) {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                 }
@@ -2771,11 +2774,15 @@ impl AppView {
         // Its OS notifications go with it (D3, Shady #83 R2-3); quitting
         // waits for Linux's bus task to close them, within GPUI's shutdown
         // allowance.
+        // The rail's stores (D6b): each file's last snapshot handed to the
+        // process's writer, which the app's quit waits for, this window
+        // open or not (`rail_wishes::Home::on_quit`).
         subs.push(cx.on_release(|this, cx| {
             this.flush_panels();
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
@@ -2784,6 +2791,7 @@ impl AppView {
             this.flush_tabs();
             this.flush_favs();
             this.flush_app();
+            this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             async move { gone.wait().await }
         }));
@@ -2958,6 +2966,7 @@ impl AppView {
             attach_source: None,
             lease_wake: None,
             agent_rail: Default::default(),
+            wishes: crate::rail_wishes::Stores::at_launch(),
             refolds: crate::board::Refolds::default(),
             settings: Default::default(),
             usage: crate::usage_view::UsageUi::new(None, Default::default()),
@@ -4811,12 +4820,12 @@ impl AppView {
     /// The composer's Enter with `text` in it, as its subscription sends it
     /// (the view-level tests, `split_tests`, which need a unix socket).
     #[cfg(all(test, unix))]
-    pub(crate) fn enter(&mut self, text: String) -> bool {
-        self.submit(text)
+    pub(crate) fn enter(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        self.submit(text, cx)
     }
 
     /// Send the composer's text. `false` keeps it in the composer.
-    fn submit(&mut self, text: String) -> bool {
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         #[cfg(test)]
         self.submits.push((text.clone(), self.model.lives[self.panes.cur.live].watch.focus().is_some()));
         let Some(c) = &self.client else {
@@ -4891,13 +4900,38 @@ impl AppView {
             return true;
         }
         let busy = self.model.lives[self.panes.cur.live].transcript.busy();
+        // The notices that ride it (D6b, `crate::rail_wishes`): with it now,
+        // or it goes once their marks are written (out of the composer
+        // already); refused, it stays.
+        let body = text;
+        let ride = match self.ride_notices(self.panes.cur.live, self.panes.cur.id, seq, busy, body.clone(), cx) {
+            Ok(crate::desires::Riding::Go(r)) => r,
+            // In flight already (it may have gone): its echo is the text as
+            // it goes.
+            Ok(crate::desires::Riding::Wait(_)) => {
+                self.panes.cur.draft_note = None;
+                self.panes.cur.watch_note = None;
+                self.fx.col(self.panes.cur.id).sent().set(Some((self.fx.clock(), busy)));
+                self.return_to_end();
+                return true;
+            }
+            Err(why) => {
+                self.model.lives[self.panes.cur.live].last_error = Some(why);
+                return false;
+            }
+        };
+        let text = ride.text;
+        let Some(c) = &self.client else { return false };
         let sent = if busy { c.on(seq).steer(text.clone()) } else { c.on(seq).submit(text.clone()) };
+        self.ride_went(self.panes.cur.live, &text, ride.carrier, sent.is_ok());
         if sent.is_err() {
             self.model.lives[self.panes.cur.live].last_error = Some("the connection thread has stopped".into());
             return false;
         }
         log::debug!(target: "synaps_desktop::send", "{} ({} chars)", if busy { "steer" } else { "submit" }, text.chars().count());
-        self.model.lives[self.panes.cur.live].sent(self.panes.cur.id, text);
+        // Its echo is the text sent (the notices' trailer too); a refusal
+        // or a detach gives the body back.
+        self.model.lives[self.panes.cur.live].sent_as(self.panes.cur.id, body, text);
         self.panes.cur.draft_note = None;
         self.panes.cur.watch_note = None;
         // Handoff out: the composer's bar, then the new block's (a steer
@@ -8156,12 +8190,17 @@ impl AppView {
         // The cards waiting here, while none is entered (D2b): its click is
         // Ctrl+J. Not over a prompt's card, which Ctrl+J visits first.
         let chip: Option<SharedString> = (!to_card && worker.is_none()).then(|| self.ask_chip()).flatten().map(Into::into);
+        // What the next message tells the agent (D6b): its click keeps it
+        // back for a later one.
+        let tells: Option<SharedString> = (!to_card && worker.is_none()).then(|| self.tells_chip()).flatten().map(Into::into);
         let hint: Option<(SharedString, Hsla)> = if let Some(n) = self.composer_note() {
             Some((n.clone(), self.note_color(&n, p)))
         } else if self.client.is_none() && !self.synthetic {
             Some(("offline: no daemon to send to".into(), p.dim_u))
         } else if let Some(c) = chip.clone() {
             Some((c, p.acc))
+        } else if let Some(t) = tells.clone() {
+            Some((t, p.acc))
         } else if self.client.is_none() {
             Some(("offline: synthetic transport, nothing is sent".into(), p.dim_u))
         } else if self.model.lives[self.panes.cur.live].switching() {
@@ -8274,7 +8313,7 @@ impl AppView {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 let text = this.panes.cur.composer.read(cx).value().trim().to_string();
-                if !text.is_empty() && this.submit(text) {
+                if !text.is_empty() && this.submit(text, cx) {
                     this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                 }
                 cx.notify();
@@ -8407,7 +8446,7 @@ impl AppView {
             let send = if short {
                 fbtn("send", label::STEER, can_send, Fill::Btn, p, m).on_click(cx.listener(|this, _, window, cx| {
                     let text = this.panes.cur.composer.read(cx).value().trim().to_string();
-                    if !text.is_empty() && this.submit(text) {
+                    if !text.is_empty() && this.submit(text, cx) {
                         this.panes.cur.composer.update(cx, |s, cx| s.set_value("", window, cx));
                     }
                     cx.notify();
@@ -8486,14 +8525,35 @@ impl AppView {
             // Cut short, its tooltip has it whole.
             let hint = hint.filter(|_| fit.hint).map(|(h, c)| {
                 let is_chip = chip.as_ref() == Some(&h);
+                let is_tells = !is_chip && tells.as_ref() == Some(&h);
                 let said = h.clone();
                 mono(h.clone(), m.meta, c)
-                    .id(if is_chip { "composer-chip" } else { "composer-note" })
-                    .debug_selector(move || if is_chip { format!("composer-chip {said}") } else { "composer-note".into() })
+                    .id(if is_chip {
+                        "composer-chip"
+                    } else if is_tells {
+                        "composer-tells"
+                    } else {
+                        "composer-note"
+                    })
+                    .debug_selector(move || {
+                        if is_chip {
+                            format!("composer-chip {said}")
+                        } else if is_tells {
+                            format!("composer-tells {said}")
+                        } else {
+                            "composer-note".into()
+                        }
+                    })
                     .when(is_chip, |d| {
                         let pane = self.panes.cur.id;
                         d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.in_pane(pane, |this| this.jump_to_card(window, cx));
+                        }))
+                    })
+                    .when(is_tells, |d| {
+                        let pane = self.panes.cur.id;
+                        d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.in_pane(pane, |this| this.keep_back(cx));
                         }))
                     })
                     .ml(px(16.))
@@ -9927,6 +9987,10 @@ fn span(node: &crate::split::Node, rects: &[(PaneId, crate::split::Rect)]) -> (f
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diag::mark("first_render");
+        // Tests: every change to the rail's stores asked for its write
+        // (D6b, Shady #103 R3-P2-2: a settle's and a compaction's too).
+        #[cfg(test)]
+        assert!(!self.wishes.unscheduled(), "a rail store changed and no write was asked for");
         // Every frame drawn (`SYNAPS_DESKTOP_LOG=debug`): what an idle
         // window costs is countable.
         log::debug!(target: "synaps_desktop::frame", "frame");

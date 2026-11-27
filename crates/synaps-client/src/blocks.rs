@@ -134,7 +134,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
-use cards_spec::board::{Board, Event, Place, State};
+use cards_spec::board::{Board, Event, Place, State, Visibility};
 use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
@@ -2176,6 +2176,11 @@ pub struct Drawn {
     pub committed_to: u64,
     /// Live blocks on the board, groups and members included.
     pub live: usize,
+    /// Its visibility records (§3.5): as drawn, the live turn's included
+    /// (what a click is made on), and the history's alone (settled: what a
+    /// desire settles against). D6b's.
+    pub visibility: Arc<Visibility>,
+    pub settled: Arc<Visibility>,
     /// The board's op log (§3.8: ≤ 256 lines, oldest first), each line
     /// with where its event is ([`Mark`]: its time is its row's), and the
     /// revision records and tombstones it still holds (§1.8), records
@@ -2186,10 +2191,26 @@ pub struct Drawn {
     pub tombstones: Arc<[Tombstone]>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
-    /// upper bound), its committed fates. A row's [`Arc`] of it is its.
+    /// upper bound), its committed fates, its op log, records and
+    /// tombstones, its visibility maps ([`vis_owned`]: `settled`, which its
+    /// worker holds too, counted in both; `visibility` once more unless it
+    /// is `settled`'s). A row's
+    /// [`Arc`] of it is its.
     pub bytes: usize,
 }
 
+/// A visibility map in its own [`Arc`], owned bytes (§1.8's model): the
+/// allocation (its counts and the map's inline part) and what the map
+/// owns, `heap` (B2's count of its records: [`State::owned_by_owner`]'s).
+fn vis_owned(heap: usize) -> usize {
+    ARC + std::mem::size_of::<Visibility>() + heap
+}
+
+/// What a state's visibility map owns past its inline part
+/// ([`State::owned_by_owner`]'s fourth owner).
+fn vis_heap(s: &State) -> usize {
+    s.owned_by_owner()[3]
+}
 /// Where a log line or a record's event is: its row, and the call that
 /// made it (its `tool_id`), by which the row's time is found
 /// ([`crate::Transcript::call_at`]: a lookup, never a walk of the rows).
@@ -2258,6 +2279,10 @@ pub struct Worker {
     /// events come and go.
     bytes: usize,
     board: Board,
+    /// The history's visibility records, as of the history read last, and
+    /// what their map owns ([`vis_heap`]).
+    settled: Arc<Visibility>,
+    settled_heap: usize,
     /// The board's card fold's bytes ([`Board::card_fold_bytes`], an
     /// estimate that reads every card), as of its position then: read
     /// again when the history is read on, not per slice.
@@ -2305,6 +2330,8 @@ impl Default for Worker {
             hist: 0,
             bytes: 0,
             board: Board::new(block::Generation::of(&Value::Null)),
+            settled: Arc::default(),
+            settled_heap: 0,
             cards: (0, 0),
             batch: Batch::default(),
             committed: VecDeque::new(),
@@ -2328,9 +2355,12 @@ impl Worker {
 
     /// What it keeps (bytes, heap included): its journal and rows as
     /// allocated, the committed fates not taken yet (their queue as
-    /// allocated), its board and the overlay's, each with its card fold.
+    /// allocated), its board and the overlay's, each with its card fold,
+    /// and the history's visibility map ([`vis_owned`]; the last
+    /// publication shares it, and counts it too).
     pub fn bytes(&self) -> usize {
         self.bytes
+            + vis_owned(self.settled_heap)
             + (self.journal.capacity() - self.journal.len()) * std::mem::size_of::<Event>()
             + self.rows.capacity() * std::mem::size_of::<Option<u64>>()
             + self.committed.capacity() * std::mem::size_of::<(u64, Fate)>()
@@ -2514,6 +2544,13 @@ impl Worker {
         let history = input.history_len;
         let (log, want) = (input.live.log, input.live.len);
         if !self.over.as_ref().is_some_and(|o| o.log == log && o.history == history) {
+            // The history's records (once a history: its view's replay
+            // changes no record).
+            let settled = self.board.view(&self.journal[..history]);
+            if *settled.visibility() != *self.settled {
+                self.settled = Arc::new(settled.visibility().clone());
+                self.settled_heap = vis_heap(&settled);
+            }
             // Its fold a copy of the board's, counted as copied (a copy
             // has no room to spare).
             let board = self.board.clone();
@@ -2659,6 +2696,9 @@ impl Worker {
             + (shown_n + bound_n) * ARC;
         let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
+        // The live view's records: the history's map when they are its
+        // (one allocation, shared), else a map of their own.
+        let visibility = if *view.visibility() == *self.settled { None } else { Some(Arc::new(view.visibility().clone())) };
         // The op log, records and tombstones (D7): copies, each record and
         // line with its event's mark (its row, its call's id: [`Mark`],
         // one allocation a call, within the budget, the newest lines'
@@ -2686,6 +2726,8 @@ impl Worker {
         let calls = CALL_IDS_MAX - room;
         let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Mark>() + calls + 3 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
+            + vis_owned(self.settled_heap)
+            + visibility.as_ref().map_or(0, |_| vis_owned(vis_heap(view)))
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
             + rail.iter().map(Shown::list_bytes).sum::<usize>()
@@ -2703,6 +2745,8 @@ impl Worker {
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
+            visibility: visibility.unwrap_or_else(|| self.settled.clone()),
+            settled: self.settled.clone(),
             log,
             records,
             tombstones,

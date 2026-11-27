@@ -230,8 +230,22 @@ impl Live {
     /// `text` went to the daemon. A turn the user sent and then left
     /// running is still news when it ends off screen (the reply is what
     /// they are waiting for); one they watched to its end is in `seen`.
+    #[cfg(test)]
     pub fn sent(&mut self, pane: PaneId, text: String) {
         self.in_flight.push_back(pane, text);
+    }
+
+    /// The user's `body` went to the daemon as `wire` (the notices that
+    /// rode it after it, D6b): its echo is `wire`'s, and what goes back to
+    /// the pane is `body`.
+    pub(crate) fn sent_as(&mut self, pane: PaneId, body: String, wire: String) {
+        self.in_flight.0.push_back(Input { to: Target::Pane(pane), body, wire: Ok(wire) });
+    }
+
+    /// The user's `body` waits for its notices' marks (D6b's ticket
+    /// `ticket`): out of the composer, not sent yet ([`InFlight::went`]).
+    pub(crate) fn waiting(&mut self, pane: PaneId, body: String, ticket: u64) {
+        self.in_flight.0.push_back(Input { to: Target::Pane(pane), body, wire: Err(ticket) });
     }
 
     /// Worker `handle_id`'s view, just polled, tells the attached
@@ -274,11 +288,11 @@ impl Live {
     /// memo hears the refusal, [`crate::deliver`]).
     pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> bool {
         match self.in_flight.pop_front() {
-            Some((Target::Pane(pane), t)) => {
-                effects.push(Effect::Restore(pane, t));
+            Some(Input { to: Target::Pane(pane), body, .. }) => {
+                effects.push(Effect::Restore(pane, body));
                 false
             }
-            Some((Target::Card(_), _)) => true,
+            Some(Input { to: Target::Card(_), .. }) => true,
             None => false,
         }
     }
@@ -290,15 +304,15 @@ impl Live {
         // One text per pane, in the order sent: each to its own composer.
         let all = self.in_flight.take();
         let mut panes: Vec<PaneId> = Vec::new();
-        for (p, _) in &all {
-            if let Target::Pane(p) = p
+        for i in &all {
+            if let Target::Pane(p) = &i.to
                 && !panes.contains(p)
             {
                 panes.push(*p);
             }
         }
         for p in panes {
-            let texts: Vec<&str> = all.iter().filter(|(q, _)| *q == Target::Pane(p)).map(|(_, t)| t.as_str()).collect();
+            let texts: Vec<&str> = all.iter().filter(|i| i.to == Target::Pane(p)).map(|i| i.body.as_str()).collect();
             effects.push(Effect::Restore(p, texts.join("\n")));
         }
     }
@@ -329,29 +343,56 @@ pub(crate) enum Target {
     Card(cards_spec::CardId),
 }
 
-/// Input sent and not yet confirmed, oldest first, each with what sent it
+/// One input in flight: what sent it, the user's text (what goes back to
+/// it), and what the daemon echoes once it went: the text as sent (the
+/// notices that rode it after the body, D6b), or, while it waits for their
+/// marks to be written, its ticket (not sent yet, [`InFlight::went`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Input {
+    pub(crate) to: Target,
+    pub(crate) body: String,
+    pub(crate) wire: Result<String, u64>,
+}
+
+impl Input {
+    /// Whether the daemon's echo `text` is this one's (its text as sent).
+    pub(crate) fn echoed(&self, text: &str) -> bool {
+        self.wire.as_ref().is_ok_and(|w| w.trim() == text.trim())
+    }
+}
+
+/// Input sent and not yet confirmed, each with what sent it
 /// (split/architecture.md §6.5): a refusal or a detach gives it back to
-/// that pane's composer, never another's, or to its card.
+/// that pane's composer, never another's, or to its card. Its echo
+/// confirms it by the text as sent ([`Input::echoed`]), never the body
+/// alone. The inputs sent are in the order they went on the wire (one
+/// that waited for its marks takes its place when it goes, behind what
+/// went before it: Shady #103 R4-P2-1), so the oldest sent is the one the
+/// daemon handles first; one still waiting has no place in that order.
 #[derive(Default, Debug)]
-pub(crate) struct InFlight(VecDeque<(Target, String)>);
+pub(crate) struct InFlight(VecDeque<Input>);
 
 impl InFlight {
     /// The texts, oldest first (tests).
     #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
-        self.0.iter().map(|(_, t)| t)
+        self.0.iter().map(|i| &i.body)
     }
 
+    #[cfg(test)]
     pub(crate) fn push_back(&mut self, pane: PaneId, text: String) {
         self.push(Target::Pane(pane), text);
     }
 
     pub(crate) fn push(&mut self, target: Target, text: String) {
-        self.0.push_back((target, text));
+        self.0.push_back(Input { to: target, body: text.clone(), wire: Ok(text) });
     }
 
-    pub(crate) fn pop_front(&mut self) -> Option<(Target, String)> {
-        self.0.pop_front()
+    /// The oldest sent (a refusal's: the daemon handles input in order;
+    /// one still waiting for its marks wasn't sent).
+    pub(crate) fn pop_front(&mut self) -> Option<Input> {
+        let i = self.0.iter().position(|i| i.wire.is_ok())?;
+        self.0.remove(i)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -360,22 +401,45 @@ impl InFlight {
 
     /// The daemon echoed `text`: the oldest send of it is confirmed.
     pub(crate) fn confirm(&mut self, text: &str) {
-        if let Some(i) = self.0.iter().position(|(_, s)| s.trim() == text.trim()) {
+        if let Some(i) = self.0.iter().position(|i| i.echoed(text)) {
             self.0.remove(i);
         }
+    }
+
+    /// The input waiting on `ticket` went as `wire` (its echo's text now):
+    /// sent now, behind every input that went before it, whenever it was
+    /// typed. Or it wasn't sent (`None`): no longer in flight, what sent it
+    /// and its text, to give back.
+    pub(crate) fn went(&mut self, ticket: u64, wire: Option<String>) -> Option<(Target, String)> {
+        went(&mut self.0, ticket, wire)
     }
 
     /// Pane `from` left the store (closed, or on another session now):
     /// what it sent is pane `to`'s (Shady #36 L5, r2 L-c).
     pub(crate) fn rehome(&mut self, from: PaneId, to: PaneId) {
-        for (p, _) in self.0.iter_mut().filter(|(p, _)| *p == Target::Pane(from)) {
-            *p = Target::Pane(to);
+        for i in self.0.iter_mut().filter(|i| i.to == Target::Pane(from)) {
+            i.to = Target::Pane(to);
         }
     }
 
     /// Everything, oldest first; none left.
-    pub(crate) fn take(&mut self) -> Vec<(Target, String)> {
+    pub(crate) fn take(&mut self) -> Vec<Input> {
         std::mem::take(&mut self.0).into()
+    }
+}
+
+/// [`InFlight::went`] on `inputs` (a live store's, or an attachment's a
+/// tab switch left, [`crate::model::Model::left_went`]).
+pub(crate) fn went(inputs: &mut VecDeque<Input>, ticket: u64, wire: Option<String>) -> Option<(Target, String)> {
+    let i = inputs.iter().position(|i| i.wire == Err(ticket))?;
+    let mut input = inputs.remove(i)?;
+    match wire {
+        Some(w) => {
+            input.wire = Ok(w);
+            inputs.push_back(input);
+            None
+        }
+        None => Some((input.to, input.body)),
     }
 }
 
@@ -607,6 +671,31 @@ mod tests {
         let mut fx = Vec::new();
         l.give_back_all(&mut fx);
         assert_eq!(fx, vec![Effect::Restore(a, "one from a".into()), Effect::Restore(b, "again b".into())]);
+        assert!(l.in_flight.is_empty());
+    }
+
+    /// D6b (Shady #103 R3-P2-1): an input is confirmed by its text as
+    /// sent (its notices' trailer too), never its body alone; one waiting
+    /// for its marks isn't sent, so a refusal is the oldest sent's, and one
+    /// that couldn't go is given back.
+    #[test]
+    fn input_is_confirmed_by_its_text_as_sent() {
+        let a = PaneId::FIRST;
+        let mut l = Live::default();
+        l.waiting(a, "later".into(), 7);
+        l.sent_as(a, "now".into(), "now\n[block plan v1 dismissed]".into());
+        l.in_flight.confirm("now");
+        assert_eq!(l.in_flight.iter().count(), 2, "the body alone isn't its echo");
+        let mut fx = Vec::new();
+        l.give_back_oldest(&mut fx);
+        assert_eq!(fx, vec![Effect::Restore(a, "now".into())], "refused: the oldest sent, never one waiting");
+        assert_eq!(l.in_flight.went(7, Some("later\n[block x v2 shown]".into())), None, "it went");
+        l.in_flight.confirm("later");
+        assert_eq!(l.in_flight.iter().count(), 1);
+        l.in_flight.confirm("later\n[block x v2 shown]");
+        assert!(l.in_flight.is_empty(), "its echo, as sent");
+        l.waiting(a, "lost".into(), 8);
+        assert_eq!(l.in_flight.went(8, None), Some((Target::Pane(a), "lost".into())), "not sent: back to its pane");
         assert!(l.in_flight.is_empty());
     }
 }

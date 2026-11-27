@@ -491,6 +491,67 @@ fn an_unwind_under_a_stores_lock_drops_what_it_set_aside_after_the_lock() {
     drop(hold(&store));
 }
 
+/// D6b's visibility maps are counted (Shady #103 R3-P2-7): a history of
+/// notices for ids that have no live block holds no block of its own, yet
+/// its publication and its worker each hold the records' map (64 records,
+/// counted by both); a live turn's own notice makes the publication a
+/// second map, counted once more; records equal to the history's are its
+/// map, shared.
+#[test]
+fn the_visibility_maps_are_counted() {
+    let put = json!([{"op":"put","id":"x","kind":"note","body":{"text":"x"}}, {"op":"remove","id":"x"}]);
+    let history = |notice: bool, n: usize| {
+        let mut h = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t0", "name": "cards_block", "input": block_input(put.clone())}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t0", "content": block_receipt(&put)}]}),
+        ];
+        for k in 0..n {
+            h.push(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}));
+            // Not a notice: the same bytes in the journal.
+            let word = if notice { "block" } else { "blokk" };
+            h.push(json!({"role": "user", "content": format!("m\n[{word} i{k:02} v1 dismissed]")}));
+        }
+        h
+    };
+    let heap = |h: &[Value]| {
+        let i = input(h);
+        Board::fold(i.generation, &i.events()).view(&i.events()).owned_by_owner()[3]
+    };
+    let run = |h: &[Value]| {
+        let mut w = Worker::default();
+        let d = w.run(&input(h), &mut || true).expect("done");
+        (w, d)
+    };
+    let (_, d0) = run(&history(true, 0));
+    let (wp, dp) = run(&history(false, 64));
+    let (wn, dn) = run(&history(true, 64));
+    let h64 = heap(&history(true, 64));
+    assert_eq!((dn.live, dn.settled.len(), dp.settled.len()), (0, 64, 0), "64 records, no live block");
+    assert!(h64 >= 64 * std::mem::size_of::<block::BlockId>(), "{h64}");
+    assert!(Arc::ptr_eq(&dn.visibility, &dn.settled), "the history's records: its map, shared");
+    assert!(dn.bytes >= d0.bytes + h64, "the publication counts the map: {} vs {} + {h64}", dn.bytes, d0.bytes);
+    assert!(dp.bytes < dn.bytes);
+    let own = |w: &Worker| w.bytes() - w.retained().board_bytes;
+    assert!(own(&wn) >= own(&wp) + h64, "the worker counts its own: {} vs {} + {h64}", own(&wn), own(&wp));
+    // Exactly its map's heap, read from the map it holds.
+    let mut bare = wn;
+    let counted = bare.bytes();
+    assert_eq!(bare.settled_heap, h64, "its map's heap, read");
+    bare.settled_heap = 0;
+    assert_eq!(counted - bare.bytes(), h64, "the worker counts its map");
+    // A live turn's notice: a map of its own, the history's kept.
+    let hb = read(&history(true, 64));
+    let mut log = LiveLog::default();
+    log.user(&hb, "go\n[block z v1 dismissed]", None);
+    let mut w = Worker::default();
+    let dl = w.run(&Input::of(&hb, &log).expect("blocks"), &mut || true).expect("done");
+    // (At the cap, 64: the live one evicts the oldest.)
+    let z = block::BlockId::parse("z").expect("an id");
+    assert!(!Arc::ptr_eq(&dl.visibility, &dl.settled) && dl.visibility.dismissed(&z) && !dl.settled.dismissed(&z));
+    assert!(dl.bytes >= dn.bytes + h64, "both maps: {} vs {} + {h64}", dl.bytes, dn.bytes);
+}
+
 /// One block call of `ops` as the history holds it: its message, then
 /// its result (a receipt).
 fn call_of(id: &str, ops: Value) -> [Value; 2] {

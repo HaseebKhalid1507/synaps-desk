@@ -40,6 +40,8 @@ mod key_clock_tests;
 mod keys_tests;
 #[path = "narrow_tests.rs"]
 mod narrow_tests;
+#[path = "rail_wishes_ui_tests.rs"]
+mod rail_wishes_ui_tests;
 #[path = "remember_tests.rs"]
 mod remember_tests;
 #[path = "reveal_tests.rs"]
