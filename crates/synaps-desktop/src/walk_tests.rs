@@ -1122,6 +1122,56 @@ fn a_late_undo_puts_both_stores_back_together(cx: &mut TestAppContext) {
     assert_eq!(desires(cx, &view), 0);
 }
 
+/// Shady #106 P2-2, round 2: what a failed undo write needs kept is
+/// never dropped for room. `r1`'s undo held (its cancel a write away),
+/// then `x` and Ctrl+Z on `r2`'s tombstone again and again, past
+/// [`UNDO_KEPT`](crate::rail_wishes::UNDO_KEPT) (two wishes waiting all
+/// along), and the disk refuses the writes: `r1` both as `x` left it, `r2`
+/// as before its first `x`; in memory, on the rail and in the files, and
+/// no token left to undo.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_failed_undo_keeps_both_stores_together_however_many_undos_follow(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(sec(cx, &view, "r1").is_none() && is_soft(cx, &view, "r1"), "its tombstone back, the dismissal drawn until written");
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Rail(row("r2")));
+    for n in 0..=crate::rail_wishes::UNDO_KEPT {
+        press(cx, w, "x");
+        wait(cx, w, &view, 20);
+        assert!(!is_soft(cx, &view, "r2"), "x {n}: r2's tombstone ended: {}", said(cx, &view));
+        press(cx, w, "ctrl-z");
+        wait(cx, w, &view, 20);
+        assert!(is_soft(cx, &view, "r2"), "undo {n}: back: {}", said(cx, &view));
+    }
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "r1"), None, "r1 still dismissed");
+    assert_eq!(desires(cx, &view), 1, "r1's dismissal as x left it, none of r2's");
+    assert!(!is_soft(cx, &view, "r1"), "and r1's tombstone as x left it: ended");
+    assert_eq!(sec(cx, &view, "r2"), Some((Slot::Upper, false, true)), "r2 as before its first x");
+    assert!(is_soft(cx, &view, "r2"));
+    walk_again(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"), "no token left: nothing again");
+    // The disk back as x wrote it: a restart reads it all so.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None);
+    assert_eq!(sec(cx, &view, "r2"), Some((Slot::Upper, false, true)));
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"));
+}
+
 /// The pane's conversation's presentation entries.
 fn entries(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
     view.read_with(cx, |v, _| {

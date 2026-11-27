@@ -25,13 +25,14 @@
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
 //!   tombstone ended; and only where its key is offered now (a block the
-//!   agent moved since is refused, [`MOVED_SINCE`]), and where the caps
-//!   would drop what it puts back at once (refused before either store
-//!   changes, `presentation::NO_ROOM`). An undo whose desire
+//!   agent moved since is refused, [`MOVED_SINCE`]), and not where the
+//!   caps would drop what it puts back at once (refused before either
+//!   store changes, `presentation::NO_ROOM`). An undo whose desire
 //!   is a write away puts its presentation back at once (the desire draws
 //!   as before until it is written); that write failing puts both back as
-//!   the key left them ([`Stores::undo_landed`]). A key's token names its
-//!   undo ([`UNDO_KEPT`] kept).
+//!   the key left them ([`Stores::undo_landed`]). What that takes is kept
+//!   with the write, never dropped for room: one per id waiting, until
+//!   its write lands. A key's token names its undo ([`UNDO_KEPT`] kept).
 //! - **Riding** ([`AppView::ride_notices`]): the composer's `Submit` (idle)
 //!   or `Steer` (a turn runs) carries what [`Desires::ride`] attaches; one
 //!   whose marks aren't written yet goes once they are ([`Landed::Send`]),
@@ -172,7 +173,9 @@ pub(crate) struct Stores {
     /// D7's undo of each key's change, by its token, oldest first.
     undos: VecDeque<(u64, Undo)>,
     next_undo: u64,
-    /// Undos whose desire's write is out, their presentation put back.
+    /// Undos whose desire's write is out, their presentation put back:
+    /// at most one per id with a wish not written (≤ `desires::QUEUE_MAX`),
+    /// each until that wish lands.
     undoing: VecDeque<Undoing>,
     /// Tests: every message sent to a session, as it went.
     #[cfg(test)]
@@ -203,7 +206,10 @@ struct Undo {
 
 /// An undo's desire not written yet, its presentation put back already:
 /// if that write fails, and the desire is back to what the key left, the
-/// presentation goes back too ([`Stores::undo_landed`]).
+/// presentation goes back too ([`Stores::undo_landed`]). Only kept where
+/// that can be: a failed write puts the desire back to what drew before
+/// its id's first wish not written, so an undo whose key's own wish isn't
+/// written either needs none (both stores go back to before that key).
 struct Undoing {
     conv: String,
     generation: Generation,
@@ -506,12 +512,18 @@ impl BlockDesires for Stores {
                     self.said = Some(format!("{id}: {why}"));
                     return Asked::Refused(why);
                 }
-                // A write away, and the presentation with it.
+                // A write away, and the presentation with it: what its
+                // failure needs kept (type docs), this id's newest, until
+                // the write lands. Bounded by the wishes waiting, never
+                // dropped for room.
                 Ok(Ask::Saving) if u.pres.0 != u.pres.1 => {
-                    let (conv, id, r, left, pres) = (u.conv.clone(), id.clone(), u.r.clone(), left.clone(), u.pres.clone());
-                    self.undoing.push_back(Undoing { conv, generation: *g, id, r, left, pres });
-                    if self.undoing.len() > UNDO_KEPT {
-                        self.undoing.pop_front();
+                    let desires = &self.desires;
+                    self.undoing.retain(|o| {
+                        desires.pending(&o.conv, &o.generation, &o.id) && !(o.conv == u.conv && o.generation == *g && o.id == *id)
+                    });
+                    if same(desires.desire(&u.conv, g, id), left.as_ref()) {
+                        let (conv, id, r, left, pres) = (u.conv.clone(), id.clone(), u.r.clone(), left.clone(), u.pres.clone());
+                        self.undoing.push_back(Undoing { conv, generation: *g, id, r, left, pres });
                     }
                 }
                 Ok(_) => {}
@@ -528,8 +540,12 @@ impl Stores {
     /// stands, or, the desire back to what its key left, its presentation
     /// goes back too (unless it changed since): all of it, or nothing.
     pub(crate) fn undo_landed(&mut self, conv: &str, id: &BlockId, kept: bool) {
-        let (mine, rest): (VecDeque<Undoing>, VecDeque<Undoing>) =
-            std::mem::take(&mut self.undoing).into_iter().partition(|u| u.conv == conv && u.id == *id);
+        // Its own: the id's whose wish landed (another generation's may
+        // still wait).
+        let desires = &self.desires;
+        let (mine, rest): (VecDeque<Undoing>, VecDeque<Undoing>) = std::mem::take(&mut self.undoing)
+            .into_iter()
+            .partition(|u| u.conv == conv && u.id == *id && !desires.pending(&u.conv, &u.generation, &u.id));
         self.undoing = rest;
         if kept {
             return;
