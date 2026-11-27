@@ -1538,6 +1538,53 @@ fn a_pending_cancel_rides_nothing() {
     assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.len() == 0);
 }
 
+/// A message marks and carries only the notices the file still has as it
+/// picked them: B supersedes A's sent dismissal while A's message waits
+/// for its mark, so A's message goes plain, and B's Show (already an
+/// obligation, its sent mark inherited) rides A's next message.
+#[test]
+fn a_send_carries_only_what_the_file_still_has() {
+    let h = H::with(&["tests"]);
+    let g = generation();
+    let d = dir("send-checks-the-file");
+    let mut a = desires(&d);
+    a.dismiss_now(J, &g, &id("tests"), &h.vis()).unwrap();
+    let first = a.ride_now(J, &g, &h.vis(), "first", Carry::Steer);
+    a.lost(first.carrier.unwrap());
+    let mut b = desires(&d);
+    let Riding::Wait(t) = a.ride(J, &g, &h.vis(), "second", Carry::Submit) else { panic!("waits for its mark") };
+    let w = a.next_write().unwrap();
+    assert_eq!(b.show_now(J, &g, &id("tests"), &h.vis()), Ok(Now::Wished(2)));
+    let sent = a.landed(in_background(w)).into_iter().find_map(|l| match l {
+        Landed::Send { ticket, ride } if ticket == t => Some(ride),
+        _ => None,
+    });
+    let sent = sent.expect("its mark landed");
+    assert_eq!((sent.text.as_str(), sent.carrier), ("second", None), "v1 is superseded in the file: nothing rides");
+    let next = a.ride_now(J, &g, &h.vis(), "third", Carry::Submit);
+    assert_eq!(line(&next), "[block tests v2 shown]");
+}
+
+/// A landed wish says what draws: a compaction made while the wish's write
+/// was out drops the generation, so the wish, decided in the file, doesn't
+/// draw, and says so (never `Wished` for a desire that isn't there).
+#[test]
+fn a_landed_wish_says_what_draws() {
+    let h = H::with(&["tests"]);
+    let g = generation();
+    let d = dir("landed-says");
+    let mut a = desires(&d);
+    flush(&mut a);
+    assert_eq!(a.dismiss(J, &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
+    let w = a.next_write().unwrap();
+    a.compacted(J, &h.state());
+    let done = wish_done(&a.landed(in_background(w)));
+    assert_eq!(done, [Err(Refused(MOVED.into()))]);
+    assert!(!a.dismissed(J, &g, &id("tests"), &h.vis()) && a.refused(J, &id("tests")) == Some(MOVED));
+    flush(&mut a);
+    assert_eq!(desires(&d).len(), 0, "nor in the file");
+}
+
 /// A tiny xorshift: the model's dice.
 struct Dice(u64);
 
