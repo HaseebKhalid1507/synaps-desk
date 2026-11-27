@@ -749,15 +749,15 @@ fn child() {
     let d = PathBuf::from(folder);
     let h = H::default();
     match what {
-        "writer" => {
-            std::fs::write(d.join("ready"), "").unwrap();
-            while !d.join("go").exists() {
-                std::thread::yield_now();
+        "merge" => {
+            // The parent holds the file's lock mid-write: this desk's load
+            // and wish wait for it, then read what it wrote.
+            while !d.join("holding").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            std::fs::write(d.join("waiting"), "").unwrap();
             let mut a = desires(&d);
-            for i in 0..60 {
-                a.dismiss("child", &generation(), &id(&format!("c{i}")), &h.vis()).unwrap();
-            }
+            assert_eq!(a.dismiss("child", &generation(), &id("c0"), &h.vis()), Ok(Done::Wished(1)));
         }
         "crash" => {
             let changes = [Change::Wish {
@@ -783,31 +783,43 @@ fn spawn(task: &str, d: &Path) -> std::process::Child {
         .args(["desires::tests::child", "--exact", "--test-threads=1", "--nocapture"])
         .env("SYNAPS_D6B_CHILD", format!("{task}:{}", d.display()))
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap()
 }
 
-/// Two desk processes writing one desire file at once: every write merges
-/// into the file as it is, so neither loses the other's desires.
+/// Two desk processes on one desire file: while one is mid-write (its
+/// temporary file written, not yet renamed), the other's load and wish
+/// wait for the file's lock, then merge into what it wrote, so neither
+/// loses the other's desire. (Unlocked, the second would read the old
+/// file, and one of the two writes would be lost.)
 #[test]
-fn two_processes_on_one_file_lose_no_desire() {
+fn a_second_process_waits_for_a_write_and_merges_into_it() {
     let d = dir("processes");
-    let mut child = spawn("writer", &d);
-    while !d.join("ready").exists() {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    std::fs::write(d.join("go"), "").unwrap();
-    let mut a = desires(&d);
-    let h = H::default();
-    for i in 0..60 {
-        a.dismiss("parent", &generation(), &id(&format!("p{i}")), &h.vis()).unwrap();
-    }
-    assert!(child.wait().unwrap().success());
-    let b = desires(&d);
-    assert_eq!(b.waiting(), [("child".to_string(), 60), ("parent".to_string(), 60)]);
-    a.dismiss("parent", &generation(), &id("last"), &h.vis()).unwrap();
-    assert_eq!(a.waiting(), [("child".to_string(), 60), ("parent".to_string(), 61)], "memory took the other's too, at its next write");
+    let child = spawn("merge", &d);
+    let mine =
+        [Change::Wish { conv: "parent".into(), generation: generation_key(&generation()), id: id("p0"), dismissed: true, version: 1 }];
+    let held = blockfiles::update_then::<Book>(
+        &d.join(FILE),
+        |b| apply(b, &mine, Some("parent")),
+        || {
+            std::fs::write(d.join("holding"), "")?;
+            let t = std::time::Instant::now();
+            while !d.join("waiting").exists() {
+                if t.elapsed() > std::time::Duration::from_secs(60) {
+                    return Err(std::io::Error::other("no second process"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Its load is at the lock by now (it waits up to 250 ms).
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        },
+    );
+    assert!(held.is_ok(), "{held:?}");
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(desires(&d).waiting(), [("child".to_string(), 1), ("parent".to_string(), 1)]);
 }
 
 /// A desk killed between writing its temporary file and the rename: the
@@ -818,7 +830,7 @@ fn a_crash_mid_write_keeps_the_file_and_the_next_load_sweeps() {
     let mut a = desires(&d);
     a.dismiss(J, &generation(), &id("tests"), &H::default().vis()).unwrap();
     let before = std::fs::read(d.join(FILE)).unwrap();
-    assert!(!spawn("crash", &d).wait().unwrap().success());
+    assert!(!spawn("crash", &d).wait_with_output().unwrap().status.success());
     assert_eq!(std::fs::read(d.join(FILE)).unwrap(), before, "atomic: the old file whole");
     let left = || {
         std::fs::read_dir(&d)
