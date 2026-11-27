@@ -72,6 +72,7 @@ pub struct RuntimeInfo {
     pub subagent_timeout: Option<u64>,
     pub max_tool_output: Option<u64>,
     pub bash_timeout: Option<u64>,
+    pub bash_max_timeout: Option<u64>,
     /// The session's own system prompt (`None`: the daemon's default).
     pub system_prompt: Option<std::sync::Arc<str>>,
 }
@@ -91,6 +92,7 @@ impl RuntimeInfo {
             subagent_timeout: n("subagent_timeout"),
             max_tool_output: n("max_tool_output"),
             bash_timeout: n("bash_timeout"),
+            bash_max_timeout: n("bash_max_timeout"),
             system_prompt: o.get("system_prompt").and_then(Value::as_str).map(std::sync::Arc::from),
         };
         (info != RuntimeInfo::default()).then_some(info)
