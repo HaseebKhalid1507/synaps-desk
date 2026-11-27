@@ -97,6 +97,7 @@
 //! - [`synthetic`]: deterministic load for benches
 
 pub mod blocks;
+pub mod cache_expiry;
 pub mod cards;
 pub mod client;
 pub mod conn;
@@ -108,15 +109,17 @@ pub mod protocol;
 pub mod synthetic;
 pub mod transcript;
 
+pub use cache_expiry::{CacheExpiry, CacheReason, CacheState, QueryError, QueryErrorCode, decode_query_reply, render_cache_expiry};
 pub use client::{
-    ATTACH_MAX, Backoff, Client, ClientClosed, ClientOptions, Command, CommandReply, CreateOptions, Cwd, Error, Event, Expect,
-    RELOAD_RETRY, RELOAD_WINDOW, RELOADING, RequestError, STEER_UNSUPPORTED, SessionRef, Status, WatchReply,
+    ATTACH_MAX, Backoff, CacheExpiryReply, Client, ClientClosed, ClientOptions, Command, CommandReply, CreateOptions, Cwd, Error, Event,
+    Expect, RELOAD_RETRY, RELOAD_WINDOW, RELOADING, RequestError, STEER_UNSUPPORTED, SessionRef, Status, WatchReply,
 };
 pub use conn::{Endpoint, Identity, Incompatible, InvalidName};
 pub use history::HistoryUpdate;
 pub use protocol::{
-    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, EventMeta, FEATURE_CACHE_EXPIRY,
-    FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, PromptOutcome, Rejected, RenameFailure,
-    RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage, validate_session_name,
+    AttachMode, Attached, CATALOG_PAGE_MAX, CatalogCursor, ClientInput, ClientKind, ContinueInfo, DaemonLife, EventMeta,
+    FEATURE_CACHE_EXPIRY, FEATURE_SAVED_SESSIONS, FEATURE_SESSION_PAGE, HistoryMode, InvalidSessionName, MISSING_CWD, PromptOutcome,
+    Rejected, RenameFailure, RenameRefusal, SAVED_SESSIONS_MAX, SavedSession, SessionEvent, SessionMeta, Setting, WatchEvent, WatchPage,
+    validate_session_name,
 };
 pub use transcript::{Transcript, TranscriptError};

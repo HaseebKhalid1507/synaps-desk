@@ -32,6 +32,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::cache_expiry::{CacheExpiry, QueryError, decode_query_reply};
 use crate::conn::{Conn, Endpoint, Identity, Incompatible};
 use crate::history::{HistoryMirror, HistoryUpdate};
 use crate::protocol::*;
@@ -309,6 +310,9 @@ pub enum Command {
     /// `SessionQuery::Status` → `Event::SessionStatus`. See
     /// [`SessionRef::status`].
     Status,
+    /// `SessionQuery::CacheExpiry` → `Event::CacheExpiry`. See
+    /// [`SessionRef::cache_expiry`].
+    CacheExpiry,
 }
 
 impl Command {
@@ -333,7 +337,7 @@ impl Command {
             Command::SubagentSteer { .. } => "subagent_steer",
             Command::CancelWorker { .. } | Command::EngineCommand { .. } => "engine_command",
             Command::Set(_) => "set",
-            Command::Status => "query",
+            Command::Status | Command::CacheExpiry => "query",
         }
     }
 }
@@ -385,6 +389,7 @@ impl std::fmt::Debug for Command {
             Command::Set(setting) => f.debug_tuple("Set").field(setting).finish(),
             other => f.write_str(match other {
                 Command::Status => "Status",
+                Command::CacheExpiry => "CacheExpiry",
                 Command::RefreshSessions => "RefreshSessions",
                 Command::Cancel => "Cancel",
                 Command::Resync => "Resync",
@@ -623,12 +628,34 @@ pub enum Event {
         reply: Result<Option<String>, String>,
     },
     /// The answer to [`SessionRef::status`]: the session's `Status` value
-    /// (`model`, `cost`, `keepwarm`, `pinned`, `cache_ttl`, and from newer
-    /// daemons `cache`), as the daemon sent it.
+    /// (`model`, `cost`, `keepwarm`, `pinned`, `cache_ttl`), as the daemon
+    /// sent it.
     SessionStatus {
         attach_seq: u64,
         value: Value,
     },
+    /// What became of [`SessionRef::cache_expiry`].
+    CacheExpiry {
+        attach_seq: u64,
+        reply: CacheExpiryReply,
+    },
+}
+
+/// What a [`SessionRef::cache_expiry`] got back.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CacheExpiryReply {
+    /// The daemon's evidence.
+    Answer(CacheExpiry),
+    /// Its typed error (`stale`: ask once more; `superseded`: a newer ask's
+    /// answer follows).
+    Error(QueryError),
+    /// The daemon cannot decode the query: its `Welcome.features` does not
+    /// list [`crate::protocol::FEATURE_CACHE_EXPIRY`] (nothing was sent), or
+    /// it failed the frame as malformed (a daemon that lists the feature
+    /// for an earlier contract). Asking it again is pointless; the
+    /// connection is unharmed.
+    Unsupported,
 }
 
 /// What became of a slash command ([`Event::EngineReply`]).
@@ -695,6 +722,7 @@ impl Event {
             | Event::EngineReply { attach_seq, .. }
             | Event::SettingReply { attach_seq, .. }
             | Event::SessionStatus { attach_seq, .. }
+            | Event::CacheExpiry { attach_seq, .. }
             | Event::Detached { attach_seq, .. } => Some(*attach_seq),
             Event::Error { attach_seq, .. } => *attach_seq,
             Event::Status(_)
@@ -1129,14 +1157,22 @@ impl SessionRef<'_> {
         self.send(Command::Set(setting))
     }
 
-    /// The session's status (`SessionQuery::Status{cache: true}`: cost,
-    /// keep-warm, the cache's TTL and when the cache expires) →
-    /// `Event::SessionStatus`, answered to this client only. Ask only a
-    /// daemon whose `Welcome.features` lists [`crate::protocol::FEATURE_CACHE_EXPIRY`] (an
-    /// older one does not take the opt-in). Read-only, any attach mode. Not
-    /// connected: nothing comes back (ask again on the next attach).
+    /// The session's status (`SessionQuery::Status`: cost, keep-warm, the
+    /// configured cache TTL) → `Event::SessionStatus`. Read-only, any
+    /// attach mode. Not connected: nothing comes back (ask again on the
+    /// next attach).
     pub fn status(&self) -> Result<(), ClientClosed> {
         self.send(Command::Status)
+    }
+
+    /// What the session's own requests show about its prompt cache
+    /// (`SessionQuery::CacheExpiry`, SynapsCLI #462) → `Event::CacheExpiry`,
+    /// answered to this client only. A daemon without
+    /// [`crate::protocol::FEATURE_CACHE_EXPIRY`] is not sent it
+    /// ([`CacheExpiryReply::Unsupported`]). Read-only, any attach mode;
+    /// never wakes a parked session. Not connected: nothing comes back.
+    pub fn cache_expiry(&self) -> Result<(), ClientClosed> {
+        self.send(Command::CacheExpiry)
     }
 
     /// Leave this attachment only (`Detach` + `Bye`); the others stay. Its
@@ -1689,7 +1725,7 @@ async fn without_session<F: Future>(
             out = &mut fut => return Some(out),
             cmd = cmds.recv() => match cmd {
                 None | Some(Command::Detach) | Some(Command::Shutdown) => return None,
-                Some(Command::Resync) | Some(Command::RefreshSessions) | Some(Command::Status) => {}
+                Some(Command::Resync) | Some(Command::RefreshSessions) | Some(Command::Status) | Some(Command::CacheExpiry) => {}
                 Some(Command::CancelWorker { handle_id }) => emit(events, Event::WorkerCancel {
                     attach_seq,
                     handle_id,
@@ -1826,6 +1862,22 @@ fn unknown_variant(message: &str) -> Option<&str> {
     Some(rest.split_once('`')?.0)
 }
 
+/// A typed query in flight on a session connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typed {
+    Status,
+    CacheExpiry,
+}
+
+/// A `CacheExpiry` query's `value`: the evidence, or the error it carries
+/// (a reply that does not decode is an `internal` error).
+fn expiry_reply(value: &Value) -> CacheExpiryReply {
+    match decode_query_reply::<CacheExpiry>(value) {
+        Ok(c) => CacheExpiryReply::Answer(c),
+        Err(e) => CacheExpiryReply::Error(e),
+    }
+}
+
 /// A `SubagentWatch` query's `value`: a page, or the session's "no subagent".
 fn watch_reply(value: Value, handle_id: &str) -> WatchReply {
     if let Some(e) = value.get("error").and_then(Value::as_str) {
@@ -1924,8 +1976,9 @@ async fn session_loop(
         // `Set`s in flight: `(id, setting name)`, oldest first (a refusal
         // carries no id: it is the oldest's).
         let mut sets: VecDeque<(u64, &'static str)> = VecDeque::new();
-        // `Status` queries in flight (ids).
-        let mut statuses: VecDeque<u64> = VecDeque::new();
+        // `Status` and `CacheExpiry` queries in flight: `(id, which)`.
+        let mut statuses: VecDeque<(u64, Typed)> = VecDeque::new();
+        let expiry_ok = conn.welcome.features.iter().any(|f| f == FEATURE_CACHE_EXPIRY);
         let query = |sid: &str| ClientFrame::Cmd {
             session_id: sid.to_string(),
             cmd: SessionCommand::Query { id: query_id, query: SessionQuery::Messages },
@@ -1933,6 +1986,7 @@ async fn session_loop(
         let rejected = attached.rejected;
         let connection = sh.connections.fetch_add(1, Ordering::Relaxed) + 1;
         attached.connection = connection;
+        attached.daemon = conn.welcome.life();
         emit(&events, Event::Attached { attach_seq, attached, mode, reconnect: previous.is_some() });
         if rejected.total() > 0 {
             emit_error(&events, Some(attach_seq), Error::Decode(DecodeError { kind: "attached".into(), error: rejected.to_string() }));
@@ -2026,7 +2080,7 @@ async fn session_loop(
                         Command::Set(setting) => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !statuses.contains(&id) {
+                                if id != query_id && !sets.iter().any(|s| s.0 == id) && !statuses.iter().any(|s| s.0 == id) {
                                     break id;
                                 }
                             };
@@ -2038,20 +2092,31 @@ async fn session_loop(
                             sets.push_back((id, setting.name()));
                             SessionCommand::Set { id, setting }
                         }
-                        Command::Status => {
+                        Command::CacheExpiry if !expiry_ok => {
+                            // An older daemon would fail the frame as malformed.
+                            emit(&events, Event::CacheExpiry { attach_seq, reply: CacheExpiryReply::Unsupported });
+                            continue;
+                        }
+                        typed @ (Command::Status | Command::CacheExpiry) => {
                             let id = loop {
                                 let id = crate::conn::random_pair().0 & (RESERVED_QUERY_ID_BASE - 1);
-                                if id != query_id && !statuses.contains(&id) && !sets.iter().any(|s| s.0 == id) && !cancels.iter().any(|c| c.0 == id) {
+                                if id != query_id
+                                    && !statuses.iter().any(|s| s.0 == id)
+                                    && !sets.iter().any(|s| s.0 == id)
+                                    && !cancels.iter().any(|c| c.0 == id)
+                                {
                                     break id;
                                 }
                             };
                             if statuses.len() == WATCHES_MAX {
                                 statuses.pop_front();
                             }
-                            statuses.push_back(id);
-                            // The app asks only a daemon that lists
-                            // `cache_expiry` (`FEATURE_CACHE_EXPIRY`).
-                            SessionCommand::Query { id, query: SessionQuery::Status { cache: true } }
+                            let (which, query) = match typed {
+                                Command::Status => (Typed::Status, SessionQuery::Status),
+                                _ => (Typed::CacheExpiry, SessionQuery::CacheExpiry),
+                            };
+                            statuses.push_back((id, which));
+                            SessionCommand::Query { id, query }
                         }
                         _ => continue,
                     };
@@ -2114,11 +2179,14 @@ async fn session_loop(
                             emit(&events, Event::SettingReply { attach_seq, setting, reply });
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result")
-                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| statuses.iter().position(|o| *o == q))
+                            && let Some(k) = v.get("id").and_then(Value::as_u64).and_then(|q| statuses.iter().position(|o| o.0 == q))
                         {
-                            statuses.remove(k);
+                            let (_, which) = statuses.remove(k).expect("present");
                             let value = v.get_mut("value").map(Value::take).unwrap_or_default();
-                            emit(&events, Event::SessionStatus { attach_seq, value });
+                            emit(&events, match which {
+                                Typed::Status => Event::SessionStatus { attach_seq, value },
+                                Typed::CacheExpiry => Event::CacheExpiry { attach_seq, reply: expiry_reply(&value) },
+                            });
                             continue;
                         }
                         if v.get("ev").and_then(Value::as_str) == Some("query_result") {
@@ -2233,6 +2301,11 @@ async fn session_loop(
                                 for (_, handle_id, since) in watches.drain(..) {
                                     emit(&events, Event::SubagentWatch { attach_seq, session_id: sid.clone(), handle_id, since, reply: WatchReply::Unsupported });
                                 }
+                                continue;
+                            }
+                            Some("cache_expiry") => {
+                                statuses.retain(|s| s.1 != Typed::CacheExpiry);
+                                emit(&events, Event::CacheExpiry { attach_seq, reply: CacheExpiryReply::Unsupported });
                                 continue;
                             }
                             Some("subagent_steer") => {

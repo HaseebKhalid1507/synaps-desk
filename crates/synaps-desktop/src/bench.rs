@@ -1349,9 +1349,13 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 if let Some(secs) = std::env::var("SYNAPS_BENCH_WARM").ok().and_then(|s| s.parse::<u64>().ok()) {
                     let warm = |secs: Option<u64>| {
                         move |v: &mut AppView, _: &mut Context<AppView>| {
-                            v.model.lives[v.panes.cur.live].stats.warm = secs.map(|s| {
-                                let st = json!({"keepwarm": {"mode": "auto"}, "cache": {"ttl": "5m", "expires_in_secs": s}});
-                                crate::warm::Warm::from_status(&st, crate::warm::Moment::now())
+                            let now = crate::warm::Moment::now();
+                            (v.model.cache_expiry, v.model.expiry_query) = (true, true);
+                            let stats = &mut v.model.lives[v.panes.cur.live].stats;
+                            stats.warm = secs.map(|_| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now, None, &Default::default()));
+                            stats.expiry = secs.map(|s| {
+                                let c = json!({"state": "warm", "warm_for_secs": s, "proof_ttl_secs": 300, "requested_ttl_secs": 300});
+                                crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now)
                             });
                         }
                     };
@@ -1392,28 +1396,45 @@ pub fn start(view: &Entity<AppView>, opts: BenchOptions, window: &mut Window, cx
                 }
                 // `SYNAPS_BENCH_WARM_STATES=S`: the right panel's cache section
                 // in each state it shows, S s apiece, each announced on stdout
-                // (`warm-state <name>`) for a still: under a minute, at zero,
-                // unknown (`—`: a status without `cache`), an older daemon's
-                // (no section), a downgraded 1h.
+                // (`warm-state <name>`) for a still: warm under a minute, the
+                // band, cold, no matching request, unknown (`—`: parked), a
+                // daemon that can't say (`—`), none at all (no section), 5m
+                // proved of a 1h asked.
                 if let Some(hold) = std::env::var("SYNAPS_BENCH_WARM_STATES").ok().and_then(|s| s.parse::<f64>().ok()) {
                     let _ = upd(cx, &|v, _| v.model.local_session(v.panes.cur.live, "bench-warm"));
                     let kw = json!({"mode": "off", "session_pings": 0, "session_keepwarm_usd": 0.0});
+                    let st = json!({"keepwarm": kw});
+                    let pinged = json!({"pinned": true,
+                        "keepwarm": {"mode": "auto", "session_pings": 3, "session_keepwarm_usd": 0.0123, "period": {"next_ping_in_secs": 240}}});
                     let states = [
-                        ("under-a-minute", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 42}}))),
-                        ("cold", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw, "cache": {"ttl": "5m", "expires_in_secs": 0}}))),
-                        ("unknown", Some(json!({"cache_ttl": {"setting": "5m"}, "keepwarm": kw}))),
-                        ("older-daemon", None),
+                        ("under-a-minute", Some(st.clone()), Some(json!({"state": "warm", "warm_for_secs": 42, "proof_ttl_secs": 300})), true),
                         (
-                            "downgraded",
-                            Some(json!({"cache_ttl": {"setting": "1h"}, "pinned": true,
-                                "keepwarm": {"mode": "auto", "session_pings": 3, "session_keepwarm_usd": 0.0123, "period": {"next_ping_in_secs": 240}},
-                                "cache": {"ttl": "5m", "expires_in_secs": 268, "downgraded": true}})),
+                            "band",
+                            Some(st.clone()),
+                            Some(json!({"state": "unknown", "reason": "may_have_expired", "lapse_by_secs": 2400, "proof_ttl_secs": 300,
+                                "requested_ttl_secs": 3600})),
+                            true,
+                        ),
+                        ("cold", Some(st.clone()), Some(json!({"state": "cold", "reason": "expired", "proof_ttl_secs": 300})), true),
+                        ("no-match", Some(st.clone()), Some(json!({"state": "unknown", "reason": "no_matching_request"})), true),
+                        ("unknown", Some(st.clone()), Some(json!({"state": "unknown", "reason": "parked"})), true),
+                        ("cannot-tell", Some(st.clone()), None, false),
+                        ("none", None, None, true),
+                        (
+                            "five-of-an-hour",
+                            Some(pinged),
+                            Some(json!({"state": "warm", "warm_for_secs": 268, "proof_ttl_secs": 300, "requested_ttl_secs": 3600,
+                                "proof_cache_tokens": 20000, "next_ping_in_secs": 240})),
+                            true,
                         ),
                     ];
-                    for (name, st) in states {
+                    for (name, st, answer, asked) in states {
                         let set = move |v: &mut AppView, _: &mut Context<AppView>| {
-                            v.model.lives[v.panes.cur.live].stats.warm =
-                                st.as_ref().map(|s| crate::warm::Warm::from_status(s, crate::warm::Moment::now()));
+                            let now = crate::warm::Moment::now();
+                            (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
+                            let stats = &mut v.model.lives[v.panes.cur.live].stats;
+                            stats.warm = st.as_ref().map(|s| crate::warm::Warm::from_status(s, now, None, &Default::default()));
+                            stats.expiry = answer.as_ref().map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(c), now));
                         };
                         let _ = upd(cx, &set);
                         sleep(0.8).await;

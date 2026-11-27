@@ -2466,19 +2466,35 @@ impl AppView {
                     .child(div().flex_1().child(kv(label::COST, cost.clone(), true, glow(8, &cost, p.cost_ch), p))),
             );
         // The prompt cache's countdown and keep-warm (`crate::warm`): once
-        // the session's status has come.
-        let cache = s.warm.as_ref().map(|w| {
+        // either answer has come, from a daemon that answers the cache
+        // query (one without it: no section, whatever a store kept; one
+        // that refused it: its keep-warm, and `—`).
+        let asked = self.model.expiry_query;
+        let cache = (self.model.cache_expiry && (s.warm.is_some() || s.expiry.is_some())).then(|| {
             let now = crate::warm::Moment::now();
-            let left = w.left(now);
-            let (exp, exp_c) = match left {
-                Some(d) if d.is_zero() => ("cold".to_string(), p.dim_ch),
-                Some(d) if d.as_secs() < 60 => (crate::warm::clock(d), p.warn_ch),
-                Some(d) => (crate::warm::clock(d), p.ink),
-                None if w.knows_expiry => ("cold".to_string(), p.dim_ch),
-                None => ("—".to_string(), p.dim_ch),
+            let w = s.warm.as_ref();
+            let e = s.expiry.as_ref().filter(|_| asked);
+            let exp = crate::warm::expires(e, asked, now);
+            let exp_c = match exp.tone {
+                crate::warm::Tone::Ink => p.ink,
+                crate::warm::Tone::Warn => p.warn_ch,
+                crate::warm::Tone::Dim => p.dim_ch,
             };
-            let ping = w.ping_in(now).map_or_else(|| "—".to_string(), crate::warm::clock);
-            let spent = format!("${:.4}", w.spent);
+            let dash = || "—".to_string();
+            let ping = w.and_then(|w| w.ping_in(now)).map_or_else(dash, crate::warm::clock);
+            let spent = w.map_or_else(dash, |w| format!("${:.4}", w.spent));
+            let text = exp.text.clone();
+            let expires = div().flex_1().id("right-cache-expires").debug_selector(move || format!("right-cache-expires {text}")).child(kv(
+                label::EXPIRES,
+                exp.text,
+                true,
+                exp_c,
+                p,
+            ));
+            let expires = match exp.tip {
+                Some(tip) => expires.tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)).into_any_element(),
+                None => expires.into_any_element(),
+            };
             v_flex()
                 .debug_selector(|| "right-cache".into())
                 .px(px(24.))
@@ -2487,9 +2503,9 @@ impl AppView {
                 .border_b_1()
                 .border_color(p.hair)
                 .child(section(label::PROMPT_CACHE, p))
-                .child(h_flex().mt(px(20.)).child(div().flex_1().child(kv(label::EXPIRES, exp, true, exp_c, p))).child({
-                    let ttl = div().flex_1().child(kv(label::TTL, crate::warm::ttl_line(w).unwrap_or_else(|| "—".into()), false, p.ink, p));
-                    match crate::warm::ttl_tip(w) {
+                .child(h_flex().mt(px(20.)).child(expires).child({
+                    let ttl = div().flex_1().child(kv(label::TTL, e.and_then(crate::warm::ttl_line).unwrap_or_else(dash), false, p.ink, p));
+                    match e.and_then(crate::warm::ttl_tip) {
                         Some(tip) => ttl
                             .id("right-cache-ttl")
                             .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx))
@@ -2500,8 +2516,8 @@ impl AppView {
                 .child(
                     h_flex()
                         .mt(px(22.))
-                        .child(div().flex_1().child(kv(label::KEEP_WARM, crate::warm::mode_line(w), false, p.ink, p)))
-                        .child(div().flex_1().child(kv(label::PINGS, w.pings.to_string(), false, p.ink, p))),
+                        .child(div().flex_1().child(kv(label::KEEP_WARM, w.map_or_else(dash, crate::warm::mode_line), false, p.ink, p)))
+                        .child(div().flex_1().child(kv(label::PINGS, w.map_or_else(dash, |w| w.pings.to_string()), false, p.ink, p))),
                 )
                 .child(
                     h_flex()

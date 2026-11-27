@@ -52,6 +52,13 @@ fn welcome_and_lists_decode() {
     assert_eq!(w.sessions.len(), 2);
     assert_eq!(w.rejected_sessions, 0);
     assert!(w.sessions[0].title.is_some());
+    // Its lifetime: no `boot_id` from this (older) daemon.
+    let life = w.life();
+    assert_eq!((life.boot_id.as_str(), life.generation, life.pid), ("", 1, 3534757));
+    let mut v: serde_json::Value = serde_json::from_str(fixture("welcome.json").trim()).unwrap();
+    v["boot_id"] = "9f3c61d2a07e45b1".into();
+    let DaemonFrame::Welcome(w) = decode_frame(&v.to_string()).unwrap() else { panic!() };
+    assert_eq!(w.life().boot_id, "9f3c61d2a07e45b1");
     let DaemonFrame::SessionList { sessions, rejected } = decode_frame(fixture("session_list.json").trim()).unwrap() else { panic!() };
     assert!(sessions.is_empty() || !sessions[0].id.is_empty());
     assert_eq!(rejected, 0);
