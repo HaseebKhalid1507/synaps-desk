@@ -469,6 +469,16 @@ mod tests {
         assert!(!s.detached);
     }
 
+    /// `RuntimeView` has carried `bash_max_timeout` since 2026-09
+    /// (SynapsCLI `session/view.rs:30`); THIS SESSION's row reads it.
+    #[test]
+    fn runtime_view_reads_bash_max_timeout() {
+        let view = |max: u64| RuntimeInfo::from_value(&json!({"model": "m", "bash_timeout": 120, "bash_max_timeout": max}));
+        assert_ne!(view(600), view(300), "two views that differ only in it differ");
+        assert!(RuntimeInfo::from_value(&json!({"bash_max_timeout": 600})).is_some(), "a view of it alone is a view");
+        assert_ne!(view(300), RuntimeInfo::from_value(&json!({"model": "m", "bash_timeout": 120})), "an older view, without it");
+    }
+
     #[test]
     fn compact_numbers() {
         assert_eq!(compact(512), "512");

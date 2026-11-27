@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn every_tui_row_has_one_place() {
-        assert_eq!(ALL.len(), 88);
+        assert_eq!(ALL.len(), 89, "SynapsCLI 0.13.0's ALL_SETTINGS (013d1c4): 89 rows");
         let config: Vec<&str> = CONFIG_GROUPS.iter().flat_map(|(_, k)| k.iter().copied()).collect();
         assert_eq!(config.len(), 22, "22 rows through the dash");
         for k in &config {
@@ -416,14 +416,49 @@ mod tests {
             assert!(config.contains(&k), "{k}: a session row's default is a CONFIG row");
         }
         let reference: usize = Cat::ORDER.iter().map(|&c| reference(c).count()).sum();
-        assert_eq!(reference, 58, "58 reference rows");
-        // 88 = 22 CONFIG + 58 REFERENCE + theme (APP) + 6 terminal-only + 1 derived.
+        assert_eq!(reference, 59, "59 reference rows");
+        // 89 = 22 CONFIG + 59 REFERENCE + theme (APP) + 6 terminal-only + 1 derived.
         assert_eq!(22 + reference + 1 + TERMINAL_ONLY.len() + 1, ALL.len());
         let mut keys: Vec<&str> = ALL.iter().map(|d| d.key).collect();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), 88, "no key twice");
+        assert_eq!(keys.len(), 89, "no key twice");
         assert!(ALL.iter().all(|d| !secret(d.key)), "no row is a secret");
+        // 0.13.0's new row: Agent, read here (the dash doesn't write it),
+        // where the TUI lists it: after subagent_thinking.
+        let agent: Vec<&str> = super::reference(Cat::Agent).map(|d| d.key).collect();
+        assert!(agent.windows(2).any(|w| w == ["subagent_thinking", "subagent_model"]), "{agent:?}");
+        assert!(!is_config("subagent_model"));
+        // And its reworded help.
+        assert!(def("compaction_model").is_some_and(|d| d.help.starts_with("Who writes /compact summaries: match (this chat's model")));
+        // THIS SESSION: RuntimeView's settings, in the TUI's order, each
+        // with its default for new sessions in CONFIG (checked above).
+        assert_eq!(
+            SESSION_KEYS.as_slice(),
+            &[
+                "model",
+                "thinking",
+                "context_window",
+                "compaction_model",
+                "api_retries",
+                "subagent_timeout",
+                "max_tool_output",
+                "bash_timeout",
+                "bash_max_timeout"
+            ]
+        );
+    }
+
+    /// The TUI's `subagent_model_row_shows_inherit_when_unset`: unset, blank
+    /// or `inherit` is `inherit` (the foreground model); else as written.
+    #[test]
+    fn subagent_model_shows_inherit_when_unset() {
+        for (raw, says) in
+            [(None, "inherit"), (Some("inherit"), "inherit"), (Some("   "), "inherit"), (Some("claude-sonnet-4-6"), "claude-sonnet-4-6")]
+        {
+            assert_eq!(shown("subagent_model", raw), says, "{raw:?}");
+        }
+        assert_eq!(shown("subagent_thinking", None), "default", "only subagent_model inherits");
     }
 
     #[test]
