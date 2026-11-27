@@ -153,6 +153,9 @@ pub struct Pane {
     /// The agent card the keys entered here, and the focus that holds
     /// them then ([`crate::ask_keys`], D2b).
     pub(crate) ask: crate::ask_keys::CardMode,
+    /// The block walk here, the focus that holds its keys, and the local
+    /// undo ([`crate::walk`], D7).
+    pub(crate) walk: crate::walk::WalkMode,
     /// A body the user opened or closed (S1) ([`BodyHold`]).
     pub(crate) body_hold: Cell<Option<BodyHold>>,
     /// The user's scroll while an answered card folds: the room it leaves
@@ -469,6 +472,8 @@ impl Pane {
         self.block_scroll.borrow_mut().clear();
         self.block_of = 0;
         self.lease.clear();
+        self.walk.walk = None;
+        self.walk.undo.clear();
     }
 
     /// A pane with nothing on it yet: an empty list following its tail.
@@ -514,6 +519,7 @@ impl Pane {
             fold_gap: RefCell::new(Vec::new()),
             ask_shown: Default::default(),
             ask: Default::default(),
+            walk: Default::default(),
             body_hold: Cell::new(None),
             touch_kept: Cell::new(false),
             metrics_gen: 0,
@@ -1041,6 +1047,7 @@ impl crate::app::AppView {
                 || p.secret_input.read(cx).focus_handle(cx).is_focused(window)
                 || p.allow_all_focus.is_focused(window)
                 || p.ask.focus.as_ref().is_some_and(|f| f.is_focused(window))
+                || p.walk.holds(window)
                 || (view_field && tabs.view() == Some(crate::tabs::Kind::Settings));
             if has {
                 return if p.id == focused { KeysAt::Focused } else { KeysAt::Other };

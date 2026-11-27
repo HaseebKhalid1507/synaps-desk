@@ -139,7 +139,7 @@ use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
 pub use cards_spec::block::{BlockId, Body, Kind, Ref, Tag};
-pub use cards_spec::board::Block;
+pub use cards_spec::board::{Block, Logged, Record, Tombstone};
 
 use crate::transcript::{Item, ItemKind};
 
@@ -1875,8 +1875,10 @@ struct Cursor {
 pub struct Input {
     pub epoch: u64,
     pub generation: block::Generation,
-    /// The staged chunks: the history's events from `from` on.
+    /// The staged chunks: the history's events from `from` on, and their
+    /// bytes, heap included.
     chunks: Vec<Chunk>,
+    staged: usize,
     pub from: usize,
     pub history_len: usize,
     /// The history ends with an assistant message's calls: their batch is
@@ -1908,6 +1910,7 @@ impl Input {
             epoch: history.epoch,
             generation: history.generation.or(log.first).unwrap_or_else(|| block::Generation::of(&Value::Null)),
             chunks: history.staged.iter().cloned().collect(),
+            staged: history.staged_bytes,
             from: history.from,
             history_len: history.len,
             history_open: history.open.as_ref().is_some_and(|(_, n)| *n > 0),
@@ -1920,6 +1923,22 @@ impl Input {
     /// Its live turn's events.
     pub fn live_len(&self) -> usize {
         self.live.len
+    }
+
+    /// One handle of an input let go off this thread (D7's archive
+    /// capture of a compaction's predecessor: Shady #105 R2-2), whichever
+    /// way its holder ends: handed to this thread's bin
+    /// ([`dispose::current`]) in O(1), and dropped by its disposer, with
+    /// it, if it was their last owner, the history's worker (its journal,
+    /// its board) and the staged chunks. Charged meanwhile with what they
+    /// keep (the worker's as of its last job: an overcount while another
+    /// owner keeps them, never under). Refused or with no disposer, it is
+    /// dropped here, as everything a bin is handed (module docs of
+    /// [`dispose`]). This thread's cost: one element.
+    pub fn retire(input: Arc<Input>) {
+        let elements = input.history_len + 1;
+        let bytes = input.shared.bytes.load(Ordering::Relaxed) + input.staged + input.chunks.capacity() * std::mem::size_of::<Chunk>();
+        dispose::current().retire(input, elements, bytes);
     }
 
     /// A block call in its live turn.
@@ -2157,11 +2176,46 @@ pub struct Drawn {
     pub committed_to: u64,
     /// Live blocks on the board, groups and members included.
     pub live: usize,
+    /// The board's op log (§3.8: ≤ 256 lines, oldest first), each line
+    /// with where its event is ([`Mark`]: its time is its row's), and the
+    /// revision records and tombstones it still holds (§1.8), records
+    /// marked too: what D7's op log and revision walk read (§3.6). Copies
+    /// of the board's, counted at B2's count of them.
+    pub log: Arc<[(Logged, Mark)]>,
+    pub records: Arc<[(Record, Mark)]>,
+    pub tombstones: Arc<[Tombstone]>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates. A row's [`Arc`] of it is its.
     pub bytes: usize,
 }
+
+/// Where a log line or a record's event is: its row, and the call that
+/// made it (its `tool_id`), by which the row's time is found
+/// ([`crate::Transcript::call_at`]: a lookup, never a walk of the rows).
+/// Only a call has a row.
+///
+/// **Bounded** (Shady #105 R2-1): a board keeps a call's id once, shared
+/// by every line and record of that call (one allocation, whatever its
+/// ops), an id of at most [`CALL_ID_MAX`] bytes, and [`CALL_IDS_MAX`]
+/// bytes of ids in all, its Arcs' counts included: the newest lines'
+/// first, then the newest records'. Past either, a mark keeps its row
+/// and no id: its time is unknown, and drawn as such (`—`), never
+/// guessed. A lookup by it hashes [`CALL_ID_MAX`] bytes at most.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mark {
+    pub row: Option<u64>,
+    pub call: Option<Arc<str>>,
+}
+
+/// A call id a board's marks keep, at most (bytes; [`Mark`]): a model's
+/// tool ids are some 30.
+pub const CALL_ID_MAX: usize = 128;
+
+/// The call ids a board's marks keep in all, at most (bytes, their Arcs'
+/// counts included; [`Mark`]): room for every line and record of a board
+/// at B2's caps (256 and 1,024) with a model's ids.
+pub const CALL_IDS_MAX: usize = 64 * 1024;
 
 /// What a [`Worker`] keeps, counted: the journal's events (and a row
 /// each) and the events it has room for, those of them the live turn's,
@@ -2605,13 +2659,40 @@ impl Worker {
             + (shown_n + bound_n) * ARC;
         let rows: HashMap<u64, Arc<RowBlocks>> = rows.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let committed: Arc<[(u64, Fate)]> = self.committed.iter().copied().collect();
+        // The op log, records and tombstones (D7): copies, each record and
+        // line with its event's mark (its row, its call's id: [`Mark`],
+        // one allocation a call, within the budget, the newest lines'
+        // first, then the newest records'); B2's count of its owners
+        // bounds them (their deques' slots and heap), plus a mark each,
+        // the ids kept, and their Arcs.
+        let lines: Vec<&Logged> = view.log().collect();
+        let recs: Vec<&Record> = view.records().collect();
+        let mut ids: HashMap<usize, Option<Arc<str>>> = HashMap::new();
+        let mut room = CALL_IDS_MAX;
+        for pos in lines.iter().rev().map(|l| l.at.event).chain(recs.iter().rev().map(|r| r.at.event)) {
+            ids.entry(pos).or_insert_with(|| match self.journal.get(pos) {
+                Some(Event::Call { tool_id, .. }) if row(pos).is_some() && tool_id.len() <= CALL_ID_MAX && tool_id.len() + ARC <= room => {
+                    room -= tool_id.len() + ARC;
+                    Some(Arc::from(tool_id.as_str()))
+                }
+                _ => None,
+            });
+        }
+        let mark = |pos: usize| Mark { row: row(pos), call: ids.get(&pos).cloned().flatten() };
+        let log: Arc<[(Logged, Mark)]> = lines.iter().map(|l| ((*l).clone(), mark(l.at.event))).collect();
+        let records: Arc<[(Record, Mark)]> = recs.iter().map(|r| ((*r).clone(), mark(r.at.event))).collect();
+        let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
+        let [_, tombs, recs, _, _, _, logs] = view.owned_by_owner();
+        let calls = CALL_IDS_MAX - room;
+        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Mark>() + calls + 3 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
             + rail.iter().map(Shown::list_bytes).sum::<usize>()
             + blocks
             + ARC
-            + committed.len() * std::mem::size_of::<(u64, Fate)>();
+            + committed.len() * std::mem::size_of::<(u64, Fate)>()
+            + kept;
         Drawn {
             epoch: input.epoch,
             generation: Some(input.generation),
@@ -2622,6 +2703,9 @@ impl Worker {
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),
+            log,
+            records,
+            tombstones,
             bytes,
         }
     }

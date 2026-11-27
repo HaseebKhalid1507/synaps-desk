@@ -1985,6 +1985,21 @@ impl Transcript {
         }
     }
 
+    /// The time of call `tool_id`'s row (its message's, or its live
+    /// event's), if it has one: a lookup of the row by its call, never a
+    /// walk of the rows (D7's op log and revision labels, at most 256 a
+    /// view).
+    pub fn call_at(&self, tool_id: &str) -> Option<&Arc<str>> {
+        let ix = self.tools.get(tool_id).copied()?;
+        self.items.get(ix).filter(|i| i.tool.as_ref().is_some_and(|t| t.tool_id == tool_id)).and_then(|i| i.at.as_ref())
+    }
+
+    /// The conversation it holds (its journal): a compaction, a clear or a
+    /// resume moves it on.
+    pub fn journal(&self) -> &str {
+        &self.journal_id
+    }
+
     fn tool_mut(&mut self, tool_id: &str) -> Option<usize> {
         self.tools.get(tool_id).copied().filter(|&ix| ix < self.items.len())
     }
