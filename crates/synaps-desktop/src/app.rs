@@ -193,9 +193,11 @@ impl TabCache {
     /// inputs and results, a card's or block's input kept whole, heap
     /// included), the rows' strings, the display rows, the files ledger,
     /// the board's input (its history's journal and the live turn's log,
-    /// heap included: `Transcript::blocks_bytes`), and per item what the
-    /// strings do not show (the list's heights, maps, allocator slack:
-    /// [`ITEM_OVERHEAD`]). Measured once, when the tab is left.
+    /// heap included: `Transcript::blocks_bytes`), what the card sync
+    /// keeps (`Transcript::card_sync_bytes`: none, shed as the tab is left,
+    /// [`AppView::cache_list`]), and per item what the strings do not show
+    /// (the list's heights, maps, allocator slack: [`ITEM_OVERHEAD`]).
+    /// Measured once, when the tab is left.
     pub(crate) fn bytes(&self) -> usize {
         let item = |i: &Item| {
             std::mem::size_of::<Item>()
@@ -214,6 +216,7 @@ impl TabCache {
             + self.stats.subagents.bytes()
             + self.watch.bytes()
             + self.transcript.blocks_bytes()
+            + self.transcript.card_sync_bytes()
     }
 }
 
@@ -3983,8 +3986,10 @@ impl AppView {
 
     /// The pane's list and rows of `transcript` to the tab cache under
     /// `key` (with `stats` and its worker views, `watch`); a fresh, empty
-    /// list in their place.
-    fn cache_list(&mut self, key: Option<String>, transcript: Transcript, stats: Stats, watch: Watch) {
+    /// list in their place. The transcript keeps nothing of its card sync
+    /// but the cards: its attach, when it is shown again, reads them anew.
+    fn cache_list(&mut self, key: Option<String>, mut transcript: Transcript, stats: Stats, watch: Watch) {
+        transcript.shed_card_sync();
         self.panes.cur.card = None;
         self.panes.cur.attach_wait = None;
         self.panes.cur.attach_due = None;

@@ -18,6 +18,8 @@ mod ask_tests;
 mod blocks_tests;
 #[path = "blocks_ui_tests.rs"]
 mod blocks_ui_tests;
+#[path = "card_sync_tab_tests.rs"]
+mod card_sync_tab_tests;
 #[path = "cards_d_tests.rs"]
 mod cards_d_tests;
 #[path = "change_tests.rs"]
