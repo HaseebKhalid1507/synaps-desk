@@ -86,16 +86,23 @@
 //! **The file**, `block-desires.json` next to `settings.json`: per
 //! conversation, per generation (the first 16 hex digits), its desires,
 //! ≤ [`ENTRY_MAX`] bytes each, and nothing else. **No cap evicts a desire**.
+//! A file past them was never this desk's: past [`RESERVE`] it isn't read,
+//! and past the counts, or past the reserve with every version at its
+//! widest, it reads as the writer would have admitted it, the rest left
+//! out, said, the file set aside first ([`crate::blockfiles`]). One that
+//! couldn't be set aside isn't written over ([`Desires::held`]): memory
+//! only until a sweep sets it aside, or the user discards it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use cards_spec::block::message::{self, NOTICE_IDS_MAX, Notice, NoticeLine, Trailer, VERSION_MAX, Visibility as Seen};
 use cards_spec::block::{BlockId, Generation};
 use cards_spec::board::Visibility;
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, NotOwned, Owned, Stored};
+use crate::blockfiles::{self, Gate, Left, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "block-desires.json";
@@ -249,17 +256,41 @@ impl Book {
         wide.desires_mut().for_each(|d| d.version = VERSION_MAX);
         wide.text().len()
     }
+
+    /// The reserve as every change keeps it ([`Desires::commit`]): the file
+    /// within [`RESERVE`] with every version at its widest, so any desire
+    /// in it can be superseded (its version gaining digits) and still fit.
+    fn within_reserve(&self) -> bool {
+        self.widest_bytes() <= RESERVE
+    }
+
+    /// The first `n` of `read`, as a book.
+    fn of(read: &[(&String, &String, BlockId, Desire)], n: usize) -> Book {
+        let mut book = Book::default();
+        for (key, g, id, d) in &read[..n] {
+            book.set(key, g, id, Some(d.clone()));
+        }
+        book.tidy();
+        book
+    }
 }
 
 impl Stored for Book {
-    fn parse(text: &str) -> Result<(Self, usize), String> {
+    const BYTES_MAX: usize = RESERVE;
+
+    /// The caps as the writer admits a new id ([`PER_CONVERSATION`],
+    /// [`PER_DESK`]), one desire at a time: the ones that may have been
+    /// sent first (obligations), then the file's order; then, in that
+    /// order, as many as keep the reserve ([`Book::within_reserve`]); the
+    /// rest left out.
+    fn parse(text: &str) -> Result<(Self, Left), String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if v["version"].as_u64() != Some(FORMAT) {
             return Err(format!("not format {FORMAT}"));
         }
         let convs = v["conversations"].as_object().ok_or("no conversations")?;
         let gen_ok = |g: &str| g.len() == 16 && g.bytes().all(|b| b.is_ascii_hexdigit());
-        let (mut book, mut bad) = (Book::default(), 0);
+        let (mut read, mut bad) = (Vec::new(), 0);
         for (key, gens) in convs {
             let Some(gens) = gens.as_object().filter(|_| key_ok(key)) else {
                 bad += 1;
@@ -274,14 +305,32 @@ impl Stored for Book {
                     let bit = |k: &str| d[k].as_u64().filter(|b| *b <= 1).map(|b| b == 1);
                     let version = d["v"].as_u64().filter(|v| (1..=u64::from(VERSION_MAX)).contains(v)).map(|v| v as u32);
                     match (BlockId::parse(id), bit("d"), version, bit("s")) {
-                        (Some(id), Some(dismissed), Some(v), Some(sent)) => book.set(key, g, &id, Some(Desire::new(dismissed, v, sent))),
+                        (Some(id), Some(dismissed), Some(v), Some(sent)) => read.push((key, g, id, Desire::new(dismissed, v, sent))),
                         _ => bad += 1,
                     }
                 }
             }
         }
-        book.tidy();
-        Ok((book, bad))
+        read.sort_by_key(|(.., d)| !d.sent);
+        let (mut kept, mut per, mut over) = (Vec::new(), BTreeMap::<&str, usize>::new(), 0);
+        for r in read {
+            let here = per.entry(r.0.as_str()).or_default();
+            if *here >= PER_CONVERSATION || kept.len() >= PER_DESK {
+                over += 1;
+                continue;
+            }
+            *here += 1;
+            kept.push(r);
+        }
+        // The most of them, in order, that keep the reserve: a longer
+        // prefix never takes fewer bytes.
+        let (mut fits, mut past) = (0, kept.len() + 1);
+        while past - fits > 1 {
+            let n = usize::midpoint(fits, past);
+            if Book::of(&kept, n).within_reserve() { fits = n } else { past = n }
+        }
+        over += kept.len() - fits;
+        Ok((Book::of(&kept, fits), Left { bad, over }))
     }
 
     fn text(&self) -> String {
@@ -329,6 +378,9 @@ pub(crate) struct Write {
     /// until the write ran ([`blockfiles::Owned`]).
     path: Option<PathBuf>,
     owner: Option<Owned>,
+    /// Whether the file may be written over, as its sweeps decide where
+    /// they run ([`Gate`]).
+    gate: Arc<Gate>,
     work: Work,
 }
 
@@ -357,8 +409,8 @@ impl Write {
         let sweep = matches!(self.work, Work::Sweep);
         let done = match (&self.path, self.work) {
             (None, _) => Ok(None),
-            (Some(p), Work::Sweep) => Ok(blockfiles::sweep::<Book>(p)),
-            (Some(p), Work::Snapshot(text)) => blockfiles::write(p, &text).map(|()| None),
+            (Some(p), Work::Sweep) => self.gate.sweep::<Book>(p),
+            (Some(p), Work::Snapshot(text)) => self.gate.write(p, &text).map(|()| None),
         };
         drop(self.owner);
         Landing { ticket: self.ticket, seq: self.seq, sweep, done }
@@ -510,6 +562,15 @@ pub(crate) struct Desires {
     next_ticket: u64,
     /// The sweep still to run (the owner's first write).
     sweep: bool,
+    /// Whether the file may be written over, decided where the writes run
+    /// ([`Gate`]): what [`Desires::held`] says once a sweep's word landed.
+    gate: Arc<Gate>,
+    /// A sweep that couldn't set the file aside: why, and the change count
+    /// it ran at. Nothing is written over the file meanwhile (memory only),
+    /// and each change runs the sweep again ([`Desires::held`]).
+    held: Option<(String, u64)>,
+    /// The user discarded the file held: it is written over from now.
+    discarded: bool,
     /// Why the file read as empty at the load, what its sweep said, or that
     /// it is another process's (Settings says it).
     pub(crate) trouble: Option<String>,
@@ -548,6 +609,7 @@ impl Desires {
         Desires {
             path,
             sweep: owner.is_ok(),
+            gate: Gate::new(owner.is_ok()),
             owner,
             book,
             known: BTreeMap::new(),
@@ -564,6 +626,8 @@ impl Desires {
             failed_at: None,
             out: None,
             next_ticket: 0,
+            held: None,
+            discarded: false,
             trouble,
         }
     }
@@ -585,21 +649,24 @@ impl Desires {
 
     /// The next write to run off the UI thread, once the one out landed: the
     /// sweep first, then memory whole whenever it changed since the file.
+    /// Held: the sweep again at each change, and memory only meanwhile.
     pub(crate) fn next_write(&mut self) -> Option<Write> {
         if self.out.is_some() {
             return None;
         }
         let (path, owner) = self.file();
-        let work = if std::mem::take(&mut self.sweep) {
-            Work::Sweep
+        let again = self.held.as_ref().is_some_and(|(_, at)| self.seq > *at);
+        let (work, path) = if std::mem::take(&mut self.sweep) || again {
+            (Work::Sweep, path)
         } else if self.seq > self.written && self.failed_at != Some(self.seq) {
-            Work::Snapshot(if path.is_some() { self.book.text() } else { String::new() })
+            let path = path.filter(|_| self.held.is_none());
+            (Work::Snapshot(if path.is_some() { self.book.text() } else { String::new() }), path)
         } else {
             return None;
         };
         self.next_ticket += 1;
         self.out = Some(self.next_ticket);
-        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, work })
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, gate: self.gate.clone(), work })
     }
 
     /// The file and its lock, owned; else neither (memory only).
@@ -612,7 +679,9 @@ impl Desires {
 
     /// The window's last write, or the app's (it closes, it quits): memory
     /// whole if it changed since the file has, whatever write is out (the
-    /// writer runs this one after it). What it does is no one's to hear.
+    /// writer runs this one after it). It writes only if the file may be
+    /// written over once what runs before it ran ([`Gate`]): a sweep out
+    /// whose word never lands decides it. What it does is no one's to hear.
     pub(crate) fn last_write(&mut self) -> Option<Write> {
         let (Some(path), Some(owner)) = self.file() else { return None };
         if self.seq <= self.written {
@@ -624,6 +693,7 @@ impl Desires {
             seq: self.seq,
             path: Some(path),
             owner: Some(owner),
+            gate: self.gate.clone(),
             work: Work::Snapshot(self.book.text()),
         })
     }
@@ -651,6 +721,27 @@ impl Desires {
     #[cfg(test)]
     pub(crate) fn swept(&mut self) {
         self.sweep = false;
+        self.gate.open();
+    }
+
+    /// Why the file isn't written over, if it isn't: a sweep couldn't set
+    /// it aside (memory only until one does, or the user discards it).
+    pub(crate) fn held(&self) -> Option<&str> {
+        self.held.as_ref().map(|(why, _)| why.as_str())
+    }
+
+    /// The user's: the file held written over, set aside or not (memory,
+    /// whole, its next write). `false`: none was held.
+    pub(crate) fn discard_held(&mut self) -> bool {
+        if self.held.take().is_none() {
+            return false;
+        }
+        self.discarded = true;
+        self.gate.discard();
+        // Memory isn't what the file has: a snapshot is due.
+        self.seq += 1;
+        self.written = 0;
+        true
     }
 
     /// The writer took no more (`why`: it didn't start, or stopped): the
@@ -683,7 +774,19 @@ impl Desires {
         self.out = None;
         let mut out = Vec::new();
         match l.done {
-            Ok(said) if l.sweep => self.trouble = said.or(self.trouble.take()),
+            Ok(said) if l.sweep => {
+                if self.held.take().is_some() {
+                    // Set aside at last: memory, whole, written over it.
+                    self.written = 0;
+                }
+                self.trouble = said.or(self.trouble.take());
+            }
+            Err(why) if l.sweep => {
+                if !self.discarded {
+                    self.held = Some((why.clone(), l.seq));
+                    self.trouble = Some(why);
+                }
+            }
             Ok(_) => {
                 self.written = l.seq;
                 for (k, a) in self.take_asked(l.seq) {
@@ -779,7 +882,7 @@ impl Desires {
             return Err(Refused(format!("{FULL_DESK} ({} bytes, over {RESERVE})", now.len())));
         }
         let wide = next.widest_bytes();
-        if wide > RESERVE && wide > self.book.widest_bytes() {
+        if !next.within_reserve() && wide > self.book.widest_bytes() {
             return Err(Refused(format!("{FULL_DESK} ({wide} bytes at the widest, over {RESERVE})")));
         }
         if now != was {

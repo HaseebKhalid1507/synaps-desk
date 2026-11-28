@@ -39,10 +39,25 @@
 //!
 //! **A file that doesn't parse** reads as empty, and the sweep copies it
 //! aside to `<file>.bad` before anything is written over it; the log says
-//! so.
+//! so. **Reads are bounded**: a file past its store's [`Stored::BYTES_MAX`]
+//! (more than its writer ever writes) isn't read at all: it reads as
+//! empty and the sweep moves it aside (never copied). One that parses is
+//! fitted to its writer's caps as it's read ([`Stored::parse`]): what
+//! they leave out is said, and the sweep copies the file aside first.
+//!
+//! **Nothing is written over a file that wasn't set aside.** It goes to
+//! the first of its aside names ([`aside_name`]) that's free, or one that
+//! already holds the same bytes; never over another file there. If none
+//! takes it, or the sweep can't read it, the sweep says so (never "set
+//! aside") and the store keeps to memory ([`sweep`]'s `Err`): it tries the
+//! sweep again at its next change, and writes the file once a sweep set it
+//! aside, or once the user discarded it. That is decided where the writes
+//! run, not by what the UI thread heard ([`Gate`]): a snapshot handed to
+//! the writer before a sweep's word landed (a window's last, at its end)
+//! runs after that sweep, and writes only if it said yes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -52,11 +67,62 @@ use crate::recall;
 
 /// What a store's file holds, read and written whole.
 pub(crate) trait Stored: Default {
-    /// The file's text as this store reads it: what parses, and how many
-    /// entries were left out (unreadable); `Err` for a file that isn't one.
-    fn parse(text: &str) -> Result<(Self, usize), String>;
+    /// The file's bytes at most: its writer never writes more, and a
+    /// bigger file isn't read.
+    const BYTES_MAX: usize;
+    /// The file's text as this store reads it: what parses, fitted to the
+    /// caps its writer keeps, and what was left out; `Err` for a file that
+    /// isn't one.
+    fn parse(text: &str) -> Result<(Self, Left), String>;
     /// The file's text.
     fn text(&self) -> String;
+}
+
+/// What a read of a file that parses left out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Left {
+    /// Entries that don't read.
+    pub(crate) bad: usize,
+    /// Entries past the caps: what the writer would refuse or fit away.
+    pub(crate) over: usize,
+}
+
+/// Why a file is set aside, and (copied, not moved) its bytes as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Aside {
+    /// Past [`Stored::BYTES_MAX`]: not read, read as empty.
+    TooBig(String),
+    /// Doesn't parse: read as empty.
+    Unreadable(String, Vec<u8>),
+    /// Parsed, past the caps: what fits kept.
+    Over(String, Vec<u8>),
+}
+
+impl Aside {
+    fn why(&self) -> &str {
+        match self {
+            Aside::TooBig(w) | Aside::Unreadable(w, _) | Aside::Over(w, _) => w,
+        }
+    }
+
+    /// The bytes to copy aside; none: the file is moved.
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Aside::TooBig(_) => None,
+            Aside::Unreadable(_, b) | Aside::Over(_, b) => Some(b),
+        }
+    }
+}
+
+/// The names a file set aside may take ([`aside_name`]).
+pub(crate) const ASIDE_NAMES: usize = 10;
+
+/// `path`'s `n`th aside name: `<file>.bad`, then `<file>.bad.1` … `.bad.9`.
+pub(crate) fn aside_name(path: &Path, n: usize) -> PathBuf {
+    match n {
+        0 => path.with_file_name(format!("{}.bad", name(path))),
+        n => path.with_file_name(format!("{}.bad.{n}", name(path))),
+    }
 }
 
 /// Every temporary file's number in this process.
@@ -317,29 +383,56 @@ impl Drop for Writer {
     }
 }
 
-/// The file as it is: missing is empty; one that doesn't parse reads as
-/// empty, why said.
-fn read<S: Stored>(path: &Path) -> Result<(S, Option<String>), String> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+/// The file as it is: missing is empty; one past [`Stored::BYTES_MAX`]
+/// isn't read, and reads as empty, as does one that doesn't parse; one
+/// that parses is fitted to the caps. Why, said, if it's to be set aside.
+fn read<S: Stored>(path: &Path) -> Result<(S, Option<Aside>), String> {
+    use std::io::Read as _;
+    let too_big = || Aside::TooBig(format!("over {} bytes", S::BYTES_MAX));
+    // Its kind first: opening a pipe or a device could wait forever.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((S::default(), None)),
         Err(e) => return Err(format!("{}: {e}", name(path))),
     };
-    match String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string()).and_then(|t| S::parse(&t)) {
-        Ok((s, 0)) => Ok((s, None)),
-        Ok((s, bad)) => {
-            log::warn!(target: "synaps_desktop::blocks", "{}: {bad} unreadable entries left out", path.display());
-            Ok((s, None))
+    if !meta.is_file() {
+        return Err(format!("{}: not a regular file", name(path)));
+    }
+    if meta.len() > S::BYTES_MAX as u64 {
+        return Ok((S::default(), Some(too_big())));
+    }
+    let mut bytes = Vec::new();
+    // At most one byte past the bound: a file grown since is refused too.
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", name(path)))?;
+    file.take(S::BYTES_MAX as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", name(path)))?;
+    if bytes.len() > S::BYTES_MAX {
+        return Ok((S::default(), Some(too_big())));
+    }
+    match std::str::from_utf8(&bytes).map_err(|_| "not UTF-8".to_string()).and_then(S::parse) {
+        Ok((s, left)) => {
+            if left.bad > 0 {
+                log::warn!(target: "synaps_desktop::blocks", "{}: {} unreadable entries left out", path.display(), left.bad);
+            }
+            if left.over == 0 {
+                return Ok((s, None));
+            }
+            let why = format!("{} entries past its caps left out", left.over);
+            log::warn!(target: "synaps_desktop::blocks", "{}: {why}", path.display());
+            Ok((s, Some(Aside::Over(why, bytes))))
         }
-        Err(why) => Ok((S::default(), Some(why))),
+        Err(why) => Ok((S::default(), Some(Aside::Unreadable(why, bytes)))),
     }
 }
 
 /// The store at `path` as it is (the owner's launch read, on the UI
-/// thread): missing is empty, and one that doesn't parse reads as empty,
-/// why said (set aside by the [`sweep`]).
+/// thread): missing is empty, one past its bound or that doesn't parse
+/// reads as empty, one past its caps as what fits; why said (set aside by
+/// the [`sweep`]).
 pub(crate) fn peek<S: Stored>(path: &Path) -> (S, Option<String>) {
-    read::<S>(path).unwrap_or_else(|why| (S::default(), Some(why)))
+    match read::<S>(path) {
+        Ok((s, aside)) => (s, aside.map(|a| format!("{}: {}", name(path), a.why()))),
+        Err(why) => (S::default(), Some(why)),
+    }
 }
 
 /// The disk's writes made on this thread (tests: none on the UI thread).
@@ -372,23 +465,130 @@ pub(crate) fn own_once_free(path: &Path) -> Result<Owned, NotOwned> {
     }
 }
 
+/// Whether a store's file may be written over (module docs), decided where
+/// its writes run: by its sweeps ([`sweep`]'s `Ok`: yes; `Err`: no), else
+/// by the user's discard (yes from then, whatever a sweep says). Shut
+/// until a sweep said yes. Every write of the store holds it, so a
+/// snapshot handed over before a sweep's word reached the UI thread waits
+/// on that sweep's word, not on the UI thread's.
+#[derive(Debug)]
+pub(crate) struct Gate(AtomicU8);
+
+const SHUT: u8 = 0;
+const OPEN: u8 = 1;
+const DISCARDED: u8 = 2;
+
+impl Gate {
+    /// A store's: shut if a sweep is to run first (`sweep`), else open (a
+    /// store that never writes its file).
+    pub(crate) fn new(sweep: bool) -> Arc<Gate> {
+        Arc::new(Gate(AtomicU8::new(if sweep { SHUT } else { OPEN })))
+    }
+
+    /// [`sweep`] at `path`, its word kept: open if the file may be written
+    /// over, else shut (discarded: still open).
+    pub(crate) fn sweep<S: Stored>(&self, path: &Path) -> Result<Option<String>, String> {
+        let done = sweep::<S>(path);
+        let to = if done.is_ok() { OPEN } else { SHUT };
+        let _ = self.0.try_update(Ordering::SeqCst, Ordering::SeqCst, |was| (was != DISCARDED).then_some(to));
+        done
+    }
+
+    /// [`write`] at `path`, if it may be written over; else why not.
+    pub(crate) fn write(&self, path: &Path, text: &str) -> Result<(), String> {
+        match self.0.load(Ordering::SeqCst) {
+            SHUT => Err(format!("{}: not set aside, so not written over", name(path))),
+            _ => write(path, text),
+        }
+    }
+
+    /// The user's: the file written over from now, set aside or not.
+    pub(crate) fn discard(&self) {
+        self.0.store(DISCARDED, Ordering::SeqCst);
+    }
+
+    /// Tests: nothing to sweep.
+    #[cfg(test)]
+    pub(crate) fn open(&self) {
+        let _ = self.0.compare_exchange(SHUT, OPEN, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 /// The owner's first write: what crashes left beside the file removed, and
-/// a file that doesn't parse copied aside (`<file>.bad`) before a snapshot
-/// replaces it. What went wrong, if anything.
-pub(crate) fn sweep<S: Stored>(path: &Path) -> Option<String> {
+/// a file read as empty or fitted (past its bound, unreadable, past its
+/// caps) set aside ([`set_aside`]) before a snapshot replaces it. `Ok`: the
+/// file may be written over, and what went wrong, if anything. `Err`: it
+/// may not (module docs): one to set aside that wasn't, or that couldn't
+/// be read; why.
+pub(crate) fn sweep<S: Stored>(path: &Path) -> Result<Option<String>, String> {
     counted();
     let swept = recall::sweep(path).err().map(|e| format!("{}: leftovers not swept ({e})", name(path)));
-    let unreadable = match read::<S>(path) {
-        Ok((_, Some(why))) => {
-            let bad = path.with_file_name(format!("{}.bad", name(path)));
-            let kept = std::fs::copy(path, &bad).map(|_| ()).map_err(|e| e.to_string());
-            log::warn!(target: "synaps_desktop::blocks", "{}: unreadable ({why}), set aside ({kept:?}); read as empty", path.display());
-            Some(format!("{}: unreadable ({why}), set aside", name(path)))
+    let aside = match read::<S>(path) {
+        Ok((_, Some(aside))) => aside,
+        Ok(_) => return Ok(swept),
+        Err(why) => {
+            log::warn!(target: "synaps_desktop::blocks", "{why}: not read, so not written over");
+            return Err(format!("{why}: not read, so not written over"));
         }
-        Ok(_) => None,
-        Err(why) => Some(why),
     };
-    swept.or(unreadable)
+    let (what, then) = match &aside {
+        Aside::TooBig(why) => (format!("too big ({why})"), "read as empty"),
+        Aside::Unreadable(why, _) => (format!("unreadable ({why})"), "read as empty"),
+        Aside::Over(why, _) => (format!("past its caps ({why})"), "what fits kept"),
+    };
+    match set_aside(path, &aside) {
+        Ok(to) => {
+            log::warn!(target: "synaps_desktop::blocks", "{}: {what}, set aside ({}); {then}", path.display(), to.display());
+            Ok(swept.or(Some(format!("{}: {what}, set aside ({})", name(path), name(&to)))))
+        }
+        Err(e) => {
+            log::warn!(target: "synaps_desktop::blocks", "{}: {what}, not set aside ({e}): nothing written over it; {then}", path.display());
+            Err(format!("{}: {what}, not set aside ({e})", name(path)))
+        }
+    }
+}
+
+/// `path`'s file set aside: moved if past its bound (its size is
+/// anyone's), else its bytes as read copied, this user's only, to the
+/// first of its aside names that's free, or one already holding those
+/// bytes; never over another file. Where it went.
+fn set_aside(path: &Path, aside: &Aside) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    for n in 0..ASIDE_NAMES {
+        let to = aside_name(path, n);
+        match std::fs::symlink_metadata(&to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_file() && aside.bytes().is_some_and(|b| holds(&to, m.len(), b)) => return Ok(to),
+            Ok(_) => continue,
+            Err(e) => return Err(format!("{}: {e}", name(&to))),
+        }
+        let done = match aside.bytes() {
+            None => std::fs::rename(path, &to),
+            Some(bytes) => recall::create_private(&to).and_then(|mut f| {
+                let written = f.write_all(bytes).and_then(|()| f.sync_all());
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&to);
+                }
+                written
+            }),
+        };
+        match done {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", name(&to))),
+        }
+    }
+    Err(format!("{ASIDE_NAMES} files of its name beside it already"))
+}
+
+/// Whether the file at `to`, `len` bytes, holds exactly `bytes`.
+fn holds(to: &Path, len: u64, bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    if len != bytes.len() as u64 {
+        return false;
+    }
+    let mut had = Vec::new();
+    std::fs::File::open(to).and_then(|f| f.take(len + 1).read_to_end(&mut had)).is_ok() && had == bytes
 }
 
 /// `text`, the whole file, written at `path` (module docs).

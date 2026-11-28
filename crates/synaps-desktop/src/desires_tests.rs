@@ -966,6 +966,294 @@ fn an_unreadable_file_is_set_aside() {
     assert_eq!(desires(&d).len(), 1);
 }
 
+/// A file of `desires` (conversation, id, sent), each dismissed at v1 in
+/// [`generation`]'s generation, as a hand would write it.
+pub(crate) fn hand_written(desires: impl IntoIterator<Item = (String, String, bool)>) -> String {
+    let g = generation_key(&generation());
+    let mut convs = serde_json::Map::new();
+    for (conv, id, sent) in desires {
+        let gens = convs.entry(conv).or_insert_with(|| json!({ g.as_str(): {} }));
+        gens[g.as_str()][id] = json!({"d": 1, "v": 1, "s": u8::from(sent)});
+    }
+    json!({"version": 3, "conversations": convs}).to_string()
+}
+
+/// A hand-written file past the reserve (§1.8: no desk writes one) isn't
+/// read: it reads as empty, said, and is moved aside (never copied: its
+/// size is anyone's). One at the reserve is read; one byte more isn't.
+#[test]
+fn a_file_past_the_reserve_isnt_read() {
+    let d = dir("oversized");
+    let text = hand_written((0..3000).map(|i| (format!("c{i:04}"), format!("b{i:04}"), false)));
+    assert!(text.len() > RESERVE, "{}", text.len());
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), 0, "not read");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains(FILE) && t.contains("too big")), "said: {:?}", a.trouble);
+    assert!(!d.join(FILE).exists(), "moved aside");
+    assert_eq!(std::fs::metadata(d.join(format!("{FILE}.bad"))).unwrap().len(), text.len() as u64, "whole");
+    drop(a);
+
+    let one = hand_written([(J.to_string(), "tests".to_string(), false)]);
+    for (pad, read) in [(RESERVE - one.len(), true), (RESERVE + 1 - one.len(), false)] {
+        let d = dir(&format!("oversized-{pad}"));
+        std::fs::write(d.join(FILE), format!("{one}{}", " ".repeat(pad))).unwrap();
+        let a = desires(&d);
+        assert_eq!((a.len(), a.trouble.is_none()), (usize::from(read), read), "{} bytes", one.len() + pad);
+    }
+}
+
+/// A hand-written file past the counts (§1.8: no desk writes one) reads as
+/// the writer would have admitted it, one desire at a time: those that may
+/// have been sent first, then the file's order; [`PER_CONVERSATION`] and
+/// [`PER_DESK`] at most. What's left out is said, and the file is copied
+/// aside before anything is written over it.
+#[test]
+fn a_file_past_the_counts_reads_as_the_writer_admits_it() {
+    let g = generation();
+    let d = dir("past-the-counts");
+    // 100 in one conversation, its last ten sent.
+    let text = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), i >= 90)));
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), PER_CONVERSATION);
+    let kept = |i: usize| a.desire(J, &g, &id(&format!("b{i:03}"))).is_some();
+    assert!((90..100).all(kept), "the sent first");
+    assert!((0..54).all(kept) && !(54..90).any(kept), "then the file's order");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains("36 entries past its caps")), "said: {:?}", a.trouble);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), text, "set aside");
+    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), text, "not written over yet");
+    drop(a);
+    assert_eq!(in_file(&d).len(), PER_CONVERSATION, "a restart reads the same");
+
+    // 600 conversations, one each.
+    let d = dir("past-the-desk");
+    std::fs::write(d.join(FILE), hand_written((0..600).map(|i| (format!("c{i:03}"), "plan".to_string(), false)))).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), PER_DESK);
+    assert!(a.desire("c511", &g, &id("plan")).is_some() && a.desire("c512", &g, &id("plan")).is_none(), "the file's order");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains("88 entries past its caps")), "said: {:?}", a.trouble);
+}
+
+/// Shady #108 P2-1: a file within the reserve as written and within the
+/// counts, but past the reserve with every version at its widest (512
+/// sent dismissals at v9, exactly 64 KiB as written, 69,632 bytes at the
+/// widest), reads as the writer would have admitted it: as many as keep
+/// the reserve, in order, the rest left out, said, the file set aside.
+/// Then an admitted sent dismissal is superseded across a digit (v9 →
+/// v10), as every admitted desire can be.
+#[test]
+fn a_file_past_the_reserve_at_its_widest_reads_as_the_writer_admits_it() {
+    let g = generation();
+    let gk = generation_key(&g);
+    let file = |keys: &[String]| {
+        let convs: serde_json::Map<String, Value> =
+            keys.iter().map(|k| (k.clone(), json!({ gk.as_str(): {"a": {"d": 1, "v": 9, "s": 1}} }))).collect();
+        json!({"version": 3, "conversations": convs}).to_string()
+    };
+    let mut keys: Vec<String> = (0..PER_DESK).map(|i| format!("c{i:03}")).collect();
+    let short = RESERVE - file(&keys).len();
+    for (i, k) in keys.iter_mut().enumerate() {
+        k.push_str(&"k".repeat(short / PER_DESK + usize::from(i < short % PER_DESK)));
+        assert!(k.len() <= KEY_MAX, "{}", k.len());
+    }
+    let text = file(&keys);
+    assert_eq!(text.len(), RESERVE, "64 KiB as written");
+    let mut whole = Book::default();
+    for k in &keys {
+        whole.set(k, &gk, &id("a"), Some(Desire::new(true, 9, true)));
+    }
+    assert_eq!(whole.text(), text, "the writer's own text");
+    assert_eq!(whole.widest_bytes(), 69_632, "past the reserve at its widest");
+
+    let d = dir("past-the-widest");
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let mut a = desires(&d);
+    let n = a.len();
+    assert!(n > 0 && n < PER_DESK, "{n} of {PER_DESK} kept");
+    assert!(a.book.text().len() <= RESERVE && a.book.widest_bytes() <= RESERVE, "{} at the widest", a.book.widest_bytes());
+    assert!(keys[..n].iter().all(|k| a.desire(k, &g, &id("a")).is_some()), "the file's order");
+    assert!(keys[n..].iter().all(|k| a.desire(k, &g, &id("a")).is_none()), "the rest left out");
+    let left = format!("{} entries past its caps", PER_DESK - n);
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains(&left)), "said: {:?}", a.trouble);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), text, "set aside");
+    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), text, "not written over yet");
+
+    let h = H::default();
+    assert_eq!(a.show_now(&keys[0], &g, &id("a"), &h.vis()), Ok(Now::Wished(10)), "superseded across a digit");
+    assert!(a.desire(&keys[0], &g, &id("a")).is_some_and(|d| !d.dismissed && d.version == 10 && d.sent));
+    assert_eq!(a.dismiss_now(&keys[n - 1], &g, &id("a"), &h.vis()), Ok(Now::Unchanged));
+    assert!(matches!(a.show_now(&keys[n - 1], &g, &id("a"), &h.vis()), Ok(Now::Wished(_))), "the last admitted too");
+    drop(a);
+    let b = in_file(&d);
+    assert_eq!(b.len(), n, "a restart reads the same");
+    assert!(b.text().len() <= RESERVE && b.widest_bytes() <= RESERVE);
+}
+
+/// The aside names a file can take: `<file>.bad`, then `.bad.1` … `.bad.9`.
+pub(crate) fn aside_names(path: &Path) -> Vec<PathBuf> {
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    std::iter::once(format!("{name}.bad")).chain((1..10).map(|n| format!("{name}.bad.{n}"))).map(|n| path.with_file_name(n)).collect()
+}
+
+/// Shady #108 P2-2: a file to set aside that can't be (every name it may
+/// take is a folder) is never written over. Its sweep says so, never "set
+/// aside"; a wish is kept in memory and draws; neither its write nor the
+/// window's last writes the file, nor does a restart's. A change once a
+/// name is free sets it aside first, then writes memory whole over it.
+/// A file past the counts (copied aside) and one past the bound (moved).
+#[test]
+fn a_file_that_cant_be_set_aside_is_never_written_over() {
+    let g = generation();
+    let h = H::default();
+    for (name, text) in [
+        ("over", hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)))),
+        ("too-big", hand_written((0..3000).map(|i| (format!("c{i:04}"), format!("b{i:04}"), false)))),
+    ] {
+        let d = dir(&format!("unkept-{name}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, &text).unwrap();
+        let names = aside_names(&path);
+        names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        let mut a = desires(&d);
+        let kept = a.len();
+        let said = a.trouble.clone().unwrap_or_default();
+        assert_eq!(a.dismiss_now("other", &g, &id("tests"), &h.vis()), Ok(Now::Wished(1)), "{name}");
+        assert!(a.dismissed("other", &g, &id("tests"), &h.vis()), "{name}: kept in memory, it draws");
+        let _ = a.dismiss("other", &g, &id("plan"), &h.vis());
+        if let Some(w) = a.last_write() {
+            let _ = w.run();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "{name}: never written over");
+        assert!(said.contains("not set aside"), "{name}: {said}");
+        drop(a);
+        let a = desires(&d);
+        assert!(a.trouble.as_deref().is_some_and(|t| t.contains("not set aside")), "{name}: a restart: {:?}", a.trouble);
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "{name}: a restart writes nothing over it");
+        assert!(names.iter().all(|n| n.is_dir()), "{name}: no folder touched");
+        drop(a);
+
+        let mut a = desires(&d);
+        std::fs::remove_dir(&names[3]).unwrap();
+        assert_eq!(a.dismiss_now("other", &g, &id("tests"), &h.vis()), Ok(Now::Wished(1)), "{name}");
+        assert_eq!(std::fs::read(&names[3]).unwrap(), text.as_bytes(), "{name}: set aside at last");
+        let aside = format!("set aside ({FILE}.bad.3)");
+        assert!(a.trouble.as_deref().is_some_and(|t| t.contains(&aside)), "{name}: {:?}", a.trouble);
+        assert_eq!(in_file(&d).len(), kept + 1, "{name}: then memory, whole, written over it");
+    }
+}
+
+/// Shady #108 R2-P2-1: the window's last write, handed over while the
+/// launch's sweep is out (its word not landed, and never to: the window
+/// closed), waits on that sweep where the writes run. A sweep that couldn't
+/// set the file aside (every name it may take a folder) leaves it as it
+/// was; one that set it aside, or had nothing to (a file that reads
+/// whole), lets memory whole be written over it. Past the counts (copied
+/// aside) and past the bound (moved).
+#[test]
+fn the_last_write_waits_on_the_sweep_out_before_it() {
+    let g = generation();
+    let h = H::default();
+    let over = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    let too_big = hand_written((0..3000).map(|i| (format!("c{i:04}"), format!("b{i:04}"), false)));
+    let whole = hand_written((0..3).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    let mut wrong = Vec::new();
+    for (name, text, free) in [
+        ("over", &over, Some(false)),
+        ("over-set-aside", &over, Some(true)),
+        ("too-big", &too_big, Some(false)),
+        ("too-big-set-aside", &too_big, Some(true)),
+        ("whole", &whole, None),
+    ] {
+        let d = dir(&format!("last-behind-{name}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, text).unwrap();
+        let names = aside_names(&path);
+        if free.is_some() {
+            names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        }
+        if free == Some(true) {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        let mut a = Desires::load(Some(path.clone()));
+        let kept = a.len();
+        let sweep = a.next_write().expect("the launch's sweep");
+        assert_eq!(a.dismiss("other", &g, &id("tests"), &h.vis()), Ok(Ask::Saving), "{name}");
+        assert!(a.next_write().is_none(), "{name}: the sweep out, the change behind it");
+        let last = a.last_write().expect("memory changed: the window's last write");
+        drop(a);
+        drop(sweep.run());
+        drop(last.run());
+        let done = match free {
+            Some(false) => std::fs::read(&path).unwrap() == text.as_bytes() && names.iter().all(|n| n.is_dir()),
+            Some(true) => std::fs::read(&names[3]).unwrap() == text.as_bytes() && in_file(&d).len() == kept + 1,
+            None => in_file(&d).len() == kept + 1,
+        };
+        if !done {
+            wrong.push(name);
+        }
+    }
+    // Every case, then what went wrong: not set aside, never written over;
+    // set aside (or nothing to), memory whole written over it.
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// Shady #108 R2-P2-1, a file held (its sweep's word landed: not set
+/// aside): a change runs the sweep again, and the window's last write
+/// handed over behind it writes memory whole only if that sweep set the
+/// file aside; else nothing.
+#[test]
+fn the_last_write_behind_a_held_files_sweep_waits_on_it() {
+    let g = generation();
+    let h = H::default();
+    let text = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    for free in [false, true] {
+        let d = dir(&format!("last-held-{free}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, &text).unwrap();
+        let names = aside_names(&path);
+        names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        let mut a = desires(&d);
+        assert!(a.held().is_some(), "held");
+        let kept = a.len();
+        if free {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        assert_eq!(a.dismiss("other", &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
+        let sweep = a.next_write().expect("the sweep again");
+        let last = a.last_write().expect("memory changed: the window's last write");
+        drop(a);
+        drop(sweep.run());
+        drop(last.run());
+        if free {
+            assert!(std::fs::read(&names[3]).unwrap() == text.as_bytes(), "set aside");
+            assert_eq!(in_file(&d).len(), kept + 1, "then memory, whole, written over it");
+        } else {
+            assert!(std::fs::read(&path).unwrap() == text.as_bytes(), "never written over");
+        }
+    }
+}
+
+/// Shady #108 P2-2: a file set aside never goes over another recovery
+/// file: `.bad` taken by an older one, it goes to `.bad.1`; the same file
+/// again (a launch with no change since) is where it already is.
+#[test]
+fn a_file_set_aside_goes_over_no_other() {
+    let d = dir("aside-names");
+    let names = aside_names(&d.join(FILE));
+    std::fs::write(&names[0], "an older one").unwrap();
+    let text = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let a = desires(&d);
+    assert_eq!(std::fs::read_to_string(&names[0]).unwrap(), "an older one", "kept");
+    assert_eq!(std::fs::read_to_string(&names[1]).unwrap(), text, "set aside beside it");
+    drop(a);
+    let a = desires(&d);
+    let aside = format!("set aside ({FILE}.bad.1)");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains(&aside)), "{:?}", a.trouble);
+    assert!(!names[2].exists(), "where it already is");
+}
+
 /// What crashes left beside the file is swept by its owner's first write:
 /// regular files of exactly `<file>.tmp.<pid>.<n>`, never a link (nor what
 /// it names), a folder or another name.
@@ -1677,19 +1965,20 @@ fn edge_book(target: usize, v: u32) -> Book {
     book
 }
 
-/// The reserve on the file as written, version widths counted: a file
+/// The reserve on the file as written, version widths counted: memory
 /// exactly at 64 KiB refuses a Show of one of its desires that would
 /// write v10 over v9 (a byte more): refused at once, nothing drawn,
 /// nothing written. A new id is admitted only if every desire could still
-/// be superseded at its widest version.
+/// be superseded at its widest version. (No read admits such memory now,
+/// [`a_file_past_the_reserve_at_its_widest_reads_as_the_writer_admits_it`]:
+/// it's put in place here, the writer's own check tested alone.)
 #[test]
 fn the_reserve_counts_a_versions_width() {
     let g = generation();
     let d = dir("reserve-width");
     let book = edge_book(RESERVE, 9);
-    std::fs::write(d.join(FILE), book.text()).unwrap();
     let mut a = desires(&d);
-    assert_eq!(a.len(), book.len());
+    a.book = book.clone();
     let (conv, slot) = book.conversations.iter().next().map(|(c, g)| (c.clone(), g.values().next().unwrap().clone())).unwrap();
     let t = slot.keys().next().unwrap().clone();
     let shared = H::with(&[t.as_str()]).vis();
@@ -1697,7 +1986,7 @@ fn the_reserve_counts_a_versions_width() {
     let refused = a.show(&conv, &g, &t, &shared);
     assert!(matches!(&refused, Err(Refused(why)) if why.starts_with(FULL_DESK) && why.contains("65537 bytes")), "{refused:?}");
     assert!(a.dismissed(&conv, &g, &t, &shared) && !a.pending(&conv, &g, &t) && !a.writing(), "nothing drawn, nothing to write");
-    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), book.text(), "nothing written");
+    assert!(!d.join(FILE).exists(), "nothing written");
 
     // Admission at the widest: a book whose desires fit now but not at
     // their widest takes no new id; one that fits at the widest takes it,
@@ -1705,8 +1994,8 @@ fn the_reserve_counts_a_versions_width() {
     let d = dir("reserve-widest");
     let narrow = edge_book(RESERVE - 1_000, 1);
     assert!(narrow.widest_bytes() > RESERVE && narrow.text().len() < RESERVE);
-    std::fs::write(d.join(FILE), narrow.text()).unwrap();
     let mut a = desires(&d);
+    a.book = narrow;
     let refused = a.dismiss(J, &g, &id("new"), &H::default().vis());
     assert!(matches!(&refused, Err(Refused(why)) if why.contains("at the widest")), "{refused:?}");
     let mut fits = edge_book(RESERVE - 1_000, 1);

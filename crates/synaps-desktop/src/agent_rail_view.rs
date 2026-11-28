@@ -468,20 +468,36 @@ impl AppView {
         });
         let line = || h_flex().h(px(LINE)).w_full().gap(px(GAP)).items_center().whitespace_nowrap();
         let first = (show.is_some() || note.is_some() || said.is_some()).then(|| line().children(show).children(note).children(said));
-        Some(v_flex().mt(px(12.)).w_full().children(first).children(memory.map(|m| self.memory_line(m, p))).into_any_element())
+        Some(v_flex().mt(px(12.)).w_full().children(first).children(memory.map(|m| self.memory_line(m, p, cx))).into_any_element())
     }
 
     /// The footer's line while this desk keeps its rail changes in memory
-    /// only (D6b: another desk has its files, or they can't be kept).
-    fn memory_line(&self, text: String, p: &Palette) -> Div {
+    /// only (D6b: another desk has its files, or they can't be kept, or one
+    /// couldn't be set aside: then its `discard it`).
+    fn memory_line(&self, text: String, p: &Palette, cx: &Context<Self>) -> Div {
         let t = crate::ask::shown(&text, cards_spec::Lines::Single);
-        h_flex().h(px(LINE)).w_full().items_center().whitespace_nowrap().child(
-            mono(t.clone(), size::META, p.warn)
-                .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .debug_selector(move || format!("agent-memory {t}")),
-        )
+        let discard = self.wishes.held().is_some().then(|| {
+            mono("discard it".to_string(), size::META, p.dim_ch)
+                .id("agent-memory-discard")
+                .flex_none()
+                .cursor_pointer()
+                .debug_selector(|| "agent-memory-discard".into())
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.discard_held(cx)))
+        });
+        h_flex()
+            .h(px(LINE))
+            .w_full()
+            .gap(px(GAP))
+            .items_center()
+            .whitespace_nowrap()
+            .child(
+                mono(t.clone(), size::META, p.warn)
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .debug_selector(move || format!("agent-memory {t}")),
+            )
+            .children(discard)
     }
 
     /// The session the panel describes: the focused pane's.
@@ -828,7 +844,7 @@ impl AppView {
                     .pb(px(12.))
                     .border_b_1()
                     .border_color(p.hair)
-                    .child(self.memory_line(m, p))
+                    .child(self.memory_line(m, p, cx))
                     .into_any_element(),
             );
         };
