@@ -1048,21 +1048,21 @@ fn stub_of(name: &str, more: &str) -> String {
 }
 
 /// `text` sent (the walk left first): the message is `want`, what rode it
-/// included. Sending needs the view tests' daemon, a unix socket
-/// (`AppView::enter`): elsewhere the walk is only left.
+/// included, and its notices are sent (a later `u` supersedes, never
+/// cancels). Through the composer's send to the view tests' daemon, a
+/// unix socket (`AppView::enter`); elsewhere the same send, its socket
+/// taken as having it (`AppView::send_socketless`).
 fn told(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, want: &str, what: &str) {
     if walking(cx, w, view) {
         press(cx, w, "escape");
     }
     #[cfg(unix)]
-    {
-        view.update(cx, |v, cx| assert!(v.enter(text.into(), cx)));
-        landed(cx, w, view);
-        let sent = view.read_with(cx, |v, _| v.wishes.outbox.last().cloned());
-        assert_eq!(sent.as_deref(), Some(want), "{what}");
-    }
+    view.update(cx, |v, cx| assert!(v.enter(text.into(), cx)));
     #[cfg(not(unix))]
-    let _ = (text, want, what);
+    view.update(cx, |v, cx| assert!(v.send_socketless(text.into(), cx)));
+    landed(cx, w, view);
+    let sent = view.read_with(cx, |v, _| v.wishes.outbox.last().cloned());
+    assert_eq!(sent.as_deref(), Some(want), "{what}");
 }
 
 /// A one-line row's height at the pane's text step: §3.5's 24 px.
@@ -1358,6 +1358,347 @@ fn the_palettes_block_commands_act_on_the_walked_block(cx: &mut TestAppContext) 
     walk_on(cx, w, &view, At::Block(row("c")));
     pick(cx, "pin the walked");
     assert!(has(cx, w, stub_of("c", "")), "pinned: its stub");
+}
+
+// ── Shady #110: what this desk draws, everywhere it draws ─────────────
+
+/// A block call as the history keeps it: the assistant's `cards_block`
+/// call of `ops` (its id `tool`), and its receipt.
+fn call(tool: &str, ops: Value) -> [Value; 2] {
+    let input = synaps_client::synthetic::block_input(ops.clone());
+    [
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_block", "input": input}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool, "content": synaps_client::synthetic::block_receipt(&ops)}]}),
+    ]
+}
+
+fn user(text: &str) -> Value {
+    json!({"role": "user", "content": text})
+}
+
+fn said_ok() -> Value {
+    json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+}
+
+fn note_op(id: &str) -> Value {
+    json!({"op": "put", "id": id, "kind": "note", "body": {"text": format!("{id} first")}})
+}
+
+/// The blocks demo's window, its history `messages` after its first, and
+/// no turn running: every board settled. The list at its end.
+fn settled_with(cx: &mut TestAppContext, messages: Vec<Value>) -> W {
+    let (win, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, win, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    super::keys_tests::at_rest(cx, win, &view);
+    let mut h = vec![user("start")];
+    h.extend(messages);
+    h.push(said_ok());
+    history_now(cx, win, &view, h);
+    super::rail_wishes_ui_tests::written(cx, &view);
+    tail(cx, win, &view);
+    (win, view)
+}
+
+/// What the history after the view's holds lands, settled; the frames
+/// after.
+fn then(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+    super::answer_tests::land(cx, w, view, messages);
+    landed(cx, w, view);
+}
+
+/// Member `name` of group `group` as this desk draws it dismissed.
+fn member_tomb(group: &str, name: &str, words: &str) -> String {
+    format!("block-member-tomb {} {} ◇ {name} · {words}", row(group), row(name))
+}
+
+/// Shady #110 P2-1: a block dismissed here, its notice not sent yet, that
+/// the agent then groups (legal: only a shared dismissal can't join a
+/// group) draws its tombstone in its group, nothing of its content; the
+/// next message tells the agent it's dismissed, and the history saying so
+/// keeps it a tombstone. A member softly dismissed draws its soft
+/// tombstone, whose click (a member's, in its group) shows it. A member
+/// under the pointer whose look changes waits with the board.
+#[gpui_kit::test]
+fn a_member_this_desk_dismissed_draws_its_tombstone_in_its_group(cx: &mut TestAppContext) {
+    let (w, view) = settled_with(cx, call("toolu_m1", json!([note_op("b"), note_op("c")])).into());
+    let (b, c, g) = (row("b"), row("c"), row("g"));
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Block(c));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    assert!(has(cx, w, tomb_of("c")), "dismissed here: its tombstone");
+    then(cx, w, &view, call("toolu_m2", json!([{"op": "merge", "into": "g", "title": "Two", "ids": ["b", "c"]}])).into());
+    tail(cx, w, &view);
+    if folded(cx, &view, "g") {
+        let at_ = head(cx, w, "g");
+        click(cx, w, at_);
+        away(cx, w);
+        wait(cx, w, &view, 1000);
+    }
+    let dismissed = member_tomb("g", "c", "dismissed · u show");
+    assert!(has(cx, w, dismissed.clone()), "grouped: its tombstone, in its group");
+    assert!(!has(cx, w, format!("block-head {c}")) && has(cx, w, format!("block-head {b}")), "nothing of c's content; b whole");
+    assert!(has(cx, w, format!("block-member {g} {b}")));
+    let line = drawn(cx, w, dismissed.clone());
+    assert!((line.size.height - line_h(cx, &view)).abs() < px(0.5), "24 px: {line:?}");
+    told(cx, w, &view, "go on", "go on\n[block c v1 dismissed]", "told as drawn");
+    then(cx, w, &view, vec![user("go on\n[block c v1 dismissed]"), said_ok()]);
+    assert_eq!(desires(cx, &view), 0, "settled");
+    assert!(has(cx, w, dismissed.clone()) && !has(cx, w, format!("block-head {c}")), "acknowledged: still its tombstone");
+    // Its click checked as painted: pressed, another desk shows c before
+    // the release; the release does nothing, and says so.
+    let at_ = drawn(cx, w, dismissed.clone()).center();
+    mouse(cx, w, at_, "move");
+    mouse(cx, w, at_, "down");
+    super::answer_tests::land(cx, w, &view, vec![user("other\n[block c v8 shown]"), said_ok()]);
+    mouse(cx, w, at_, "up");
+    landed(cx, w, &view);
+    assert_eq!(note(cx, &view), Some((c, crate::lease::CHANGED)), "a stale click: the note");
+    assert_eq!(desires(cx, &view), 0, "nothing asked");
+    away(cx, w);
+    wait(cx, w, &view, 2000);
+    assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, dismissed.clone()), "the other desk's Show drawn");
+
+    // A member's soft tombstone, and its click: shown, in its group.
+    softly(cx, w, &view, &["b".into()]);
+    let soft = member_tomb("g", "b", crate::rail_wishes::SOFT);
+    assert!(has(cx, w, soft.clone()) && !has(cx, w, format!("block-head {b}")), "softly dismissed: its tombstone");
+    let at_ = drawn(cx, w, soft.clone()).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    assert!(!has(cx, w, soft) && has(cx, w, format!("block-head {b}")), "its click shows it");
+    assert!(!is_soft(cx, &view, "b"));
+
+    // Under the pointer, another desk's dismissal of the member waits.
+    let at_ = drawn(cx, w, format!("block-head {b}")).center();
+    mouse(cx, w, at_, "move");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.lease.member.map(|m| m.row)), Some(b), "the member's own target");
+    super::answer_tests::land(cx, w, &view, vec![user("more\n[block b v7 dismissed]"), said_ok()]);
+    assert!(waiting(cx, &view), "its look changes under the pointer: the board waits");
+    assert!(has(cx, w, format!("block-head {b}")), "still drawn as it was");
+    away(cx, w);
+    wait(cx, w, &view, 2000);
+    assert!(!waiting(cx, &view) && has(cx, w, member_tomb("g", "b", "dismissed · u show")), "drawn at the lease's end");
+}
+
+/// Shady #110 P2-2: a converted card's block (a card id) pinned into the
+/// rail leaves its stub in the transcript, `◇ card:… · in the rail · p`,
+/// none of its body; the stub's click brings it back, Ctrl+Z pins it
+/// again, and a restart keeps it so. No desire, nothing told.
+#[gpui_kit::test]
+fn a_cards_pin_leaves_its_stub_and_tells_the_agent_nothing(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    let name = format!("card:{}", synaps_client::synthetic::BLOCKS_CARD);
+    let k = row(&name);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(k));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    assert_eq!(sec(cx, &view, &name), Some((Slot::Upper, true, false)), "pinned into the rail");
+    assert!(has(cx, w, stub_of(&name, "")), "its stub in the transcript");
+    assert!(!has(cx, w, format!("block-head {k}")), "no second body there");
+    let at_ = drawn(cx, w, stub_of(&name, "")).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, &name), None, "the stub's click: back");
+    assert!(has(cx, w, format!("block-head {k}")) && !has(cx, w, stub_of(&name, "")));
+    walk_again(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    assert_eq!(sec(cx, &view, &name), Some((Slot::Upper, true, false)), "Ctrl+Z: pinned again");
+    assert!(has(cx, w, stub_of(&name, "")));
+    restart(cx, w, &view);
+    tail(cx, w, &view);
+    assert!(has(cx, w, stub_of(&name, "")) && !has(cx, w, format!("block-head {k}")), "a restart keeps it");
+    assert_eq!(desires(cx, &view), 0, "no desire");
+    told(cx, w, &view, "go on", "go on", "presentation: nothing told");
+}
+
+/// Shady #110 P2-3: a section put into the transcript keeps its local
+/// state there across an unrelated board: its fold (and its undo), its
+/// note's `more`, its well's scroll; one the agent folded, opened here
+/// and under the pointer, stays open.
+#[gpui_kit::test]
+fn a_sections_local_state_in_the_transcript_survives_another_board(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    ops(
+        cx,
+        w,
+        &view,
+        "toolu_lr",
+        json!([
+            {"op":"put","id":"r3","kind":"note","target":"rail","slot":"upper","body":{"text":"R three"}},
+            {"op":"put","id":"r4","kind":"note","target":"rail","slot":"upper","body":{"text":"R four"}},
+            {"op":"collapse","id":"r4"}
+        ]),
+    );
+    wait(cx, w, &view, 1000);
+    let (r3, r4) = (row("r3"), row("r4"));
+    for r in [r3, r4] {
+        enter(cx, w, &view);
+        walk_on(cx, w, &view, At::Rail(r));
+        press(cx, w, "p");
+        landed(cx, w, &view);
+        press(cx, w, "escape");
+    }
+    tail(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {r3}")) && has(cx, w, format!("block-head {r4}")), "both in the transcript");
+    assert!(!folded(cx, &view, "r3") && folded(cx, &view, "r4"), "r4 folded by the agent");
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(r3));
+    press(cx, w, "z");
+    walk_to(cx, w, &view, At::Block(r4));
+    press(cx, w, "z");
+    press(cx, w, "escape");
+    wait(cx, w, &view, 300);
+    assert!(folded(cx, &view, "r3") && !folded(cx, &view, "r4"), "folded, and opened, here");
+    view.update(cx, |v, _| {
+        v.panes.cur.block_more.insert(r3);
+        v.panes.cur.block_scroll.borrow_mut().insert(r3, gpui_kit::ScrollHandle::new());
+    });
+    // A board of a block after them, the pointer over r4: it lands.
+    let at_ = head(cx, w, "r4");
+    mouse(cx, w, at_, "move");
+    ops(cx, w, &view, "toolu_un", json!([note_op("after")]));
+    assert!(!waiting(cx, &view), "nothing under the pointer changes: it lands");
+    assert!(!folded(cx, &view, "r4"), "open under the pointer");
+    away(cx, w);
+    wait(cx, w, &view, 2000);
+    assert!(!waiting(cx, &view), "the board drew");
+    assert!(folded(cx, &view, "r3") && !folded(cx, &view, "r4"), "both as set here");
+    let kept = view.read_with(cx, |v, _| (v.panes.cur.block_more.contains(&r3), v.panes.cur.block_scroll.borrow().contains_key(&r3)));
+    assert_eq!(kept, (true, true), "its more and its scroll");
+    // Their undos, the last first.
+    enter(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(folded(cx, &view, "r4"), "r4's fold's undo still undoes it");
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(!folded(cx, &view, "r3"), "and r3's");
+}
+
+/// Shady #110 P2-4: the footer's `show` shows what it counts, nothing
+/// else: `r1`, put into the transcript and dismissed there, keeps its
+/// tombstone (the footer never counted it), and the next message names
+/// only `r2`. Also when `r1` becomes a tombstone while the footer is held.
+#[gpui_kit::test]
+fn the_footers_show_leaves_a_transcript_tombstone_alone(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let (r1, r2) = (row("r1"), row("r2"));
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(r1));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(r1));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(r2));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    tail(cx, w, &view);
+    assert!(has(cx, w, tomb_of("r1")) && sec(cx, &view, "r2").is_none(), "r1's tombstone in the transcript; r2 hidden");
+    assert!(has(cx, w, "agent-footer 1 dismissed · show".into()), "the footer counts r2 only");
+    told(cx, w, &view, "one", "one\n[block r1 v1, r2 v2 dismissed]", "both told");
+    footer_show(cx, w, &view);
+    landed(cx, w, &view);
+    assert!(sec(cx, &view, "r2").is_some(), "r2 shown");
+    assert!(has(cx, w, tomb_of("r1")), "r1's tombstone untouched");
+    told(cx, w, &view, "two", "two\n[block r2 v3 shown]", "only r2");
+
+    // r1 shown again, r2 dismissed; the footer held while r1 becomes a
+    // tombstone again: its release shows r2, and only r2.
+    let at_ = drawn(cx, w, tomb_of("r1")).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {r1}")), "r1 shown");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(r2));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    wait(cx, w, &view, 700);
+    let show = drawn(cx, w, "agent-footer 1 dismissed · show".into()).center();
+    mouse(cx, w, show, "move");
+    mouse(cx, w, show, "down");
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        let conv = v.conversation(live);
+        let d = v.model.lives[live].transcript.drawn().cloned().expect("a board");
+        let id = cards_spec::block::BlockId::parse("r1").expect("an id");
+        assert!(v.wishes.desires.dismiss(&conv, &d.generation.expect("a generation"), &id, &d.visibility).is_ok());
+        v.pump_wishes(cx);
+    });
+    super::rail_wishes_ui_tests::written(cx, &view);
+    mouse(cx, w, show, "up");
+    landed(cx, w, &view);
+    away(cx, w);
+    wait(cx, w, &view, 300);
+    assert!(sec(cx, &view, "r2").is_some(), "r2 shown");
+    assert!(has(cx, w, tomb_of("r1")), "r1's new tombstone untouched");
+    told(cx, w, &view, "three", "three\n[block r1 v6 dismissed]\n[block r2 v7 shown]", "r1 as dismissed, r2 shown");
+}
+
+/// Shady #110 P2-5: the lease compares what draws now with what the new
+/// board draws once it landed (its settle run). `b` and `c` dismissed by
+/// the history, shown again here (local Shows): another desk's later
+/// dismissal of `c`, under the pointer, waits (its settle ends the Show:
+/// a tombstone), and draws on release; so does one of `b`, a row above
+/// it. The history acknowledging a Show (nothing changes) lands at once.
+#[gpui_kit::test]
+fn a_settle_that_ends_a_local_show_waits_under_the_pointer(cx: &mut TestAppContext) {
+    let mut h: Vec<Value> = call("toolu_s1", json!([note_op("b")])).into();
+    h.extend(call("toolu_s2", json!([note_op("c")])));
+    h.push(user("noted\n[block b v1, c v2 dismissed]"));
+    let (w, view) = settled_with(cx, h);
+    assert!(has(cx, w, tomb_of("b")) && has(cx, w, tomb_of("c")), "dismissed by the history");
+    for name in ["c", "b"] {
+        let at_ = drawn(cx, w, tomb_of(name)).center();
+        click(cx, w, at_);
+        landed(cx, w, &view);
+        away(cx, w);
+        wait(cx, w, &view, 300);
+    }
+    assert!(has(cx, w, format!("block-head {}", row("b"))) && has(cx, w, format!("block-head {}", row("c"))), "shown here");
+    assert_eq!(desires(cx, &view), 2);
+    let over = |cx: &mut TestAppContext, what: String| {
+        let at_ = drawn(cx, w, what).center();
+        mouse(cx, w, at_, "move");
+    };
+    // c's: under the pointer.
+    over(cx, format!("block-head {}", row("c")));
+    super::answer_tests::land(cx, w, &view, vec![user("x\n[block c v5 dismissed]"), said_ok()]);
+    assert!(waiting(cx, &view), "its settle ends c's Show: the board waits");
+    assert!(has(cx, w, format!("block-head {}", row("c"))), "c drawn as it was");
+    away(cx, w);
+    wait(cx, w, &view, 2000);
+    assert!(!waiting(cx, &view) && has(cx, w, tomb_of("c")), "drawn on release: c's tombstone");
+    // b's: a row above the pointer.
+    over(cx, tomb_of("c"));
+    super::answer_tests::land(cx, w, &view, vec![user("y\n[block b v6 dismissed]"), said_ok()]);
+    assert!(waiting(cx, &view), "a row above changes: the board waits");
+    away(cx, w);
+    wait(cx, w, &view, 2000);
+    assert!(!waiting(cx, &view) && has(cx, w, tomb_of("b")), "drawn on release: b's tombstone");
+    assert_eq!(desires(cx, &view), 0, "both settled");
+    // A Show the history acknowledges: nothing changes, it lands.
+    let at_ = drawn(cx, w, tomb_of("c")).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    away(cx, w);
+    wait(cx, w, &view, 300);
+    assert_eq!(desires(cx, &view), 1);
+    over(cx, format!("block-head {}", row("c")));
+    super::answer_tests::land(cx, w, &view, vec![user("z\n[block c v7 shown]"), said_ok()]);
+    assert!(!waiting(cx, &view), "acknowledged as drawn: it lands at once");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "settled");
+    assert!(has(cx, w, format!("block-head {}", row("c"))));
 }
 
 /// Soft dismissals of `ids` carried into the pane's conversation (a

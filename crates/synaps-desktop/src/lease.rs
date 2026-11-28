@@ -303,18 +303,27 @@ impl AppView {
         // A hover the board drawn doesn't hold is stale (its block went
         // with a board drawn since): nothing of it is under the pointer.
         let Some((oi, oj, os)) = find_in(old, &op, hover.row) else { return false };
+        // Another generation (a compaction, a history replaced) carries or
+        // drops this desk's wishes as it lands: what it then draws isn't
+        // known here, so it waits.
+        if old.generation != new.generation {
+            return true;
+        }
         let Some((ni, nj, ns)) = find_in(new, &np, hover.row) else { return true };
         let Some(m) = self.panes.cur.metrics_last.get() else { return true };
         let p = &self.panes.cur;
         let g = Geom { cpl: crate::blocks::note_cpl(p.layout.column, &m), more: &p.block_more, folds: &p.block_folds };
         // What this desk draws of a block (D6b): its tombstone or its stub
-        // is one line, whatever its body.
-        let look = |d: &Drawn, s: &Shown| hash(self.look_on(d, s));
+        // is one line, whatever its body; a group's members' too. What
+        // draws now (`old`), against what `new` draws once it landed: its
+        // settle may end a desire that draws now (Shady #110 P2-5).
+        let look_old = |s: &Shown| hash((self.look_on(old, s), s.members.iter().map(|m| self.look_on(old, m)).collect::<Vec<_>>()));
+        let look_new = |s: &Shown| hash((self.look_landed(new, s), s.members.iter().map(|m| self.look_landed(new, m)).collect::<Vec<_>>()));
         // A target as painted last (the hover's tag is the one the pointer
         // came in over: a replacement drawn since is what is under it now).
         let painted = lease.painted.borrow();
         let shown = |t: Target| painted.get(&t.row).map_or(t.tag, |p| p.tag);
-        if (ni, nj) != (oi, oj) || ns.block.tag != shown(hover) || shape(ns, &g) != shape(os, &g) || look(new, ns) != look(old, os) {
+        if (ni, nj) != (oi, oj) || ns.block.tag != shown(hover) || shape(ns, &g) != shape(os, &g) || look_new(ns) != look_old(os) {
             return true;
         }
         // Its members are targets too (Shady #101 R2-3): the same ones, the
@@ -347,19 +356,20 @@ impl AppView {
             seen.push(id);
             // A row's blocks as drawn: their shapes and looks, its own then
             // the sections put there, the first `n`.
-            let drawn = |d: &Drawn, pinned: &crate::blocks::Pinned, n: usize| {
+            let drawn = |d: &Drawn, pinned: &crate::blocks::Pinned, n: usize, look: &dyn Fn(&Shown) -> u64| {
                 let own = d.rows.get(&id).map_or(&[][..], |r| &r.blocks[..]);
                 let theirs = pinned.get(&id).map_or(&[][..], Vec::as_slice);
-                hash(own.iter().chain(theirs).take(n).map(|s| (shape(s, &g), look(d, s))).collect::<Vec<_>>())
+                hash(own.iter().chain(theirs).take(n).map(|s| (shape(s, &g), look(s))).collect::<Vec<_>>())
             };
             if id == oi {
                 // Its own anchor: the blocks before it there.
-                if drawn(old, &op, oj) != drawn(new, &np, oj) {
+                if drawn(old, &op, oj, &look_old) != drawn(new, &np, oj, &look_new) {
                     return true;
                 }
                 continue;
             }
-            if shapes(old.rows.get(&id), &g) != shapes(new.rows.get(&id), &g) || drawn(old, &op, usize::MAX) != drawn(new, &np, usize::MAX)
+            if shapes(old.rows.get(&id), &g) != shapes(new.rows.get(&id), &g)
+                || drawn(old, &op, usize::MAX, &look_old) != drawn(new, &np, usize::MAX, &look_new)
             {
                 return true;
             }
@@ -412,11 +422,16 @@ impl AppView {
         // What it settled or carried, written (D6b: not only a click's).
         self.pump_wishes(cx);
         // The panes' caches keep only the blocks this board draws (§1.8:
-        // renderer caches are bounded, per pane).
+        // renderer caches are bounded, per pane): its rows' own, and the
+        // rail's sections the user put into the transcript (D6b), as the
+        // rows are built ([`AppView::pinned_in`], once it landed).
+        let pinned = self.pinned_in(live, &drawn);
         let rows: std::collections::HashSet<u64> = drawn
             .rows
             .values()
-            .flat_map(|r| r.blocks.iter().flat_map(|s| std::iter::once(s).chain(&s.members)))
+            .flat_map(|r| r.blocks.iter())
+            .chain(pinned.values().flatten())
+            .flat_map(|s| std::iter::once(s).chain(&s.members))
             .map(|s| crate::blocks::row_id(&s.block.id))
             .collect();
         for p in self.panes.iter_mut().filter(|p| p.live == live) {

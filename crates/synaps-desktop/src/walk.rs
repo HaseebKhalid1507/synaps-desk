@@ -1305,6 +1305,40 @@ impl AppView {
         cx.notify();
     }
 
+    /// Pointer-up on group member `row`'s tombstone, its `u` (`act`): the
+    /// press's target acts only if it is this one, and the bound board
+    /// still holds it as painted: the same incarnation, in the group it
+    /// was painted in ([`AppView::block_up`]'s check), the same tombstone
+    /// ([`AppView::hover_up`]'s). Else nothing, and the note. (A member
+    /// isn't walked: no undo of it is kept.)
+    pub(crate) fn member_tomb_up(&mut self, row: u64, act: Hover, window: &mut Window, cx: &mut Context<Self>) {
+        let l = &mut self.panes.cur.lease;
+        l.pressed = false;
+        let Some(down) = l.down.take().filter(|d| d.at.row == row && d.act == crate::lease::Act::Hover(act)) else { return };
+        let Hover::Show(token) = act else { return };
+        let board = self.bound_board();
+        let found = board.as_deref().and_then(|d| {
+            let (s, group) = crate::lease::find_any(d, row)?;
+            let tag = |s: &Shown| s.bound.as_ref().map(|b| b.tag);
+            let in_it =
+                group.zip(down.group).is_some_and(|(g, was)| (crate::blocks::row_id(&g.block.id), tag(g)) == (was.row, Some(was.tag)));
+            let tomb = matches!(self.look_on(d, s), crate::rail_wishes::Look::Tomb { token: t, .. } if t == token);
+            (in_it && tomb && tag(s) == Some(down.at.tag)).then(|| s.clone())
+        });
+        match (board, found) {
+            (Some(board), Some(s)) if self.block_drawn(row).is_some() => {
+                let conv = self.conversation(self.panes.cur.live);
+                let f = Found { place: self.block_desires().placed(&conv, &s.block), s, tomb: Some(token) };
+                let _ = self.wish_now(At::Block(row), Wish::Show, &board, &f, window, cx);
+            }
+            _ => self.panes.cur.lease.note = Some((row, CHANGED)),
+        }
+        if self.model.lives.ids().into_iter().any(|l| self.model.lives[l].board.waiting.is_some()) {
+            self.arm_lease_wake(cx);
+        }
+        cx.notify();
+    }
+
     /// Pointer-up on rail section `row`'s hover action `act`: as
     /// [`AppView::rail_up`].
     pub(crate) fn rail_hover_up(&mut self, row: u64, act: Hover, window: &mut Window, cx: &mut Context<Self>) {

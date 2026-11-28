@@ -571,6 +571,88 @@ impl AppView {
         Some(crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element())
     }
 
+    /// Group member `ms` (row `mid`, of the group painted as `group`) as
+    /// this desk draws it dismissed (D6b, §3.5): its tombstone, a line on
+    /// the members' ground in its place in the group, nothing of its
+    /// content. Its click is its `u`, checked as a member's press is (the
+    /// same incarnation, in the group it was painted in) and as a
+    /// tombstone's (the one painted): [`AppView::member_tomb_up`]. `None`:
+    /// it draws whole.
+    #[allow(clippy::too_many_arguments)]
+    fn member_tomb(
+        &self,
+        ms: &Shown,
+        mid: u64,
+        group: crate::lease::Target,
+        g: &Geo,
+        p: &Palette,
+        m: &Metrics,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let crate::rail_wishes::Look::Tomb { text, token } = self.drawn_look(ms) else { return None };
+        let pane = self.panes.cur.id;
+        let mtag = ms.block.tag;
+        let gid = group.row;
+        let act = crate::walk::Hover::Show(token);
+        let press = crate::lease::Press {
+            at: crate::lease::Target { row: mid, tag: mtag },
+            act: crate::lease::Act::Hover(act),
+            group: Some(group),
+        };
+        let says = self.panes.cur.lease.note.filter(|n| n.0 == mid).map(|n| n.1);
+        let t = crate::ask::shown(&text, cards_spec::Lines::Single);
+        let el = h_flex()
+            .id(("block-member-tomb", mid))
+            .debug_selector(move || format!("block-member-tomb {gid} {mid} {t}"))
+            .relative()
+            .h(px((24. * m.r).round()))
+            .w_full()
+            .gap(px(g.gap))
+            .items_center()
+            .whitespace_nowrap()
+            .bg(p.well_d)
+            .pl(px(g.pad))
+            .pr(px(g.pad))
+            .cursor_pointer()
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .child(crate::ask::shown(&text, cards_spec::Lines::Single)),
+            )
+            .children(says.map(|n| {
+                div()
+                    .flex_none()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.acc)
+                    .debug_selector(move || format!("block-says {mid} {n}"))
+                    .child(n)
+            }))
+            // Its own target, moving with its group (§6.2).
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag, gid))
+            .on_hover(cx.listener(move |this, over: &bool, _, _| this.member_hover(pane, mid, mtag, *over)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.block_down(pane, press, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.in_pane(pane, |this| this.member_tomb_up(mid, act, window, cx));
+                }),
+            );
+        Some(el.into_any_element())
+    }
+
     /// The lease's note on block row `id` (§6.2), until the next input:
     /// over its header's end, where `rN` and the state are (they are back
     /// at the next input), on the header's own ground, wrapped to two
@@ -1128,6 +1210,12 @@ impl AppView {
                 let group = crate::lease::Target { row: id, tag: s.block.tag };
                 for mshown in &s.members {
                     let mid = row_id(&mshown.block.id);
+                    // One this desk draws dismissed: its tombstone, in its
+                    // place in the group (Shady #110 P2-1).
+                    if let Some(line) = self.member_tomb(mshown, mid, group, g, p, m, cx) {
+                        col = col.child(line);
+                        continue;
+                    }
                     let folded = self.panes.cur.block_folds.folded(mid, mshown);
                     // A member is its own target (§6.2): its fold, never
                     // its group's; its group the one it was painted in.
