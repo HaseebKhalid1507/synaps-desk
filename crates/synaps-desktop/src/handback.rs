@@ -405,6 +405,23 @@ impl HandBacks {
         true
     }
 
+    /// Session `from` followed to a new id `to`, the same conversation (a
+    /// follow, a merge: [`crate::drafts::Drafts::follow`]): its memo is
+    /// `to`'s, as an attach finds it (its history is the daemon's word now),
+    /// so what it had out settles on `to`'s view, its draft with it. A memo
+    /// `to` keeps already stays `to`'s, and `from`'s where it is: B4's memos
+    /// don't merge.
+    pub(crate) fn follow(&mut self, from: &str, to: &str, now: Instant) {
+        if from == to || self.by.contains_key(to) {
+            return;
+        }
+        let Some(m) = self.by.remove(from) else { return };
+        self.taken.remove(from);
+        self.by.insert(to.to_string(), m);
+        self.on(to, Heard::Attached, now);
+        self.changes += 1;
+    }
+
     /// A session event (a `Refused` is [`HandBacks::refused`]'s: it names
     /// no text, and the window's wire order does). An attach ends what was
     /// taken in (its history is the daemon's word now); an `Idle`, the

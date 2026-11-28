@@ -1120,6 +1120,8 @@ impl AppView {
     /// every pane's editing of them, its open field and text kept.
     pub(crate) fn drafts_follow(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let gone = self.block_drafts.follow(from, to);
+        // Their hand-backs' delivery follows too (D8b).
+        self.model.memos.edits.follow(from, to, std::time::Instant::now());
         for p in self.panes.iter_mut() {
             if let Some(e) = p.edit.at.as_mut().filter(|e| e.session == from && !gone.contains(&e.key)) {
                 e.session = to.to_string();

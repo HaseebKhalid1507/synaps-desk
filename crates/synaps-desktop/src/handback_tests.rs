@@ -219,3 +219,31 @@ fn a_refusal_of_an_entry_that_isnt_the_oldest_sending_refuses_nothing() {
     assert_eq!(states(&h), (Some(M::NotSent), Some(M::Sending)));
     assert!(!h.refused("s", &a, "busy", now), "not sending now: nothing");
 }
+
+/// D8a's follow (Shady #114 P2-4) meets D8b: a session that followed to a
+/// new id takes its hand-backs' memo along, as an attach finds it (what
+/// was sending is checked on the new view); a memo the new id keeps
+/// already stays, and the one that came stays where it was.
+#[test]
+fn a_followed_session_takes_its_hand_backs_along() {
+    use cards_spec::memo::State as M;
+    let st = board(&[plan("p")]);
+    let d = drawn(st.clone());
+    let t = Transcript::new();
+    let mut h = HandBacks::default();
+    let now = Instant::now();
+    let e = edit(&st, "p", json!({"steps.fix.state":"skipped"}));
+    let a = h.hand_back("s", &e, &line1("skip fix"), &Trailer::default(), &t, Some(&d), now).unwrap();
+    h.follow("s", "s2", now);
+    assert!(h.get("s", &a).is_none(), "gone from the old id");
+    assert_eq!(h.get("s2", &a).map(|x| x.state), Some(M::Checking), "the new id's, checked on its view");
+    let (by, taken) = h.sessions();
+    assert!(taken.iter().all(|x| by.contains(x)));
+    // The new id has a memo of its own: nothing moves.
+    let b = h
+        .hand_back("s3", &edit(&st, "p", json!({"steps.deploy.stop":true})), &line1("stop"), &Trailer::default(), &t, Some(&d), now)
+        .unwrap();
+    h.follow("s3", "s2", now);
+    assert_eq!(h.get("s3", &b).map(|x| x.state), Some(M::Sending), "stays where it was");
+    assert_eq!(h.get("s2", &a).map(|x| x.state), Some(M::Checking));
+}
