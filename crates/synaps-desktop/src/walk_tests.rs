@@ -1047,14 +1047,22 @@ fn stub_of(name: &str, more: &str) -> String {
     format!("block-stub {} ◇ {name} · in the rail · p{more}", row(name))
 }
 
-/// The last message sent, after `text` is: what rode it.
-fn send(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str) -> String {
+/// `text` sent (the walk left first): the message is `want`, what rode it
+/// included. Sending needs the view tests' daemon, a unix socket
+/// (`AppView::enter`): elsewhere the walk is only left.
+fn told(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, want: &str, what: &str) {
     if walking(cx, w, view) {
         press(cx, w, "escape");
     }
-    view.update(cx, |v, cx| assert!(v.enter(text.into(), cx)));
-    landed(cx, w, view);
-    view.read_with(cx, |v, _| v.wishes.outbox.last().cloned()).unwrap_or_default()
+    #[cfg(unix)]
+    {
+        view.update(cx, |v, cx| assert!(v.enter(text.into(), cx)));
+        landed(cx, w, view);
+        let sent = view.read_with(cx, |v, _| v.wishes.outbox.last().cloned());
+        assert_eq!(sent.as_deref(), Some(want), "{what}");
+    }
+    #[cfg(not(unix))]
+    let _ = (text, want, what);
 }
 
 /// A one-line row's height at the pane's text step: §3.5's 24 px.
@@ -1119,7 +1127,7 @@ fn x_and_u_on_a_transcript_block_draw_what_they_tell_the_agent(cx: &mut TestAppC
     assert!(!outline && !round, "square, no outline");
     assert!(fills.contains(&card), "on the card's ground: {fills:?}");
     // v2: the cancelled one's version is never minted again.
-    assert_eq!(send(cx, w, &view, "go on"), "go on\n[block c v2 dismissed]", "told as drawn");
+    told(cx, w, &view, "go on", "go on\n[block c v2 dismissed]", "told as drawn");
     assert!(has(cx, w, tomb_of("c")), "still its tombstone");
     enter(cx, w, &view);
     walk_on(cx, w, &view, At::Block(c));
@@ -1127,7 +1135,7 @@ fn x_and_u_on_a_transcript_block_draw_what_they_tell_the_agent(cx: &mut TestAppC
     press(cx, w, "u");
     landed(cx, w, &view);
     assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, tomb_of("c")), "shown again");
-    assert_eq!(send(cx, w, &view, "and on"), "and on\n[block c v3 shown]", "told as drawn");
+    told(cx, w, &view, "and on", "and on\n[block c v3 shown]", "told as drawn");
     restart(cx, w, &view);
     assert!(has(cx, w, format!("block-head {c}")), "a restart keeps it");
 }
@@ -1155,7 +1163,7 @@ fn a_transcript_tombstones_click_shows_its_block(cx: &mut TestAppContext) {
     landed(cx, w, &view);
     assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, tomb_of("c")), "shown again");
     assert_eq!(desires(cx, &view), 0, "unsent: cancelled");
-    assert_eq!(send(cx, w, &view, "go on"), "go on", "nothing to tell");
+    told(cx, w, &view, "go on", "go on", "nothing to tell");
 }
 
 /// `p` on a transcript block pins it into the rail (§3.5) and leaves its
@@ -1188,7 +1196,7 @@ fn a_pin_leaves_its_stub_in_the_transcript(cx: &mut TestAppContext) {
     landed(cx, w, &view);
     assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
     assert!(has(cx, w, format!("block-head {c}")), "the block, where the agent has it");
-    assert_eq!(send(cx, w, &view, "go on"), "go on", "presentation: nothing told");
+    told(cx, w, &view, "go on", "go on", "presentation: nothing told");
 }
 
 /// `p` on an agent's rail section puts it into the transcript (§3.5), at
@@ -1213,7 +1221,7 @@ fn p_puts_an_agents_rail_section_into_the_transcript_and_back(cx: &mut TestAppCo
         (ix(r1), ix(row("c")))
     });
     assert!(r1_ix > c_ix, "at its creating call, after the run before it: {r1_ix} vs {c_ix}");
-    assert_eq!(send(cx, w, &view, "go on"), "go on", "presentation: nothing told");
+    told(cx, w, &view, "go on", "go on", "presentation: nothing told");
     enter(cx, w, &view);
     walk_to(cx, w, &view, At::Block(r1));
     press(cx, w, "p");
@@ -1325,7 +1333,7 @@ fn the_palettes_block_commands_act_on_the_walked_block(cx: &mut TestAppContext) 
     landed(cx, w, &view);
     assert!(view.read_with(cx, |v, _| v.palette.is_none()), "closed");
     assert!(has(cx, w, tomb_of("c")), "dismissed: its tombstone");
-    assert_eq!(send(cx, w, &view, "go on"), "go on\n[block c v1 dismissed]", "told as drawn");
+    told(cx, w, &view, "go on", "go on\n[block c v1 dismissed]", "told as drawn");
     // On its tombstone: `u` shows it, `p` isn't offered.
     let pick = |cx: &mut TestAppContext, query: &str| {
         cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(Mode::Commands, window, cx))).expect("the window");
@@ -1344,7 +1352,7 @@ fn the_palettes_block_commands_act_on_the_walked_block(cx: &mut TestAppContext) 
     walk_on(cx, w, &view, At::Block(row("c")));
     pick(cx, "show the walked");
     assert!(has(cx, w, format!("block-head {}", row("c"))) && !has(cx, w, tomb_of("c")), "shown again");
-    assert_eq!(send(cx, w, &view, "and on"), "and on\n[block c v2 shown]", "told as drawn");
+    told(cx, w, &view, "and on", "and on\n[block c v2 shown]", "told as drawn");
     // `p` on a transcript block: its stub.
     enter(cx, w, &view);
     walk_on(cx, w, &view, At::Block(row("c")));
