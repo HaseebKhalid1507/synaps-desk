@@ -122,7 +122,7 @@ pub(crate) trait RailVisibility {
     /// agent's sections. One the board doesn't hold as a live top-level
     /// block (in the rail or the transcript) is skipped; a transcript
     /// block listed here is pinned into the rail (its transcript stub is
-    /// D6b's to draw).
+    /// D6b's, `crate::rail_wishes::Look`).
     fn placed(&self) -> &[(Ref, Slot)] {
         &[]
     }

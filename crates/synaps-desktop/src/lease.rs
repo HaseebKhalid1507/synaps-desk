@@ -254,10 +254,22 @@ fn find(d: &Drawn, row: u64) -> Option<(u64, usize, &Shown)> {
     })
 }
 
+/// [`find`], or among the rail's sections `pinned` puts into the
+/// transcript (after their row's own blocks).
+fn find_in<'a>(d: &'a Drawn, pinned: &'a crate::blocks::Pinned, row: u64) -> Option<(u64, usize, &'a Shown)> {
+    find(d, row).or_else(|| {
+        pinned.iter().find_map(|(item, list)| {
+            let j = list.iter().position(|s| crate::blocks::row_id(&s.block.id) == row)?;
+            Some((*item, d.rows.get(item).map_or(0, |r| r.blocks.len()) + j, &list[j]))
+        })
+    })
+}
+
 /// Block row `row` on board `d`, a top-level block or a group's member,
-/// and for a member its group.
+/// and for a member its group: a transcript row's, or a rail section's
+/// (one the user put into the transcript draws a row there).
 pub(crate) fn find_any(d: &Drawn, row: u64) -> Option<(&Shown, Option<&Shown>)> {
-    d.rows.values().flat_map(|rb| rb.blocks.iter()).find_map(|s| {
+    d.rows.values().flat_map(|rb| rb.blocks.iter()).chain(d.rail.iter().flatten()).find_map(|s| {
         if crate::blocks::row_id(&s.block.id) == row {
             return Some((s, None));
         }
@@ -284,18 +296,34 @@ impl AppView {
         let lease = &self.panes.cur.lease;
         let Some(hover) = lease.hover.filter(|_| lease.active(self.fx.now())) else { return false };
         let Some(old) = old else { return false };
+        // The rail's sections the user put into the transcript draw rows
+        // too (D6b): after their creating call's own.
+        let live = self.panes.cur.live;
+        let (op, np) = (self.pinned_in(live, old), self.pinned_in(live, new));
         // A hover the board drawn doesn't hold is stale (its block went
         // with a board drawn since): nothing of it is under the pointer.
-        let Some((oi, oj, os)) = find(old, hover.row) else { return false };
-        let Some((ni, nj, ns)) = find(new, hover.row) else { return true };
+        let Some((oi, oj, os)) = find_in(old, &op, hover.row) else { return false };
+        // Another generation (a compaction, a history replaced) carries or
+        // drops this desk's wishes as it lands: what it then draws isn't
+        // known here, so it waits.
+        if old.generation != new.generation {
+            return true;
+        }
+        let Some((ni, nj, ns)) = find_in(new, &np, hover.row) else { return true };
         let Some(m) = self.panes.cur.metrics_last.get() else { return true };
         let p = &self.panes.cur;
         let g = Geom { cpl: crate::blocks::note_cpl(p.layout.column, &m), more: &p.block_more, folds: &p.block_folds };
+        // What this desk draws of a block (D6b): its tombstone or its stub
+        // is one line, whatever its body; a group's members' too. What
+        // draws now (`old`), against what `new` draws once it landed: its
+        // settle may end a desire that draws now (Shady #110 P2-5).
+        let look_old = |s: &Shown| hash((self.look_on(old, s), s.members.iter().map(|m| self.look_on(old, m)).collect::<Vec<_>>()));
+        let look_new = |s: &Shown| hash((self.look_landed(new, s), s.members.iter().map(|m| self.look_landed(new, m)).collect::<Vec<_>>()));
         // A target as painted last (the hover's tag is the one the pointer
         // came in over: a replacement drawn since is what is under it now).
         let painted = lease.painted.borrow();
         let shown = |t: Target| painted.get(&t.row).map_or(t.tag, |p| p.tag);
-        if (ni, nj) != (oi, oj) || ns.block.tag != shown(hover) || shape(ns, &g) != shape(os, &g) {
+        if (ni, nj) != (oi, oj) || ns.block.tag != shown(hover) || shape(ns, &g) != shape(os, &g) || look_new(ns) != look_old(os) {
             return true;
         }
         // Its members are targets too (Shady #101 R2-3): the same ones, the
@@ -326,17 +354,23 @@ impl AppView {
                 continue;
             }
             seen.push(id);
+            // A row's blocks as drawn: their shapes and looks, its own then
+            // the sections put there, the first `n`.
+            let drawn = |d: &Drawn, pinned: &crate::blocks::Pinned, n: usize, look: &dyn Fn(&Shown) -> u64| {
+                let own = d.rows.get(&id).map_or(&[][..], |r| &r.blocks[..]);
+                let theirs = pinned.get(&id).map_or(&[][..], Vec::as_slice);
+                hash(own.iter().chain(theirs).take(n).map(|s| (shape(s, &g), look(s))).collect::<Vec<_>>())
+            };
             if id == oi {
                 // Its own anchor: the blocks before it there.
-                let before = |d: &Drawn| {
-                    d.rows.get(&id).map_or(0, |r| hash(r.blocks[..oj.min(r.blocks.len())].iter().map(|s| shape(s, &g)).collect::<Vec<_>>()))
-                };
-                if before(old) != before(new) {
+                if drawn(old, &op, oj, &look_old) != drawn(new, &np, oj, &look_new) {
                     return true;
                 }
                 continue;
             }
-            if shapes(old.rows.get(&id), &g) != shapes(new.rows.get(&id), &g) {
+            if shapes(old.rows.get(&id), &g) != shapes(new.rows.get(&id), &g)
+                || drawn(old, &op, usize::MAX, &look_old) != drawn(new, &np, usize::MAX, &look_new)
+            {
                 return true;
             }
         }
@@ -363,16 +397,15 @@ impl AppView {
                 // Changed above the view: the pill.
                 let top = this.panes.cur.list.logical_scroll_top().item_ix;
                 let items = this.model.lives[live].transcript.items();
+                // A section put into the transcript is one of its rows (D6b).
+                let op = old.as_deref().map(|o| this.pinned_in(live, o)).unwrap_or_default();
+                let np = this.pinned_in(live, &drawn);
                 let mut above = this.panes.cur.lease.above.borrow_mut();
                 for d in this.panes.cur.disp.iter().take(top) {
                     let crate::turns::Kind::Block { .. } = d.kind else { continue };
                     let Some(item) = items.get(d.item) else { continue };
-                    let was = old.as_deref().and_then(|o| find(o, d.id)).map(|(_, _, s)| content(s));
-                    let now_is = drawn
-                        .rows
-                        .get(&item.id)
-                        .and_then(|r| r.blocks.iter().find(|s| crate::blocks::row_id(&s.block.id) == d.id))
-                        .map(content);
+                    let was = old.as_deref().and_then(|o| find_in(o, &op, d.id)).map(|(_, _, s)| content(s));
+                    let now_is = find_in(&drawn, &np, d.id).filter(|(at, ..)| *at == item.id).map(|(_, _, s)| content(s));
                     if now_is.is_some() && was != now_is && !above.contains(&d.id) {
                         above.push(d.id);
                     }
@@ -389,11 +422,16 @@ impl AppView {
         // What it settled or carried, written (D6b: not only a click's).
         self.pump_wishes(cx);
         // The panes' caches keep only the blocks this board draws (§1.8:
-        // renderer caches are bounded, per pane).
+        // renderer caches are bounded, per pane): its rows' own, and the
+        // rail's sections the user put into the transcript (D6b), as the
+        // rows are built ([`AppView::pinned_in`], once it landed).
+        let pinned = self.pinned_in(live, &drawn);
         let rows: std::collections::HashSet<u64> = drawn
             .rows
             .values()
-            .flat_map(|r| r.blocks.iter().flat_map(|s| std::iter::once(s).chain(&s.members)))
+            .flat_map(|r| r.blocks.iter())
+            .chain(pinned.values().flatten())
+            .flat_map(|s| std::iter::once(s).chain(&s.members))
             .map(|s| crate::blocks::row_id(&s.block.id))
             .collect();
         for p in self.panes.iter_mut().filter(|p| p.live == live) {

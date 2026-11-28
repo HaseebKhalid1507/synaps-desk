@@ -102,6 +102,13 @@ pub struct Pane {
     /// The pointer lease and painted targets ([`crate::lease`]).
     pub(crate) lease: crate::lease::Lease,
     pub(crate) block_more: HashSet<u64>,
+    /// The agent's rail sections the user put into this transcript (§3.5's
+    /// `p`), by their creating call's row, as the list was built with them
+    /// ([`AppView::sync_pinned`]); and the block rows this desk draws in
+    /// one line, a tombstone or a stub, as last measured
+    /// ([`AppView::sync_looks`]).
+    pub(crate) pinned_in: crate::blocks::Pinned,
+    pub(crate) looks: HashMap<u64, crate::rail_wishes::Look>,
     pub(crate) block_scroll: std::cell::RefCell<HashMap<u64, gpui_kit::ScrollHandle>>,
     /// The history the block state above is of: its session and
     /// generation ([`crate::blocks::history_of`], [`Pane::blocks_over`]).
@@ -501,6 +508,8 @@ impl Pane {
             block_folds: Default::default(),
             lease: Default::default(),
             block_more: HashSet::new(),
+            pinned_in: Default::default(),
+            looks: HashMap::new(),
             block_scroll: Default::default(),
             block_of: 0,
             unfold_hold: Vec::new(),

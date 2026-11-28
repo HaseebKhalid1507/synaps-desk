@@ -1,7 +1,11 @@
 //! Blocks in the transcript, drawn (synaps-cards `docs/blocks.md` v1.3:
-//! §1.2 places, §1.5 kinds, §6 look, heights and motion). Read-only (D5):
-//! the agent's blocks as the board publishes them ([`crate::board`]); the
-//! user may fold one locally, nothing else.
+//! §1.2 places, §1.5 kinds, §6 look, heights and motion). The agent's
+//! blocks as the board publishes them ([`crate::board`]), and what this
+//! desk's presentation makes of them (D6b, §3.5): a dismissed block draws
+//! as its one-line tombstone, one pinned into the rail as its stub
+//! ([`AppView::block_line`]), and an agent's rail section the user put
+//! into the transcript draws after its creating call's own blocks
+//! ([`Pinned`]).
 //!
 //! **Rows.** A block call the board binds, or will (pending), draws no row
 //! of its own; an unbound one is a plain tool row, the fail-safe (§1.6).
@@ -90,16 +94,38 @@ pub(crate) fn silent(it: &Item, board: bool) -> bool {
     }
 }
 
+/// The agent's rail sections the user put into the transcript (§3.5's
+/// `p`), by their creating call's row: they draw after its own blocks
+/// ([`row_block`]).
+pub(crate) type Pinned = HashMap<u64, Vec<Shown>>;
+
+/// A pinned-in section's content as its row's rev sees it: a change the
+/// agent makes to it remeasures its row, as its own row's rev does.
+fn pinned_rev(s: &Shown) -> u64 {
+    let b = &s.block;
+    hash((
+        b.tag,
+        b.rev,
+        b.collapsed,
+        b.pending,
+        s.bound.as_ref().map(|x| (x.tag, x.rev)),
+        s.members.iter().map(pinned_rev).collect::<Vec<_>>(),
+    ))
+}
+
 /// The rows of the blocks anchored at `items[range]`, in order, after
-/// `out`'s last. `joined`: under a converted card's receipt (no gap).
-pub(crate) fn rows(items: &[Item], range: Range<usize>, out: &mut Vec<Disp>, agent: &mut bool, joined: bool) {
+/// `out`'s last: each row's own, then those `pinned` puts there.
+/// `joined`: under a converted card's receipt (no gap).
+pub(crate) fn rows(items: &[Item], range: Range<usize>, out: &mut Vec<Disp>, agent: &mut bool, joined: bool, pinned: &Pinned) {
     for k in range {
-        let Some(b) = items[k].blocks.as_deref() else { continue };
-        for (j, s) in b.blocks.iter().enumerate() {
+        let own = items[k].blocks.as_deref().map_or(&[][..], |b| &b.blocks[..]);
+        let theirs = pinned.get(&items[k].id).map_or(&[][..], Vec::as_slice);
+        for (j, s) in own.iter().chain(theirs).enumerate() {
+            let rev = if j < own.len() { items[k].rev } else { pinned_rev(s) };
             out.push(Disp {
                 item: k,
                 id: row_id(&s.block.id),
-                rev: items[k].rev ^ (j as u64).rotate_left(40),
+                rev: rev ^ (j as u64).rotate_left(40),
                 kind: Kind::Block { at: j as u16 },
                 gap: if joined && j == 0 { Gap::None } else { Gap::Part },
                 who: if *agent { Who::None } else { Who::Agent },
@@ -107,6 +133,14 @@ pub(crate) fn rows(items: &[Item], range: Range<usize>, out: &mut Vec<Disp>, age
             *agent = true;
         }
     }
+}
+
+/// Block `at` of `item`'s row as [`rows`] laid it: its own, then the
+/// sections `pinned` puts there.
+pub(crate) fn row_block<'a>(item: &'a Item, at: u16, pinned: &'a Pinned) -> Option<&'a Shown> {
+    let own = item.blocks.as_deref().map_or(&[][..], |b| &b.blocks[..]);
+    let at = at as usize;
+    own.get(at).or_else(|| pinned.get(&item.id)?.get(at - own.len()))
 }
 
 /// A block's sizes at the text step (§6.2).
@@ -385,8 +419,11 @@ impl AppView {
     /// Block row `d` (`at`, its item's `at`th block): its card (module docs).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_block(&self, item: &Item, at: u16, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
-        let Some(s) = item.blocks.as_deref().and_then(|b| b.blocks.get(at as usize)) else { return div().into_any_element() };
+        let Some(s) = row_block(item, at, &self.panes.cur.pinned_in) else { return div().into_any_element() };
         let g = Geo::of(m);
+        if let Some(line) = self.block_line(s, id, &g, p, m, cx) {
+            return line;
+        }
         let fit = Fit::of(self.panes.cur.layout.column);
         let folded = self.panes.cur.block_folds.folded(id, s);
         let streaming = self.model.lives[self.panes.cur.live].shown().busy();
@@ -461,6 +498,159 @@ impl AppView {
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| this.block_down(pane, press, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(move |this, _: &MouseUpEvent, _, cx| this.block_up(pane, id, press.act, cx)));
         crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element()
+    }
+
+    /// Block `s` (row `id`) as this desk draws it in one line, if it does
+    /// (§3.5, [`crate::rail_wishes::Look`]): dismissed, its tombstone; pinned
+    /// into the rail, its stub. A fixed line on the card's ground, no
+    /// spine (the agent's changes to it don't draw here), square, mono in
+    /// the dim ink. A painted target, as the block's header is: a click is
+    /// its key (`u` on a tombstone, `p` on a stub), checked as a hover
+    /// action is; the walk's ring paints a tombstone's token with it.
+    fn block_line(&self, s: &Shown, id: u64, g: &Geo, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::rail_wishes::Look;
+        let (text, tomb, act, kind) = match self.drawn_look(s) {
+            Look::Full => return None,
+            Look::Tomb { text, token } => (text, Some(token), crate::walk::Hover::Show(token), "block-tomb"),
+            Look::Stub { text } => (text, None, crate::walk::Hover::Pin, "block-stub"),
+        };
+        let pane = self.panes.cur.id;
+        let tag = s.block.tag;
+        let says = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1);
+        let t = crate::ask::shown(&text, cards_spec::Lines::Single);
+        let press = crate::lease::Press { at: crate::lease::Target { row: id, tag }, act: crate::lease::Act::Hover(act), group: None };
+        let el = h_flex()
+            .id(("block", id))
+            .debug_selector(move || format!("{kind} {id} {t}"))
+            .relative()
+            .h(px((24. * m.r).round()))
+            .w_full()
+            .gap(px(g.gap))
+            .items_center()
+            .whitespace_nowrap()
+            .bg(p.card_d)
+            .pl(px(g.spine + g.pad))
+            .pr(px(g.pad))
+            .cursor_pointer()
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .child(crate::ask::shown(&text, cards_spec::Lines::Single)),
+            )
+            .children(says.map(|n| {
+                div()
+                    .flex_none()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.acc)
+                    .debug_selector(move || format!("block-says {id} {n}"))
+                    .child(n)
+            }))
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
+            .children(self.walk_ring(crate::walk::At::Block(id), tag, tomb, p))
+            .on_hover(cx.listener(move |this, over: &bool, _, _| this.block_hover(pane, id, tag, *over)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.block_down(pane, press, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.in_pane(pane, |this| this.hover_up(id, act, window, cx));
+                }),
+            );
+        Some(crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el.into_any_element()).into_any_element())
+    }
+
+    /// Group member `ms` (row `mid`, of the group painted as `group`) as
+    /// this desk draws it dismissed (D6b, §3.5): its tombstone, a line on
+    /// the members' ground in its place in the group, nothing of its
+    /// content. Its click is its `u`, checked as a member's press is (the
+    /// same incarnation, in the group it was painted in) and as a
+    /// tombstone's (the one painted): [`AppView::member_tomb_up`]. `None`:
+    /// it draws whole.
+    #[allow(clippy::too_many_arguments)]
+    fn member_tomb(
+        &self,
+        ms: &Shown,
+        mid: u64,
+        group: crate::lease::Target,
+        g: &Geo,
+        p: &Palette,
+        m: &Metrics,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let crate::rail_wishes::Look::Tomb { text, token } = self.drawn_look(ms) else { return None };
+        let pane = self.panes.cur.id;
+        let mtag = ms.block.tag;
+        let gid = group.row;
+        let act = crate::walk::Hover::Show(token);
+        let press = crate::lease::Press {
+            at: crate::lease::Target { row: mid, tag: mtag },
+            act: crate::lease::Act::Hover(act),
+            group: Some(group),
+        };
+        let says = self.panes.cur.lease.note.filter(|n| n.0 == mid).map(|n| n.1);
+        let t = crate::ask::shown(&text, cards_spec::Lines::Single);
+        let el = h_flex()
+            .id(("block-member-tomb", mid))
+            .debug_selector(move || format!("block-member-tomb {gid} {mid} {t}"))
+            .relative()
+            .h(px((24. * m.r).round()))
+            .w_full()
+            .gap(px(g.gap))
+            .items_center()
+            .whitespace_nowrap()
+            .bg(p.well_d)
+            .pl(px(g.pad))
+            .pr(px(g.pad))
+            .cursor_pointer()
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.dim_t)
+                    .child(crate::ask::shown(&text, cards_spec::Lines::Single)),
+            )
+            .children(says.map(|n| {
+                div()
+                    .flex_none()
+                    .font_family(fonts::MONO)
+                    .text_px(m.meta)
+                    .text_color(p.acc)
+                    .debug_selector(move || format!("block-says {mid} {n}"))
+                    .child(n)
+            }))
+            // Its own target, moving with its group (§6.2).
+            .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, mid, mtag, gid))
+            .on_hover(cx.listener(move |this, over: &bool, _, _| this.member_hover(pane, mid, mtag, *over)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.block_down(pane, press, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.in_pane(pane, |this| this.member_tomb_up(mid, act, window, cx));
+                }),
+            );
+        Some(el.into_any_element())
     }
 
     /// The lease's note on block row `id` (§6.2), until the next input:
@@ -1020,6 +1210,12 @@ impl AppView {
                 let group = crate::lease::Target { row: id, tag: s.block.tag };
                 for mshown in &s.members {
                     let mid = row_id(&mshown.block.id);
+                    // One this desk draws dismissed: its tombstone, in its
+                    // place in the group (Shady #110 P2-1).
+                    if let Some(line) = self.member_tomb(mshown, mid, group, g, p, m, cx) {
+                        col = col.child(line);
+                        continue;
+                    }
                     let folded = self.panes.cur.block_folds.folded(mid, mshown);
                     // A member is its own target (§6.2): its fold, never
                     // its group's; its group the one it was painted in.
@@ -1285,7 +1481,7 @@ impl AppView {
         let d = self.panes.cur.disp[ix];
         let Kind::Block { at } = d.kind else { return None };
         let items = self.model.lives[self.panes.cur.live].shown().items();
-        let s = items.get(d.item)?.blocks.as_deref()?.blocks.get(at as usize)?.clone();
+        let s = row_block(items.get(d.item)?, at, &self.panes.cur.pinned_in)?.clone();
         Some((ix, s))
     }
 
@@ -1299,7 +1495,7 @@ impl AppView {
         let items = self.model.lives[self.panes.cur.live].shown().items();
         self.panes.cur.disp.iter().enumerate().find_map(|(ix, d)| {
             let Kind::Block { at } = d.kind else { return None };
-            let s = items.get(d.item)?.blocks.as_deref()?.blocks.get(at as usize)?;
+            let s = row_block(items.get(d.item)?, at, &self.panes.cur.pinned_in)?;
             s.members.iter().find(|m| row_id(&m.block.id) == id).map(|m| (ix, m.clone()))
         })
     }
