@@ -134,7 +134,8 @@ pub enum Answer {
 /// Config requests in order (one channel, many clicks): one write in
 /// flight, the latest value per key queued behind it, each request stamped
 /// and a reply older than one already applied dropped, no read while a
-/// write is out.
+/// write is out. Queued writes whose gate closed wait, nothing out, for a
+/// read to prove it again ([`ConfigOrder::park`]).
 #[derive(Default)]
 pub(crate) struct ConfigOrder {
     seq: u64,
@@ -150,7 +151,7 @@ impl ConfigOrder {
     /// A write: `Some` to send now, `None` queued (replacing an older
     /// value for its key).
     pub fn write(&mut self, key: &'static str, value: Option<String>) -> Option<Send> {
-        if self.writing.is_some() {
+        if self.writing.is_some() || !self.queued.is_empty() {
             self.queued.retain(|q| q.0 != key);
             self.queued.push((key, value));
             return None;
@@ -181,11 +182,7 @@ impl ConfigOrder {
     pub fn written(&mut self) -> (bool, Option<Send>) {
         let key = self.writing.take();
         let newer = key.is_some_and(|k| self.queued.iter().any(|q| q.0 == k));
-        if self.queued.is_empty() {
-            return (newer, None);
-        }
-        let (k, v) = self.queued.remove(0);
-        (newer, self.write(k, v))
+        (newer, self.resume())
     }
 
     /// Another dash or daemon: every reply on its way is stale and the
@@ -195,10 +192,40 @@ impl ConfigOrder {
         self.queued.clear();
     }
 
-    /// The write just taken could not be sent: nothing is out.
-    pub fn abandon(&mut self) {
+    /// The write just taken could not be sent: nothing is out, and what
+    /// waited goes (its keys).
+    pub fn abandon(&mut self) -> Vec<&'static str> {
         self.writing = None;
-        self.queued.clear();
+        self.queued.drain(..).map(|q| q.0).collect()
+    }
+
+    /// The write just taken ([`ConfigOrder::written`]) is not sent yet: it
+    /// waits first in the queue, nothing out (a read may go), until
+    /// [`ConfigOrder::resume`] or [`ConfigOrder::abandon`].
+    pub fn park(&mut self, (_, key, value): Send) {
+        self.writing = None;
+        self.queued.insert(0, (key, value));
+    }
+
+    /// Writes wait, parked: none is out.
+    pub fn parked(&self) -> bool {
+        self.writing.is_none() && !self.queued.is_empty()
+    }
+
+    /// What waits goes on, nothing out: the first to send.
+    pub fn resume(&mut self) -> Option<Send> {
+        if !self.parked() {
+            return None;
+        }
+        let (k, v) = self.queued.remove(0);
+        self.writing = Some(k);
+        self.seq += 1;
+        Some((self.seq, k, v))
+    }
+
+    /// What waits to be sent, in order.
+    pub fn waiting(&self) -> impl Iterator<Item = (&'static str, Option<&str>)> {
+        self.queued.iter().map(|(k, v)| (*k, v.as_deref()))
     }
 
     #[cfg(test)]
@@ -236,6 +263,9 @@ pub(crate) struct DashUi {
     /// Asked for while a find, a read or a write ran: done after it.
     want_config: bool,
     want_usage: bool,
+    /// Settings' REFERENCE values asked for before it was known where the
+    /// daemon runs: read as a find says ([`AppView::dash_found`]).
+    want_reference: bool,
     config_asking: bool,
     today_asking: bool,
     pub order: ConfigOrder,
@@ -245,6 +275,9 @@ pub(crate) struct DashUi {
     /// Finds started (the tests': an `--offline` view never probes).
     #[cfg(test)]
     pub finds: u32,
+    /// Tests: Settings' REFERENCE reads started outside a find.
+    #[cfg(test)]
+    pub reference_reads: u32,
     /// A poll fell while the window was in the background: done on return.
     missed_tick: bool,
     pub poll: Option<Task<()>>,
@@ -252,8 +285,9 @@ pub(crate) struct DashUi {
     /// gate until [`AppView::let_through`].
     #[cfg(test)]
     pub gate: Option<Vec<Landing>>,
-    /// Tests: this machine's Synaps folder, and with it a synthetic view's
-    /// finds run: the channel found as it is, its config read there.
+    /// Tests: this machine's Synaps folder, the daemon's, and with it a
+    /// synthetic view's finds run: the daemon found here, the channel as it
+    /// is, its config read there.
     #[cfg(test)]
     pub base: Option<PathBuf>,
 }
@@ -298,6 +332,20 @@ impl DashUi {
         self.want_config
     }
 
+    /// Tests: `kind`'s hold set to `at`.
+    #[cfg(test)]
+    pub fn hold_at(&mut self, kind: Kind, at: u64) {
+        self.holds[hold(kind)] = at;
+    }
+
+    /// `kind`'s view let go of what it showed: what was asked for under its
+    /// hold drops as it lands. A hold is only compared for equality: it
+    /// wraps (it would alias a ticket after 2^64 releases).
+    fn release(&mut self, kind: Kind) {
+        let h = &mut self.holds[hold(kind)];
+        *h = h.wrapping_add(1);
+    }
+
     pub fn target(&self) -> Option<Target> {
         match &self.found {
             Some(Ok((t, _))) => Some(t.clone()),
@@ -322,6 +370,17 @@ impl DashUi {
     /// `/api/info` names that pid and profile), it answers, and it can lock
     /// the file. `Err`: the first link that is not, in one line.
     pub fn config_gate(&self, daemon: Option<(u32, Option<&str>)>) -> Result<(), String> {
+        self.gate_on(daemon, self.serves.as_ref(), self.config.as_ref())
+    }
+
+    /// [`DashUi::config_gate`] on what `/api/info` said (`serves`) and the
+    /// config read (`config`): a reply's own, shown or not.
+    fn gate_on(
+        &self,
+        daemon: Option<(u32, Option<&str>)>,
+        serves: Option<&Result<Info, String>>,
+        config: Option<&ConfigSnapshot>,
+    ) -> Result<(), String> {
         let Some((pid, profile)) = daemon else { return Err("not connected to a daemon".into()) };
         match &self.local {
             None => return Err("checking where the daemon runs".into()),
@@ -333,7 +392,7 @@ impl DashUi {
             Some(Ok((_, src))) => return Err(format!("the dash is {}, not this daemon's own", src.describe())),
             _ => return Err("this daemon has no synaps-dash".into()),
         }
-        match &self.serves {
+        match serves {
             None => return Err("asking the dash which daemon it serves".into()),
             Some(Err(e)) => return Err(format!("the dash did not say which daemon it serves: {e}")),
             Some(Ok(i)) if !i.serves(pid, profile) => {
@@ -349,7 +408,7 @@ impl DashUi {
         if self.answer != Answer::Up {
             return Err("synaps-dash is not answering".into());
         }
-        match &self.config {
+        match config {
             None => Err("the config is not read yet".into()),
             Some(c) if !c.writable => Err("synaps-dash cannot lock the file".into()),
             Some(_) => Ok(()),
@@ -709,18 +768,20 @@ impl AppView {
     /// pane on screen has it open: a split's other pane may show it.
     pub(crate) fn view_shown(&mut self, opened: bool, cx: &mut Context<Self>) {
         // Let go of: a reply asked for before drops as it lands (its hold
-        // moved on), and a selection waiting for one is not loaded.
+        // moved on), and a load waiting for one (a selection) or for a find
+        // is not made.
         if !self.open_on_screen(Kind::Usage) {
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover, u.queued) = (None, None, None, None, false);
-            self.dash.holds[hold(Kind::Usage)] += 1;
+            self.dash.want_usage = false;
+            self.dash.release(Kind::Usage);
         }
         if !self.open_on_screen(Kind::Settings) {
             self.settings.reference = None;
             self.settings.writes.clear();
             self.dash.config = None;
             self.dash.serves = None;
-            self.dash.holds[hold(Kind::Settings)] += 1;
+            self.dash.release(Kind::Settings);
         }
         // Each opening reads the daemon's place, URL file and config again;
         // shown in a pane not focused (an unfold, a pane closed), Settings
@@ -795,15 +856,16 @@ impl AppView {
             self.dash.finds += 1;
         }
         if self.synthetic {
-            // Tests: found as it is, this machine's config read at `base`.
+            // Tests: the daemon found here, the channel as it is, this
+            // machine's config read at `base`.
             #[cfg(test)]
             if let Some(base) = self.dash.base.clone() {
-                let (local, found) = (self.dash.local.clone(), self.dash.found.clone());
+                let found = self.dash.found.clone();
                 let profile = self.model.daemon.as_ref().and_then(|d| d.profile.clone());
                 return self.find_with(
                     move || {
-                        let reference = matches!(local, Some(Ok(()))).then(|| crate::settings::read_reference(&base, profile.as_deref()));
-                        Probe { socket: None, local, found, reference }
+                        let reference = Some(crate::settings::read_reference(&base, profile.as_deref()));
+                        Probe { socket: None, local: Some(Ok(())), found, reference }
                     },
                     cx,
                 );
@@ -903,7 +965,7 @@ impl AppView {
             // Another store's numbers never stand under this one's header.
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
-            u.generation += 1;
+            u.generation = u.generation.wrapping_add(1);
             self.dash.today = None;
         }
         if matches!(self.dash.answer, Answer::Down(_)) {
@@ -916,6 +978,12 @@ impl AppView {
         }
         if p.socket.is_some() {
             self.dash.socket = p.socket;
+        }
+        // Settings' REFERENCE values, asked for before this find said where
+        // the daemon runs, and not brought by it (asked for under a hold
+        // Settings let go of since).
+        if std::mem::take(&mut self.dash.want_reference) && self.settings.reference.is_none() {
+            self.read_reference(cx);
         }
         let view = self.model.tabs.view();
         if std::mem::take(&mut self.dash.want_config) || view == Some(Kind::Settings) {
@@ -1003,17 +1071,22 @@ impl AppView {
                         v.dash.config_asking = false;
                         let held = v.holds(Kind::Settings, ticket);
                         if v.dash.order.fresh(seq) {
+                            let serves = info.map_err(|e| v.fail_text(&e));
                             if held {
-                                v.dash.serves = Some(info.map_err(|e| v.fail_text(&e)));
+                                v.dash.serves = Some(serves.clone());
                             }
-                            match got {
-                                Ok(c) => {
-                                    v.dash_said(Ok(()), cx);
-                                    if held {
-                                        v.dash.config = Some(c);
-                                    }
-                                }
-                                Err(e) => v.dash_said(Err(&e), cx),
+                            match &got {
+                                Ok(_) => v.dash_said(Ok(()), cx),
+                                Err(e) => v.dash_said(Err(e), cx),
+                            }
+                            // Parked writes take this reply as their proof,
+                            // shown or not.
+                            let proof = v.dash.order.parked().then(|| v.dash.gate_on(v.daemon_id(), Some(&serves), got.as_ref().ok()));
+                            if let (true, Ok(c)) = (held, got) {
+                                v.dash.config = Some(c);
+                            }
+                            if let Some(proof) = proof {
+                                v.settle_writes(proof, held, cx);
                             }
                         }
                         if std::mem::take(&mut v.dash.want_config) {
@@ -1044,7 +1117,11 @@ impl AppView {
     }
 
     fn send_write(&mut self, (seq, key, value): Send, cx: &mut Context<Self>) {
-        let Some(t) = self.dash.target() else { return self.dash.order.abandon() };
+        let Some(t) = self.dash.target() else {
+            // Never: the gate it passed needs the dash's URL.
+            self.dash.order.abandon();
+            return;
+        };
         let body = dash::config_body(key, value.as_deref());
         let ticket = self.ticket(Kind::Settings);
         cx.spawn(async move |this, cx| {
@@ -1091,16 +1168,19 @@ impl AppView {
                         }
                         match next {
                             Some(n) if v.config_gate().is_ok() => v.send_write(n, cx),
-                            Some(_) => {
-                                // The gate closed meanwhile: what waited is not sent, and says why.
-                                let why = format!("not sent: {}", v.config_gate().err().unwrap_or_default());
-                                v.dash.order.abandon();
-                                for w in v.settings.writes.values_mut().filter(|w| matches!(w, Write::Sending(_))) {
-                                    *w = Write::Refused(why.clone());
-                                }
+                            Some(n) => {
+                                // The gate closed meanwhile (Settings let go of
+                                // what proved it, or the dash said it is down):
+                                // what waited is parked for a read to prove it
+                                // again ([`AppView::settle_writes`]).
+                                v.dash.order.park(n);
+                                v.dash.want_config = true;
                             }
-                            None if std::mem::take(&mut v.dash.want_config) => v.ask_config(cx),
                             None => {}
+                        }
+                        // Every end of a write: the read that waited on it.
+                        if std::mem::take(&mut v.dash.want_config) {
+                            v.ask_config(cx);
                         }
                         v.views_changed(cx);
                     },
@@ -1109,6 +1189,34 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Parked writes ([`ConfigOrder::park`]) and a read's `proof` of the
+    /// gate (its reply's own): proven, they go on, their rows sending again
+    /// in a Settings that holds the read; not, in a Settings that holds it,
+    /// they go, and their rows say why. A Settings let go of shows nothing:
+    /// they wait for a read it holds (shown again, it reads).
+    fn settle_writes(&mut self, proof: Result<(), String>, held: bool, cx: &mut Context<Self>) {
+        match proof {
+            Ok(()) => {
+                if held {
+                    let rows: Vec<_> = self.dash.order.waiting().map(|(k, v)| (k, crate::settings::shown(k, v))).collect();
+                    for (k, shown) in rows {
+                        self.settings.writes.insert(k, Write::Sending(shown));
+                    }
+                }
+                if let Some(n) = self.dash.order.resume() {
+                    self.send_write(n, cx);
+                }
+            }
+            Err(why) if held => {
+                let why = format!("not sent: {why}");
+                for k in self.dash.order.abandon() {
+                    self.settings.writes.insert(k, Write::Refused(why.clone()));
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     /// A Usage load for the chips as they are now. One at a time: a newer
@@ -1136,10 +1244,14 @@ impl AppView {
             return self.dash_find(cx);
         }
         let Some(t) = self.dash.target() else {
-            self.usage.error = Some(match &self.dash.found {
-                Some(Err(e)) => e.clone(),
-                _ => "synaps-dash is not reachable: no URL for it".into(),
-            });
+            // Shown only by a Usage on screen (a load is asked for under its
+            // hold, [`AppView::ticket`]).
+            if self.ticket(Kind::Usage).is_some() {
+                self.usage.error = Some(match &self.dash.found {
+                    Some(Err(e)) => e.clone(),
+                    _ => "synaps-dash is not reachable: no URL for it".into(),
+                });
+            }
             return self.views_changed(cx);
         };
         if self.usage.loading {
@@ -1299,10 +1411,22 @@ impl AppView {
     }
 
     /// Settings' REFERENCE values read again, a local daemon's (off the UI
-    /// thread; a find reads them too, [`probe`]).
+    /// thread; a find reads them too, [`probe`]), for a Settings on screen.
+    /// Where the daemon runs not known yet: read as a find says.
     fn read_reference(&mut self, cx: &mut Context<Self>) {
-        let Some(base) = self.base_dir().filter(|_| self.dash.is_local()) else { return };
-        let ticket = self.ticket(Kind::Settings);
+        let (Some(base), Some(hold)) = (self.base_dir(), self.ticket(Kind::Settings)) else { return };
+        if self.dash.local.is_none() {
+            self.dash.want_reference = true;
+            return;
+        }
+        if !self.dash.is_local() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.dash.reference_reads += 1;
+        }
+        let ticket = Some(hold);
         let profile = self.model.daemon.as_ref().and_then(|d| d.profile.clone());
         cx.spawn(async move |this, cx| {
             let r = cx.background_spawn(async move { crate::settings::read_reference(&base, profile.as_deref()) }).await;
@@ -1716,6 +1840,32 @@ mod tests {
         o.reset();
         assert!(!o.fresh(w.0));
         assert_eq!(o.written(), (false, None));
+    }
+
+    /// Round 4 (Shady #113, P2-2): a queued write whose gate closed waits,
+    /// parked, nothing out: a read goes, a new write queues behind it, and
+    /// it resumes in order or goes whole.
+    #[test]
+    fn parked_writes_wait_for_a_read_then_go_on_in_order() {
+        let mut o = ConfigOrder::default();
+        let a = o.write("cache_ttl", Some("1h".into())).unwrap();
+        assert!(o.write("api_retries", Some("4".into())).is_none());
+        assert!(o.fresh(a.0));
+        let (_, next) = o.written();
+        o.park(next.unwrap());
+        assert!(o.parked() && !o.writing(), "parked: nothing out");
+        let get = o.read().expect("a read goes while writes are parked");
+        assert!(o.write("cache_ttl", Some("5m".into())).is_none(), "a new write queues behind the parked");
+        assert_eq!(o.waiting().collect::<Vec<_>>(), [("api_retries", Some("4")), ("cache_ttl", Some("5m"))]);
+        assert!(o.fresh(get));
+        let n = o.resume().unwrap();
+        assert_eq!((n.1, n.2.as_deref()), ("api_retries", Some("4")), "the parked first");
+        assert!(o.writing() && !o.parked() && o.resume().is_none(), "one out");
+        assert!(o.fresh(n.0));
+        let (_, next) = o.written();
+        o.park(next.unwrap());
+        assert_eq!(o.abandon(), ["cache_ttl"], "what waited goes, its keys said");
+        assert!(!o.parked() && !o.writing() && o.resume().is_none());
     }
 
     #[test]

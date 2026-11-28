@@ -254,6 +254,11 @@ impl Dash {
         self.state.lock().unwrap().refuse = Some(why.into());
     }
 
+    /// Its next `POST`s taken again ([`Dash::refuse`] over).
+    pub(super) fn accept(&self) {
+        self.state.lock().unwrap().refuse = None;
+    }
+
     /// Its file's `key` changed by something else (`Null`: removed).
     pub(super) fn set(&self, key: &str, value: Value) {
         self.state.lock().unwrap().values.insert(key.into(), value);

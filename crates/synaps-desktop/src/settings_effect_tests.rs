@@ -1194,16 +1194,18 @@ fn usage_loads_landing_after_a_fold_or_a_close_bring_nothing_back(cx: &mut TestA
     assert_eq!(all(cx), [false; 4], "a load's reply after the fold brings nothing back");
     assert_eq!(loads(cx), n, "and nothing is loaded for it");
     assert!(!pg.view.read_with(cx, |v, _| v.usage.loading), "the load ended");
-    // A load under way, its reply held; folded, and shown again before it
-    // lands: asked for before Usage let go, it drops, though Usage is on
-    // screen as it lands; the load the unfold asked for brings the board.
-    pg.view.update(cx, |v, cx| v.usage_load(cx));
-    settle(cx, pg.w, 8);
+    // Shown again: the unfold's load under way, its reply held; folded,
+    // and shown again before it lands: asked for before Usage let go, it
+    // drops, though Usage is on screen as it lands; the load the second
+    // unfold asked for brings the board.
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(held(cx, &pg), 1, "the unfold's load, Usage on screen; its reply held");
     resize_frame(cx, &pg, FOLDS);
     assert!(folded(cx, &pg), "folded");
     resize(cx, &pg, 1440.);
     assert!(!folded(cx, &pg), "unfolded");
-    assert_eq!((held(cx, &pg), pg.view.read_with(cx, |v, _| v.usage.queued)), (1, true), "the unfold's load waits for the one under way");
+    assert_eq!((held(cx, &pg), pg.view.read_with(cx, |v, _| v.usage.queued)), (1, true), "the second unfold's load waits");
     let_one(cx, &pg);
     assert_eq!(all(cx), [false; 4], "the load asked for before the fold drops, Usage on screen as it lands");
     assert_eq!(drain(cx, &pg), 1, "the unfold's load lands");
@@ -1231,6 +1233,335 @@ fn usage_loads_landing_after_a_fold_or_a_close_bring_nothing_back(cx: &mut TestA
     assert_eq!(drain(cx, &pg), 1, "the load's reply lands");
     assert_eq!(all(cx), [false; 4], "a load's reply after the close brings nothing back");
     assert_eq!(loads(cx), n, "and what was queued is not loaded");
+}
+
+/// Settings' REFERENCE value for `process_scopes`, as read.
+fn scopes(cx: &mut TestAppContext, pg: &Page) -> Option<String> {
+    pg.view.read_with(cx, |v, _| {
+        v.settings.reference.as_ref().and_then(|r| r.values.as_ref().ok()).and_then(|m| m.get("process_scopes").cloned())
+    })
+}
+
+/// As at launch: where the daemon runs not known (its first find to
+/// come), nothing of Settings read.
+fn unknown(cx: &mut TestAppContext, pg: &Page) {
+    changed(cx, pg, |v| {
+        v.dash.local = None;
+        v.dash.config = None;
+        v.dash.serves = None;
+        v.settings.reference = None;
+    });
+}
+
+/// Where the daemon runs not known yet, its first find under way as a fold
+/// lets Settings go and an unfold shows it again, its pane not focused:
+/// the find lands under a hold Settings let go of (its values drop) and
+/// says the daemon is here; Settings' config and REFERENCE values are read
+/// then, and drawn, with no focus and no activation. So with a find asked
+/// for while Settings is folded away. Folded away again before the find
+/// lands, no REFERENCE read is made for it; a find asked for under the
+/// hold Settings shows under brings the values, and no other read is made
+/// (Shady #113 round 4, P2-1).
+#[gpui_kit::test]
+fn settings_shown_again_before_its_first_find_reads_its_reference(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "first-find", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("first-find", "process_scopes = off\n");
+    find(cx, &pg, "process_scopes");
+    let (row, none) = ("reference process_scopes = off", "reference process_scopes = —");
+    let (_left, right) = split_beside(cx, &pg, Kind::Settings);
+    pg.view.update(cx, |v, _| v.dash.base = Some(base.0.clone()));
+    let idle = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.dash.config.as_ref().and_then(|c| c.value(IDLE)).map(String::from));
+    let reference_reads = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.dash.reference_reads);
+    let unfold = |cx: &mut TestAppContext| {
+        resize(cx, &pg, 1440.);
+        assert!(!folded(cx, &pg), "unfolded");
+        assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session pane, focused");
+    };
+    let fold = |cx: &mut TestAppContext| {
+        resize(cx, &pg, FOLDS);
+        assert!(folded(cx, &pg), "folded");
+        assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight: all Settings held goes");
+    };
+    for folded_first in [false, true] {
+        unknown(cx, &pg);
+        gate(cx, &pg);
+        if folded_first {
+            fold(cx);
+        }
+        pg.view.update(cx, |v, cx| v.dash_refind(cx));
+        settle(cx, pg.w, 8);
+        assert_eq!(held(cx, &pg), 1, "its find, held");
+        if !folded_first {
+            fold(cx);
+        }
+        let (reads, refs) = (dash.reads(), reference_reads(cx));
+        unfold(cx);
+        assert_eq!(held(cx, &pg), 1, "nothing read yet: the find is under way");
+        assert_eq!(drain(cx, &pg), 3, "the find lands; then the config read and the REFERENCE read");
+        assert_eq!(reference_reads(cx), refs + 1, "one REFERENCE read, as the find said where the daemon runs");
+        assert_eq!(scopes(cx, &pg).as_deref(), Some("off"), "its REFERENCE values");
+        assert_eq!((idle(cx).as_deref(), dash.reads()), (Some("600"), reads + 1), "its config, read once");
+        assert!(drawn(cx, pg.w, row) && !drawn(cx, pg.w, none), "drawn, in the pane not focused");
+        pg.view.update(cx, |v, _| v.dash.gate = None);
+    }
+    // Shown again, then folded away again before the find lands: no
+    // REFERENCE read for a Settings let go of.
+    unknown(cx, &pg);
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| v.dash_refind(cx));
+    settle(cx, pg.w, 8);
+    fold(cx);
+    unfold(cx);
+    fold(cx);
+    let refs = reference_reads(cx);
+    drain(cx, &pg);
+    assert_eq!(reference_reads(cx), refs, "let go of before the find landed: no REFERENCE read");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "and nothing comes back");
+    // Shown again with no find under way, then one asked for under the hold
+    // it shows under: the find brings its values, and no other read is made.
+    unknown(cx, &pg);
+    unfold(cx);
+    let refs = reference_reads(cx);
+    pg.view.update(cx, |v, cx| v.dash_refind(cx));
+    settle(cx, pg.w, 8);
+    drain(cx, &pg);
+    assert_eq!(scopes(cx, &pg).as_deref(), Some("off"), "the find's REFERENCE values");
+    assert_eq!(reference_reads(cx), refs, "brought by the find: no other read");
+}
+
+/// Settings in a split over a writable config, its find on `bash_timeout`,
+/// the gate up: write A (idle exit 900; `refused`: the dash refuses it)
+/// sent, its reply held; write B (bash timeout 300) queued behind it.
+/// `close`: Settings' pane focused (Close pane closes it).
+fn two_writes(cx: &mut TestAppContext, name: &str, refused: bool, close: bool) -> (Page, Dash) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, name, json!({IDLE: "600", "bash_timeout": "120"}), "0.13.0", json!(600));
+    find(cx, &pg, "bash_timeout");
+    let (left, _right) = split_beside(cx, &pg, Kind::Settings);
+    if close {
+        focus(cx, &pg, left);
+    }
+    found(cx, &pg);
+    gate(cx, &pg);
+    if refused {
+        dash.refuse("no");
+    }
+    pg.view.update(cx, |v, cx| v.config_write(IDLE, Some("900".into()), cx));
+    settle(cx, pg.w, 8);
+    assert_eq!((dash.posts().len(), held(cx, &pg)), (1, 1), "A posted, its reply held");
+    dash.accept();
+    pg.view.update(cx, |v, cx| v.config_write("bash_timeout", Some("300".into()), cx));
+    settle(cx, pg.w, 8);
+    assert_eq!(dash.posts().len(), 1, "B queued behind A");
+    assert!(matches!(row(cx, &pg), Some(crate::settings_view::Write::Sending(_))), "B's row, sending");
+    (pg, dash)
+}
+
+/// B's row: sending, refused, or neither.
+fn row(cx: &mut TestAppContext, pg: &Page) -> Option<crate::settings_view::Write> {
+    pg.view.read_with(cx, |v, _| v.settings.writes.get("bash_timeout").cloned())
+}
+
+/// Nothing out, nothing waiting: no write, no read asked for.
+fn idle_order(cx: &mut TestAppContext, pg: &Page) -> bool {
+    held(cx, pg) == 0 && pg.view.read_with(cx, |v, _| !v.dash.order.writing() && !v.dash.wants_config())
+}
+
+/// Writes A and B (two_writes), a fold letting Settings go and an unfold
+/// showing it again before A's reply lands: A's reply drops (Settings let
+/// go of it), and B, its gate closed with what Settings let go of, waits
+/// for the read the unfold asked for; that read proves the gate again, B's
+/// row says sending and B goes. The config comes back with B in it, and
+/// nothing is left waiting (Shady #113 round 4, P2-2).
+fn writes_across_a_fold_and_an_unfold(cx: &mut TestAppContext, refused: bool) {
+    let (pg, dash) = two_writes(cx, &format!("fold-writes-{refused}"), refused, false);
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight: all Settings held goes");
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(held(cx, &pg), 1, "the unfold's read waits for A");
+    let_one(cx, &pg);
+    assert_eq!(dash.posts().len(), 1, "B waits for a read to prove its gate again");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "A's reply, asked for before the fold, brings nothing back");
+    assert_eq!(held(cx, &pg), 1, "the unfold's read, under way");
+    let_one(cx, &pg);
+    assert_eq!(dash.posts().len(), 2, "proven again: B goes");
+    assert!(matches!(row(cx, &pg), Some(crate::settings_view::Write::Sending(_))), "B's row, sending again");
+    assert_eq!(drain(cx, &pg), 1, "B's reply lands");
+    assert_eq!(dash.holds("bash_timeout"), json!("300"), "the dash took B");
+    assert_eq!(dash.holds(IDLE), json!(if refused { "600" } else { "900" }), "and what it took of A");
+    let shown = pg.view.read_with(cx, |v, _| v.dash.config.as_ref().and_then(|c| c.value("bash_timeout")).map(String::from));
+    assert_eq!(shown.as_deref(), Some("300"), "the config, back, with B");
+    assert_eq!(row(cx, &pg), None, "B's row, done");
+    assert!(drawn(cx, pg.w, "field-bash_timeout = 300"), "drawn");
+    assert!(idle_order(cx, &pg), "nothing out, nothing waiting");
+}
+
+#[gpui_kit::test]
+fn a_write_queued_across_a_fold_goes_once_a_read_proves_its_gate(cx: &mut TestAppContext) {
+    writes_across_a_fold_and_an_unfold(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_write_queued_behind_a_refusal_across_a_fold_goes_once_a_read_proves_its_gate(cx: &mut TestAppContext) {
+    writes_across_a_fold_and_an_unfold(cx, true);
+}
+
+/// Writes A and B, a fold and an unfold before A's reply lands, and the
+/// dash meanwhile unable to lock the file: the unfold's read does not
+/// prove B's gate, and B's row says why; B is never sent. The config comes
+/// back (read-only), and nothing is left waiting (Shady #113 round 4,
+/// P2-2).
+#[gpui_kit::test]
+fn a_write_queued_across_a_fold_says_why_on_its_row_when_its_gate_stays_shut(cx: &mut TestAppContext) {
+    let (pg, dash) = two_writes(cx, "fold-shut", false, false);
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    dash.answer("writable", json!(false));
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(drain(cx, &pg), 2, "A's reply, then the unfold's read");
+    let why = "not sent: synaps-dash cannot lock the file";
+    assert_eq!(row(cx, &pg), Some(crate::settings_view::Write::Refused(why.into())), "B's row says why");
+    assert!(drawn(cx, pg.w, &format!("refused bash_timeout = {why}")), "drawn, under it");
+    assert_eq!((dash.posts().len(), dash.holds("bash_timeout")), (1, json!("120")), "B never sent");
+    assert!(pg.view.read_with(cx, |v, _| v.dash.config.as_ref().is_some_and(|c| !c.writable)), "the config, back, read-only");
+    assert!(idle_order(cx, &pg), "nothing out, nothing waiting");
+}
+
+/// Writes A and B, Close pane closing Settings before A's reply lands: A's
+/// reply drops, and B is not Settings' to let go of: the read asked for
+/// then proves its gate on its own reply (shown nowhere) and B goes, its
+/// reply shown nowhere either. `shut`: the dash cannot lock the file as
+/// that read lands; B waits, unsent, for a read under a Settings that
+/// shows it, and goes as Settings opens again. Either way Settings, open
+/// again, shows the config with B in it (Shady #113 round 4, P2-2).
+fn writes_across_a_close(cx: &mut TestAppContext, shut: bool) {
+    use crate::tabs::Kind;
+    let (pg, dash) = two_writes(cx, &format!("close-writes-{shut}"), false, true);
+    pg.view.update(cx, |v, cx| {
+        v.close_pane_tabs();
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(pg.view.read_with(cx, |v, _| v.panes.len()), 1, "the session's pane alone");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "Settings closed: all it held goes");
+    if shut {
+        dash.answer("writable", json!(false));
+    }
+    assert_eq!(drain(cx, &pg), if shut { 2 } else { 3 }, "A's reply, the read it asks for (then B's reply)");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "nothing shown for a Settings closed");
+    assert_eq!(dash.posts().len(), if shut { 1 } else { 2 }, "B goes once its gate is proven");
+    assert_eq!(held(cx, &pg), 0, "nothing under way");
+    if shut {
+        dash.answer("writable", json!(true));
+    }
+    let base = Base::new(&format!("close-writes-{shut}"), "");
+    pg.view.update(cx, |v, cx| {
+        v.dash.gate = None;
+        v.dash.base = Some(base.0.clone());
+        v.open_view(Kind::Settings, cx);
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!((dash.posts().len(), dash.holds("bash_timeout")), (2, json!("300")), "the dash took B");
+    let shown = pg.view.read_with(cx, |v, _| v.dash.config.as_ref().and_then(|c| c.value("bash_timeout")).map(String::from));
+    assert_eq!(shown.as_deref(), Some("300"), "Settings open again: the config, with B");
+    assert_eq!(row(cx, &pg), None, "B's row, done");
+    assert!(pg.view.read_with(cx, |v, _| !v.dash.order.writing() && !v.dash.wants_config()), "nothing out, nothing waiting");
+}
+
+#[gpui_kit::test]
+fn a_write_queued_as_settings_closes_goes_once_a_read_proves_its_gate(cx: &mut TestAppContext) {
+    writes_across_a_close(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_write_queued_as_settings_closes_waits_for_settings_when_its_gate_stays_shut(cx: &mut TestAppContext) {
+    writes_across_a_close(cx, true);
+}
+
+/// Usage asked for a load as its channel was to be found again (the dash
+/// did not answer), the find held as a fold lets Usage go: the find lands
+/// and loads nothing for it, and shows nothing, a URL found or none; a
+/// load asked for while Usage is let go of shows no error either. Shown
+/// again, Usage loads, or says there is no URL (Shady #113 round 4, P3).
+#[gpui_kit::test]
+fn a_find_landing_after_usage_let_go_loads_and_shows_nothing_for_it(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, _dash) = effect_page(cx, "usage-find", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("usage-find", "");
+    pg.view.update(cx, |v, _| {
+        v.usage.live = true;
+        v.dash.base = Some(base.0.clone());
+    });
+    found(cx, &pg);
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    assert!(pg.view.read_with(cx, |v, _| v.usage.board.is_some()), "Usage's board, loaded from the dash");
+    let _ = split_beside(cx, &pg, Kind::Usage);
+    let loads = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.usage.loads);
+    let all = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| usage_held(v));
+    for no_url in [false, true] {
+        changed(cx, &pg, |v| {
+            v.dash.answer = crate::views::Answer::Down(crate::dash::Fail::Unreachable("down".into()));
+            if no_url {
+                v.dash.found = Some(Err("no URL for synaps-dash".into()));
+            }
+        });
+        gate(cx, &pg);
+        pg.view.update(cx, |v, cx| v.usage_load(cx));
+        settle(cx, pg.w, 8);
+        assert_eq!(held(cx, &pg), 1, "the find first, held");
+        resize(cx, &pg, FOLDS);
+        assert!(folded(cx, &pg), "folded");
+        assert_eq!(all(cx), [false; 4], "folded out of sight: all Usage held goes");
+        let n = loads(cx);
+        assert_eq!(drain(cx, &pg), 1, "the find lands");
+        assert_eq!(loads(cx), n, "it loads nothing for a Usage let go of");
+        assert_eq!(all(cx), [false; 4], "and shows nothing: no board, no error");
+        if no_url {
+            pg.view.update(cx, |v, cx| v.usage_load(cx));
+            settle(cx, pg.w, 8);
+            assert_eq!(all(cx), [false; 4], "a load asked for while Usage is let go of: no error");
+        }
+        pg.view.update(cx, |v, _| v.dash.gate = None);
+        resize(cx, &pg, 1440.);
+        assert!(!folded(cx, &pg), "unfolded");
+        let (board, error) = pg.view.read_with(cx, |v, _| (v.usage.board.is_some(), v.usage.error.clone()));
+        if no_url {
+            assert_eq!((board, error.as_deref()), (false, Some("no URL for synaps-dash")), "shown again: no URL, said");
+        } else {
+            assert!(board && error.is_none(), "shown again: its board");
+        }
+    }
+}
+
+/// A hold at its last value moves on by wrapping: a reply asked for under
+/// it, landing after the fold, drops; one asked for after, under the
+/// wrapped hold, is taken (Shady #113 round 4).
+#[gpui_kit::test]
+fn a_hold_wraps_and_still_moves_on(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, _dash) = effect_page(cx, "wrap", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let _ = split_beside(cx, &pg, Kind::Settings);
+    found(cx, &pg);
+    pg.view.update(cx, |v, _| v.dash.hold_at(Kind::Settings, u64::MAX));
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| {
+        v.window_activated(false, cx);
+        v.window_activated(true, cx);
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(held(cx, &pg), 1, "a read under the last hold, held");
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(drain(cx, &pg), 1);
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "its reply after the fold brings nothing back");
+    resize(cx, &pg, 1440.);
+    assert_eq!(drain(cx, &pg), 1, "the unfold's read, under the wrapped hold");
+    assert!(pg.view.read_with(cx, |v, _| v.dash.config.is_some()), "taken");
 }
 
 /// `daemon_version` is read as semver 2.0.0, whole: anything else is
