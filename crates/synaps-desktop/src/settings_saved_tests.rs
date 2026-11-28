@@ -728,3 +728,316 @@ fn settings_writer_state_holds_its_ceiling(cx: &mut TestAppContext) {
         assert!(v.settings.app_note.is_none() && v.settings.receipts_note.is_none(), "no note");
     });
 }
+
+// ── review pass A (Shady #116) ────────────────────────────────────────
+
+/// Until `ok()`, in real time (a job on a thread of its own): 10 s at most.
+fn until(what: &str, ok: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !ok() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{what}: never");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Past the app's save delay, in the window's time only (a job on a
+/// thread of its own goes on by itself).
+fn past_save_delay(cx: &mut TestAppContext, pg: &Page) {
+    settle(cx, pg.w, 2);
+    cx.executor().advance_clock(crate::app::SAVE_DELAY + Duration::from_millis(50));
+    cx.run_until_parked();
+}
+
+/// A1: the close's 1 s holds over the tabs' (the layout's) and favourites'
+/// jobs. Another process holds the settings lock; a tabs job is in its
+/// write on a thread of its own (as the background executor runs it),
+/// waiting for the lock, and a favourites job behind it. Another tab's save
+/// comes as they wait: the window doesn't wait for them. The text size
+/// changes and the window closes: within its deadline (and 150 ms), naming
+/// all it couldn't write. The holder lets go: each job that then takes the
+/// lock finds the window closed, and the file is as it was.
+#[gpui_kit::test]
+fn the_close_holds_its_deadline_over_the_tabs_and_favourites_jobs(cx: &mut TestAppContext) {
+    use crate::app::{FavsJob, SaveJob};
+    let pg = page(cx, "close-jobs", NARROW);
+    std::fs::create_dir_all(path(&pg).parent().expect("its folder")).expect("the folder");
+    std::fs::write(path(&pg), r#"{"daemon_label": "start"}"#).expect("a file");
+    let before = std::fs::read(path(&pg)).expect("it");
+    let (tabs_job, favs_job) = pg.view.update(cx, |v, _| {
+        v.tabs_key = Some(format!("test:close-jobs-{}", std::process::id()));
+        (v.save_job.clone(), v.favs_job.clone())
+    });
+    // A frame with the key: the layout's first is the launch's own (split
+    // panes on), saved as the file has it.
+    settle(cx, pg.w, 2);
+    let holder = Holder::start(&path(&pg));
+    crate::app::jobs_on_threads(true);
+    pg.view.update(cx, |v, cx| {
+        v.model.tabs.open("s-close-1", "one", crate::tabs::Place::New);
+        cx.notify();
+    });
+    past_save_delay(cx, &pg);
+    until("the tabs' job in its write", || SaveJob::in_write(&tabs_job) && crate::theme::writing(&path(&pg)));
+    pg.view.update(cx, |v, cx| {
+        v.model.favs.list.push(crate::favourites::from_json(&json!([{"id": "s-close-1"}])).remove(0));
+        v.model.favs.generation += 1;
+        cx.notify();
+    });
+    past_save_delay(cx, &pg);
+    until("the favourites' job in its write", || FavsJob::in_write(&favs_job));
+    pg.view.update(cx, |v, cx| {
+        v.model.tabs.open("s-close-2", "two", crate::tabs::Place::New);
+        cx.notify();
+    });
+    let t0 = Instant::now();
+    past_save_delay(cx, &pg);
+    let took = t0.elapsed();
+    assert!(took < Duration::from_millis(150), "the window never waits for a job: {took:?}");
+    pick(cx, &pg, Pick::TextSize, "18");
+    let _ = crate::theme::said_at_close();
+    let Page { w, view, home, _events } = pg;
+    let t0 = Instant::now();
+    close(cx, w, view);
+    let took = t0.elapsed();
+    assert!(took >= crate::theme::CLOSE_DEADLINE - Duration::from_millis(20), "it waited for the jobs and the lock: {took:?}");
+    assert!(took < crate::theme::CLOSE_DEADLINE + Duration::from_millis(150), "within its deadline: {took:?}");
+    let tabs = if cfg!(feature = "split-on-tests") { "layout" } else { "tabs" };
+    assert_eq!(
+        crate::theme::said_at_close(),
+        [format!("synaps-desktop: not saved at close, settings.json is locked: text_size, {tabs}, favourites")],
+        "every key named"
+    );
+    holder.release();
+    until("every job out of its write", || !SaveJob::in_write(&tabs_job) && !FavsJob::in_write(&favs_job));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(&home.0).expect("it"), before, "no job wrote after the close");
+    let fenced = tabs_job.lock().expect("its slot").fenced + favs_job.lock().expect("its slot").fenced;
+    assert!(fenced >= 1, "a job took the lock after the close, and found the window closed");
+    crate::app::jobs_on_threads(false);
+}
+
+/// A2: a panel save under way never lands after the close. The text size
+/// goes to 18, its save held before its locked update; then to 20 (a
+/// minute on), and the window closes: the file has 20, and 20's receipt.
+/// The held save goes on and writes nothing: the file is the close's, byte
+/// for byte.
+#[gpui_kit::test]
+fn a_stale_panel_save_never_lands_after_the_close(cx: &mut TestAppContext) {
+    at_1358();
+    let pg = page(cx, "panels-stale", NARROW);
+    let gate = s::gate::hold_panels();
+    pick(cx, &pg, Pick::TextSize, "18");
+    saved(cx, &pg);
+    assert!(pg.view.read_with(cx, |v, _| v.panels_pending().text_size), "18's save out, held");
+    let t1359 = t1358() + 60_000;
+    s::set_clock(Some(t1359));
+    pick(cx, &pg, Pick::TextSize, "20");
+    saved(cx, &pg);
+    let pg = restart(cx, pg);
+    let after_close = std::fs::read(path(&pg)).expect("the close wrote");
+    let _ = gate.try_send(());
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(path(&pg)).expect("the file"), after_close, "the held save wrote nothing");
+    let v = file(&pg);
+    assert_eq!(v["text_size"], json!(20), "the latest value");
+    let want = Receipt::app(AppKey::TextSize, &AppValue::Num(20), t1359);
+    assert_eq!(v[STORE]["e"]["app#text_size"], json!([t1359, format!("{:016x}", want.digest)]), "and its receipt");
+}
+
+/// A2: panel saves go one at a time and keep each other's keys. The text
+/// size's save is held; the rail folds while it is out. The lock can't be
+/// taken: the held save fails; the text size's failure is said, and both
+/// keys are still to be written. The lock comes back: the next save
+/// writes both, and the note goes.
+#[gpui_kit::test]
+fn panel_saves_keep_each_others_keys_and_failures(cx: &mut TestAppContext) {
+    let pg = page(cx, "panels-two", NARROW);
+    let first = s::gate::hold_panels();
+    pick(cx, &pg, Pick::TextSize, "18");
+    saved(cx, &pg);
+    let next = s::gate::hold_panels();
+    pg.view.update(cx, |v, cx| {
+        let mut p = v.panels;
+        p.rail_collapsed = !p.rail_collapsed;
+        v.set_panels_pub(p, cx);
+    });
+    saved(cx, &pg);
+    let lock = unlockable(&pg);
+    let _ = first.try_send(());
+    cx.run_until_parked();
+    let text_size = s::AppKeySet::default().with(AppKey::TextSize).0;
+    pg.view.read_with(cx, |v, _| {
+        let k = v.panels_pending();
+        assert!(k.text_size && k.rail, "both still to be written: {k:?}");
+        assert!(v.settings.panels_note.as_ref().is_some_and(|n| n.keys & text_size != 0), "the text size's failure said");
+    });
+    std::fs::remove_dir(&lock).expect("the lock free");
+    let _ = next.try_send(());
+    saved(cx, &pg);
+    let v = file(&pg);
+    assert_eq!((v["text_size"].clone(), v[crate::theme::Panels::RAIL].clone()), (json!(18), json!(true)), "both written");
+    pg.view.read_with(cx, |v, _| {
+        assert!(v.settings.panels_note.is_none(), "the note goes");
+        assert!(v.panels_pending().is_empty(), "nothing waits");
+    });
+}
+
+/// A4: Usage's host is its own key under its row. A host-only save that
+/// fails shows there with its Retry; Retry lands it and its receipt, and
+/// the note goes. Each of the row's controls shows its own time.
+#[gpui_kit::test]
+fn the_usage_hosts_failure_and_time_are_its_own(cx: &mut TestAppContext) {
+    at_1358();
+    let pg = page(cx, "usage-host", NARROW);
+    let lock = unlockable(&pg);
+    pick(cx, &pg, Pick::Host, "bella");
+    saved(cx, &pg);
+    let why = note(cx, &pg).expect("the host's save failed");
+    find(cx, pg.w, "usage");
+    assert!(drawn(cx, pg.w, &format!("not-saved usage_host = {why}")), "the host's failure under its row");
+    std::fs::remove_dir(&lock).expect("the lock free");
+    click(cx, pg.w, "retry usage_host");
+    saved(cx, &pg);
+    let v = file(&pg);
+    assert_eq!(v["usage_host"], json!("bella"), "Retry wrote it");
+    assert!(receipt_ids(&pg).contains(&"app#usage_host".to_string()), "and its receipt");
+    assert!(note(cx, &pg).is_none(), "the note goes");
+    s::set_clock(Some(t1358() + 4 * 60_000));
+    pick(cx, &pg, Pick::Range, "7d");
+    saved(cx, &pg);
+    find(cx, pg.w, "usage");
+    assert!(drawn(cx, pg.w, "saved-at usage_host = saved 13:58"), "the host's time");
+    assert!(drawn(cx, pg.w, "saved-at usage_range = saved 14:02"), "the range's");
+}
+
+/// A5: two windows on one daemon and file. A's receipt for api_retries = 3
+/// (13:58) waits in a held write; B saves 5 at 14:02 and writes it. A's
+/// write lands: the file keeps B's newer receipt, and so does A; a window
+/// opened after shows 14:02 by 5. Again with A's write failed, then
+/// Retry.
+#[gpui_kit::test]
+fn an_older_daemon_receipt_never_replaces_a_newer_one(cx: &mut TestAppContext) {
+    for retried in [false, true] {
+        at_1358();
+        let name = if retried { "a5-retried" } else { "a5-held" };
+        let (a, dash) = daemon_page(cx, name, json!({"api_retries": "2"}));
+        let b = second(cx, &a);
+        local(cx, &b, &dash);
+        let (gate, lock) = match retried {
+            false => (Some(s::gate::hold()), None),
+            true => (None, Some(unlockable(&a))),
+        };
+        post(cx, &a, "api_retries", "3");
+        saved(cx, &a);
+        if let Some(lock) = lock {
+            std::fs::remove_dir(&lock).expect("the lock free");
+        }
+        let t1402 = t1358() + 4 * 60_000;
+        s::set_clock(Some(t1402));
+        post(cx, &b, "api_retries", "5");
+        saved(cx, &b);
+        match gate {
+            Some(g) => {
+                let _ = g.try_send(());
+            }
+            None => a.view.update(cx, |v, cx| v.retry_saves(cx)),
+        }
+        saved(cx, &a);
+        let ids: Vec<String> = receipt_ids(&a).into_iter().filter(|i| i.starts_with("daemon:")).collect();
+        let five = s::daemon_digest("api_retries", Some("5"));
+        assert_eq!(ids.len(), 1, "{name}: one daemon receipt");
+        assert_eq!(file(&a)[STORE]["e"][&ids[0]], json!([t1402, format!("{five:016x}")]), "{name}: B's, the newer");
+        a.view.read_with(cx, |v, _| {
+            let r = v.daemon_saved_at("api_retries", Some("5")).copied();
+            assert!(r.is_some_and(|r| r.at_ms == t1402 && !r.due()), "{name}: A holds B's: {r:?}");
+        });
+        let Page { w, view, .. } = b;
+        close(cx, w, view);
+        let c = restart(cx, a);
+        local(cx, &c, &dash);
+        find(cx, c.w, "api_retries");
+        assert!(drawn(cx, c.w, "saved-at api_retries = saved 14:02"), "{name}: B's time, by 5");
+    }
+}
+
+/// A6: a POST whose own reply holds what it sent is a save of the daemon it
+/// went to, whatever the window shows as the reply lands. The reply held,
+/// the window moves to another daemon (its order reset, its config gone);
+/// the reply lands: the window shows nothing of it, and the first daemon's
+/// receipt is due, then written, and shown back on that daemon. A refused
+/// one records nothing.
+#[gpui_kit::test]
+fn a_posts_receipt_is_its_daemons_whatever_the_window_shows(cx: &mut TestAppContext) {
+    at_1358();
+    let (pg, dash) = daemon_page(cx, "a6", json!({"api_retries": "2"}));
+    let d = s::daemon_id(None, None, Some(dash.snapshot().write_path.as_str()));
+    let away = |cx: &mut TestAppContext, pg: &Page| {
+        // As another dash or daemon found does (`dash_found`).
+        changed(cx, pg, |v| {
+            v.dash.config = None;
+            v.dash.serves = None;
+            v.dash.answer = crate::views::Answer::Unknown;
+            v.dash.order.reset();
+            v.settings.writes.clear();
+            v.model.daemon = Some(crate::model::Daemon { version: "0.13.0".into(), profile: Some("other".into()), pid: 8 });
+        });
+    };
+    let gate = s::gate::hold_post();
+    pg.view.update(cx, |v, cx| v.config_write("api_retries", Some("3".into()), cx));
+    settle(cx, pg.w, 8);
+    assert_eq!(dash.posts().len(), 1, "sent and answered, its reply held");
+    away(cx, &pg);
+    let _ = gate.try_send(());
+    settle(cx, pg.w, 8);
+    pg.view.read_with(cx, |v, _| {
+        assert!(v.dash.config.is_none(), "the window shows nothing of the old reply");
+        let r = v.settings.wrote.daemon(d, "api_retries").copied();
+        assert!(r.is_some_and(|r| r.due() && r.digest == s::daemon_digest("api_retries", Some("3"))), "its daemon's receipt, due: {r:?}");
+    });
+    saved(cx, &pg);
+    assert!(receipt_ids(&pg).iter().any(|i| i.starts_with("daemon:")), "written");
+    local(cx, &pg, &dash);
+    assert!(time_at(cx, &pg, "api_retries"), "shown back on that daemon");
+    dash.refuse("no");
+    let gate = s::gate::hold_post();
+    pg.view.update(cx, |v, cx| v.config_write("api_retries", Some("4".into()), cx));
+    settle(cx, pg.w, 8);
+    away(cx, &pg);
+    let _ = gate.try_send(());
+    settle(cx, pg.w, 8);
+    pg.view.read_with(cx, |v, _| {
+        let r = v.settings.wrote.daemon(d, "api_retries").copied();
+        assert!(r.is_some_and(|r| !r.due() && r.digest == s::daemon_digest("api_retries", Some("3"))), "a refusal records nothing: {r:?}");
+    });
+}
+
+/// A7: a write that fails marks failed only the receipt it carried. R1
+/// (api_retries = 3) is in a held write; R2 (5) takes its place; R1's
+/// write fails: R2 is still due, not failed, and its row says nothing of a
+/// lost time. Then R2's own write fails: now it says so.
+#[gpui_kit::test]
+fn an_old_flush_failure_never_fails_a_newer_receipt(cx: &mut TestAppContext) {
+    at_1358();
+    let (pg, _dash) = daemon_page(cx, "a7", json!({"api_retries": "2"}));
+    let gate = s::gate::hold();
+    post(cx, &pg, "api_retries", "3");
+    saved(cx, &pg);
+    assert!(pg.view.read_with(cx, |v, _| v.settings.app_writing.is_some()), "R1's write out, held");
+    post(cx, &pg, "api_retries", "5");
+    let lock = unlockable(&pg);
+    let _ = gate.try_send(());
+    cx.run_until_parked();
+    let kept = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.settings.receipts_note.as_ref().map(|n| n.why.to_string()));
+    let why = kept(cx).expect("R1's write failed");
+    let r2 = pg.view.read_with(cx, |v, _| v.daemon_saved_at("api_retries", Some("5")).copied()).expect("R2");
+    assert!(r2.due() && !r2.failed(), "R2 still due, not failed by R1's write");
+    find(cx, pg.w, "api_retries");
+    assert!(!drawn(cx, pg.w, &format!("not-kept api_retries = {why}")), "nothing said of R2's time");
+    saved(cx, &pg);
+    let r2 = pg.view.read_with(cx, |v, _| v.daemon_saved_at("api_retries", Some("5")).copied()).expect("R2");
+    assert!(r2.failed(), "R2's own write failed");
+    let why = kept(cx).expect("said");
+    find(cx, pg.w, "api_retries");
+    assert!(drawn(cx, pg.w, &format!("not-kept api_retries = {why}")), "and its row says so");
+    std::fs::remove_dir(&lock).expect("the lock free");
+}

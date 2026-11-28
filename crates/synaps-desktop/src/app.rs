@@ -1925,16 +1925,47 @@ pub(crate) fn well_body(prompt: &str) -> SharedString {
     SharedString::from(prompt)
 }
 
+/// `f` off the UI thread, on the background executor; in tests on a
+/// thread of its own once [`jobs_on_threads`] is set, so a test can close
+/// the window while a job waits in its write (Shady #116 A1).
+pub(crate) async fn off_ui<R: Send + 'static>(ex: gpui_kit::BackgroundExecutor, f: impl FnOnce() -> R + Send + 'static) -> R {
+    #[cfg(test)]
+    if JOBS_ON_THREADS.get() {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(f());
+        });
+        return rx.recv().await.expect("the job's thread");
+    }
+    ex.spawn(async move { f() }).await
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOBS_ON_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: the tabs', layout's and favourites' jobs on threads of their
+/// own from now on ([`off_ui`]).
+#[cfg(test)]
+pub(crate) fn jobs_on_threads(on: bool) {
+    JOBS_ON_THREADS.set(on);
+}
+
 /// A favourites write shared by the window and its background job: the job
 /// writes holding the lock and leaves what it wrote here, so the window
 /// takes it ([`crate::favourites::Favourites::written`]) whether or not the
 /// task that started it is still there.
 #[derive(Default)]
-struct FavsJob {
+pub(crate) struct FavsJob {
     /// The window closed: a job not begun yet writes nothing.
     closed: bool,
     /// The generation written, the list sent, the file's list after.
     done: Option<(u64, Vec<crate::favourites::Favourite>, Vec<crate::favourites::Favourite>)>,
+    /// Tests: jobs that found the window closed under the file's lock.
+    // STAND-IN (tests-first): never counted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fenced: u32,
 }
 
 impl FavsJob {
@@ -1956,6 +1987,13 @@ impl FavsJob {
         job.done = Some((generation, sent, file));
         Ok(())
     }
+
+    /// Tests: whether a job is in its write.
+    #[cfg(test)]
+    pub(crate) fn in_write(slot: &std::sync::Mutex<FavsJob>) -> bool {
+        // STAND-IN (tests-first): a job in its write holds the slot's lock.
+        slot.try_lock().is_err()
+    }
 }
 
 /// The tabs' (or the layout's) delayed write, shared by the window and its
@@ -1969,6 +2007,10 @@ impl FavsJob {
 pub(crate) struct SaveJob {
     /// The window's last flush has run: a job not begun writes nothing.
     closed: bool,
+    /// Tests: jobs that found the slot closed under the file's lock.
+    // STAND-IN (tests-first): never counted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fenced: u32,
     /// What the last delayed write of each kind wrote (its generation),
     /// recorded under this lock as it finishes, until the view takes it:
     /// the job's continuation, or the flush before it trusts
@@ -2011,6 +2053,13 @@ impl SaveJob {
         job.writes += 1;
         job.done[kind as usize] = Some(generation);
         Ok(true)
+    }
+
+    /// Tests: whether a job is in its write.
+    #[cfg(test)]
+    pub(crate) fn in_write(slot: &std::sync::Mutex<SaveJob>) -> bool {
+        // STAND-IN (tests-first): a job in its write holds the slot's lock.
+        slot.try_lock().is_err()
     }
 
     /// The generation a finished write of `kind` wrote, once.
@@ -2212,7 +2261,7 @@ pub struct AppView {
     favs_written: u64,
     favs_save: Option<Task<()>>,
     /// The favourites write on its way, shared with its background job.
-    favs_job: Arc<std::sync::Mutex<FavsJob>>,
+    pub(crate) favs_job: Arc<std::sync::Mutex<FavsJob>>,
     /// A favourites job is between taking the list and its result being
     /// taken (the window's own: never a wait on the job's lock).
     favs_writing: bool,
@@ -4618,11 +4667,10 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), saved, generation, slot)) = job else { return };
-            let done = cx
-                .background_spawn(
-                    async move { SaveJob::write(&slot, SaveKind::Tabs, generation, || theme::save_tabs(&path, &key, &saved)) },
-                )
-                .await;
+            let done = off_ui(cx.background_executor().clone(), move || {
+                SaveJob::write(&slot, SaveKind::Tabs, generation, || theme::save_tabs(&path, &key, &saved))
+            })
+            .await;
             let _ = this.update(cx, |v, cx| match done {
                 Ok(_) => {
                     // What it wrote, unless the flush took it first.
@@ -4670,7 +4718,7 @@ impl AppView {
                     })
                     .ok();
                 let Some((Some(path), Some(key), base, sent, generation, slot)) = job else { return };
-                let done = cx.background_spawn(async move { FavsJob::write(&slot, &path, &key, &base, sent, generation) }).await;
+                let done = off_ui(cx.background_executor().clone(), move || FavsJob::write(&slot, &path, &key, &base, sent, generation)).await;
                 let again = this.update(cx, |v, cx| {
                     let taken = v.take_favs_written();
                     if let Err(e) = done {
@@ -4781,11 +4829,10 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), layout, generation, slot)) = job else { return };
-            let done = cx
-                .background_spawn(async move {
-                    SaveJob::write(&slot, SaveKind::Layout, generation, || theme::save_layout(&path, &key, &layout))
-                })
-                .await;
+            let done = off_ui(cx.background_executor().clone(), move || {
+                SaveJob::write(&slot, SaveKind::Layout, generation, || theme::save_layout(&path, &key, &layout))
+            })
+            .await;
             let _ = this.update(cx, |v, cx| match done {
                 Ok(_) => {
                     // What it wrote, unless the flush took it first.
@@ -6796,8 +6843,18 @@ impl AppView {
         let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
         self.panels_writing = self.panels_writing.or(keys);
         let p = self.panels;
+        #[cfg(test)]
+        let gate = crate::settings_saved::gate::panels_taken();
         cx.spawn(async move |this, cx| {
-            let saved = cx.background_spawn(async move { theme::save_panels(&path, p, keys) }).await;
+            let saved = cx
+                .background_spawn(async move {
+                    #[cfg(test)]
+                    if let Some(g) = gate {
+                        let _ = g.recv().await;
+                    }
+                    theme::save_panels(&path, p, keys)
+                })
+                .await;
             let _ = this.update(cx, |v, cx| {
                 v.panels_writing = theme::PanelKeys::default();
                 match saved {
@@ -6817,6 +6874,12 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Tests: the panel keys still to be written, waiting or out.
+    #[cfg(test)]
+    pub(crate) fn panels_pending(&self) -> theme::PanelKeys {
+        self.panels_dirty.or(self.panels_writing)
     }
 
     /// The panels' failed write, tried again now (Retry, the window's

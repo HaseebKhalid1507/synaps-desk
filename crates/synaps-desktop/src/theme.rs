@@ -2448,6 +2448,13 @@ fn writer_of(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
     }
 }
 
+/// Tests: whether a write of `path` is under way in this process (its
+/// writer held).
+#[cfg(test)]
+pub(crate) fn writing(path: &Path) -> bool {
+    writer_of(path).try_lock().is_err()
+}
+
 /// [`update_settings`] with an `edit` that may refuse: the file is then
 /// left as it was. A file that is there but cannot be read is left as it
 /// was too (an error says so): only a missing one starts empty. Under the

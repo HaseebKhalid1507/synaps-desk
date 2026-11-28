@@ -952,6 +952,8 @@ impl AppView {
     fn send_write(&mut self, (seq, key, value): Send, cx: &mut Context<Self>) {
         let Some(t) = self.dash.target() else { return self.dash.order.abandon() };
         let body = dash::config_body(key, value.as_deref());
+        #[cfg(test)]
+        let gate = crate::settings_saved::gate::post_taken();
         cx.spawn(async move |this, cx| {
             let sent = value;
             let got = cx
@@ -962,6 +964,10 @@ impl AppView {
                 .await;
             // The dash's 200 is the moment a daemon value was saved.
             let at_ms = crate::settings_saved::now_ms();
+            #[cfg(test)]
+            if let Some(g) = gate {
+                let _ = g.recv().await;
+            }
             let _ = this.update(cx, |v, cx| {
                 let (newer, next) = v.dash.order.written();
                 if v.dash.order.fresh(seq) {

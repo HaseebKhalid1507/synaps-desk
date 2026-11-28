@@ -506,6 +506,13 @@ pub(crate) fn write_batch(path: &Path, batch: &AppBatch, due: &[Receipt], stale:
     Ok(written)
 }
 
+/// The file's receipt in `r`'s place, if it has one.
+fn read_entry(v: &Value, r: &Receipt) -> Option<Receipt> {
+    let x = v.get(STORE)?.get("e")?.get(r.id())?;
+    let (at_ms, d) = (x.get(0)?.as_i64()?, x.get(1)?.as_str()?);
+    Some(Receipt { at_ms, digest: u64::from_str_radix(d, 16).ok()?, flags: 0, ..*r })
+}
+
 /// The file's receipts at `path` (none: no file, or none in it).
 pub(crate) fn load(path: &Path) -> Vec<Receipt> {
     std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).map_or_else(Vec::new, |v| read_from(&v))
@@ -851,19 +858,47 @@ impl AppView {
 /// stop the test's own thread, which runs the background tasks).
 #[cfg(test)]
 pub(crate) mod gate {
+    type Next = std::cell::RefCell<Option<async_channel::Receiver<()>>>;
+
     thread_local! {
-        static NEXT: std::cell::RefCell<Option<async_channel::Receiver<()>>> = const { std::cell::RefCell::new(None) };
+        static NEXT: Next = const { std::cell::RefCell::new(None) };
+        static PANELS: Next = const { std::cell::RefCell::new(None) };
+        static POST: Next = const { std::cell::RefCell::new(None) };
+    }
+
+    fn held(next: &'static std::thread::LocalKey<Next>) -> async_channel::Sender<()> {
+        let (tx, rx) = async_channel::bounded(1);
+        next.with(|n| *n.borrow_mut() = Some(rx));
+        tx
     }
 
     /// The next app write waits until the sender sends or goes.
     pub(crate) fn hold() -> async_channel::Sender<()> {
-        let (tx, rx) = async_channel::bounded(1);
-        NEXT.with(|n| *n.borrow_mut() = Some(rx));
-        tx
+        held(&NEXT)
     }
 
     pub(crate) fn taken() -> Option<async_channel::Receiver<()>> {
         NEXT.with(|n| n.borrow_mut().take())
+    }
+
+    /// The next panels' write waits, before its locked update, until the
+    /// sender sends or goes.
+    pub(crate) fn hold_panels() -> async_channel::Sender<()> {
+        held(&PANELS)
+    }
+
+    pub(crate) fn panels_taken() -> Option<async_channel::Receiver<()>> {
+        PANELS.with(|n| n.borrow_mut().take())
+    }
+
+    /// The next `POST /api/config`'s reply waits, answered, before the
+    /// window reads it, until the sender sends or goes.
+    pub(crate) fn hold_post() -> async_channel::Sender<()> {
+        held(&POST)
+    }
+
+    pub(crate) fn post_taken() -> Option<async_channel::Receiver<()>> {
+        POST.with(|n| n.borrow_mut().take())
     }
 }
 
@@ -910,16 +945,17 @@ mod tests {
         let e = file[STORE]["e"].as_object().unwrap();
         assert_eq!(e.len(), 256);
         assert!(!e.contains_key(&all[0].id()) && e.contains_key(&all[1].id()) && e.contains_key(&next.id()), "the file the same");
-        // A tie: the smaller id goes.
+        // A tie: 256 ids at one time, the smaller id goes (Shady #116 A3:
+        // each a place of its own).
         let mut rs = Receipts::default();
         for i in 0..Receipts::CAP {
-            rs.put(Receipt::daemon([0; 8], keys[i % keys.len()], Some("x"), 9 + (i / keys.len()) as i64 * 100));
+            rs.put(Receipt::daemon([i as u8, (i >> 8) as u8, 0, 0, 0, 0, 0, 0], keys[0], Some("x"), 9));
         }
-        let mut first = keys[..].to_vec();
-        first.sort_unstable();
-        let small = first[0];
+        assert_eq!(rs.len(), Receipts::CAP, "256 places");
         rs.put(Receipt::app(AppKey::Theme, &AppValue::Null, 9_999));
-        assert!(rs.daemon([0; 8], small).is_none_or(|r| r.at_ms != 9), "the smallest id at the oldest time went");
+        assert!(rs.daemon([0; 8], keys[0]).is_none(), "the smallest id at the oldest time went");
+        assert!(rs.daemon([1, 0, 0, 0, 0, 0, 0, 0], keys[0]).is_some(), "the next stays");
+        assert!(rs.app(AppKey::Theme).is_some(), "the newer is in");
         let mut file = serde_json::json!({});
         let tie: Vec<Receipt> =
             (0..=Receipts::CAP).map(|i| Receipt::daemon([i as u8, (i >> 8) as u8, 0, 0, 0, 0, 0, 0], keys[0], None, 5)).collect();
@@ -928,6 +964,85 @@ mod tests {
         let mut ids: Vec<String> = tie.iter().map(Receipt::id).collect();
         ids.sort_unstable();
         assert!(!e.contains_key(&ids[0]) && e.contains_key(&ids[1]) && e.len() == 256, "a tie goes by id");
+    }
+
+    /// Shady #116 A3: at the cap the 257th, when it is the oldest, is the one
+    /// that goes, as in the file: older, or at the oldest time with a
+    /// smaller id. The same through `merge_file`, the window's due and
+    /// failed receipts kept.
+    #[test]
+    fn an_incoming_oldest_receipt_is_the_one_that_goes() {
+        let key = crate::settings::ALL[0].key;
+        let at = |i: usize, at_ms: i64| Receipt::daemon([i as u8, 1, 0, 0, 0, 0, 0, 0], key, Some("x"), at_ms);
+        let full: Vec<Receipt> = (0..Receipts::CAP).map(|i| at(i, 100 + i as i64)).collect();
+        let older = Receipt::daemon([0, 2, 0, 0, 0, 0, 0, 0], key, Some("x"), 1);
+        let tie = Receipt::daemon([0, 0, 0, 0, 0, 0, 0, 0], key, Some("x"), 100);
+        for (what, r) in [("older", older), ("the oldest time, a smaller id", tie)] {
+            let mut rs = Receipts::default();
+            full.iter().for_each(|r| rs.put(*r));
+            rs.put(r);
+            assert_eq!(rs.len(), Receipts::CAP, "{what}");
+            assert!(rs.daemon(r.daemon, key).is_none(), "{what}: it went");
+            assert!(full.iter().all(|f| rs.daemon(f.daemon, key).is_some()), "{what}: every one kept stays");
+            let mut file = serde_json::json!({});
+            write_into(&mut file, &full);
+            write_into(&mut file, &[r]);
+            let e = file[STORE]["e"].as_object().unwrap();
+            assert!(!e.contains_key(&r.id()) && full.iter().all(|f| e.contains_key(&f.id())), "{what}: the file the same");
+        }
+        // Through the file read again: the window's 256 are due, some
+        // failed; an older one of the file's never takes a place.
+        let mut rs = Receipts::default();
+        full.iter().for_each(|r| rs.put(*r));
+        rs.not_written(&full[..8]);
+        rs.merge_file(vec![Receipt { flags: 0, ..older }]);
+        assert!(rs.daemon(older.daemon, key).is_none(), "the file's older one went");
+        assert!(full.iter().all(|f| rs.daemon(f.daemon, key).is_some_and(Receipt::due)), "every due one kept");
+        assert_eq!(full[..8].iter().filter(|f| rs.daemon(f.daemon, key).is_some_and(Receipt::failed)).count(), 8, "and failed");
+    }
+
+    /// Shady #116 A5: a write's receipts as the file kept them: another
+    /// window's newer save of the place is kept over this one's older
+    /// receipt, in the file and in this window; this window's newer one,
+    /// still due, stays.
+    #[test]
+    fn the_newer_save_of_a_place_is_kept() {
+        let (d, key) = ([7; 8], "api_retries");
+        let mine = Receipt::daemon(d, key, Some("3"), 100);
+        let theirs = Receipt { flags: 0, ..Receipt::daemon(d, key, Some("5"), 200) };
+        let mut file = serde_json::json!({});
+        write_into(&mut file, &[theirs]);
+        write_into(&mut file, &[Receipt { flags: 0, ..mine }]);
+        assert_eq!(read_entry(&file, &mine), Some(theirs), "the file keeps the newer");
+        let mut rs = Receipts::default();
+        rs.put(mine);
+        rs.written(&[theirs]);
+        assert_eq!(rs.daemon(d, key).copied(), Some(theirs), "and so does the window, not due");
+        let newest = Receipt::daemon(d, key, Some("7"), 300);
+        rs.put(newest);
+        rs.written(&[theirs]);
+        assert_eq!(rs.daemon(d, key).copied(), Some(newest), "a newer one of the window's stays, due");
+        let app = Receipt::app(AppKey::Theme, &AppValue::Str("nord".into()), 50);
+        let mut file = serde_json::json!({});
+        write_into(&mut file, &[Receipt::app(AppKey::Theme, &AppValue::Str("dusk".into()), 90)]);
+        write_into(&mut file, &[app]);
+        assert_eq!(file[STORE]["e"]["app#theme"][0], 50, "an app value's receipt is its write's own");
+    }
+
+    /// Shady #116 A7: a write that fails marks failed only the receipt it
+    /// carried, never a newer save of its place since.
+    #[test]
+    fn a_failed_write_fails_only_the_receipt_it_carried() {
+        let mut rs = Receipts::default();
+        rs.put(Receipt::daemon([7; 8], "api_retries", Some("3"), 100));
+        let carried = rs.due();
+        rs.put(Receipt::daemon([7; 8], "api_retries", Some("5"), 200));
+        rs.not_written(&carried);
+        let r2 = *rs.daemon([7; 8], "api_retries").unwrap();
+        assert!(r2.due() && !r2.failed(), "R2 still due, not failed");
+        let carried = rs.due();
+        rs.not_written(&carried);
+        assert!(rs.daemon([7; 8], "api_retries").unwrap().failed(), "its own write failed");
     }
 
     /// Ids are a fixed size whatever the paths: ≤ 72 bytes; the store is
