@@ -26,6 +26,8 @@ mod card_sync_tab_tests;
 mod cards_d_tests;
 #[path = "change_tests.rs"]
 mod change_tests;
+#[path = "drafts_edge_ui_tests.rs"]
+mod drafts_edge_ui_tests;
 #[path = "drafts_ui_tests.rs"]
 mod drafts_ui_tests;
 #[path = "settings_effect_tests.rs"]

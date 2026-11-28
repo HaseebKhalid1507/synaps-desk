@@ -382,6 +382,9 @@ impl AppView {
     /// A finished board for store `live`, drawn now, or kept waiting under
     /// a pane's lease ([`crate::board`] lands it here).
     pub(crate) fn board_ready(&mut self, live: LiveId, drawn: Arc<Drawn>, cx: &mut Context<Self>) {
+        // The blocks drafts are drawn in stay where they were taken (§3.4).
+        let drawn = self.drafts_in_place(live, drawn);
+        self.model.lives[live].board.landed += 1;
         let old = self.model.lives[live].transcript.drawn().cloned();
         let panes: Vec<PaneId> = self.panes.iter().filter(|p| p.live == live).map(|p| p.id).collect();
         // The rail's lease too (D6a, §4): the panel draws the focused
