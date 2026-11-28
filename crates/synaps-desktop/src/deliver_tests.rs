@@ -1279,3 +1279,118 @@ fn a_message_waiting_when_its_tab_was_left_comes_back_unsent() {
     assert_eq!(m.left_went(1, 7), Some(Effect::Unsent { pane: PaneId::FIRST, session: S.into(), text: "Ship it.".into() }));
     assert_eq!(m.left_went(1, 7), None, "once");
 }
+
+// ── Two memos, one session: the wire's order (Shady #115 R1) ─────────
+
+/// The plans `p` and `q`'s bound board, and a hand-back of `id` (its
+/// edit, line 1).
+fn plan_edit(id: &str, set: Value) -> (synaps_client::blocks::Drawn, cards_spec::block::message::Edit, crate::handback::Line1) {
+    let plan = |id: &str| {
+        json!({"op":"put","id":id,"kind":"plan","title":"Plan","body":{"steps":[
+        {"id":"fix","label":"Fix","state":"todo"},{"id":"deploy","label":"Deploy","state":"todo"}]}})
+    };
+    let ops = json!([plan("p"), plan("q")]);
+    let m = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": "tp", "name": "cards_block", "input": {"ops": ops}}]}),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tp", "content": synaps_client::synthetic::block_receipt(&ops)}]}),
+    ];
+    let (b, events) = cards_spec::board::Board::of_history(&m);
+    let st = b.bound(&events);
+    let p = st.block(&cards_spec::block::Ref::parse(id).unwrap()).unwrap();
+    let e = cards_spec::block::message::Edit::new(p.id.clone(), p.rev, p.tag, &json!({"set": set})).unwrap();
+    let d = synaps_client::blocks::Drawn { board: Some(Arc::new(st)), ..Default::default() };
+    (d, e, crate::handback::Line1 { title: Some("Plan".into()), back_to: None, pieces: vec!["a change".into()] })
+}
+
+/// A hand-back of `set` on block `id` of [`S`], its clock `now`, handed
+/// to the wire: its body.
+fn hand_back(m: &mut Model, id: &str, set: Value, now: Instant) -> String {
+    let (d, e, l1) = plan_edit(id, set);
+    let t = synaps_client::Transcript::new();
+    let text = m.memos.edits.hand_back(S, &e, &l1, &cards_spec::block::message::Trailer::default(), &t, Some(&d), now).expect("admitted");
+    m.lives[LiveId::FIRST].edit_sent(text.clone());
+    text
+}
+
+/// [`CARD`] answered `label` on [`S`], its clock `now`, handed to the wire.
+fn answer_at(m: &mut Model, label: &str, now: Instant) {
+    let c = m.lives[LiveId::FIRST].transcript.cards().card("t1").expect("the card").clone();
+    let text = m.memos.press(S, &c, pick(label), now).expect("pressed");
+    m.lives[LiveId::FIRST].card_sent(CardId::parse(CARD).unwrap(), text);
+}
+
+fn refuse(m: &mut Model, reason: &str) {
+    let refused = synaps_client::Error::Refused { command: Some("submit".into()), reason: reason.into() };
+    m.apply(Event::Error { attach_seq: Some(1), error: refused });
+}
+
+fn edit_state(m: &Model, body: &str) -> Option<State> {
+    m.memos.edits.get(S, body).map(|e| e.state)
+}
+
+/// §3.7, "Two memos, one session", by the wire's order: a `Refused`
+/// names no text, so the window's inputs in flight (the order they went)
+/// say whose it is, and only that entry hears it. A card's answer then a
+/// hand-back: the first refusal is the card's, the second the
+/// hand-back's. The hand-back first: the other way. Their clocks don't
+/// decide: the same instant, or the hand-back's older though it went
+/// second, the refusal is still the wire's oldest input's.
+#[test]
+fn a_refusal_is_the_wire_oldest_inputs_whatever_the_memos_clocks() {
+    let t0 = Instant::now();
+    // The card's answer, then the hand-back.
+    let mut m = one();
+    answer_at(&mut m, "Refactor the parser", t0);
+    let body = hand_back(&mut m, "p", json!({"steps.fix.state":"skipped"}), t0 + Duration::from_millis(5));
+    assert_eq!(m.lives[LiveId::FIRST].in_flight.iter().count(), 2, "both on the wire");
+    refuse(&mut m, "busy");
+    assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::NotSent), "the card's: it went first");
+    assert_eq!(edit_state(&m, &body), Some(State::Sending), "the hand-back's untouched");
+    refuse(&mut m, "still busy");
+    assert_eq!(edit_state(&m, &body), Some(State::NotSent), "then the hand-back's");
+    assert!(m.lives[LiveId::FIRST].in_flight.is_empty());
+    // The hand-back, then the card's answer, at the same instant.
+    let mut m = one();
+    let body = hand_back(&mut m, "p", json!({"steps.fix.state":"skipped"}), t0);
+    answer_at(&mut m, "Refactor the parser", t0);
+    refuse(&mut m, "busy");
+    assert_eq!(edit_state(&m, &body), Some(State::NotSent), "the hand-back's: it went first, the clocks tied");
+    assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::Sending), "the card's untouched");
+    refuse(&mut m, "still busy");
+    assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::NotSent));
+    // The card's answer first, the hand-back after it with an older clock
+    // (a send that waited: its clock isn't its place on the wire).
+    let mut m = one();
+    answer_at(&mut m, "Refactor the parser", t0 + Duration::from_millis(50));
+    let body = hand_back(&mut m, "p", json!({"steps.fix.state":"skipped"}), t0);
+    refuse(&mut m, "busy");
+    assert_eq!(state(&m, LiveId::FIRST, S).map(|s| s.0), Some(State::NotSent), "the wire's oldest: the card's");
+    assert_eq!(edit_state(&m, &body), Some(State::Sending));
+}
+
+/// Two hand-backs (two blocks' edits) at the same instant: the memo's
+/// order is the wire's (each send's clock after the last), so the first
+/// refusal is the first sent's. A refusal of an input the memo's oldest
+/// sending entry isn't (it timed out to checking meanwhile) refuses
+/// nothing: never another message, which may be on the wire.
+#[test]
+fn two_hand_backs_at_one_instant_are_refused_in_the_order_they_went() {
+    let t0 = Instant::now();
+    let mut m = one();
+    let a = hand_back(&mut m, "p", json!({"steps.fix.state":"skipped"}), t0);
+    let b = hand_back(&mut m, "q", json!({"steps.deploy.stop":true}), t0);
+    refuse(&mut m, "busy");
+    assert_eq!((edit_state(&m, &a), edit_state(&m, &b)), (Some(State::NotSent), Some(State::Sending)), "the first sent's");
+    refuse(&mut m, "busy");
+    assert_eq!(edit_state(&m, &b), Some(State::NotSent));
+    // A timed out to checking, B sending: A's refusal is A's or nothing.
+    let mut m = one();
+    let a = hand_back(&mut m, "p", json!({"steps.fix.state":"skipped"}), t0);
+    m.memos.edits.tick(t0 + cards_spec::memo::ECHO_WAIT + Duration::from_millis(1));
+    assert_eq!(edit_state(&m, &a), Some(State::Checking));
+    let b = hand_back(&mut m, "q", json!({"steps.deploy.stop":true}), t0 + cards_spec::memo::ECHO_WAIT + Duration::from_millis(2));
+    refuse(&mut m, "busy");
+    assert_eq!(edit_state(&m, &b), Some(State::Sending), "B went after A: A's refusal is never B's");
+    assert_eq!(edit_state(&m, &a), Some(State::Unconfirmed), "A's view settles it: not confirmed, never not sent");
+}

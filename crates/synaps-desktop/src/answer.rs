@@ -622,13 +622,13 @@ impl AppView {
         let Some(c) = self.client.as_ref() else {
             match self.synthetic_tx.clone().filter(|_| self.synthetic) {
                 Some(tx) => self.synthetic_answer(live, out, tx, cx),
-                None => self.model.card_unsent(live, "offline"),
+                None => self.model.card_unsent(live, &out.card, "offline"),
             }
             return;
         };
         let sent = if out.busy { c.on(out.seq).steer(out.text.clone()) } else { c.on(out.seq).submit(out.text.clone()) };
         if sent.is_err() {
-            self.model.card_unsent(live, "the connection thread has stopped");
+            self.model.card_unsent(live, &out.card, "the connection thread has stopped");
             return;
         }
         log::debug!(target: "synaps_desktop::send", "card {}: {} ({} chars)", out.card, if out.busy { "steer" } else { "submit" }, out.text.chars().count());

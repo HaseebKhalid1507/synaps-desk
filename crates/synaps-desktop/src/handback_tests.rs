@@ -1,12 +1,13 @@
 //! The hand-back model's own tests (D8b, blocks.md §3.7, §1.8): what a
-//! row says the board did, what reads as an edit, the memos' bounds, and
-//! a refusal given to the memo whose oldest sending entry is older.
+//! row says the board did, what reads as an edit, the memos' bounds (a
+//! session leaving whole, the room a Discard makes). A refusal's routing
+//! by the wire's order is `crate::deliver`'s (its tests).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use cards_spec::block::Ref;
 use cards_spec::block::message::{Edit, Trailer};
-use cards_spec::block::{Ref, Tag};
 use cards_spec::board::{Board, Code, EditOutcome, EditResult, Pos, State};
 use serde_json::{Value, json};
 use synaps_client::Transcript;
@@ -126,20 +127,95 @@ fn sixteen_sessions_of_hand_backs_and_a_seventeenth_waits() {
     assert!(h.latest("s0", &e.id, e.of).is_none(), "the settled memo went");
 }
 
-/// §3.7, "Two memos, one session": a `Refused` names no text; it is the
-/// memo's whose oldest sending entry is older: the card's answer sent
-/// first takes it, then the hand-back.
+/// Shady #115 finding 1 (§1.8): a session leaves whole. Delivered hand-backs
+/// (taken in, their histories never settled) in more than 16 sessions,
+/// one after another: each memo that goes to make room takes what it had
+/// taken in with it, so both maps keep the same sessions, at most 16,
+/// and what they keep stays under its bound after every one.
 #[test]
-fn a_refusal_is_the_older_sending_entrys() {
+fn a_session_leaving_takes_what_it_had_taken_in() {
     let st = board(&[plan("p")]);
     let d = drawn(st.clone());
     let t = Transcript::new();
-    let mut m = crate::deliver::Memos::default();
-    let t0 = Instant::now();
+    let mut h = HandBacks::default();
+    let now = Instant::now();
     let e = edit(&st, "p", json!({"steps.fix.state":"skipped"}));
-    m.edits.hand_back("s", &e, &line1("skip fix"), &Trailer::default(), &t, Some(&d), t0).unwrap();
-    let body = m.edits.latest("s", &e.id, e.of).unwrap().text.clone();
-    m.on("s", Heard::Refused { reason: "busy" }, t0 + Duration::from_millis(5));
-    assert_eq!(m.edits.get("s", &body).map(|x| x.state), Some(cards_spec::memo::State::NotSent), "the only one sending");
-    let _: Tag = e.of;
+    let bound = SESSIONS_MAX * (2 * bm::CAP * ENTRY_MAX_BYTES + 4096);
+    for k in 0..3 * SESSIONS_MAX {
+        let s = format!("s{k}");
+        let text = h.hand_back(&s, &e, &line1("skip fix"), &Trailer::default(), &t, Some(&d), now).expect("room");
+        h.on(&s, Heard::Echo { text: &text, driver: false }, now);
+        h.on(&s, Heard::Delivered { text: &text }, now);
+        assert_eq!(h.get(&s, &text).map(|x| x.state), Some(cards_spec::memo::State::InChat), "{s}: taken in");
+        let (by, taken) = h.sessions();
+        assert!(by.len() <= SESSIONS_MAX, "{s}: {} memos", by.len());
+        assert!(taken.iter().all(|x| by.contains(x)), "{s}: what was taken in outlives its memo: {taken:?} vs {by:?}");
+        assert!(h.bytes() <= bound, "{s}: {} bytes kept", h.bytes());
+    }
+}
+
+/// §1.8 and §3.7: the caps the user can make room under. Sixteen
+/// sessions each with a hand-back not sent: a 17th is refused; Discard on
+/// one (its entry, by its body) makes room. A session's 32 not sent: its
+/// 33rd is refused ([`bm::FULL`]) until one is discarded.
+#[test]
+fn a_full_desk_or_memo_makes_room_when_one_is_discarded() {
+    let st = board(&[plan("p")]);
+    let d = drawn(st.clone());
+    let t = Transcript::new();
+    let mut h = HandBacks::default();
+    let now = Instant::now();
+    let e = edit(&st, "p", json!({"steps.fix.state":"skipped"}));
+    let mut first = String::new();
+    for k in 0..SESSIONS_MAX {
+        let s = format!("s{k}");
+        let text = h.hand_back(&s, &e, &line1("skip fix"), &Trailer::default(), &t, Some(&d), now).expect("room");
+        assert!(h.refused(&s, &text, "busy", now), "{s}: refused, its own");
+        if k == 0 {
+            first = text;
+        }
+    }
+    assert_eq!(h.may_hand_back("s16", &e, &line1("skip fix"), &t, Some(&d)).err().as_deref(), Some(SESSIONS_FULL));
+    assert!(h.forget("s0", &first), "Discard");
+    h.may_hand_back("s16", &e, &line1("skip fix"), &t, Some(&d)).expect("room once one is discarded");
+    // One session's memo, full of hand-backs not sent (each another
+    // block's: none covers another; 32 blocks, the most a board has).
+    let many: Vec<Value> = (0..bm::CAP).map(|k| plan(&format!("p{k}"))).collect();
+    let st = board(&many);
+    let d = drawn(st.clone());
+    let mut h = HandBacks::default();
+    let mut texts = Vec::new();
+    for k in 0..bm::CAP {
+        let e = edit(&st, &format!("p{k}"), json!({"steps.fix.label": format!("Fix {k}")}));
+        let text = h.hand_back("s", &e, &line1(&format!("rename {k}")), &Trailer::default(), &t, Some(&d), now).expect("room");
+        assert!(h.refused("s", &text, "busy", now));
+        texts.push(text);
+    }
+    let more = edit(&st, "p0", json!({"steps.deploy.label": "Deploy more"}));
+    assert_eq!(h.may_hand_back("s", &more, &line1("rename more"), &t, Some(&d)).err().as_deref(), Some(bm::FULL));
+    assert!(h.forget("s", &texts[3]));
+    h.may_hand_back("s", &more, &line1("rename more"), &t, Some(&d)).expect("room once one is discarded");
+}
+
+/// Shady #115 finding 9: a refusal names one input, this desk's text, and
+/// refuses that entry only if it is its memo's oldest sending (the memo
+/// answers a `Refused` with its oldest): else nothing, never another
+/// entry, which may be on the wire.
+#[test]
+fn a_refusal_of_an_entry_that_isnt_the_oldest_sending_refuses_nothing() {
+    use cards_spec::memo::State as M;
+    let st = board(&[plan("p"), plan("q")]);
+    let d = drawn(st.clone());
+    let t = Transcript::new();
+    let mut h = HandBacks::default();
+    let now = Instant::now();
+    let (ea, eb) = (edit(&st, "p", json!({"steps.fix.state":"skipped"})), edit(&st, "q", json!({"steps.deploy.stop":true})));
+    let a = h.hand_back("s", &ea, &line1("skip fix"), &Trailer::default(), &t, Some(&d), now).unwrap();
+    let b = h.hand_back("s", &eb, &line1("stop"), &Trailer::default(), &t, Some(&d), now).unwrap();
+    let states = |h: &HandBacks| (h.get("s", &a).map(|e| e.state), h.get("s", &b).map(|e| e.state));
+    assert!(!h.refused("s", &b, "busy", now), "B isn't the oldest sending: nothing");
+    assert_eq!(states(&h), (Some(M::Sending), Some(M::Sending)));
+    assert!(h.refused("s", &a, "busy", now), "A is");
+    assert_eq!(states(&h), (Some(M::NotSent), Some(M::Sending)));
+    assert!(!h.refused("s", &a, "busy", now), "not sending now: nothing");
 }

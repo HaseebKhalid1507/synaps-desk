@@ -545,18 +545,10 @@ impl Memos {
                 x.ended = true;
             }
         }
-        // A refusal names no text: it is the memo's whose oldest sending
-        // entry is older (§3.7, "Two memos, one session").
-        if let Heard::Refused { .. } = ev {
-            let card = self.by.get(session).and_then(Memo::oldest_sending);
-            let edit = self.edits.oldest_sending(session);
-            if edit.is_some_and(|e| card.is_none_or(|c| e < c)) {
-                self.edits.on(session, ev, now);
-                return;
-            }
-        } else {
-            self.edits.on(session, ev, now);
-        }
+        // A refusal names no text: the window's wire order does, and
+        // [`Memos::refused`] routes it. The block memos never hear one
+        // here; a card memo's is its own.
+        self.edits.on(session, ev, now);
         self.with(session, |m| m.on(ev, now));
         match ev {
             Heard::Delivered { text } => {
@@ -838,6 +830,38 @@ impl Memos {
         self.by.get(session)?.get(&CardId::parse(card)?).map(|e| e.state)
     }
 
+    /// The daemon refused `input`, the oldest this desk sent on `session`
+    /// (the window's wire order, `Live`'s inputs in flight): a card's
+    /// answer is that card's, a hand-back that text's (§3.7, "Two memos,
+    /// one session": the wire's order, not the memos' clocks, says which).
+    /// Each memo refuses its oldest sending entry: only if that is the
+    /// input's, else nothing (the clock and views settle it), never
+    /// another message (one that may be on the wire).
+    pub(crate) fn refused(&mut self, session: &str, input: &crate::live::Input, reason: &str, now: Instant) {
+        match &input.to {
+            crate::live::Target::Edit => {
+                let wire = input.wire.as_deref().unwrap_or(&input.body);
+                self.edits.refused(session, wire, reason, now);
+            }
+            crate::live::Target::Card(card) => self.card_refused(session, card, reason, now),
+            crate::live::Target::Pane(_) => {}
+        }
+    }
+
+    /// Card `card`'s answer on `session` refused, or never handed to the
+    /// connection: not sent, if its memo's oldest sending entry is it.
+    pub(crate) fn card_refused(&mut self, session: &str, card: &CardId, reason: &str, now: Instant) {
+        let Some(m) = self.by.get(session) else { return };
+        let mut c = m.clone();
+        c.on(Heard::Refused { reason }, now);
+        let hit = m.entries().iter().zip(c.entries()).find(|(a, b)| a != b).map(|(a, _)| &a.card);
+        if hit != Some(card) {
+            log::info!(target: "synaps_desktop::deliver", "card {card}: refused, not its memo's oldest sending: nothing refused here");
+            return;
+        }
+        self.with(session, |m| m.on(Heard::Refused { reason }, now));
+    }
+
     /// Whether Resend shows on `card` (with the window's `input_gate()`).
     pub(crate) fn may_resend(&self, session: &str, card: &CardId, fold: &Fold) -> bool {
         self.by.get(session).is_some_and(|m| m.may_resend(card, fold)) && !self.doubtful(session, card, fold)
@@ -921,21 +945,27 @@ impl crate::model::Model {
         self.lives[lid].card_sent(out.card, out.text);
     }
 
-    /// `out` could not be handed to the connection (its thread stopped):
-    /// not sent.
-    pub(crate) fn card_unsent(&mut self, lid: crate::live::LiveId, reason: &str) {
-        self.card_refused(lid, reason);
-    }
-
-    /// A card's answer from store `lid` was refused, or never went: not
-    /// sent. Then the view as it is, which the memo follows again: an
-    /// answer it leaves at rest that a lost one's copy shows over is
-    /// retired at once ([`Memos::retire`]), not at the next event.
-    pub(crate) fn card_refused(&mut self, lid: crate::live::LiveId, reason: &str) {
+    /// Card `card`'s answer could not be handed to the connection (its
+    /// thread stopped): not sent, that card's alone (never the oldest
+    /// sending, which may be on the wire: [`Memos::card_refused`]).
+    pub(crate) fn card_unsent(&mut self, lid: crate::live::LiveId, card: &CardId, reason: &str) {
         let l = &self.lives[lid];
         if let Some(s) = l.active.as_ref().map(|a| a.session_id.as_str()) {
             let now = Instant::now();
-            self.memos.on(s, Heard::Refused { reason }, now);
+            self.memos.card_refused(s, card, reason, now);
+            self.memos.observe(s, &l.transcript, now);
+        }
+    }
+
+    /// The daemon refused `input`, the oldest store `lid` sent ([`Memos::refused`]).
+    /// Then the view as it is, which the memo follows again: an answer it
+    /// leaves at rest that a lost one's copy shows over is retired at once
+    /// ([`Memos::retire`]), not at the next event.
+    pub(crate) fn input_refused(&mut self, lid: crate::live::LiveId, input: &crate::live::Input, reason: &str) {
+        let l = &self.lives[lid];
+        if let Some(s) = l.active.as_ref().map(|a| a.session_id.as_str()) {
+            let now = Instant::now();
+            self.memos.refused(s, input, reason, now);
             self.memos.observe(s, &l.transcript, now);
         }
     }

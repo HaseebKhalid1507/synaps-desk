@@ -46,7 +46,7 @@ use std::sync::Arc;
 use cards_spec::block::message::{Edit, build};
 
 use crate::handback::Line1;
-use cards_spec::block::{DiffState, Generation, HunkState, ItemId, Kind, PLAN_STEPS_MAX, Ref, Step, StepState, Tag};
+use cards_spec::block::{Author, DiffState, Generation, HunkState, ItemId, Kind, PLAN_STEPS_MAX, Ref, Step, StepState, Tag};
 use cards_spec::board::{BLOCK_MAX_OWNED, Block, Code, EditResult, Key, State, keys};
 use serde_json::{Map, Value, json};
 use synaps_client::blocks::{Body, Drawn};
@@ -200,10 +200,26 @@ pub(crate) struct Draft {
     pub serial: u64,
     /// A restore (§3.6): line 1 says `back to r<M>: `.
     pub back_to: Option<u32>,
-    /// Handed back (D8b): the edit's body, in flight. It draws, marked
-    /// sending, over the board until the board holds it (§3.7), and takes
-    /// no key.
+    /// Handed back (D8b): the edit's body. It draws, marked with its
+    /// delivery, over the board until the board holds it (§3.7), and
+    /// takes no key and no new hold.
     pub sent: Option<String>,
+    /// Its hand-back waits for its notices' marks: not on the wire, and no
+    /// memo entry owns it yet, so nothing settles or drops it. An end
+    /// (a replace, a compaction) leaves it as any draft's, its text
+    /// recoverable; its wait then sends nothing.
+    pub waiting: bool,
+    /// The board input revision its row first showed at, in the chat: a
+    /// board at or past it has read it (`Drawn::rev`), whatever outcomes
+    /// that board still keeps.
+    pub shown_at: Option<u64>,
+    /// The revisions after `B` read for [`Draft::other`], through this
+    /// one: a watermark, so what the board's caches let go after is never
+    /// read as nothing.
+    pub checked: u32,
+    /// Another hand-back of its incarnation landed since `B` (§5.4): kept
+    /// once seen, until the history rolls back below it.
+    pub other: bool,
 }
 
 impl Draft {
@@ -226,7 +242,16 @@ impl Draft {
             serial: 0,
             back_to: None,
             sent: None,
+            waiting: false,
+            shown_at: None,
+            checked: 0,
+            other: false,
         })
+    }
+
+    /// Its hand-back is on the wire: the memo owns its delivery.
+    pub(crate) fn on_wire(&self) -> bool {
+        self.sent.is_some() && !self.waiting
     }
 
     /// Its base body's steps, if it is a plan's.
@@ -743,8 +768,35 @@ impl Draft {
     /// desk's, so one landing while it is held is another's.
     pub(crate) fn other_edit(&self, st: &State) -> Option<u32> {
         let b = st.block(&self.id).filter(|b| b.tag == self.tag)?;
-        let from = st.records_of(self.tag).find(|r| r.rev == self.base).map(|r| r.at)?;
-        st.outcomes().any(|o| o.id == self.id && o.at > from).then_some(b.rev)
+        self.other.then_some(b.rev)
+    }
+
+    /// What the bound board `st` says of other edits since `B` (§5.4),
+    /// kept once seen ([`Draft::other`]): a revision of this incarnation
+    /// after `B` that a user wrote (a hand-back admitted on this tag; one
+    /// naming another incarnation of the id changes nothing here). Each
+    /// revision is read once, past [`Draft::checked`]; one whose record
+    /// the board let go before it was read counts (never read as the
+    /// agent's). A history rolled back below what was read reads again
+    /// from `B`. Whether it changed.
+    pub(crate) fn note_other(&mut self, st: &State) -> bool {
+        let Some(b) = st.block(&self.id).filter(|b| b.tag == self.tag) else { return false };
+        let was = self.other;
+        if self.checked < self.base || b.rev < self.checked {
+            self.checked = self.base;
+            self.other = false;
+        }
+        for rev in self.checked + 1..=b.rev {
+            if self.other {
+                break;
+            }
+            self.other = st.records_of(self.tag).find(|r| r.rev == rev).is_none_or(|r| r.author == Author::User);
+        }
+        self.checked = self.checked.max(b.rev);
+        if self.other != was {
+            self.serial += 1;
+        }
+        self.other != was
     }
 
     /// A restore (§3.6) of `now` (the current incarnation, bound) back to
@@ -882,10 +934,17 @@ impl Drafts {
         let mut moved = false;
         // One sent whose block ended: the board draws what it is now (its
         // delivery carries on, §3.7).
+        // One waiting for its notices' marks isn't on its way: it ends as
+        // any draft does, its text kept.
         let n = self.all.len();
-        self.all.retain(|(s, x)| !(s == session && x.sent.is_some() && x.ended.is_none() && x.fate(d) != Fate::Held));
+        self.all.retain(|(s, x)| !(s == session && x.on_wire() && x.ended.is_none() && x.fate(d) != Fate::Held));
         moved |= self.all.len() < n;
         for (_, x) in self.all.iter_mut().filter(|(s, _)| s == session) {
+            if x.ended.is_none()
+                && let Some(st) = d.board.as_deref()
+            {
+                moved |= x.note_other(st);
+            }
             if x.ended.is_none() {
                 let f = x.fate(d);
                 if f != Fate::Held {
@@ -913,7 +972,7 @@ impl Drafts {
 
     fn end(&mut self, session: &str, f: Fate) -> bool {
         let n = self.all.len();
-        self.all.retain(|(s, x)| !(s == session && x.sent.is_some()));
+        self.all.retain(|(s, x)| !(s == session && x.on_wire()));
         let mut any = self.all.len() < n;
         for (_, x) in self.all.iter_mut().filter(|(s, x)| s == session && x.ended.is_none()) {
             log::info!(target: "synaps_desktop::drafts", "draft of {} ended: {f:?}", x.id);
@@ -925,21 +984,51 @@ impl Drafts {
     }
 
     /// Session `session`'s draft of `id`'s incarnation `tag` was handed
-    /// back as `body` (`None`: it wasn't, after all: held again).
+    /// back as `body`, on the wire (`None`: it wasn't, after all: held
+    /// again, or ended as it was).
     pub(crate) fn sent(&mut self, session: &str, id: &Ref, tag: Tag, body: Option<String>) {
         if let Some(d) = self.get_mut(session, id, tag) {
             d.sent = body;
+            d.waiting = false;
+            d.shown_at = None;
             d.serial += 1;
         }
     }
 
-    /// Session `session`'s handed-back drafts that `drawn` says are done
-    /// with (their edit not in flight, and the board holding the history
-    /// it is in): they go, and the board draws the block. Their rows.
-    pub(crate) fn settle_sent(&mut self, session: &str, done: &dyn Fn(&str) -> bool) -> Vec<u64> {
+    /// Session `session`'s draft of `id`'s incarnation `tag` is handed back
+    /// as `body`, once its notices' marks are written ([`Draft::waiting`]).
+    pub(crate) fn wait(&mut self, session: &str, id: &Ref, tag: Tag, body: String) {
+        if let Some(d) = self.get_mut(session, id, tag) {
+            d.sent = Some(body);
+            d.waiting = true;
+            d.serial += 1;
+        }
+    }
+
+    /// The draft waiting to hand back `body` on incarnation `tag` (any
+    /// session's) wasn't sent after all: held again, or ended as it was,
+    /// its text kept.
+    pub(crate) fn unwait(&mut self, tag: Tag, body: &str) {
+        if let Some((_, d)) = self.all.iter_mut().find(|(_, d)| d.waiting && d.tag == tag && d.sent.as_deref() == Some(body)) {
+            d.sent = None;
+            d.waiting = false;
+            d.serial += 1;
+        }
+    }
+
+    /// Session `session`'s draft of incarnation `tag`, whatever its id.
+    pub(crate) fn of_tag(&self, session: &str, tag: Tag) -> Option<&Draft> {
+        self.all.iter().find(|(s, d)| s == session && d.tag == tag).map(|(_, d)| d)
+    }
+
+    /// Session `session`'s handed-back drafts on the wire that `done` says
+    /// are done with (their edit not in flight, and the board holding the
+    /// history it is in): they go, and the board draws the block. One
+    /// waiting for its notices' marks is never done. Their rows.
+    pub(crate) fn settle_sent(&mut self, session: &str, done: &mut dyn FnMut(&mut Draft) -> bool) -> Vec<u64> {
         let mut rows = Vec::new();
-        self.all.retain(|(s, d)| {
-            let go = s == session && d.sent.as_deref().is_some_and(done);
+        self.all.retain_mut(|(s, d)| {
+            let go = s == session && d.on_wire() && done(d);
             if go {
                 rows.push(crate::blocks::row_id(&d.id));
             }

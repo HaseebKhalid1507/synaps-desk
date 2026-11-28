@@ -422,7 +422,71 @@ fn another_edit_since_b_is_told_and_ticks_are_not() {
     let (b, events) = Board::of_history(&h);
     let other = b.bound(&events);
     assert_eq!(other.block(&Ref::parse("plan").unwrap()).unwrap().rev, 3);
+    let mut d = d;
+    assert!(!d.note_other(&ticked), "the agent's tick");
+    assert!(d.note_other(&other));
     assert_eq!(d.other_edit(&other), Some(3));
+}
+
+/// Shady #115 finding 10: `another edit arrived` is this incarnation's,
+/// read off its revisions (a watermark), not the board's outcomes. It
+/// stays through 40 hand-backs of other blocks (past the 32 outcomes the
+/// board keeps), seen first on a board that has them all; a late
+/// hand-back naming the id's earlier incarnation tells nothing; a history
+/// rolled back below it forgets it.
+#[test]
+fn another_edit_is_the_incarnations_whatever_the_board_lets_go() {
+    let (st, g) = board(&[plan()]);
+    let mut d = take(&st, g, "plan");
+    let tag = block(&st, "plan").tag;
+    let other_ops: Vec<Value> = (0..10).map(|k| json!([{"op":"put","id":format!("n{k}"),"kind":"note","body":{"text":"x"}}])).collect();
+    let mut rounds = vec![plan()];
+    rounds.extend(other_ops.iter().cloned());
+    let mut h = history("go", &rounds);
+    h.push(json!({"role": "user", "content": format!(
+        "[block plan edited r1] Close the refresh race → skip test\n{{\"of\":\"{tag}\",\"set\":{{\"steps.test.state\":\"skipped\"}}}}")}));
+    let (all, _) = board(&rounds);
+    for k in 0..40 {
+        let n = block(&all, &format!("n{}", k % 10));
+        h.push(json!({"role": "user", "content": format!(
+            "[block {} edited r1] x\n{{\"of\":\"{}\",\"set\":{{\"text\":\"y{k}\"}}}}", n.id, n.tag)}));
+    }
+    let (b, events) = Board::of_history(&h);
+    let many = b.bound(&events);
+    assert!(!many.outcomes().any(|o| o.id == d.id), "the board let its outcome go");
+    assert!(d.note_other(&many), "read off the revisions");
+    assert_eq!(d.other_edit(&many), Some(2));
+    // A late hand-back naming the earlier incarnation: nothing here.
+    let (st, g) = board(&[plan()]);
+    let old = block(&st, "plan").tag;
+    let replace =
+        json!([{"op":"replace","id":"plan","kind":"plan","title":"Another","body":{"steps":[{"id":"fix","label":"Fix","state":"todo"}]}}]);
+    let (now, _) = board(&[plan(), replace.clone()]);
+    let mut d = take(&now, g, "plan");
+    assert_ne!(d.tag, old);
+    let mut h = history("go", &[plan(), replace]);
+    h.push(json!({"role": "user", "content": format!(
+        "[block plan edited r1] Close the refresh race → skip test\n{{\"of\":\"{old}\",\"set\":{{\"steps.test.state\":\"skipped\"}}}}")}));
+    let (b, events) = Board::of_history(&h);
+    let late = b.bound(&events);
+    assert!(!d.note_other(&late), "another incarnation's: not this one's");
+    assert_eq!(d.other_edit(&late), None);
+    // Rolled back below it: forgotten.
+    let (st, g) = board(&[plan()]);
+    let mut d = take(&st, g, "plan");
+    assert!(d.note_other(&other_of(&st)));
+    assert!(d.note_other(&st), "rolled back to B");
+    assert_eq!(d.other_edit(&st), None);
+}
+
+/// [`plan`]'s board with another desk's hand-back on it.
+fn other_of(st: &State) -> State {
+    let tag = block(st, "plan").tag;
+    let mut h = history("go", &[plan()]);
+    h.push(json!({"role": "user", "content": format!(
+        "[block plan edited r1] Close the refresh race → skip test\n{{\"of\":\"{tag}\",\"set\":{{\"steps.test.state\":\"skipped\"}}}}")}));
+    let (b, events) = Board::of_history(&h);
+    b.bound(&events)
 }
 
 /// A draft handed back (D8b) is sent: it takes no new hold until it
@@ -438,7 +502,30 @@ fn a_sent_draft_takes_no_new_hold_and_is_charged_its_body() {
     all.sent("s", &b.id, b.tag, Some(body.clone()));
     assert!(all.bytes() >= before + 1000);
     assert_eq!(all.take("s", &b, g).err(), Some(crate::handback::SENDING));
-    assert_eq!(all.settle_sent("s", &|t| t != body), Vec::<u64>::new(), "still out");
-    assert_eq!(all.settle_sent("s", &|t| t == body), vec![crate::blocks::row_id(&b.id)]);
+    assert_eq!(all.settle_sent("s", &mut |d| d.sent.as_deref() != Some(&body)), Vec::<u64>::new(), "still out");
+    assert_eq!(all.settle_sent("s", &mut |d| d.sent.as_deref() == Some(&body)), vec![crate::blocks::row_id(&b.id)]);
     assert_eq!(all.count("s"), 0, "it went: the board draws the block");
+}
+
+/// Shady #115 finding 2 (P1): a draft waiting for its notices' marks is
+/// not on the wire: nothing settles it (no memo entry is no proof it
+/// went), a take is refused, an end (a replace, a compaction) keeps its
+/// text, and once it didn't go it is held again.
+#[test]
+fn a_waiting_draft_is_never_settled_and_an_end_keeps_it() {
+    let (st, g) = board(&[plan()]);
+    let mut all = Drafts::default();
+    let b = block(&st, "plan");
+    all.take("s", &b, g).unwrap().strike(&id("fix")).unwrap();
+    let body = "the edit".to_string();
+    all.wait("s", &b.id, b.tag, body.clone());
+    assert_eq!(all.settle_sent("s", &mut |_| true), Vec::<u64>::new(), "waiting: never settled");
+    assert_eq!(all.take("s", &b, g).err(), Some(crate::handback::SENDING), "no competing hold");
+    assert!(all.compacted("s"));
+    let d = all.of("s").next().expect("kept through a compaction");
+    assert!(d.waiting && d.sent.as_deref() == Some(body.as_str()));
+    all.unwait(b.tag, &body);
+    let d = all.of("s").next().expect("not sent: kept");
+    assert!(!d.waiting && d.sent.is_none(), "its text the user's again");
+    assert!(d.ended.is_some(), "ended as any draft");
 }

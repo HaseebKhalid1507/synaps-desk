@@ -290,16 +290,16 @@ impl Live {
 
     /// A refusal: the oldest unconfirmed text was refused (the daemon
     /// handles input in order, and earlier echoes confirmed the rest).
-    /// A composer's goes back to it; a card's is the card's: `true` (its
-    /// memo hears the refusal, [`crate::deliver`]).
-    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> bool {
+    /// A composer's goes back to it; a card's answer or a hand-back is its
+    /// memo's: that input, which the memos route by (its card, its text:
+    /// [`crate::deliver::Memos::refused`]), never by their own clocks.
+    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> Option<Input> {
         match self.in_flight.pop_front() {
             Some(Input { to: Target::Pane(pane), body, .. }) => {
                 effects.push(Effect::Restore(pane, body));
-                false
+                None
             }
-            Some(Input { to: Target::Card(_) | Target::Edit, .. }) => true,
-            None => false,
+            other => other,
         }
     }
 

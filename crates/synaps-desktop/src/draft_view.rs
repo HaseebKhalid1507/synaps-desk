@@ -382,7 +382,7 @@ impl AppView {
         let row = e.row;
         let (session, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
         let Some(d) = self.editing_draft() else { return };
-        if d.sent.is_some() {
+        if d.sent.is_some() && d.ended.is_none() {
             self.edit_says(row, crate::handback::SENDING, cx);
             return;
         }
@@ -805,14 +805,35 @@ impl AppView {
         if let Some(r) = walked.or(self.panes.cur.edit.at.as_ref().map(|e| e.row)) {
             self.saw_changed(r);
         }
-        // A restore that waited for the bound board: it is here.
-        if let Some((pane, row)) = self.restore_wanted
-            && pane == self.panes.cur.id
-            && self.bound_board().is_some_and(|b| b.board.is_some())
-        {
+        // A restore that waited for the bound board: it is here. What it
+        // was pressed on still shown, it goes; else nothing, and the block
+        // says why.
+        if self.restore_wanted.as_ref().is_some_and(|w| !self.panes.iter().any(|p| p.id == w.pane)) {
             self.restore_wanted = None;
-            self.restore_now(row, cx);
         }
+        if let Some(w) = self.restore_wanted.clone()
+            && w.pane == self.panes.cur.id
+        {
+            let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone());
+            let shown = self
+                .panes
+                .cur
+                .walk
+                .walk
+                .as_ref()
+                .filter(|v| v.at.row() == w.row)
+                .and_then(|v| v.rev.as_ref())
+                .map(|v| (v.rev.at, v.rev.tag));
+            if session.as_deref() != Some(w.session.as_str()) || shown != Some((w.at, w.tag)) {
+                self.restore_wanted = None;
+                log::info!(target: "synaps_desktop::handback", "a restore that waited: {}", crate::handback_view::RESTORE_LEFT);
+                self.edit_says(w.row, crate::handback_view::RESTORE_LEFT, cx);
+            } else if self.bound_board().is_some_and(|b| b.board.is_some()) {
+                self.restore_wanted = None;
+                self.restore_now(w.row, Some(&w), cx);
+            }
+        }
+        self.sync_outcomes(cx);
         let Some(e) = self.panes.cur.edit.at.as_ref() else {
             if self.panes.cur.edit.holds(window) {
                 self.edit_leave(true, window, cx);
@@ -852,8 +873,10 @@ impl AppView {
             };
             // And for a restore asked for (§3.6): its pre-check is the
             // same ([`AppView::restore`]).
-            let restoring = self.restore_wanted.is_some_and(|(pane, _)| self.panes.iter().any(|p| p.id == pane && p.live == live));
-            let want = self.block_drafts.holds(&session) || restoring;
+            // A hand-back waiting for its notices' marks: its pre-check runs
+            // again at the wire, on the bound board then.
+            let restoring = self.restore_wanted.as_ref().is_some_and(|w| self.panes.iter().any(|p| p.id == w.pane && p.live == live));
+            let want = self.block_drafts.holds(&session) || restoring || self.edit_waits.values().any(|w| w.lid() == live);
             let l = &mut self.model.lives[live];
             if l.transcript.blocks_keeps_bound() != want {
                 l.transcript.blocks_keep_bound(want);
@@ -1363,7 +1386,9 @@ impl AppView {
 
     /// The drafts dock, over the composer (module docs): the session's
     /// drafts with no row drawn in this pane (gone, compacted), a line
-    /// each, with Copy to composer and Discard.
+    /// each, with Copy to composer and Discard; then this desk's
+    /// hand-backs whose block ended while they say something (D8b,
+    /// [`AppView::ended_hand_backs`]), with Copy and Discard, no Resend.
     pub(crate) fn drafts_dock(&self, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session = self.edit_session()?;
         let rowless: Vec<&Draft> = self
@@ -1371,7 +1396,8 @@ impl AppView {
             .of(&session)
             .filter(|d| self.block_drawn(crate::blocks::row_id(&d.id)).is_none() || d.ended == Some(Fate::Orphan))
             .collect();
-        if rowless.is_empty() {
+        let ended = self.ended_hand_backs();
+        if rowless.is_empty() && ended.is_empty() {
             return None;
         }
         let pane = self.panes.cur.id;
@@ -1435,6 +1461,56 @@ impl AppView {
                             .text_px(m.meta)
                             .text_color(p.dim_t)
                             .child(t),
+                    )
+                    .child(act("Copy to composer", true))
+                    .child(act("Discard", false)),
+            );
+        }
+        for (body, words) in ended {
+            let key = crate::handback_view::entry_key(&body);
+            let act = |label: &'static str, copy: bool| {
+                let body = body.clone();
+                div()
+                    .id((label, key))
+                    .flex_none()
+                    .px(px(8.))
+                    .cursor_pointer()
+                    .font_family(fonts::SANS)
+                    .text_px(m.meta)
+                    .text_color(p.prose_t)
+                    .bg(p.well_d)
+                    .debug_selector(move || format!("dock-button {label} hand-back {key}"))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.in_pane(pane, |this| {
+                            if copy {
+                                this.hand_back_copy(&body, window, cx);
+                            } else {
+                                this.hand_back_discard(&body, cx);
+                            }
+                        });
+                    }))
+            };
+            let tt = words.clone();
+            col = col.child(
+                h_flex()
+                    .w_full()
+                    .gap(px(8.))
+                    .items_center()
+                    .whitespace_nowrap()
+                    .debug_selector(move || format!("dock-hand-back {tt}"))
+                    .child(crate::app::display("SENT", fonts::size::D_S, p.focus).flex_none())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_family(fonts::SANS)
+                            .text_px(m.meta)
+                            .text_color(p.dim_t)
+                            .child(words),
                     )
                     .child(act("Copy to composer", true))
                     .child(act("Discard", false)),

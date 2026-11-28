@@ -155,6 +155,22 @@ pub(crate) struct Refolds {
     pub(crate) started: u64,
 }
 
+impl Refolds {
+    /// Whether the one scratch is taken: a re-fold runs or waits, or one
+    /// finished is kept for its request.
+    pub(crate) fn busy(&self) -> bool {
+        self.running.is_some() || self.next.is_some() || self.done.is_some()
+    }
+
+    /// Whether store `live`'s re-fold to `target` still stands: running
+    /// (not stopped), next, or finished and kept.
+    pub(crate) fn wants(&self, live: LiveId, target: Target) -> bool {
+        self.running.as_ref().is_some_and(|j| (j.live, j.target) == (live, target) && !j.stop.load(Ordering::Relaxed))
+            || self.next == Some((live, target))
+            || self.done.as_ref().is_some_and(|d| (d.live, d.target) == (live, target))
+    }
+}
+
 struct Running {
     live: LiveId,
     target: Target,

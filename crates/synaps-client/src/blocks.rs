@@ -1891,6 +1891,9 @@ struct Cursor {
 #[derive(Clone, Debug)]
 pub struct Input {
     pub epoch: u64,
+    /// The transcript's input revision it is (`Transcript::blocks_rev`):
+    /// what a board folded from it says it has read ([`Drawn::rev`]).
+    pub rev: u64,
     pub generation: block::Generation,
     /// The staged chunks: the history's events from `from` on, and their
     /// bytes, heap included.
@@ -1925,6 +1928,7 @@ impl Input {
         // string): folded again once the history lands, as any live turn.
         Some(Input {
             epoch: history.epoch,
+            rev: 0,
             generation: history.generation.or(log.first).unwrap_or_else(|| block::Generation::of(&Value::Null)),
             chunks: history.staged.iter().cloned().collect(),
             staged: history.staged_bytes,
@@ -2174,6 +2178,10 @@ pub struct Drawn {
     /// The input it was folded from: its history, the history's events,
     /// and all its events (the live turn's after them).
     pub epoch: u64,
+    /// The input revision it was folded from ([`Input::rev`]): a board at
+    /// or past the revision a message showed at has read it (D8b: a
+    /// hand-back's draft draws until then, whatever outcomes it keeps).
+    pub rev: u64,
     /// Its conversation generation (§1.2): the same history, folded again
     /// (a resync), has the same; a cleared or compacted one another.
     pub generation: Option<block::Generation>,
@@ -2211,7 +2219,8 @@ pub struct Drawn {
     pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
     /// What each hand-back still kept did (§3.7's application layer, B2's
-    /// outcomes, ≤ 256), with its user message's row (what its row draws)
+    /// outcomes, ≤ `board::OUTCOMES_MAX`: an evicted one is re-folded,
+    /// `Target::Outcome`), with its user message's row (what its row draws)
     /// and its body's hash ([`body_hash`]: a steer the engine drained has
     /// no row until its history lands). D8b's. A copy of the board's,
     /// counted at B2's count of them.
@@ -2795,6 +2804,7 @@ impl Worker {
             + kept;
         Drawn {
             epoch: input.epoch,
+            rev: input.rev,
             generation: Some(input.generation),
             history: input.history_len,
             events: self.journal.len(),

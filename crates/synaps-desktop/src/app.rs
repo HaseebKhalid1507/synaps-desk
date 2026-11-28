@@ -2445,11 +2445,17 @@ pub struct AppView {
     /// [`crate::handback_view`]; ≤ `desires::QUEUE_MAX`, as every message
     /// that waits).
     pub(crate) edit_waits: std::collections::HashMap<u64, crate::handback_view::EditSend>,
-    /// The `changed your edit` chips seen ([`crate::handback_view::SEEN_MAX`]).
-    pub(crate) changed_seen: Vec<(String, cards_spec::block::Ref, cards_spec::block::Tag, cards_spec::block::Path)>,
-    /// A restore waiting for its pane's bound board (`R`, §3.6): the
-    /// pane, the block row.
-    pub(crate) restore_wanted: Option<(crate::pane::PaneId, u64)>,
+    /// The `changed your edit` overwrites seen ([`crate::handback_view::SEEN_MAX`]).
+    pub(crate) changed_seen: Vec<crate::handback_view::Seen>,
+    /// A restore waiting for its pane's bound board (`R`, §3.6): what it
+    /// was pressed on.
+    pub(crate) restore_wanted: Option<crate::handback_view::RestoreWanted>,
+    /// Evicted hand-back outcomes re-folded ([`crate::handback_view::OUTCOMES_KEPT`]).
+    pub(crate) outcomes_kept: Vec<crate::handback_view::KeptOutcome>,
+    /// An evicted outcome a row drew this frame: its store, row and place.
+    pub(crate) outcome_wanted: std::cell::Cell<Option<(crate::live::LiveId, u64, cards_spec::board::Pos)>>,
+    /// The evicted outcome re-folding: its store, row, place and history.
+    pub(crate) outcome_asked: Option<(crate::live::LiveId, u64, cards_spec::board::Pos, u64)>,
     /// What hand-backs would have gone to the daemon (tests).
     #[cfg(test)]
     pub(crate) edit_sends: Vec<crate::handback::EditOut>,
@@ -3092,6 +3098,9 @@ impl AppView {
             edit_waits: std::collections::HashMap::new(),
             changed_seen: Vec::new(),
             restore_wanted: None,
+            outcomes_kept: Vec::new(),
+            outcome_wanted: std::cell::Cell::new(None),
+            outcome_asked: None,
             #[cfg(test)]
             edit_sends: Vec::new(),
             ask_presses: Default::default(),

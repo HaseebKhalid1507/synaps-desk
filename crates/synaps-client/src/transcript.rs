@@ -448,6 +448,11 @@ pub struct Transcript {
     /// Compactions applied since it was made (the journal moved to its
     /// successor): D6b carries the predecessor's dismissals across.
     compactions: u64,
+    /// The history is a compaction's successor: its first message is the
+    /// summary ([`is_compaction_summary`]). The history's own word, the
+    /// same for a desk that saw the compaction and one that attached
+    /// after it (D8b's `compacted away`).
+    successor: bool,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
@@ -612,6 +617,33 @@ impl Transcript {
         self.compactions
     }
 
+    /// Whether row `id` is one of the history's (not the live turn's).
+    pub fn in_history(&self, id: u64) -> bool {
+        self.items[..self.history_end.min(self.items.len())].iter().any(|i| i.id == id)
+    }
+
+    /// Whether row `id` is a message a compaction carried into this
+    /// history, its successor (synaps-cards blocks.md §5.2: a queued
+    /// message moves there): a history row before any of the agent's in
+    /// a history whose first message is the summary. Nothing of this
+    /// generation came before it, so a block it names that isn't there
+    /// was the predecessor's. From the history alone: the same on a late
+    /// attach as on the desk that saw the compaction.
+    pub fn carried(&self, id: u64) -> bool {
+        if !self.successor {
+            return false;
+        }
+        for it in &self.items[..self.history_end.min(self.items.len())] {
+            if it.id == id {
+                return true;
+            }
+            if matches!(it.kind, ItemKind::Assistant | ItemKind::Thinking | ItemKind::Tool) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// A turn is running.
     pub fn busy(&self) -> bool {
         self.busy
@@ -661,7 +693,10 @@ impl Transcript {
     /// The board's input now ([`crate::blocks::Input`]): `None` with no
     /// block call in the history or the live turn.
     pub fn blocks_input(&self) -> Option<crate::blocks::Input> {
-        crate::blocks::Input::of(&self.blocks, &self.live_log)
+        crate::blocks::Input::of(&self.blocks, &self.live_log).map(|mut i| {
+            i.rev = self.blocks_rev;
+            i
+        })
     }
 
     /// Whether the board's jobs keep the bound board itself, from the next
@@ -1473,6 +1508,7 @@ impl Transcript {
     /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
         self.after_summary = false;
+        self.successor = messages.first().is_some_and(is_compaction_summary);
         self.cards = crate::cards::HistoryCards::default();
         self.blocks = crate::blocks::HistoryBlocks::default();
         self.live_log = self.live_log.renewed();

@@ -23,19 +23,33 @@
 //! - **Application** is the board's (§3.7): each hand-back's outcome, per
 //!   key, drawn on its row ([`outcome_words`]). "In the chat" never means
 //!   "applied".
+//! - **A send is a transaction** ([`Staged`]): the memo's transition runs
+//!   on a copy of the session's memo; it is committed once the connection
+//!   took the message, and dropped if it didn't, so a message that never
+//!   left moves nothing (no entry sending that isn't on the wire, none
+//!   retired or evicted by one that never went). Each send's clock is
+//!   strictly after the last ([`HandBacks::clock`]): the memo's order is
+//!   the wire's.
+//! - **A refusal is its own input's** ([`HandBacks::refused`]): the
+//!   window's wire order (`Live`'s inputs in flight) names the refused
+//!   input, a hand-back's by its text, and only that entry hears it. The
+//!   memo refuses its oldest sending entry; when that isn't the refused
+//!   one (an entry that timed out to checking), nothing is refused here
+//!   and the clock and views settle it, never another message.
 //! - **Bounded** (§1.8): the memo keeps 32 entries a session, each at most
 //!   [`ENTRY_MAX_BYTES`]; the desk keeps memos for [`SESSIONS_MAX`]
-//!   sessions, a session's memo going once it is empty. A hand-back on
-//!   another session past that is refused ([`SESSIONS_FULL`]) while every
-//!   session kept has an entry that can't go (one not in the chat or
-//!   retired); else the memo with none goes.
+//!   sessions, a session's memo going once it is empty, and with it what
+//!   it had taken in ([`HandBacks::drop_session`]: one owner for both
+//!   maps). A hand-back on another session past that is refused
+//!   ([`SESSIONS_FULL`]) while every session kept has an entry that can't
+//!   go (one not in the chat or retired); else the memo with none goes.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cards_spec::block::message::{self, Edit, Summary, Trailer};
 use cards_spec::block::{Ref, Tag};
-use cards_spec::board::{Code, EditOutcome, EditResult, Key, keys};
+use cards_spec::board::{Code, EditResult, Key, keys};
 use cards_spec::memo::block::{self as bm, ENTRY_MAX_BYTES, Memo, Refusal};
 use cards_spec::memo::{Event as Heard, Resend, State};
 use synaps_client::Transcript;
@@ -93,7 +107,7 @@ impl<'a> DeskEdits<'a> {
 }
 
 /// Whether one of `t`'s rows is user text whose body is `body`.
-fn shows(t: &Transcript, body: &str) -> bool {
+pub(crate) fn shows(t: &Transcript, body: &str) -> bool {
     t.items().iter().any(|i| i.kind == ItemKind::User && !i.is_note() && message::split(&i.text).0 == body)
 }
 
@@ -182,6 +196,37 @@ pub(crate) struct HandBacks {
     /// Bumped whenever an entry changes: blocks and rows drawn from one
     /// are measured again.
     changes: u64,
+    /// The clock of the last send committed ([`HandBacks::clock`]).
+    last_sent: Option<Instant>,
+}
+
+/// A send staged on a copy of its session's memo (module docs): the text
+/// to hand the connection, and the memo as it is once that went.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    session: String,
+    memo: Memo,
+    text: String,
+    at: Instant,
+}
+
+impl Staged {
+    /// The message to send: the body, the notices riding it.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// What staging a Resend came to.
+#[derive(Debug)]
+pub(crate) enum Staging {
+    /// Send this.
+    Send(Staged),
+    /// The view isn't settled: the entry checks (this memo, committed
+    /// now), and nothing is sent.
+    Checking(Staged),
+    /// The gate doesn't hold: nothing is sent.
+    No,
 }
 
 impl HandBacks {
@@ -212,11 +257,6 @@ impl HandBacks {
         self.by.len()
     }
 
-    /// `session`'s oldest entry sending: when.
-    pub(crate) fn oldest_sending(&self, session: &str) -> Option<Instant> {
-        self.by.get(session).and_then(Memo::oldest_sending)
-    }
-
     fn with<R>(&mut self, session: &str, f: impl FnOnce(&mut Memo) -> R) -> Option<R> {
         let m = self.by.get_mut(session)?;
         let before = m.entries().to_vec();
@@ -225,16 +265,154 @@ impl HandBacks {
             self.changes += 1;
         }
         if m.entries().is_empty() {
-            self.by.remove(session);
-            self.taken.remove(session);
+            self.drop_session(session);
         }
         Some(r)
     }
 
-    /// A session event (a `Refused` is [`crate::deliver::Memos::on`]'s to
-    /// route). An attach ends what was taken in (its history is the
-    /// daemon's word now); an `Idle`, the turn that took each in.
+    /// `session`'s memo goes, and what it had taken in with it: the one way
+    /// a session leaves (module docs), so neither map outlives the other.
+    fn drop_session(&mut self, session: &str) {
+        self.by.remove(session);
+        self.taken.remove(session);
+    }
+
+    /// The sessions each map keeps (tests: the two agree).
+    #[cfg(test)]
+    pub(crate) fn sessions(&self) -> (Vec<&str>, Vec<&str>) {
+        let mut by: Vec<&str> = self.by.keys().map(String::as_str).collect();
+        let mut taken: Vec<&str> = self.taken.keys().map(String::as_str).collect();
+        by.sort_unstable();
+        taken.sort_unstable();
+        (by, taken)
+    }
+
+    /// The clock for a send at `now`: strictly after the last committed,
+    /// so the memo's oldest sending entry is the wire's oldest (two sends
+    /// in one tick of a coarse clock are still told apart).
+    pub(crate) fn clock(&self, now: Instant) -> Instant {
+        self.last_sent.map_or(now, |l| now.max(l + Duration::from_nanos(1)))
+    }
+
+    /// `session`'s memo copied, `f` run on it with its view: what
+    /// [`HandBacks::commit`] keeps if the message goes.
+    fn stage<R>(&self, session: &str, t: &Transcript, drawn: Option<&Drawn>, f: impl FnOnce(&mut Memo, &DeskEdits<'_>) -> R) -> (Memo, R) {
+        let mut m = self.by.get(session).cloned().unwrap_or_default();
+        let edits = self.edits(session, t, drawn);
+        let r = f(&mut m, &edits);
+        (m, r)
+    }
+
+    /// The staged send went (the connection took it), or the memo moved
+    /// with nothing sent (a Resend that checks): its memo is the session's
+    /// now. A new session's takes the room [`HandBacks::room`] makes.
+    pub(crate) fn commit(&mut self, st: Staged) {
+        let Staged { session, memo, at, .. } = st;
+        if self.room(&session).is_err() {
+            // Checked as it was staged, on this thread: nothing came between.
+            log::warn!(target: "synaps_desktop::handback", "a hand-back's memo had no room as it was committed");
+        }
+        self.last_sent = Some(self.last_sent.map_or(at, |l| l.max(at)));
+        let same = self.by.get(&session).is_some_and(|m| m.entries() == memo.entries());
+        if !same {
+            self.changes += 1;
+        }
+        if memo.entries().is_empty() {
+            self.drop_session(&session);
+        } else {
+            self.by.insert(session, memo);
+        }
+    }
+
+    /// A hand-back of `edit` on `session`, `trailer` riding it, staged
+    /// ([`Staged`]): the message to send, or why not (nothing changes).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_hand_back(
+        &self,
+        session: &str,
+        edit: &Edit,
+        l1: &Line1,
+        trailer: &Trailer,
+        t: &Transcript,
+        drawn: Option<&Drawn>,
+        now: Instant,
+    ) -> Result<Staged, String> {
+        self.may_room(session)?;
+        let (memo, r) = self.stage(session, t, drawn, |m, e| m.hand_back(edit, &l1.summary(), trailer, e, now));
+        let text = r.map_err(|r| refusal(&r))?;
+        Ok(Staged { session: session.to_string(), memo, text, at: now })
+    }
+
+    /// A Retry of hand-back `body` (not sent), staged.
+    pub(crate) fn stage_retry(
+        &self,
+        session: &str,
+        body: &str,
+        trailer: &Trailer,
+        t: &Transcript,
+        drawn: Option<&Drawn>,
+        now: Instant,
+    ) -> Option<Staged> {
+        let (memo, text) = self.stage(session, t, drawn, |m, e| m.retry(body, trailer, e, now));
+        Some(Staged { session: session.to_string(), memo, text: text?, at: now })
+    }
+
+    /// A Resend of hand-back `body` (not confirmed) against the view as it
+    /// is, staged.
+    pub(crate) fn stage_resend(
+        &self,
+        session: &str,
+        body: &str,
+        trailer: &Trailer,
+        t: &Transcript,
+        drawn: Option<&Drawn>,
+        now: Instant,
+    ) -> Staging {
+        if !self.by.contains_key(session) {
+            return Staging::No;
+        }
+        let (memo, r) = self.stage(session, t, drawn, |m, e| {
+            let view = bm::View { edits: e, settled: crate::deliver::settled(t), queued: t.queued_message(), streaming: t.busy() };
+            m.resend(body, trailer, &view, now)
+        });
+        let session = session.to_string();
+        match r {
+            Resend::Send(text) => Staging::Send(Staged { session, memo, text, at: now }),
+            Resend::Checking => Staging::Checking(Staged { session, memo, text: String::new(), at: now }),
+            Resend::No => Staging::No,
+        }
+    }
+
+    /// The daemon refused the input this desk sent as `wire` on `session`
+    /// (module docs): its entry is not sent, if the memo's oldest sending
+    /// entry is it; else nothing changes. Whether it was refused here.
+    pub(crate) fn refused(&mut self, session: &str, wire: &str, reason: &str, now: Instant) -> bool {
+        let body = message::split(wire).0;
+        let Some(m) = self.by.get(session) else { return false };
+        let Some(i) = m.entries().iter().position(|e| e.text == body && e.retired.is_none() && e.state == State::Sending) else {
+            log::info!(target: "synaps_desktop::handback", "a refused hand-back isn't sending: its memo settles it");
+            return false;
+        };
+        let mut c = m.clone();
+        c.on(Heard::Refused { reason }, now);
+        let hit = m.entries().iter().zip(c.entries()).position(|(a, b)| a != b);
+        if hit != Some(i) {
+            log::info!(target: "synaps_desktop::handback", "a refused hand-back isn't its memo's oldest sending: nothing refused here");
+            return false;
+        }
+        self.by.insert(session.to_string(), c);
+        self.changes += 1;
+        true
+    }
+
+    /// A session event (a `Refused` is [`HandBacks::refused`]'s: it names
+    /// no text, and the window's wire order does). An attach ends what was
+    /// taken in (its history is the daemon's word now); an `Idle`, the
+    /// turn that took each in.
     pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
+        if let Heard::Refused { .. } = ev {
+            return;
+        }
         match ev {
             Heard::Attached => {
                 self.taken.remove(session);
@@ -278,7 +456,7 @@ impl HandBacks {
                 self.taken.remove(session);
             }
         }
-        let Self { by, taken, changes } = self;
+        let Self { by, taken, changes, .. } = self;
         let edits = DeskEdits::of(t, drawn).with(taken.get(session));
         let view = bm::View { edits: &edits, settled, queued: t.queued_message(), streaming: t.busy() };
         let Some(m) = by.get_mut(session) else { return };
@@ -295,19 +473,30 @@ impl HandBacks {
     }
 
     /// Room for a memo of `session`: it has one, there are fewer than
-    /// [`SESSIONS_MAX`], or one with nothing that can't go goes.
+    /// [`SESSIONS_MAX`], or one with nothing that can't go goes (and what
+    /// it had taken in: [`HandBacks::drop_session`]).
     fn room(&mut self, session: &str) -> Result<(), String> {
+        self.may_room(session)?;
         if self.by.contains_key(session) || self.by.len() < SESSIONS_MAX {
             return Ok(());
         }
-        let spare = self.by.iter().find(|(_, m)| !m.entries().iter().any(bm::Entry::recoverable)).map(|(s, _)| s.clone());
-        match spare {
-            Some(s) => {
-                self.by.remove(&s);
-                Ok(())
-            }
-            None => Err(SESSIONS_FULL.into()),
+        if let Some(s) = self.spare() {
+            self.drop_session(&s);
         }
+        Ok(())
+    }
+
+    /// Whether [`HandBacks::room`] would make room for `session`.
+    fn may_room(&self, session: &str) -> Result<(), String> {
+        if self.by.contains_key(session) || self.by.len() < SESSIONS_MAX || self.spare().is_some() {
+            return Ok(());
+        }
+        Err(SESSIONS_FULL.into())
+    }
+
+    /// A kept session whose memo has nothing that can't go.
+    fn spare(&self) -> Option<String> {
+        self.by.iter().find(|(_, m)| !m.entries().iter().any(bm::Entry::recoverable)).map(|(s, _)| s.clone())
     }
 
     /// Whether `edit` may be handed back on `session` now (`t` and `drawn`
@@ -320,19 +509,15 @@ impl HandBacks {
         t: &Transcript,
         drawn: Option<&Drawn>,
     ) -> Result<(), String> {
-        if !self.by.contains_key(session)
-            && self.by.len() >= SESSIONS_MAX
-            && self.by.values().all(|m| m.entries().iter().any(bm::Entry::recoverable))
-        {
-            return Err(SESSIONS_FULL.into());
-        }
+        self.may_room(session)?;
         let empty = Memo::default();
         let edits = self.edits(session, t, drawn);
         self.by.get(session).unwrap_or(&empty).may_hand_back(edit, &l1.summary(), &edits).map_err(|r| refusal(&r))
     }
 
-    /// A hand-back of `edit` on `session`, `trailer` riding it: the
-    /// message to send.
+    /// A hand-back of `edit` on `session`, `trailer` riding it, staged and
+    /// committed at once (tests: a connection that took it).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn hand_back(
         &mut self,
@@ -344,18 +529,10 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Result<String, String> {
-        self.room(session)?;
-        let Self { by, taken, changes } = self;
-        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
-        let m = by.entry(session.to_string()).or_default();
-        let r = m.hand_back(edit, &l1.summary(), trailer, &edits, now).map_err(|r| refusal(&r));
-        if m.entries().is_empty() {
-            by.remove(session);
-        }
-        if r.is_ok() {
-            *changes += 1;
-        }
-        r
+        let st = self.stage_hand_back(session, edit, l1, trailer, t, drawn, self.clock(now))?;
+        let text = st.text.clone();
+        self.commit(st);
+        Ok(text)
     }
 
     pub(crate) fn may_retry(&self, session: &str, body: &str, t: &Transcript, drawn: Option<&Drawn>) -> bool {
@@ -366,50 +543,27 @@ impl HandBacks {
         self.by.get(session).is_some_and(|m| m.may_resend(body, &self.edits(session, t, drawn)))
     }
 
-    /// Retry hand-back `body` (not sent), `trailer` riding it.
-    pub(crate) fn retry(
-        &mut self,
-        session: &str,
-        body: &str,
-        trailer: &Trailer,
-        t: &Transcript,
-        drawn: Option<&Drawn>,
-        now: Instant,
-    ) -> Option<String> {
-        let Self { by, taken, changes } = self;
-        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
-        let r = by.get_mut(session)?.retry(body, trailer, &edits, now);
-        *changes += 1;
-        r
-    }
-
-    /// A Resend of hand-back `body` (not confirmed) against the view as it
-    /// is, `trailer` riding it.
-    pub(crate) fn resend(
-        &mut self,
-        session: &str,
-        body: &str,
-        trailer: &Trailer,
-        t: &Transcript,
-        drawn: Option<&Drawn>,
-        now: Instant,
-    ) -> Resend {
-        let Self { by, taken, changes } = self;
-        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
-        let view = bm::View { edits: &edits, settled: crate::deliver::settled(t), queued: t.queued_message(), streaming: t.busy() };
-        let Some(m) = by.get_mut(session) else { return Resend::No };
-        *changes += 1;
-        m.resend(body, trailer, &view, now)
-    }
-
     /// Discard (§3.7, `Memo::forget`): the entry goes, nothing else.
     pub(crate) fn forget(&mut self, session: &str, body: &str) -> bool {
         self.with(session, |m| m.forget(body).is_some()).unwrap_or(false)
     }
 
-    /// This desk's latest entry of incarnation `of` of `id` on `session`.
+    /// This desk's entries of incarnation `of` of `id` on `session`,
+    /// oldest first.
+    pub(crate) fn of_incarnation<'a>(&'a self, session: &str, id: &Ref, of: Tag) -> impl Iterator<Item = &'a bm::Entry> + 'a {
+        let id = id.clone();
+        self.by.get(session).into_iter().flat_map(|m| m.entries()).filter(move |e| e.id == id && e.of == of)
+    }
+
+    /// This desk's newest entry of incarnation `of` of `id` (tests).
+    #[cfg(test)]
     pub(crate) fn latest(&self, session: &str, id: &Ref, of: Tag) -> Option<&bm::Entry> {
-        self.by.get(session)?.entries().iter().rev().find(|e| e.id == *id && e.of == of)
+        self.of_incarnation(session, id, of).last()
+    }
+
+    /// `session`'s entries, oldest first.
+    pub(crate) fn entries<'a>(&'a self, session: &str) -> impl Iterator<Item = &'a bm::Entry> + 'a {
+        self.by.get(session).into_iter().flat_map(|m| m.entries())
     }
 
     /// The edit of the incarnation in flight, if any (§3.7).
@@ -469,21 +623,28 @@ fn why(k: &Key, c: Code) -> Option<String> {
 /// nothing. `compacted`: its block's generation was compacted away
 /// (§5.2: the queued message moved to the successor, where its id names
 /// no block).
-pub(crate) fn outcome_words(o: &EditOutcome, edit: Option<&Edit>, compacted: bool) -> String {
-    match o.result {
+#[cfg(test)]
+pub(crate) fn outcome_words(o: &cards_spec::board::EditOutcome, edit: Option<&Edit>, compacted: bool) -> String {
+    words_of(o.result, &o.codes, edit, compacted)
+}
+
+/// [`outcome_words`] of an outcome's result and codes (one a re-fold
+/// found, kept without its place).
+pub(crate) fn words_of(result: EditResult, codes: &[Code], edit: Option<&Edit>, compacted: bool) -> String {
+    match result {
         EditResult::Rewritten => return "not applied: the block was rewritten".into(),
         EditResult::Gone if compacted => return COMPACTED_AWAY.into(),
         EditResult::Gone => return "not applied: the block is gone".into(),
         EditResult::Revisions => return "not applied: replace the block or use a new id".into(),
         EditResult::Applied => {}
     }
-    let n = o.codes.len();
-    let applied = o.codes.iter().filter(|c| matches!(c, Code::Applied | Code::Unchanged | Code::Overwritten)).count();
-    let over = o.codes.iter().filter(|c| **c == Code::Overwritten).count();
+    let n = codes.len();
+    let applied = codes.iter().filter(|c| matches!(c, Code::Applied | Code::Unchanged | Code::Overwritten)).count();
+    let over = codes.iter().filter(|c| **c == Code::Overwritten).count();
     let mut out = if applied == n { "applied".to_string() } else { format!("applied {applied} of {n}") };
     if let Some(e) = edit {
         let mut said: Vec<String> = Vec::new();
-        for (k, c) in keys(e).iter().zip(&o.codes) {
+        for (k, c) in keys(e).iter().zip(codes) {
             if let Some(w) = why(k, *c).filter(|w| !said.contains(w)) {
                 out.push_str(" · ");
                 out.push_str(&w);

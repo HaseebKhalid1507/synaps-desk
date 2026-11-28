@@ -1062,19 +1062,29 @@ impl AppView {
             self.edit_says(at.row(), crate::handback_view::VIEW_ONLY, cx);
             return;
         };
-        self.restore_now(row, cx);
+        self.restore_now(row, None, cx);
     }
 
     /// The restore of row `row`'s past revision in view (`R`): sent, the
     /// walk back on the latest; or why not. Without the bound board kept
-    /// (no draft holds one), it waits for it: the next job keeps it.
-    pub(crate) fn restore_now(&mut self, row: u64, cx: &mut Context<Self>) {
-        if !self.bound_board().is_some_and(|b| b.board.is_some()) {
-            self.restore_wanted = Some((self.panes.cur.id, row));
+    /// (no draft holds one), it waits for it, bound to what was pressed
+    /// ([`crate::handback_view::RestoreWanted`]: this walk's revision,
+    /// this session): the next job keeps the board. `want`: that press,
+    /// its board here now.
+    pub(crate) fn restore_now(&mut self, row: u64, want: Option<&crate::handback_view::RestoreWanted>, cx: &mut Context<Self>) {
+        if want.is_none() && !self.bound_board().is_some_and(|b| b.board.is_some()) {
+            let session = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone());
+            let shown =
+                self.panes.cur.walk.walk.as_ref().filter(|w| w.at.row() == row).and_then(|w| w.rev.as_ref()).map(|v| (v.rev.at, v.rev.tag));
+            let (Some(session), Some((at, tag))) = (session, shown) else {
+                self.edit_says(row, "walk to a past revision first ([)", cx);
+                return;
+            };
+            self.restore_wanted = Some(crate::handback_view::RestoreWanted { pane: self.panes.cur.id, session, row, at, tag });
             self.sync_drafts(cx);
             return;
         }
-        match self.restore(row, cx) {
+        match self.restore(row, want, cx) {
             Ok(()) => {
                 if let Some(w) = self.panes.cur.walk.walk.as_mut() {
                     w.rev = None;
