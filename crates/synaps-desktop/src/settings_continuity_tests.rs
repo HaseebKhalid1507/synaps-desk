@@ -530,20 +530,31 @@ fn remember_toggle_saves(cx: &mut TestAppContext) {
     assert!(!relaunch(&pg).remember, "read back: off");
 }
 
-/// 11. Forget remembered choices: the memory file goes, a relaunch
+/// 11. Forget remembered choices: two questions remembered, in memory and
+/// in their file; Forget empties the memory, the file goes, a relaunch
 /// recalls nothing, and the row says nothing is remembered. Red:
-/// `forget_card_choices` does nothing.
+/// `forget_card_choices` does nothing; `Recall::forget` keeps the memory.
 #[gpui_kit::test]
 fn forget_remembered_choices(cx: &mut TestAppContext) {
+    use crate::recall::{Recall, Store};
     let pg = page(cx, "forget", NARROW);
     let w = pg.w;
     let path: PathBuf = pg.home.0.with_file_name(crate::recall::FILE);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, b"{}").unwrap();
-    changed(cx, &pg, |v| v.recall = crate::recall::Recall::new(true, Some(path.clone())));
+    // The file as the app writes it: two questions, the second answered
+    // with two ticks.
+    let mut store = Store::default();
+    store.put("0123456789abcdef".into(), vec![1]);
+    store.put("fedcba9876543210".into(), vec![0, 2]);
+    std::fs::write(&path, store.to_text()).unwrap();
+    assert_eq!(Store::parse(&std::fs::read_to_string(&path).unwrap()), Ok((store, 0)), "a good file");
+    changed(cx, &pg, |v| v.recall = Recall::new(true, Some(path.clone())));
+    let live = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.recall.len());
+    assert_eq!(live(cx), 2, "both remembered, read in");
     find(cx, w, "remember");
-    assert!(drawn(cx, w, "recall-forget") && !drawn(cx, w, "recall-none"), "a file there: Forget");
+    assert!(drawn(cx, w, "recall-forget") && !drawn(cx, w, "recall-none"), "something remembered: Forget");
     click(cx, w, "recall-forget");
+    assert_eq!(live(cx), 0, "the memory is empty");
     assert!(!path.exists(), "the file is gone");
     assert!(!crate::recall::Recall::new(true, Some(path.clone())).offers_forget(), "a relaunch: nothing there");
     assert!(drawn(cx, w, "recall-none") && !drawn(cx, w, "recall-forget"), "nothing remembered");
@@ -875,28 +886,39 @@ fn session_view(prompt: Option<&str>) -> Value {
         "view": {"model": "anthropic/claude-opus-4-1", "thinking_level": "medium", "system_prompt": prompt}}})
 }
 
+/// "Remember card choices"' help as today's page words it: its first
+/// sentence, and the two after it.
+const RECALL_FIRST: &str = "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”.";
+const RECALL_REST: &str = "The highlight is only a starting point: nothing is ticked or sent for you, and Enter sends what's ticked (on a one-choice card, the option highlighted). Only which option you picked is kept, on this machine, never a note or a field's text.";
+
 /// 25. A click on a row's help shows all of it, another its first
-/// sentence; the session's prompt is in its well, all of it there to
-/// scroll through; on the daemon's prompt, it says so. Red: the help
-/// click does nothing.
+/// sentence; the session's prompt is in its well, every word of it there
+/// to scroll through; on the daemon's prompt, it says so. Each text is
+/// read from the selector of the element it was handed to. Red: the help
+/// click does nothing; the help is always its first sentence; the well
+/// draws another body of as many lines.
 #[gpui_kit::test]
 fn full_help_and_the_prompt_body_are_readable(cx: &mut TestAppContext) {
     let pg = page(cx, "help", NARROW);
     let w = pg.w;
     let key = crate::recall::SETTING;
+    let (first, full) = (format!("help-text {key} = {RECALL_FIRST}"), format!("help-text {key} = {RECALL_FIRST} {RECALL_REST}"));
     find(cx, w, "remember");
-    assert!(drawn(cx, w, &format!("help-text {key} first")));
+    assert!(drawn(cx, w, &first) && !drawn(cx, w, &full), "its first sentence");
     click(cx, w, &format!("help {key}"));
-    assert!(drawn(cx, w, &format!("help-text {key} full")) && !drawn(cx, w, &format!("help-text {key} first")), "all of it");
+    assert!(drawn(cx, w, &full) && !drawn(cx, w, &first), "all of it");
     assert_eq!(pg.view.read_with(cx, |v, _| v.settings.open_help), Some(key));
     click(cx, w, &format!("help {key}"));
-    assert!(drawn(cx, w, &format!("help-text {key} first")), "its first sentence again");
+    assert!(drawn(cx, w, &first) && !drawn(cx, w, &full), "its first sentence again");
+    // Sixty rules, each its own, and a last line no other text has.
     let lines = 60;
-    let prompt: String = (1..=lines).map(|n| format!("Rule {n}: say what you did, then why.\n")).collect();
+    let mut prompt: String = (1..lines).map(|n| format!("Rule {n}: say what you did in step {n}, then why.\n")).collect();
+    prompt.push_str("Sentinel 7f3a: the sixtieth line, the prompt's last.\n");
     heard(cx, w, &pg.view, vec![session_view(Some(&prompt))]);
     find(cx, w, "prompt");
-    assert!(drawn(cx, w, "locked system_prompt = custom") && drawn(cx, w, "system-prompt"), "its prompt, in the well");
-    let well = bounds(cx, w, "system-prompt");
+    let body = format!("system-prompt = {prompt}");
+    assert!(drawn(cx, w, "locked system_prompt = custom") && drawn(cx, w, &body), "this session's prompt, every word, in the well");
+    let well = bounds(cx, w, &body);
     let (shown, max) = (f32::from(well.size.height), pg.view.read_with(cx, |v, _| -f32::from(v.bars.prompt.scroll.max_offset().y)));
     assert!(shown <= 12. * 20. + 1. && shown + max.abs() >= lines as f32 * 20., "all {lines} lines, in a well {shown} px tall ({max})");
     let at = well.center();

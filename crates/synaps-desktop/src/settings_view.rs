@@ -777,11 +777,9 @@ impl AppView {
                             .when(!key.is_empty(), |d| d.child(mono(key, 12., p.dim))),
                     )
                     .when(!r.help.is_empty(), |d| {
-                        d.child(
-                            sans(help, 13., 20., p.dim)
-                                .whitespace_normal()
-                                .debug_selector(move || format!("help-text {key} {}", if open { "full" } else { "first" })),
-                        )
+                        // Its selector says the text it was handed (tests).
+                        let said = help.clone();
+                        d.child(sans(help, 13., 20., p.dim).whitespace_normal().debug_selector(move || format!("help-text {key} = {said}")))
                     })
                     .when_some(r.tag, |d, t| d.child(mono(t, 12., p.dim).mt(px(2.)))),
             )
@@ -1412,26 +1410,31 @@ impl AppView {
         if settings::matches(find, "System prompt", "system_prompt", "system prompt") {
             let prompt = self.model.lives[self.panes.cur.live].stats.view.as_ref().and_then(|v| v.system_prompt.clone());
             let well = match prompt {
-                Some(text) => v_flex()
-                    .child(
-                        div()
-                            .id("system-prompt")
-                            .debug_selector(|| "system-prompt".into())
-                            .mt(px(8.))
-                            .max_h(px(12. * 20.))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.bars.prompt.scroll)
-                            .p(px(10.))
-                            .bg(p.code)
-                            .font_family(crate::fonts::MONO)
-                            .text_px(13.)
-                            .line_height(px(20.))
-                            .text_color(p.code_fg)
-                            .whitespace_normal()
-                            .child(SharedString::from(text)),
-                    )
-                    .child(self.bars.prompt.bar(crate::scrollbar::Ground::Canvas))
-                    .into_any_element(),
+                Some(text) => {
+                    // Its selector says the body it was handed (tests).
+                    let body = SharedString::from(text);
+                    let said = body.clone();
+                    v_flex()
+                        .child(
+                            div()
+                                .id("system-prompt")
+                                .debug_selector(move || format!("system-prompt = {said}"))
+                                .mt(px(8.))
+                                .max_h(px(12. * 20.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.bars.prompt.scroll)
+                                .p(px(10.))
+                                .bg(p.code)
+                                .font_family(crate::fonts::MONO)
+                                .text_px(13.)
+                                .line_height(px(20.))
+                                .text_color(p.code_fg)
+                                .whitespace_normal()
+                                .child(body),
+                        )
+                        .child(self.bars.prompt.bar(crate::scrollbar::Ground::Canvas))
+                        .into_any_element()
+                }
                 None => mono("the daemon's default prompt", 13., p.dim)
                     .mt(px(4.))
                     .debug_selector(|| "system-prompt-none".into())
