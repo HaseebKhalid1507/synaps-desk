@@ -1330,6 +1330,55 @@ fn settings_shown_again_before_its_first_find_reads_its_reference(cx: &mut TestA
     assert_eq!(reference_reads(cx), refs, "brought by the find: no other read");
 }
 
+/// A check of where the daemon runs that failed (its registry entry stale),
+/// a find under way to correct it as a fold lets Settings go and an unfold
+/// shows it again, its pane not focused: the find lands under a hold
+/// Settings let go of and says the daemon is here; one REFERENCE read is
+/// made then, and its values drawn, with no focus and no activation. So
+/// with a find asked for while Settings is folded away (Shady #113 round 5).
+#[gpui_kit::test]
+fn settings_shown_again_after_a_failed_check_reads_its_reference(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "failed-check", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("failed-check", "process_scopes = off\n");
+    find(cx, &pg, "process_scopes");
+    let (row, none) = ("reference process_scopes = off", "reference process_scopes = —");
+    let (_left, right) = split_beside(cx, &pg, Kind::Settings);
+    pg.view.update(cx, |v, _| v.dash.base = Some(base.0.clone()));
+    let reference_reads = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.dash.reference_reads);
+    for folded_first in [false, true] {
+        unknown(cx, &pg);
+        changed(cx, &pg, |v| v.dash.local = Some(Err("2 registry entries on this machine claim pid 7 (one is stale)".into())));
+        gate(cx, &pg);
+        let fold = |cx: &mut TestAppContext| {
+            resize(cx, &pg, FOLDS);
+            assert!(folded(cx, &pg), "folded");
+            assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight: all Settings held goes");
+        };
+        if folded_first {
+            fold(cx);
+        }
+        pg.view.update(cx, |v, cx| v.dash_refind(cx));
+        settle(cx, pg.w, 8);
+        assert_eq!(held(cx, &pg), 1, "its find, held");
+        if !folded_first {
+            fold(cx);
+        }
+        let (reads, refs) = (dash.reads(), reference_reads(cx));
+        resize(cx, &pg, 1440.);
+        assert!(!folded(cx, &pg), "unfolded");
+        assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session pane, focused");
+        assert_eq!(held(cx, &pg), 1, "nothing read yet: the find is under way");
+        assert_eq!(drain(cx, &pg), 3, "the find lands; then the config read and the REFERENCE read");
+        assert!(pg.view.read_with(cx, |v, _| v.dash.is_local()), "the find: here");
+        assert_eq!(reference_reads(cx), refs + 1, "one REFERENCE read, as the find proved the daemon here");
+        assert_eq!(scopes(cx, &pg).as_deref(), Some("off"), "its REFERENCE values");
+        assert_eq!(dash.reads(), reads + 1, "its config, read once");
+        assert!(drawn(cx, pg.w, row) && !drawn(cx, pg.w, none), "drawn, in the pane not focused");
+        pg.view.update(cx, |v, _| v.dash.gate = None);
+    }
+}
+
 /// Settings in a split over a writable config, its find on `bash_timeout`,
 /// the gate up: write A (idle exit 900; `refused`: the dash refuses it)
 /// sent, its reply held; write B (bash timeout 300) queued behind it.

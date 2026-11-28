@@ -263,8 +263,9 @@ pub(crate) struct DashUi {
     /// Asked for while a find, a read or a write ran: done after it.
     want_config: bool,
     want_usage: bool,
-    /// Settings' REFERENCE values asked for before it was known where the
-    /// daemon runs: read as a find says ([`AppView::dash_found`]).
+    /// Settings' REFERENCE values asked for while the daemon was not proven
+    /// here (not known yet, or a check that failed): read as a find says
+    /// ([`AppView::dash_found`]).
     want_reference: bool,
     config_asking: bool,
     today_asking: bool,
@@ -979,8 +980,8 @@ impl AppView {
         if p.socket.is_some() {
             self.dash.socket = p.socket;
         }
-        // Settings' REFERENCE values, asked for before this find said where
-        // the daemon runs, and not brought by it (asked for under a hold
+        // Settings' REFERENCE values, asked for before this find proved the
+        // daemon here, and not brought by it (asked for under a hold
         // Settings let go of since).
         if std::mem::take(&mut self.dash.want_reference) && self.settings.reference.is_none() {
             self.read_reference(cx);
@@ -1412,14 +1413,12 @@ impl AppView {
 
     /// Settings' REFERENCE values read again, a local daemon's (off the UI
     /// thread; a find reads them too, [`probe`]), for a Settings on screen.
-    /// Where the daemon runs not known yet: read as a find says.
+    /// The daemon not proven here (where it runs not known yet, or a check
+    /// that failed, a find to correct it): read as a find says.
     fn read_reference(&mut self, cx: &mut Context<Self>) {
         let (Some(base), Some(hold)) = (self.base_dir(), self.ticket(Kind::Settings)) else { return };
-        if self.dash.local.is_none() {
-            self.dash.want_reference = true;
-            return;
-        }
         if !self.dash.is_local() {
+            self.dash.want_reference = true;
             return;
         }
         #[cfg(test)]
