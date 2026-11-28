@@ -355,8 +355,7 @@ impl AppView {
         };
         // Fresh on each open (its history starts empty); a value past the
         // field's cap never opens it (its row says so).
-        // STAND-IN (tests-first): any value opens.
-        if value.len() > crate::settings_editor::VALUE_CAP && value.is_empty() {
+        if value.len() > crate::settings_editor::VALUE_CAP {
             return;
         }
         self.settings.editing = Some(e);
@@ -673,8 +672,7 @@ impl AppView {
             Edit::DashUrl => "field-dash-url".into(),
         };
         // Longer than the field takes: its length, and where to edit it.
-        // STAND-IN (tests-first): a value of any length is shown.
-        let long = !editing && value.len() > crate::settings_editor::VALUE_CAP && value.is_empty();
+        let long = !editing && value.len() > crate::settings_editor::VALUE_CAP;
         let value: SharedString = match long {
             true => format!("{} bytes: longer than this app edits; use /settings in the TUI", crate::usage::thousands(value.len() as u64))
                 .into(),

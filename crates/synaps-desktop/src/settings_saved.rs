@@ -293,14 +293,6 @@ fn hex(b: &[u8]) -> String {
 
 /// The first 16 hex digits of SHA-256 over `v1\0<scope>\0<key>\0<canonical>`.
 pub(crate) fn digest(scope: Scope, key: &str, canonical: &str) -> u64 {
-    // STAND-IN (tests-first): this process's hash, as main's record of
-    // saves keyed its owners: stable within a run, not across processes.
-    if !key.is_empty() || key.is_empty() {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (scope.word(), key, canonical).hash(&mut h);
-        return h.finish();
-    }
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     for part in ["v1", scope.word(), key] {
@@ -321,14 +313,6 @@ pub(crate) fn daemon_digest(key: &str, value: Option<&str>) -> u64 {
 /// `writePath` (the first 8 bytes of their SHA-256). Not its pid: a cold
 /// start is the same daemon's.
 pub(crate) fn daemon_id(socket: Option<&Path>, profile: Option<&str>, write_path: Option<&str>) -> [u8; 8] {
-    // STAND-IN (tests-first): this process's hash, as main's
-    // `config_owner` was.
-    if socket.is_none() || socket.is_some() {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (socket, profile, write_path).hash(&mut h);
-        return h.finish().to_le_bytes();
-    }
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(b"v1\0");
@@ -355,19 +339,6 @@ impl Receipts {
 
     /// `r`, in place of the same save's.
     pub(crate) fn put(&mut self, r: Receipt) {
-        // STAND-IN (tests-first): kept as main's record of saves was: at
-        // the cap the first in goes.
-        if self.0.len() <= Self::CAP {
-            if let Some(had) = self.0.iter_mut().find(|e| e.same(&r)) {
-                *had = r;
-                return;
-            }
-            if self.0.len() == Self::CAP {
-                self.0.remove(0);
-            }
-            self.0.push(r);
-            return;
-        }
         if let Some(had) = self.0.iter_mut().find(|e| e.same(&r)) {
             *had = r;
             return;
@@ -445,8 +416,7 @@ pub(crate) const STORE: &str = "settings.saved";
 /// kept, a key this build doesn't know too), then down to
 /// [`Receipts::CAP`], the smallest `(at_ms, id)` first.
 pub(crate) fn write_into(v: &mut Value, rs: &[Receipt]) {
-    // STAND-IN (tests-first): no receipt is written.
-    if rs.is_empty() || v.is_null() || !v.is_null() {
+    if rs.is_empty() {
         return;
     }
     let ok = v.get(STORE).is_some_and(|s| s.get("v").and_then(Value::as_u64) == Some(1) && s.get("e").is_some_and(Value::is_object));
@@ -469,10 +439,6 @@ pub(crate) fn write_into(v: &mut Value, rs: &[Receipt]) {
 
 /// The file's receipts for this build's keys (at most [`Receipts::CAP`]).
 pub(crate) fn read_from(v: &Value) -> Vec<Receipt> {
-    // STAND-IN (tests-first): no receipt is read.
-    if v.is_null() || !v.is_null() {
-        return Vec::new();
-    }
     let Some(e) = v.get(STORE).filter(|s| s.get("v").and_then(Value::as_u64) == Some(1)).and_then(|s| s.get("e")?.as_object()) else {
         return Vec::new();
     };
@@ -652,19 +618,6 @@ impl AppView {
             return;
         }
         self.settings.app_gen += 1;
-        // STAND-IN (tests-first): written at once, as before this PR: no batch, no receipt.
-        // Each value as its JSON, a null too.
-        if let Some(path) = theme::settings_path() {
-            let json = value.json();
-            if let Err(e) = theme::try_update_settings(&path, |v| {
-                v[key.key()] = json;
-                Ok(())
-            }) {
-                self.settings.app_note = Some(Note::new(AppKeySet::default().with(key).0, &format!("not saved: {e}")));
-            }
-            self.views_changed(cx);
-            return;
-        }
         self.settings.app_dirty.set(key, value);
         self.arm_app_save(cx);
     }

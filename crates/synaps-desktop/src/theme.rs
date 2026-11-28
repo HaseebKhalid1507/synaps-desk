@@ -2326,11 +2326,26 @@ pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<st
 /// The settings file's lock for a write: [`LOCK_TRIES`] tries off the UI
 /// thread, or until the close's deadline while one runs. There is no
 /// unlocked write: `Err` names the lock, and nothing is written.
-fn take_settings_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
-    // STAND-IN (tests-first): as before this PR, one wait for the lock, then
-    // the write goes ahead unlocked.
+fn take_settings_lock(path: &Path) -> std::io::Result<std::fs::File> {
     let lock = path.with_extension("json.lock");
-    Ok(lock_settings(&lock, LOCK_WAIT * LOCK_TRIES).ok())
+    let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
+    let busy = || std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{name} is locked by another process"));
+    let cannot = |why: String| std::io::Error::other(format!("{name} can't be locked: {why}"));
+    if let Some(by) = CLOSING.get() {
+        return lock_settings(&lock, by.saturating_duration_since(std::time::Instant::now())).map_err(|e| match e {
+            LockFail::Busy => busy(),
+            LockFail::Cannot(why) => cannot(why),
+        });
+    }
+    for i in 1..=LOCK_TRIES {
+        match lock_settings(&lock, LOCK_WAIT) {
+            Ok(f) => return Ok(f),
+            Err(LockFail::Busy) if i < LOCK_TRIES => std::thread::sleep(LOCK_GAP),
+            Err(LockFail::Busy) => return Err(busy()),
+            Err(LockFail::Cannot(why)) => return Err(cannot(why)),
+        }
+    }
+    Err(busy())
 }
 
 thread_local! {

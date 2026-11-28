@@ -89,17 +89,12 @@ impl EditGuard {
             let inserted = e.new_end_byte.saturating_sub(e.start_byte);
             self.charge = self.charge.saturating_add(Self::charge_of(replaced, inserted, several));
         }
-        // STAND-IN (tests-first): never rebuilt.
-        self.charge > self.budget && self.budget == 0
+        self.charge > self.budget
     }
 
     /// A paste of `text` over `selected` bytes of `len`: within the cap,
     /// and within the budget.
     pub(crate) fn paste(&self, len: usize, selected: usize, text: usize) -> Pasted {
-        // STAND-IN (tests-first): every paste goes to the kit.
-        if len < usize::MAX {
-            return Pasted::Go;
-        }
         if len - selected.min(len) + text > self.cap() {
             Pasted::Refuse
         } else if self.charge.saturating_add(Self::charge_of(selected, text, false)) > self.budget {
@@ -138,11 +133,6 @@ pub(crate) enum Field {
 /// Esc, the tab's close) never draws again, so without this frame its
 /// input, text and history would stay held.
 pub(crate) fn render_retired(retired: &mut [Option<Entity<InputState>>; 2]) -> Vec<gpui_kit::Div> {
-    // STAND-IN (tests-first): no last frame: a replaced input is dropped as it is.
-    if retired.len() == 2 {
-        *retired = [None, None];
-        return Vec::new();
-    }
     retired
         .iter_mut()
         .filter_map(Option::take)
@@ -258,10 +248,6 @@ impl AppView {
     /// The value field closed (a commit, Esc, a blur, the tab's close): an
     /// empty one in its place, deferred out of its own handlers.
     pub(crate) fn retire_value_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // STAND-IN (tests-first): the closed field keeps its input, as before this PR.
-        if self.settings.editing.is_none() || self.settings.editing.is_some() {
-            return;
-        }
         cx.defer_in(window, |this, window, cx| {
             if this.settings.editing.is_none() {
                 this.new_field(Field::Value, "", false, window, cx);
@@ -274,10 +260,6 @@ impl AppView {
     /// text, history and buffers go with the old entities), unless they
     /// are fresh already.
     pub(crate) fn settings_tab_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // STAND-IN (tests-first): the fields keep their inputs, as before this PR.
-        if self.settings.editing.is_none() || self.settings.editing.is_some() {
-            return;
-        }
         if self.model.tabs.iter().any(|t| t.kind == crate::tabs::Kind::Settings) {
             return;
         }
