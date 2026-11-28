@@ -425,6 +425,9 @@ fn a_post_is_a_save_only_if_its_reply_holds_what_it_sent(cx: &mut TestAppContext
     assert_eq!(dash.posts().last(), Some(&json!({"key": "api_retries", "value": "3"})), "3 sent");
     assert_eq!(shows(cx, &pg, "api_retries").as_deref(), Some("5"), "the reply's 5 shows");
     assert!(!under(cx, &pg, "api_retries", &[&said]), "3 sent, 5 replied: not this app's save");
+    dash.set("api_retries", json!("3"));
+    reread(cx, &pg, &dash);
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "3 there later, by another hand: still not this app's");
     dash.during_post("api_retries", json!("5"));
     post(cx, &pg, "api_retries", None);
     assert!(!under(cx, &pg, "api_retries", &[&said]), "unset sent, 5 replied: not this app's save");

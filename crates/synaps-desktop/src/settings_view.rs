@@ -228,6 +228,7 @@ impl Saves {
         self.0.iter().find(|&&(o, k, _)| (o, k) == (owner, key)).is_some_and(|e| e.2 == Self::digest(value))
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
