@@ -44,6 +44,14 @@
 //! empty and the sweep moves it aside (never copied). One that parses is
 //! fitted to its writer's caps as it's read ([`Stored::parse`]): what
 //! they leave out is said, and the sweep copies the file aside first.
+//!
+//! **Nothing is written over a file that wasn't set aside.** It goes to
+//! the first of its aside names ([`aside_name`]) that's free, or one that
+//! already holds the same bytes; never over another file there. If none
+//! takes it, or the sweep can't read it, the sweep says so (never "set
+//! aside") and the store keeps to memory ([`sweep`]'s `Err`): it tries the
+//! sweep again at its next change, and writes the file once a sweep set it
+//! aside, or once the user discarded it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,22 +84,41 @@ pub(crate) struct Left {
     pub(crate) over: usize,
 }
 
-/// Why a file is set aside.
+/// Why a file is set aside, and (copied, not moved) its bytes as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Aside {
     /// Past [`Stored::BYTES_MAX`]: not read, read as empty.
     TooBig(String),
     /// Doesn't parse: read as empty.
-    Unreadable(String),
+    Unreadable(String, Vec<u8>),
     /// Parsed, past the caps: what fits kept.
-    Over(String),
+    Over(String, Vec<u8>),
 }
 
 impl Aside {
     fn why(&self) -> &str {
         match self {
-            Aside::TooBig(w) | Aside::Unreadable(w) | Aside::Over(w) => w,
+            Aside::TooBig(w) | Aside::Unreadable(w, _) | Aside::Over(w, _) => w,
         }
+    }
+
+    /// The bytes to copy aside; none: the file is moved.
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Aside::TooBig(_) => None,
+            Aside::Unreadable(_, b) | Aside::Over(_, b) => Some(b),
+        }
+    }
+}
+
+/// The names a file set aside may take ([`aside_name`]).
+pub(crate) const ASIDE_NAMES: usize = 10;
+
+/// `path`'s `n`th aside name: `<file>.bad`, then `<file>.bad.1` … `.bad.9`.
+pub(crate) fn aside_name(path: &Path, n: usize) -> PathBuf {
+    match n {
+        0 => path.with_file_name(format!("{}.bad", name(path))),
+        n => path.with_file_name(format!("{}.bad.{n}", name(path))),
     }
 }
 
@@ -378,7 +405,7 @@ fn read<S: Stored>(path: &Path) -> Result<(S, Option<Aside>), String> {
     if bytes.len() > S::BYTES_MAX {
         return Ok((S::default(), Some(too_big())));
     }
-    match String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string()).and_then(|t| S::parse(&t)) {
+    match std::str::from_utf8(&bytes).map_err(|_| "not UTF-8".to_string()).and_then(S::parse) {
         Ok((s, left)) => {
             if left.bad > 0 {
                 log::warn!(target: "synaps_desktop::blocks", "{}: {} unreadable entries left out", path.display(), left.bad);
@@ -388,9 +415,9 @@ fn read<S: Stored>(path: &Path) -> Result<(S, Option<Aside>), String> {
             }
             let why = format!("{} entries past its caps left out", left.over);
             log::warn!(target: "synaps_desktop::blocks", "{}: {why}", path.display());
-            Ok((s, Some(Aside::Over(why))))
+            Ok((s, Some(Aside::Over(why, bytes))))
         }
-        Err(why) => Ok((S::default(), Some(Aside::Unreadable(why)))),
+        Err(why) => Ok((S::default(), Some(Aside::Unreadable(why, bytes)))),
     }
 }
 
@@ -436,32 +463,80 @@ pub(crate) fn own_once_free(path: &Path) -> Result<Owned, NotOwned> {
 }
 
 /// The owner's first write: what crashes left beside the file removed, and
-/// a file that doesn't parse copied aside (`<file>.bad`) before a snapshot
-/// replaces it. What went wrong, if anything.
-pub(crate) fn sweep<S: Stored>(path: &Path) -> Option<String> {
+/// a file read as empty or fitted (past its bound, unreadable, past its
+/// caps) set aside ([`set_aside`]) before a snapshot replaces it. `Ok`: the
+/// file may be written over, and what went wrong, if anything. `Err`: it
+/// may not (module docs): one to set aside that wasn't, or that couldn't
+/// be read; why.
+pub(crate) fn sweep<S: Stored>(path: &Path) -> Result<Option<String>, String> {
     counted();
     let swept = recall::sweep(path).err().map(|e| format!("{}: leftovers not swept ({e})", name(path)));
-    let unreadable = match read::<S>(path) {
-        Ok((_, Some(aside))) => {
-            let bad = path.with_file_name(format!("{}.bad", name(path)));
-            // One past its bound is moved, never copied: its size is
-            // anyone's.
-            let (what, then, kept) = match &aside {
-                Aside::TooBig(why) => (format!("too big ({why})"), "read as empty", std::fs::rename(path, &bad).map_err(|e| e.to_string())),
-                Aside::Unreadable(why) => (format!("unreadable ({why})"), "read as empty", copy(path, &bad)),
-                Aside::Over(why) => (format!("past its caps ({why})"), "what fits kept", copy(path, &bad)),
-            };
-            log::warn!(target: "synaps_desktop::blocks", "{}: {what}, set aside ({kept:?}); {then}", path.display());
-            Some(format!("{}: {what}, set aside", name(path)))
+    let aside = match read::<S>(path) {
+        Ok((_, Some(aside))) => aside,
+        Ok(_) => return Ok(swept),
+        Err(why) => {
+            log::warn!(target: "synaps_desktop::blocks", "{why}: not read, so not written over");
+            return Err(format!("{why}: not read, so not written over"));
         }
-        Ok(_) => None,
-        Err(why) => Some(why),
     };
-    swept.or(unreadable)
+    let (what, then) = match &aside {
+        Aside::TooBig(why) => (format!("too big ({why})"), "read as empty"),
+        Aside::Unreadable(why, _) => (format!("unreadable ({why})"), "read as empty"),
+        Aside::Over(why, _) => (format!("past its caps ({why})"), "what fits kept"),
+    };
+    match set_aside(path, &aside) {
+        Ok(to) => {
+            log::warn!(target: "synaps_desktop::blocks", "{}: {what}, set aside ({}); {then}", path.display(), to.display());
+            Ok(swept.or(Some(format!("{}: {what}, set aside ({})", name(path), name(&to)))))
+        }
+        Err(e) => {
+            log::warn!(target: "synaps_desktop::blocks", "{}: {what}, not set aside ({e}): nothing written over it; {then}", path.display());
+            Err(format!("{}: {what}, not set aside ({e})", name(path)))
+        }
+    }
 }
 
-fn copy(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::copy(from, to).map(|_| ()).map_err(|e| e.to_string())
+/// `path`'s file set aside: moved if past its bound (its size is
+/// anyone's), else its bytes as read copied, this user's only, to the
+/// first of its aside names that's free, or one already holding those
+/// bytes; never over another file. Where it went.
+fn set_aside(path: &Path, aside: &Aside) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    for n in 0..ASIDE_NAMES {
+        let to = aside_name(path, n);
+        match std::fs::symlink_metadata(&to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_file() && aside.bytes().is_some_and(|b| holds(&to, m.len(), b)) => return Ok(to),
+            Ok(_) => continue,
+            Err(e) => return Err(format!("{}: {e}", name(&to))),
+        }
+        let done = match aside.bytes() {
+            None => std::fs::rename(path, &to),
+            Some(bytes) => recall::create_private(&to).and_then(|mut f| {
+                let written = f.write_all(bytes).and_then(|()| f.sync_all());
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&to);
+                }
+                written
+            }),
+        };
+        match done {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", name(&to))),
+        }
+    }
+    Err(format!("{ASIDE_NAMES} files of its name beside it already"))
+}
+
+/// Whether the file at `to`, `len` bytes, holds exactly `bytes`.
+fn holds(to: &Path, len: u64, bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    if len != bytes.len() as u64 {
+        return false;
+    }
+    let mut had = Vec::new();
+    std::fs::File::open(to).and_then(|f| f.take(len + 1).read_to_end(&mut had)).is_ok() && had == bytes
 }
 
 /// `text`, the whole file, written at `path` (module docs).

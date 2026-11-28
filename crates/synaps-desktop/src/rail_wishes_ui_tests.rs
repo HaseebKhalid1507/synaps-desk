@@ -586,6 +586,43 @@ fn memory_only_is_said_for_as_long_as_it_lasts(cx: &mut TestAppContext) {
     assert!(has(cx, w, says), "still said");
 }
 
+/// Shady #108 P2-2, in the window: a desires file its sweep couldn't set
+/// aside (every name it may take a folder) is never written over. The
+/// footer says memory only and why, never "set aside", with its `discard
+/// it`; a dismissal draws, kept in memory, and the window's end writes
+/// nothing. `discard it` writes memory over the file, and says so.
+#[gpui_kit::test]
+fn a_file_not_set_aside_is_written_over_only_once_discarded(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    let (path, ppath) = files("held");
+    let text = crate::desires::tests::hand_written((0..100).map(|i| (crate::desires::tests::J.to_string(), format!("b{i:03}"), false)));
+    std::fs::write(&path, &text).expect("the file");
+    crate::desires::tests::aside_names(&path).iter().for_each(|n| std::fs::create_dir(n).expect("a folder"));
+    let home = crate::rail_wishes::Home::take(Some(path.clone()), Some(ppath));
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    away(cx, w, &view);
+    let said = view.read_with(cx, |v, _| v.wishes.memory_only()).expect("memory only, said");
+    assert!(said.starts_with(crate::rail_wishes::MEMORY_ONLY) && said.contains("not set aside"), "{said}");
+    assert!(has(cx, w, format!("agent-memory {}", crate::ask::shown(&said, cards_spec::Lines::Single))), "on the rail");
+    assert!(has(cx, w, "agent-memory-discard".into()), "with its discard");
+    action(cx, w, "plan", "agent-x");
+    away(cx, w, &view);
+    assert!(!has_sec(cx, &view, "plan"), "kept in memory: it draws");
+    view.update(cx, |v, _| v.flush_wishes());
+    written(cx, &view);
+    assert_eq!(std::fs::read(&path).expect("the file"), text.as_bytes(), "never written over");
+
+    let discard = drawn(cx, w, "agent-memory-discard".into()).center();
+    click(cx, w, discard);
+    away(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.wishes.memory_only().is_none()), "saved again");
+    assert!(!has(cx, w, "agent-memory-discard".into()));
+    assert!(has(cx, w, format!("agent-said {}", crate::rail_wishes::DISCARDED)), "said");
+    let now = std::fs::read_to_string(&path).expect("the file");
+    assert!(now != text && now.contains(r#""plan":{"d":1"#), "memory, whole, written over it: {now}");
+    assert!(!has_sec(cx, &view, "plan"));
+}
+
 /// R3-P2-5: the footer's `show` acts on the set it drew, never on a count
 /// alike: pressed over `1 dismissed` (plan), held while the rail changes
 /// to another `1 dismissed` (cause), it does nothing, and says so.
@@ -814,7 +851,6 @@ fn a_resend_after_a_restart_is_confirmed_by_its_echo(cx: &mut TestAppContext) {
 // Shady's review of #103, round 4 (2ae2b6e).
 
 /// A folder of the test home's own, new, and its two files' paths.
-#[cfg(unix)]
 fn files(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = crate::theme::test_home::root().join(name);
     let _ = std::fs::remove_dir_all(&dir);

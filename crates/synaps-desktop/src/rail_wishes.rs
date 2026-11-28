@@ -57,8 +57,10 @@
 //!   last snapshot ([`AppView::flush_wishes`]), and the app's quit, a
 //!   window open or not, waits for them ([`Home::on_quit`]).
 //! - **The rail's footer** says what a refusal or a settle said last, and,
-//!   for as long as this desk doesn't own its files, that it keeps its
-//!   changes in memory only ([`Stores::memory_only`]).
+//!   for as long as this desk doesn't own its files, or keeps one it
+//!   couldn't set aside from being written over, that it keeps its changes
+//!   in memory only ([`Stores::memory_only`]); then its `discard it`
+//!   writes over it ([`Stores::discard_held`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -87,6 +89,8 @@ const SENT_MAX: usize = 256;
 
 /// The footer's word while this desk doesn't own its files.
 pub(crate) const MEMORY_ONLY: &str = "this desk keeps rail changes in memory only";
+/// The footer's word once its `discard it` wrote over a file held.
+pub(crate) const DISCARDED: &str = "discarded · rail changes are saved again";
 
 /// The process's hold on the rail's two files ([`crate::blockfiles`]):
 /// each one's lock, taken once at the launch (`main`, before any window)
@@ -302,14 +306,32 @@ impl Stores {
         self.desires.writer_lost(why)
     }
 
-    /// While either file isn't this desk's: that it keeps its changes in
+    /// While either file isn't this desk's, or is held (a sweep couldn't
+    /// set it aside, [`Desires::held`]): that it keeps its changes in
     /// memory only, and why.
     pub(crate) fn memory_only(&self) -> Option<String> {
-        let why = self.desires.not_owned().or(self.pres.not_owned())?;
+        let Some(why) = self.desires.not_owned().or(self.pres.not_owned()) else {
+            let held = self.held()?;
+            return Some(format!("{MEMORY_ONLY} · {held}"));
+        };
         Some(match why {
             NotOwned::Held => format!("{MEMORY_ONLY} · another desk has its files"),
             NotOwned::Failed(why) => format!("{MEMORY_ONLY} · {why}"),
         })
+    }
+
+    /// Why a file isn't written over, if one isn't: its sweep couldn't set
+    /// it aside.
+    pub(crate) fn held(&self) -> Option<&str> {
+        self.desires.held().or(self.pres.held())
+    }
+
+    /// The user's `discard it`: each file held written over from now, set
+    /// aside or not. `false`: none was held.
+    pub(crate) fn discard_held(&mut self) -> bool {
+        let desires = self.desires.discard_held();
+        let pres = self.pres.discard_held();
+        desires || pres
     }
 
     /// Tests: a write out on either file.
@@ -643,6 +665,16 @@ impl AppView {
         }
         self.pump_wishes(cx);
         // The rail draws what it has now (memory only, said).
+        cx.notify();
+    }
+
+    /// The footer's `discard it`: each file held (its sweep couldn't set it
+    /// aside) written over from now, memory whole its next write; said.
+    pub(crate) fn discard_held(&mut self, cx: &mut Context<Self>) {
+        if self.wishes.discard_held() {
+            self.wishes.said = Some(DISCARDED.into());
+            self.pump_wishes(cx);
+        }
         cx.notify();
     }
 

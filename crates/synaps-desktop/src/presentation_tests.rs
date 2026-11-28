@@ -547,6 +547,54 @@ fn a_file_past_its_bound_isnt_read() {
     }
 }
 
+/// Shady #108 P2-2, the presentation's file too: one to set aside that
+/// can't be (every name it may take is a folder) is never written over;
+/// its sweep says so, never "set aside"; a pin is kept in memory and
+/// draws; neither its write nor the window's last writes the file, nor
+/// does a restart's. A change once a name is free sets it aside first,
+/// then writes memory whole over it. Past the counts and past the bound.
+#[test]
+fn a_file_that_cant_be_set_aside_is_never_written_over() {
+    let mut h = H::default();
+    h.ops(json!([note("plan", "x"), note("tests", "x")]));
+    let ids = |n: u64| (0..n).map(|i| (format!("s{i:02}"), i + 1)).collect::<Vec<_>>();
+    for (name, text) in [
+        ("over", hand_written((0..300u64).map(|c| (format!("c{c:03}"), c + 1, ids(1))))),
+        ("too-big", hand_written((0..1000u64).map(|c| (format!("c{c:03}"), c + 1, ids(ENTRIES_MAX as u64))))),
+    ] {
+        let d = dir(&format!("p-unkept-{name}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, &text).unwrap();
+        let names = crate::desires::tests::aside_names(&path);
+        names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        let mut p = presentation(&d);
+        let said = p.trouble.clone().unwrap_or_default();
+        pin(&mut p, &h, "plan").unwrap();
+        assert_eq!(at(&p, &h, "plan").place, Place::Rail(Slot::Upper), "{name}: kept in memory, it draws");
+        let s = h.state();
+        let _ = p.pin(J, s.block(&r("tests")).expect("live"));
+        if let Some(w) = p.last_write() {
+            let _ = w.run();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "{name}: never written over");
+        assert!(said.contains("not set aside"), "{name}: {said}");
+        drop(p);
+        let p = presentation(&d);
+        assert!(p.trouble.as_deref().is_some_and(|t| t.contains("not set aside")), "{name}: a restart: {:?}", p.trouble);
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes(), "{name}: a restart writes nothing over it");
+        assert!(names.iter().all(|n| n.is_dir()), "{name}: no folder touched");
+        drop(p);
+
+        let mut p = presentation(&d);
+        std::fs::remove_dir(&names[3]).unwrap();
+        pin(&mut p, &h, "plan").unwrap();
+        assert_eq!(std::fs::read(&names[3]).unwrap(), text.as_bytes(), "{name}: set aside at last");
+        let aside = format!("set aside ({FILE}.bad.3)");
+        assert!(p.trouble.as_deref().is_some_and(|t| t.contains(&aside)), "{name}: {:?}", p.trouble);
+        assert!(reread(&d).book.conversations.contains_key(J), "{name}: then memory, whole, written over it");
+    }
+}
+
 /// A pipe where the file goes isn't opened (opening one waits for a
 /// writer, forever): its read says so at once.
 #[cfg(unix)]

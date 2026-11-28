@@ -33,7 +33,10 @@
 //! [`CONVERSATIONS_MAX`] conversations and [`FILE_BYTES_MAX`] bytes, the
 //! least recently touched conversation going first. It's presentation: no
 //! wish is lost. A file read is fitted the same way (one past
-//! [`FILE_BYTES_MAX`] isn't read), what went said ([`crate::blockfiles`]).
+//! [`FILE_BYTES_MAX`] isn't read), what went said ([`crate::blockfiles`]);
+//! one that couldn't be set aside isn't written over
+//! ([`Presentation::held`]): memory only until a sweep sets it aside, or
+//! the user discards it.
 //! **Drawn at once, written off the UI thread:** memory is the truth. A
 //! change draws now, and a snapshot of memory, whole, is written
 //! ([`Presentation::next_write`], run on the process's writer, holding the
@@ -350,7 +353,7 @@ impl Write {
     /// The write, on whatever thread runs it ([`crate::blockfiles`]).
     pub(crate) fn run(self) -> Landing {
         let done = match &self.text {
-            None => Ok(blockfiles::sweep::<Book>(&self.path)),
+            None => blockfiles::sweep::<Book>(&self.path),
             Some(text) => blockfiles::write(&self.path, text).map(|()| None),
         };
         drop(self.owner);
@@ -374,6 +377,12 @@ pub(crate) struct Presentation {
     out: Option<u64>,
     next_ticket: u64,
     sweep: bool,
+    /// A sweep that couldn't set the file aside: why, and the change count
+    /// it ran at. Nothing is written over the file meanwhile (memory only),
+    /// and each change runs the sweep again ([`Presentation::held`]).
+    held: Option<(String, u64)>,
+    /// The user discarded the file held: it is written over from now.
+    discarded: bool,
     /// Why the last write failed, until one lands.
     pub(crate) failed: Option<String>,
     /// Why the file read as empty at the load, what its sweep said, or that
@@ -419,6 +428,8 @@ impl Presentation {
             failed_at: None,
             out: None,
             next_ticket: 0,
+            held: None,
+            discarded: false,
             failed: None,
             trouble,
         }
@@ -426,14 +437,18 @@ impl Presentation {
 
     /// The next write to run off the UI thread, once the one out landed:
     /// the sweep first, then memory whole whenever it changed since the
-    /// file. Memory only: none.
+    /// file. Memory only: none. Held: the sweep again at each change, and
+    /// nothing else.
     pub(crate) fn next_write(&mut self) -> Option<Write> {
         let (path, owner) = self.file()?;
         if self.out.is_some() {
             return None;
         }
-        let text = if std::mem::take(&mut self.sweep) {
+        let again = self.held.as_ref().is_some_and(|(_, at)| self.seq > *at);
+        let text = if std::mem::take(&mut self.sweep) || again {
             None
+        } else if self.held.is_some() {
+            return None;
         } else if self.seq > self.written && self.failed_at != Some(self.seq) {
             Some(self.book.text())
         } else {
@@ -470,7 +485,7 @@ impl Presentation {
     /// after it); no one hears how it went.
     pub(crate) fn last_write(&mut self) -> Option<Write> {
         let (path, owner) = self.file()?;
-        if self.seq <= self.written {
+        if self.seq <= self.written || self.held.is_some() {
             return None;
         }
         self.next_ticket += 1;
@@ -487,19 +502,40 @@ impl Presentation {
     /// (a change no write was asked for yet).
     #[cfg(test)]
     pub(crate) fn due(&self) -> bool {
-        self.owner.is_ok() && self.out.is_none() && self.seq > self.written && self.failed_at != Some(self.seq)
+        let held = self.held.as_ref().is_some_and(|(_, at)| self.seq <= *at);
+        self.owner.is_ok() && self.out.is_none() && self.seq > self.written && self.failed_at != Some(self.seq) && !held
     }
 
     /// Whether a write is out or to make.
     #[cfg_attr(not(test), expect(dead_code, reason = "tests"))]
     pub(crate) fn writing(&self) -> bool {
-        self.owner.is_ok() && (self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq)))
+        let held = self.held.as_ref().is_some_and(|(_, at)| self.seq <= *at);
+        self.owner.is_ok() && (self.out.is_some() || self.sweep || (self.seq > self.written && self.failed_at != Some(self.seq) && !held))
     }
 
     /// Tests: nothing to sweep (a folder of its own, new).
     #[cfg(test)]
     pub(crate) fn swept(&mut self) {
         self.sweep = false;
+    }
+
+    /// Why the file isn't written over, if it isn't: a sweep couldn't set
+    /// it aside (memory only until one does, or the user discards it).
+    pub(crate) fn held(&self) -> Option<&str> {
+        self.held.as_ref().map(|(why, _)| why.as_str())
+    }
+
+    /// The user's: the file held written over, set aside or not (memory,
+    /// whole, its next write). `false`: none was held.
+    pub(crate) fn discard_held(&mut self) -> bool {
+        if self.held.take().is_none() {
+            return false;
+        }
+        self.discarded = true;
+        // Memory isn't what the file has: a snapshot is due.
+        self.seq += 1;
+        self.written = 0;
+        true
     }
 
     /// The writer took no more (`why`: it didn't start, or stopped): the
@@ -521,7 +557,18 @@ impl Presentation {
         self.out = None;
         match l.done {
             Ok(said) if l.sweep => {
+                if self.held.take().is_some() {
+                    // Set aside at last: memory, whole, written over it.
+                    self.written = 0;
+                }
                 self.trouble = said.or(self.trouble.take());
+                Ok(())
+            }
+            Err(why) if l.sweep => {
+                if !self.discarded {
+                    self.held = Some((why.clone(), l.seq));
+                    self.trouble = Some(why);
+                }
                 Ok(())
             }
             Ok(_) => {
