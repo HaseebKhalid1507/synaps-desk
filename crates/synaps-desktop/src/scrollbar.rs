@@ -388,6 +388,16 @@ impl BarState {
         std::mem::take(&mut self.0.borrow_mut().paints)
     }
 
+    /// Tests: what the bar's test logs hold (every paint, every frame's
+    /// thumb), dropped with their room: a heap measurement excludes them.
+    #[cfg(test)]
+    pub(crate) fn drain_test_logs(&self) {
+        let mut s = self.0.borrow_mut();
+        drop(std::mem::take(&mut s.paints));
+        #[cfg(unix)]
+        drop(std::mem::take(&mut s.thumbs));
+    }
+
     /// Tests: every frame since the last call, as prepainted: the pane's
     /// viewport, the bar's tag ([`Bar::tag`]) and the thumb's rect as
     /// painted (`None`: none painted).

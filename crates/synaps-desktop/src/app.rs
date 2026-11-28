@@ -1911,7 +1911,7 @@ pub(crate) fn lines_below(below: f32, line: f32) -> usize {
 }
 
 /// What the picker says after a save.
-fn saved_note(saved: Option<(std::io::Result<()>, std::path::PathBuf)>, overridden: &str) -> SharedString {
+pub(crate) fn saved_note(saved: Option<(std::io::Result<()>, std::path::PathBuf)>, overridden: &str) -> SharedString {
     match saved {
         Some((Ok(()), path)) => format!("saved to {}{overridden}", path.display()).into(),
         Some((Err(e), _)) => format!("not saved: {e}").into(),
@@ -2127,6 +2127,8 @@ pub struct AppView {
     pub(crate) height: f32,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
+    /// The picker's last save was the theme's (else the accent's).
+    pub(crate) picker_theme: bool,
     /// Where the mouse-down that closed the picker from outside was: the
     /// click it starts must not reopen it on its trigger, however long it
     /// is held.
@@ -2274,6 +2276,15 @@ pub struct AppView {
     pub(crate) keys_rearm: bool,
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
+    /// The fields' inputs just replaced, drawn once more, hidden, so the
+    /// kit lets them go ([`crate::settings_editor::render_retired`]).
+    pub(crate) settings_retired: [Option<Entity<InputState>>; 2],
+    /// Their subscriptions, replaced with them, and their edit guards
+    /// (`settings_editor.rs`).
+    pub(crate) settings_find_subs: [Subscription; 2],
+    pub(crate) settings_input_subs: [Subscription; 2],
+    pub(crate) settings_find_guard: crate::settings_editor::EditGuard,
+    pub(crate) settings_input_guard: crate::settings_editor::EditGuard,
     pub(crate) gear_menu: bool,
     /// Overlays as they leave (fluid.md §3.10): what was open last frame,
     /// and what closed and when, drawn without a hitbox until gone; the
@@ -2656,8 +2667,16 @@ impl AppView {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::palette::PLACEHOLDER));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
-        let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
-        let settings_input = cx.new(|cx| InputState::new(window, cx));
+        // Settings' two short fields, each capped by the kit's validator,
+        // their subscriptions beside them: the edit guard replaces both
+        // (`settings_editor.rs`).
+        let find_cap = crate::settings_editor::FIND_CAP;
+        let value_cap = crate::settings_editor::VALUE_CAP;
+        let settings_find =
+            cx.new(|cx| InputState::new(window, cx).placeholder("find a setting").validate(move |t, _| t.len() <= find_cap));
+        let settings_input = cx.new(|cx| InputState::new(window, cx).validate(move |t, _| t.len() <= value_cap));
+        let settings_find_subs = Self::field_subs(crate::settings_editor::Field::Find, &settings_find, window, cx);
+        let settings_input_subs = Self::field_subs(crate::settings_editor::Field::Value, &settings_input, window, cx);
         let mut subs = vec![
             // The palette filters as it is typed.
             cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
@@ -2717,26 +2736,6 @@ impl AppView {
                     this.apply_custom_accent(cx);
                 }
             }),
-            cx.subscribe_in(&settings_find, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
-                if let InputEvent::Change = ev {
-                    let text = input.read(cx).value().to_string();
-                    this.settings_find(text, cx);
-                }
-            }),
-            cx.subscribe_in(&settings_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => {
-                    this.settings_commit(cx);
-                    window.focus(&this.focus, cx);
-                }
-                // Clicked away: the edit is left as it was.
-                InputEvent::Blur => {
-                    let was = this.settings.editing.take();
-                    if was.is_some() {
-                        this.views_changed(cx);
-                    }
-                }
-                _ => {}
-            }),
         ];
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -2791,19 +2790,23 @@ impl AppView {
         // process's writer, which the app's quit waits for, this window
         // open or not (`rail_wishes::Home::on_quit`).
         subs.push(cx.on_release(|this, cx| {
-            this.flush_panels();
-            this.flush_tabs();
-            this.flush_favs();
-            this.flush_app();
+            theme::closing(|| {
+                this.flush_panels();
+                this.flush_tabs();
+                this.flush_favs();
+                this.flush_app();
+            });
             this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
         subs.push(cx.on_app_quit(|this, cx| {
-            this.flush_panels();
-            this.flush_tabs();
-            this.flush_favs();
-            this.flush_app();
+            theme::closing(|| {
+                this.flush_panels();
+                this.flush_tabs();
+                this.flush_favs();
+                this.flush_app();
+            });
             this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             async move { gone.wait().await }
@@ -2834,6 +2837,8 @@ impl AppView {
             secret_input,
             settings_find,
             settings_input,
+            settings_find_subs,
+            settings_input_subs,
             settings_pane,
             usage_pane,
             focus,
@@ -2928,6 +2933,7 @@ impl AppView {
             height: 0.,
             picker_open: false,
             picker_note: None,
+            picker_theme: false,
             picker_dismissed: None,
             accent_source: theme::Source::Default,
             theme_source: theme::Source::Default,
@@ -2996,6 +3002,11 @@ impl AppView {
             keys_rearm: false,
             settings_find: i.settings_find,
             settings_input: i.settings_input,
+            settings_retired: [None, None],
+            settings_find_subs: i.settings_find_subs,
+            settings_input_subs: i.settings_input_subs,
+            settings_find_guard: crate::settings_editor::EditGuard::find(),
+            settings_input_guard: crate::settings_editor::EditGuard::value(),
             gear_menu: false,
             menu_was: None,
             menu_leaving: None,
@@ -4731,7 +4742,7 @@ impl AppView {
                     self.model.favs.quiet = false;
                     self.model.favs.written(&sent, file);
                 }
-                Err(e) => eprintln!("synaps-desktop: favourites not saved: {e}"),
+                Err(e) => theme::not_saved_at_close(&["favourites"], &e),
             }
         }
     }
@@ -4818,7 +4829,7 @@ impl AppView {
                 job.writes += 1;
                 match theme::save_layout(&path, key, &self.layout_now()) {
                     Ok(()) => self.layout_written = self.layout_gen(),
-                    Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+                    Err(e) => theme::not_saved_at_close(&["layout"], &e),
                 }
             }
             return;
@@ -4831,7 +4842,7 @@ impl AppView {
             job.writes += 1;
             match theme::save_tabs(&path, key, &self.saved_tabs().saved()) {
                 Ok(()) => self.tabs_written = self.saved_tabs().generation,
-                Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+                Err(e) => theme::not_saved_at_close(&["tabs"], &e),
             }
         }
     }
@@ -6548,16 +6559,28 @@ impl AppView {
     }
 
     /// The accent override (`None`: the theme's own `prompt_fg` and
-    /// `border_active`), repainted at once and saved.
+    /// `border_active`), repainted at once and saved with the app's batch
+    /// (off the UI thread; the picker's note says how it went).
     pub(crate) fn set_accent(&mut self, hex: Option<u32>, cx: &mut Context<Self>) {
         theme::update(cx, |c| c.accent = hex);
-        let overridden = match self.accent_source {
-            theme::Source::Flag => " (the next launch's --accent wins over it)".to_string(),
-            theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_ACCENT),
-            _ => String::new(),
-        };
-        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_accent(&path, hex), path)), &overridden));
+        self.picker_note = None;
+        self.picker_theme = false;
+        self.save_app(crate::settings_saved::AppKey::Accent, crate::settings_saved::AppValue::of(hex.map(theme::to_hex)), cx);
         cx.notify();
+    }
+
+    /// What the picker's note adds to `saved to …`: the pin that wins at
+    /// the next launch over the theme (or the accent) saved.
+    pub(crate) fn picker_overridden(&self) -> String {
+        let (flag, env, src) = match self.picker_theme {
+            true => ("--theme", theme::ENV_THEME, self.theme_source),
+            false => ("--accent", theme::ENV_ACCENT, self.accent_source),
+        };
+        match src {
+            theme::Source::Flag => format!(" (the next launch's {flag} wins over it)"),
+            theme::Source::Env if !(self.picker_theme && self.theme_follows_config) => format!(" (${env} wins over it at the next launch)"),
+            _ => String::new(),
+        }
     }
 
     /// A built-in theme (or the `<base>/themes/<name>` file over it),
@@ -6593,12 +6616,9 @@ impl AppView {
             c.raw = raw;
         });
         self.theme_follows_config = saved.is_none();
-        let overridden = match self.theme_source {
-            theme::Source::Flag => " (the next launch's --theme wins over it)".to_string(),
-            theme::Source::Env if saved.is_some() => format!(" (${} wins over it at the next launch)", theme::ENV_THEME),
-            _ => String::new(),
-        };
-        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_theme(&path, saved), path)), &overridden));
+        self.picker_note = None;
+        self.picker_theme = true;
+        self.save_app(crate::settings_saved::AppKey::Theme, crate::settings_saved::AppValue::of(saved.map(String::from)), cx);
         cx.notify();
     }
 
@@ -6764,7 +6784,9 @@ impl AppView {
     }
 
     /// Write the changed panel keys on the background executor (a read, a
-    /// write, two fsyncs: never on the UI thread).
+    /// write, two fsyncs: never on the UI thread), the rows' receipts with
+    /// them. A failure stays to write with the next change, the window's
+    /// return, or Retry, and says so under its rows.
     fn save_panels(&mut self, cx: &mut Context<Self>) {
         // Never a width in the middle of a drag: its end saves again.
         if self.drag.as_ref().is_some_and(|g| g.moved) {
@@ -6778,14 +6800,30 @@ impl AppView {
             let saved = cx.background_spawn(async move { theme::save_panels(&path, p, keys) }).await;
             let _ = this.update(cx, |v, cx| {
                 v.panels_writing = theme::PanelKeys::default();
-                if let Err(e) = saved {
-                    v.panels_dirty = v.panels_dirty.or(keys);
-                    v.model.lives[v.panes.cur.live].last_error = Some(format!("panel layout not saved: {e}"));
-                    cx.notify();
+                match saved {
+                    Ok(written) => {
+                        for r in written {
+                            v.settings.wrote.put(r);
+                        }
+                        v.settings.panels_note = None;
+                    }
+                    Err(e) => {
+                        v.panels_dirty = v.panels_dirty.or(keys);
+                        v.settings.panels_note = Some(crate::settings_saved::Note::new(keys.rows(), &format!("not saved: {e}")));
+                        v.model.lives[v.panes.cur.live].last_error = Some(format!("panel layout not saved: {e}"));
+                    }
                 }
+                v.views_changed(cx);
             });
         })
         .detach();
+    }
+
+    /// The panels' failed write, tried again now (Retry, the window's
+    /// return).
+    pub(crate) fn save_panels_now(&mut self, cx: &mut Context<Self>) {
+        self.panels_save = None;
+        self.save_panels(cx);
     }
 
     /// A save still waiting (or still being written), written now, here:
@@ -6798,7 +6836,7 @@ impl AppView {
             && let Some(path) = theme::settings_path()
             && let Err(e) = theme::save_panels(&path, self.panels, keys)
         {
-            eprintln!("synaps-desktop: panel layout not saved: {e}");
+            theme::not_saved_at_close(&keys.names(), &e);
         }
     }
 
@@ -8858,6 +8896,8 @@ struct Inputs {
     pub(crate) secret_input: Entity<InputState>,
     settings_find: Entity<InputState>,
     settings_input: Entity<InputState>,
+    settings_find_subs: [Subscription; 2],
+    settings_input_subs: [Subscription; 2],
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
@@ -10143,9 +10183,9 @@ impl Render for AppView {
         let open_views = self.model.tabs.iter().filter(|t| t.kind != crate::tabs::Kind::Session).count();
         if (view, open_views) != (self.shown_view, self.shown_views) {
             (self.shown_view, self.shown_views) = (view, open_views);
-            let me = cx.weak_entity();
-            cx.defer(move |cx| {
-                let _ = me.update(cx, |v, cx| v.view_shown(cx));
+            cx.defer_in(window, move |v, window, cx| {
+                v.view_shown(cx);
+                v.settings_tab_closed(window, cx);
             });
         }
         // What the view on screen reads of the rest of the app changed (the
@@ -10439,6 +10479,7 @@ impl Render for AppView {
         self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
+        let retired = crate::settings_editor::render_retired(&mut self.settings_retired);
         let root = h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -10842,6 +10883,7 @@ impl Render for AppView {
             .children((view.is_none() || self.panes.split()).then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
             // Drag and drop's targets and preview (split panes step 4).
             .children(drop_layer)
+            .children(retired)
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))

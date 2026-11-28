@@ -140,19 +140,26 @@ pub(crate) struct ConfigOrder {
     seq: u64,
     seen: u64,
     writing: Option<&'static str>,
-    queued: Vec<(&'static str, Option<String>)>,
+    /// The latest value per key, reserved once to [`ConfigOrder::QUEUE`]
+    /// (the writable keys).
+    queued: Vec<(&'static str, Option<Box<str>>)>,
 }
 
 /// A write to send: its stamp, key and value (`None` unsets).
 pub(crate) type Send = (u64, &'static str, Option<String>);
 
 impl ConfigOrder {
+    pub(crate) const QUEUE: usize = 22;
+
     /// A write: `Some` to send now, `None` queued (replacing an older
     /// value for its key).
     pub fn write(&mut self, key: &'static str, value: Option<String>) -> Option<Send> {
         if self.writing.is_some() {
+            if self.queued.capacity() == 0 {
+                self.queued.reserve_exact(Self::QUEUE);
+            }
             self.queued.retain(|q| q.0 != key);
-            self.queued.push((key, value));
+            self.queued.push((key, value.map(String::into_boxed_str)));
             return None;
         }
         self.writing = Some(key);
@@ -185,7 +192,23 @@ impl ConfigOrder {
             return (newer, None);
         }
         let (k, v) = self.queued.remove(0);
-        (newer, self.write(k, v))
+        (newer, self.write(k, v.map(String::from)))
+    }
+
+    /// The bytes it holds: its queue's reserve and values.
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.queued.capacity() * std::mem::size_of::<(&'static str, Option<Box<str>>)>()
+            + self.queued.iter().map(|q| q.1.as_ref().map_or(0, |v| v.len())).sum::<usize>()
+    }
+
+    /// Tests: the queue filled directly, behind a write out.
+    #[cfg(test)]
+    pub(crate) fn fill(&mut self, keys: &[&'static str], value: &str) {
+        self.writing = self.writing.or(Some("model"));
+        for k in keys {
+            let _ = self.write(k, Some(value.to_string()));
+        }
     }
 
     /// Another dash or daemon: every reply on its way is stale and the
@@ -677,6 +700,7 @@ impl AppView {
                 self.dash.found_gen = None;
                 self.dash.want_config = true;
                 self.dash_find(cx);
+                self.read_receipts(cx);
             }
             Some(Kind::Usage) => {
                 let stale = self.usage.fetched.is_none_or(|t| t.elapsed() >= POLL);
@@ -707,14 +731,12 @@ impl AppView {
         self.dash.config_of(self.daemon_id())
     }
 
-    /// Whose config `c` is, for the record of this run's writes: the
-    /// daemon (its socket and profile) and the file (PLAN §2.2's receipt
-    /// identity). Not its pid: a cold start is the same daemon's.
-    pub(crate) fn config_owner(&self, c: &ConfigSnapshot) -> u64 {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (&self.dash.socket, self.model.daemon.as_ref().map(|d| &d.profile), &c.write_path).hash(&mut h);
-        h.finish()
+    /// Whose config `c` is, for its receipts: the daemon (its socket and
+    /// profile) and the file (PLAN §2.2's `<d>`). Not its pid: a cold start
+    /// is the same daemon's.
+    pub(crate) fn config_owner(&self, c: &ConfigSnapshot) -> [u8; 8] {
+        let profile = self.model.daemon.as_ref().and_then(|d| d.profile.as_deref());
+        crate::settings_saved::daemon_id(self.dash.socket.as_deref(), profile, Some(c.write_path.as_str()))
     }
 
     /// Whose config the dash has, when not this daemon's.
@@ -938,6 +960,8 @@ impl AppView {
                     serde_json::from_str::<ConfigSnapshot>(&text).map_err(|e| Fail::Bad(e.to_string()))
                 })
                 .await;
+            // The dash's 200 is the moment a daemon value was saved.
+            let at_ms = crate::settings_saved::now_ms();
             let _ = this.update(cx, |v, cx| {
                 let (newer, next) = v.dash.order.written();
                 if v.dash.order.fresh(seq) {
@@ -947,8 +971,12 @@ impl AppView {
                             // A save only if the reply holds what was sent: the
                             // dash reads the file again for it, after its lock,
                             // and another writer's value can be there.
+                            // Its receipt is due: written by the next app
+                            // write, or by its own (PLAN §2.2).
                             if c.exposes(key) && c.value(key) == sent.as_deref() {
-                                v.settings.wrote.insert(v.config_owner(&c), key, sent.as_deref());
+                                let r = crate::settings_saved::Receipt::daemon(v.config_owner(&c), key, sent.as_deref(), at_ms);
+                                v.settings.wrote.put(r);
+                                v.arm_receipts_save(cx);
                             }
                             v.dash.config = Some(c);
                             if !newer {
@@ -982,6 +1010,15 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Tests: the daemon queue's write out answered ([`ConfigOrder::fill`]),
+    /// what waited behind it sent.
+    #[cfg(test)]
+    pub(crate) fn resume_config_queue(&mut self, cx: &mut Context<Self>) {
+        if let (_, Some(next)) = self.dash.order.written() {
+            self.send_write(next, cx);
+        }
     }
 
     /// A Usage load for the chips as they are now. One at a time: a newer
@@ -1140,6 +1177,10 @@ impl AppView {
         }
         if active && std::mem::take(&mut self.dash.missed_tick) {
             self.dash_tick(cx);
+        }
+        // A save that failed is tried again as the window comes back.
+        if active {
+            self.retry_saves(cx);
         }
         // Idle exit's comparison is the dash's to read again, Settings on
         // screen in any pane (one refresh: `/api/info`, then the config; a
