@@ -306,6 +306,13 @@ pub fn first_sentence(help: &str) -> &str {
     help
 }
 
+/// The help's sentence that holds byte `byte`. **Compile-only scaffolding**
+/// (PLAN §4): the next commit gives it its body.
+#[allow(dead_code)]
+pub fn sentence_at(help: &str, byte: usize) -> std::ops::Range<usize> {
+    0..0
+}
+
 /// A row matches the find text (lowercase) by its label, key or help.
 /// Allocates nothing (it runs for every row on every frame of a find).
 pub fn matches(find: &str, label: &str, key: &str, help: &str) -> bool {
