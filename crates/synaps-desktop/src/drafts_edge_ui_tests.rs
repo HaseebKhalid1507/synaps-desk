@@ -12,7 +12,11 @@
 //! anchor's call is gone where it is drawn, and while the pane watches a
 //! worker (R2 P2-3); marked
 //! text past a note's cap, and a composition's preedits in a field's
-//! history, refused as they come (R2 P2-4).
+//! history, refused as they come (R2 P2-4). Round 3 (Shady #114 at
+//! `6ce4784`): a composition's commit counted at the marked text it takes
+//! out (R3 P2-1); a cold reload keeps a held block at its call's row, not
+//! its old number (R3 P2-2); a follow keeps the blocks before a held
+//! block as they were taken, for the agent's later moves.
 
 use std::sync::Arc;
 
@@ -343,6 +347,12 @@ fn conv() -> Vec<Value> {
 /// on screen (a reattach, or a follow to a new id).
 fn attach(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, id: &str, h: &[Value]) {
     let (seq, _) = attachment(cx, view);
+    attach_as(cx, w, view, seq, id, h);
+}
+
+/// The daemon's `Attached` for `id` with history `h`, answering attach
+/// `seq`.
+fn attach_as(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, seq: u64, id: &str, h: &[Value]) {
     let frame = json!({"type": "attached", "client": 2, "input_owner": 2, "client_input": "shared",
         "meta": {"id": id, "model": "m", "lifecycle": "live"},
         "conversation": {"messages_len": h.len(), "api_messages": h}});
@@ -1258,4 +1268,246 @@ fn a_notify_with_nothing_changed_counts_nothing_in_a_composition(cx: &mut TestAp
     assert!(marked(cx, w, &f), "the composition goes on");
     mark_in(cx, w, &f, "かなa");
     assert_eq!(history(cx, &view), h + "かな".len() + "かなa".len(), "the next preedit: what it took out and what it marked");
+}
+
+// ── Round 3 (Shady #114 at 6ce4784) ───────────────────────────────────
+
+/// The open field's text selected whole.
+fn select_all(cx: &mut TestAppContext, w: AnyWindowHandle, f: &Entity<gpui_kit::component::input::InputState>) {
+    let n = line_value(cx, f).len();
+    cx.update_window(w, |_, _, cx| f.update(cx, |s, cx| s.set_selected_range(0..n, cx))).expect("the window");
+    settle(cx, w, 4);
+}
+
+/// What the kit keeps of a step, `add` bytes, billed to `kept` (bytes
+/// since its history was last cleared): none, the field's count 0 (it
+/// cleared the history, the step's change with it). The field counts at
+/// least what the kit keeps, and is within its budget once the step is
+/// done (past it, the history is cleared at that step).
+fn bill(cx: &mut TestAppContext, view: &Entity<AppView>, kept: &mut usize, add: usize, at: &str) -> bool {
+    let h = history(cx, view);
+    *kept = if h == 0 { 0 } else { *kept + add };
+    assert!(h >= *kept, "{at}: counted {h} of the {kept} bytes the kit keeps");
+    assert!(h <= crate::draft_view::FIELD_HISTORY_MAX, "{at}: {h} counted, past the budget, not cleared");
+    h == 0
+}
+
+/// Shady #114 R3 P2-1: a label made `x`, then, over and over: selected
+/// whole and marked with 100 `a`s; committed with 100 `b`s (another
+/// candidate, as long: the kit keeps the marked text it takes out and
+/// the candidate, not the text the composition began on); selected whole
+/// and made `x` again. The kit keeps 101 + 200 + 101 bytes a cycle. At
+/// each step the field counts at least what the kit keeps, and its
+/// history is cleared before that passes [`FIELD_HISTORY_MAX`] and one
+/// change.
+///
+/// [`FIELD_HISTORY_MAX`]: crate::draft_view::FIELD_HISTORY_MAX
+#[gpui_kit::test]
+fn an_ime_commit_counts_the_marked_text_it_takes_out(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "r");
+    let f = line(cx, &view).expect("the label's field");
+    let n = line_value(cx, &f).len();
+    select_all(cx, w, &f);
+    put_in(cx, w, &f, "x");
+    let mut kept = 0;
+    bill(cx, &view, &mut kept, n + 1, "made x");
+    let (a, b) = ("a".repeat(100), "b".repeat(100));
+    let mut clears = 0;
+    for k in 0..60 {
+        select_all(cx, w, &f);
+        let before = line_value(cx, &f).len();
+        mark_in(cx, w, &f, &a);
+        let refused = !marked(cx, w, &f);
+        clears += usize::from(bill(cx, &view, &mut kept, before + 100, &format!("{k}: marked")));
+        if !refused {
+            put_in(cx, w, &f, &b);
+            assert_eq!(line_value(cx, &f), b, "{k}: committed");
+            clears += usize::from(bill(cx, &view, &mut kept, 200, &format!("{k}: committed")));
+            select_all(cx, w, &f);
+            put_in(cx, w, &f, "x");
+            clears += usize::from(bill(cx, &view, &mut kept, 101, &format!("{k}: made x")));
+        }
+        assert!(kept <= crate::draft_view::FIELD_HISTORY_MAX + 200, "{k}: the kit keeps {kept} bytes, past the budget and a change");
+    }
+    assert!(clears > 0, "its history cleared");
+    assert_eq!(line_value(cx, &f), label_of(cx, &view, "fix"), "the field the draft's");
+}
+
+/// A new tab on session `sid`, shown.
+fn new_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, sid: &str) {
+    let client = view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.open_tab(crate::app::Open::Attach { session_id: sid.into(), fallback: None, open: false }, crate::tabs::Place::New);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    board(cx, w, view);
+}
+
+/// Tab `ix` shown.
+fn show_tab(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ix: usize) {
+    let client = view.update(cx, |v, cx| {
+        let c = v.client.take();
+        v.focus_tab(ix);
+        cx.notify();
+        c
+    });
+    cx.run_until_parked();
+    settle(cx, w, 8);
+    view.update(cx, |v, _| v.client = client);
+    board(cx, w, view);
+}
+
+/// The row of call `call` on screen, and the call of row `row` there.
+fn rows_of(cx: &mut TestAppContext, view: &Entity<AppView>, call: &str, row: u64) -> (Option<u64>, Option<String>) {
+    view.read_with(cx, |v, _| {
+        let items = v.model.lives[v.panes.cur.live].transcript.items();
+        let at = items.iter().find(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == call)).map(|i| i.id);
+        let of = items.iter().find(|i| i.id == row).map(|i| i.tool.as_ref().map_or_else(|| format!("{:?}", i.kind), |c| c.tool_id.clone()));
+        (at, of)
+    })
+}
+
+/// Shady #114 R3 P2-2: `p` taken under `S` at its anchor (call
+/// `toolu_h0`), held; the agent puts `x`, then moves `p` to the end, the
+/// move waiting. `S` follows to `T`, its rows numbered on from `S`'s, and
+/// `T`'s history goes on with a block a call. The tab leaves `T`, and
+/// `T`'s transcript is evicted from the cache; back on `T`, its history
+/// replays into a new transcript, numbered from 1 again: `p`'s old row
+/// number is another call's row, and `toolu_h0`'s row has another number.
+/// `p` stays at the anchor it was taken at, in both panes. Let go: where
+/// the agent's move put it.
+#[gpui_kit::test]
+fn a_cold_reload_keeps_a_held_block_at_its_calls_row_not_its_old_number(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    let s = session(cx, &view);
+    attach(cx, w, &view, &s, &conv());
+    tail(cx, w, &view);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "x");
+    let (px_, pm) = (json!([{"op":"put","id":"x","kind":"note","body":{"text":"after"}}]), json!([{"op":"move","id":"p"}]));
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_x", px_.clone());
+    ops(cx, w, &view, "toolu_m", pm.clone());
+    lease_over(cx, w, &view);
+    // Enough calls that a replay from 1 has a row numbered as `toolu_h0`'s
+    // under `T` (within a board's 32 live blocks).
+    let ys: Vec<String> = (0..24).map(|k| format!("y{k}")).collect();
+    let mut names: Vec<&str> = vec!["n", "g", "p", "x"];
+    names.extend(ys.iter().map(String::as_str));
+    let mut h = conv();
+    h.push(json!({"role": "user", "content": "go on"}));
+    called(&mut h, "toolu_x", &px_);
+    called(&mut h, "toolu_m", &pm);
+    for y in &ys {
+        called(&mut h, &format!("toolu_{y}"), &json!([{"op":"put","id":y,"kind":"note","body":{"text":"later"}}]));
+    }
+    attach(cx, w, &view, T, &h);
+    assert_eq!(session(cx, &view), T, "followed");
+    lease_over(cx, w, &view);
+    assert_eq!(order(cx, &view, &names), names, "followed: at its anchor");
+    let (Some(old), _) = rows_of(cx, &view, "toolu_h0", 0) else { panic!("toolu_h0's row") };
+    new_tab(cx, w, &view, crate::demo::SID);
+    assert!(view.update(cx, |v, _| v.tab_cache.take(&T.to_string())).is_some(), "T's transcript cached, then evicted");
+    show_tab(cx, w, &view, 0);
+    assert_eq!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().len()), 0, "a new transcript");
+    let seq = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].wanted()).expect("its attach asked for");
+    attach_as(cx, w, &view, seq, T, &h);
+    let (now, there) = rows_of(cx, &view, "toolu_h0", old);
+    assert!(now.is_some_and(|r| r != old), "toolu_h0 numbered anew: {now:?}, was {old}");
+    assert!(there.as_ref().is_some_and(|c| c.starts_with("toolu_y")), "row {old} another call's: {there:?}");
+    lease_over(cx, w, &view);
+    split(cx, w, &view);
+    tail(cx, w, &view);
+    let panes = view.read_with(cx, |v, _| v.panes.ids());
+    for &q in &panes {
+        assert_eq!(order_in(cx, &view, q, &names), names, "at its anchor, not row {old}'s: pane {q:?}");
+    }
+    assert_eq!(drafts_of(cx, &view, T, "p").pop().map(|d| d.1), Some(None), "held all along");
+    // A board that lands before the places are synced: its row found by
+    // its call there too, not by the number it had.
+    let (p, now) = (Ref::parse("p").expect("an id"), now.expect("toolu_h0's row"));
+    let in_its_row = view.update(cx, |v, _| {
+        let live = v.panes.cur.live;
+        let place = v.block_drafts.in_row(T, &p).and_then(|d| d.place.clone());
+        let Some(crate::drafts::Place::Row { item, call, after }) = place else { panic!("held in a row: {place:?}") };
+        assert_eq!((item, call.as_deref()), (now, Some("toolu_h0")), "its place: toolu_h0's row now");
+        v.block_drafts.re_place(T, &p, Some(crate::drafts::Place::Row { item: old, call, after }));
+        let d = v.model.lives[live].transcript.drawn().cloned().expect("a board");
+        let drawn = v.drafts_in_place(live, d);
+        drawn.rows.get(&now).is_some_and(|r| r.blocks.iter().any(|s| s.block.id == p))
+            && !drawn.rows.get(&old).is_some_and(|r| r.blocks.iter().any(|s| s.block.id == p))
+    });
+    assert!(in_its_row, "drawn in toolu_h0's row {now}, not row {old}");
+    // Let go: where the agent's move put it.
+    view.update(cx, |v, cx| v.focus_pane(panes[0], crate::pane::KeysTo::Pane, cx));
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "escape");
+    press(cx, w, "escape");
+    board(cx, w, &view);
+    lease_over(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.len()), 0);
+    let mut moved: Vec<&str> = vec!["n", "g", "x", "p"];
+    moved.extend(ys.iter().map(String::as_str));
+    for &q in &panes {
+        assert_eq!(order_in(cx, &view, q, &names), moved, "let go: where the agent put it, pane {q:?}");
+    }
+}
+
+/// Shady #114 R3, the `reanchor-agents` mutant: at call `A`, `[a, b, p,
+/// c]`; `p` taken (the blocks before it: `b`, `a`), held; the agent moves
+/// `b`, then `p`, to the rail: the desk draws `[a, p, c]`. A follow to a
+/// new id keeps the blocks before `p` as they were taken, not as they
+/// are drawn now (`a`): the agent moves `b` back after `a`, and `p` is
+/// after `b` again, `[a, b, p, c]`.
+#[gpui_kit::test]
+fn a_follow_keeps_the_blocks_before_a_held_block_as_they_were_taken(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    let s = session(cx, &view);
+    let four = json!([
+        {"op":"put","id":"a","kind":"note","body":{"text":"one"}},
+        {"op":"put","id":"b","kind":"note","body":{"text":"two"}},
+        {"op":"put","id":"p","kind":"plan","title":"Close the race","body":{"steps":[{"id":"fix","label":"Fix","state":"todo"}]}},
+        {"op":"put","id":"c","kind":"note","body":{"text":"four"}}
+    ]);
+    let mut h = vec![json!({"role": "user", "content": "Plan the fix"})];
+    called(&mut h, "toolu_h0", &four);
+    attach(cx, w, &view, &s, &h);
+    tail(cx, w, &view);
+    let names = ["a", "b", "p", "c"];
+    assert_eq!(order(cx, &view, &names), names);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "x");
+    let after = |cx: &mut TestAppContext, sid: &str| -> Vec<Option<String>> {
+        let p = Ref::parse("p").expect("an id");
+        view.read_with(cx, |v, _| match v.block_drafts.in_row(sid, &p).and_then(|d| d.place.clone()) {
+            Some(crate::drafts::Place::Row { after, .. }) => after.iter().map(|r| r.block().map(|b| b.as_str().to_string())).collect(),
+            other => panic!("held in a row: {other:?}"),
+        })
+    };
+    let ba = vec![Some("b".to_string()), Some("a".to_string())];
+    assert_eq!(after(cx, &s), ba, "taken: b, then a, before it");
+    let mv = json!([{"op":"move","id":"b","target":"rail"},{"op":"move","id":"p","target":"rail"}]);
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_mr", mv.clone());
+    lease_over(cx, w, &view);
+    assert_eq!(order(cx, &view, &names), ["a", "p", "c"], "b in the rail, p held");
+    h.push(json!({"role": "user", "content": "go on"}));
+    called(&mut h, "toolu_mr", &mv);
+    attach(cx, w, &view, T, &h);
+    assert_eq!(session(cx, &view), T, "followed");
+    lease_over(cx, w, &view);
+    assert_eq!(order(cx, &view, &names), ["a", "p", "c"], "followed: as it was");
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_mb", json!([{"op":"move","id":"b","at":{"after":"a"}}]));
+    lease_over(cx, w, &view);
+    assert_eq!(order(cx, &view, &names), names, "b back after a: p after b, as taken");
+    assert_eq!(after(cx, T), ba, "the blocks before it as taken, kept through the follow");
 }

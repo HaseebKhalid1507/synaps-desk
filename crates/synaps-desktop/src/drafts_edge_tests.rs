@@ -7,7 +7,8 @@
 //! order their drafts were made (R2 P2-1); drafts of two incarnations
 //! meeting in a follow, one in the row, the other in the dock (R2 P2-2);
 //! a place found by its rows' calls once a reattach numbers them anew
-//! (R2 P2-3).
+//! (R2 P2-3). Round 3: a place found by its call where its old number
+//! names another row (R3 P2-2).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -630,9 +631,9 @@ fn a_place_is_found_by_its_rows_call_once_its_rows_are_numbered_anew() {
     let p = Place::of(&taken, &r("p")).expect("drawn").called(calls);
     assert_eq!(p, Place::Row { item: 1, call: call(), after: vec![r("a")] });
     let (old, new) = (|row: u64| row == 1, |row: u64| row == 40 || row == 41);
-    let by_call = |c: &str| (c == "toolu_h0").then_some(40);
-    assert!(p.there(old) && !p.there(new));
-    assert_eq!(p.renumbered(old, by_call), Some(p.clone()), "its row there: as it is");
+    let (at_old, by_call) = (|c: &str| (c == "toolu_h0").then_some(1), |c: &str| (c == "toolu_h0").then_some(40));
+    assert!(p.there(old, at_old) && !p.there(new, by_call));
+    assert_eq!(p.renumbered(old, at_old), Some(p.clone()), "its row there: as it is");
     assert_eq!(p.renumbered(new, by_call), Some(Place::Row { item: 40, call: call(), after: vec![r("a")] }), "found by its call");
     assert_eq!(p.renumbered(new, |_| None), None, "its call gone too: none");
     let q = Place::of(&taken, &r("q")).expect("drawn").called(calls);
@@ -643,4 +644,36 @@ fn a_place_is_found_by_its_rows_call_once_its_rows_are_numbered_anew() {
     let bare = d.bytes();
     d.place = Some(p.clone());
     assert!(d.bytes() >= bare + p.heap() && p.heap() >= "toolu_h0".len() + "a".len(), "its place counted");
+}
+
+/// Shady #114 R3 P2-2: a place whose rows have calls is found by them
+/// alone, whatever row has its old number now. A cold reload (a tab's
+/// transcript evicted, replayed into a new one) numbers rows from 1
+/// again: row 40 is call `B`'s there, and `A`'s row is 7. The row, and a
+/// rail section's stored row, are `A`'s 7; neither is there as it was.
+/// `A`'s call gone, its old number another's: gone, not that row. A row
+/// with no call: by its number.
+#[test]
+fn a_place_is_found_by_its_call_where_its_old_number_names_another_row() {
+    let a = || Some(Arc::<str>::from("toolu_A"));
+    let has = |row: u64| (1..=60).contains(&row);
+    let by_call = |c: &str| match c {
+        "toolu_A" => Some(7),
+        "toolu_B" => Some(40),
+        _ => None,
+    };
+    let b_only = |c: &str| (c == "toolu_B").then_some(40);
+    let p = Place::Row { item: 40, call: a(), after: vec![r("a")] };
+    assert!(!p.there(has, by_call), "row 40 is B's now");
+    assert_eq!(p.renumbered(has, by_call), Some(Place::Row { item: 7, call: a(), after: vec![r("a")] }), "A's row");
+    assert_eq!(p.renumbered(has, b_only), None, "A's call gone: not B's row");
+    let q = Place::Rail { slot: 0, row: Some(40), call: a(), after: vec![r("b")] };
+    assert!(!q.there(has, by_call), "the rail's stored row 40 is B's now");
+    assert_eq!(q.renumbered(has, by_call), Some(Place::Rail { slot: 0, row: Some(7), call: a(), after: vec![r("b")] }), "A's row");
+    assert_eq!(q.renumbered(has, b_only), Some(Place::Rail { slot: 0, row: None, call: None, after: vec![r("b")] }), "its slot kept");
+    let at_a = Place::Row { item: 7, call: a(), after: vec![] };
+    assert!(at_a.there(has, by_call), "its call's row, its number: there");
+    let bare = Place::Row { item: 40, call: None, after: vec![] };
+    assert!(bare.there(has, by_call), "no call: by its number");
+    assert_eq!(bare.renumbered(|row| row == 41, by_call), None, "no call, its number gone: none");
 }

@@ -830,8 +830,9 @@ impl Place {
     }
 
     /// Whether its rows are in a transcript that has row `has` (none
-    /// numbered anew since it was taken).
-    pub(crate) fn there(&self, has: impl Fn(u64) -> bool) -> bool {
+    /// numbered anew since it was taken). Fail-first (Shady #114 R3
+    /// P2-2): the call's row `_by_call` finds is not asked, as at 6ce4784.
+    pub(crate) fn there(&self, has: impl Fn(u64) -> bool, _by_call: impl Fn(&str) -> Option<u64>) -> bool {
         match self {
             Place::Row { item, .. } => has(*item),
             Place::Rail { row, .. } => row.is_none_or(has),

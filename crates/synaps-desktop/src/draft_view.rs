@@ -1106,7 +1106,7 @@ impl AppView {
             // not renumbered): held where the board draws it now.
             let t = &l.transcript;
             for (id, p) in self.block_drafts.places(&session) {
-                if p.there(|r| has_row(t, r)) {
+                if p.there(|r| has_row(t, r), |c| row_of_call(t, c)) {
                     continue;
                 }
                 let now = t.drawn().filter(|d| d.epoch == t.blocks_epoch());
@@ -1218,7 +1218,7 @@ impl AppView {
             .places(session)
             .into_iter()
             .filter_map(|(id, p)| {
-                if p.there(|r| has_row(t, r)) {
+                if p.there(|r| has_row(t, r), |c| row_of_call(t, c)) {
                     Some((id, p))
                 } else {
                     p.renumbered(|r| has_row(t, r), |c| row_of_call(t, c)).map(|q| (id, q))
