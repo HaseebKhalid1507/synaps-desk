@@ -28,7 +28,7 @@ use crate::app::AppView;
 use crate::handback::{EditOut, SENDING};
 use crate::walk::At;
 
-type W = (AnyWindowHandle, Entity<AppView>);
+pub(super) type W = (AnyWindowHandle, Entity<AppView>);
 
 /// The plan `p` at r1: `fix`, `test`, `deploy`, todo.
 fn plan_ops() -> Value {
@@ -49,33 +49,33 @@ fn rounds() -> Vec<Value> {
 
 /// A settled session, idle, with the plan `p` (and the note `n` before
 /// it), the list at its end.
-fn planned(cx: &mut TestAppContext) -> W {
+pub(super) fn planned(cx: &mut TestAppContext) -> W {
     settled_with(cx, rounds())
 }
 
 /// The history [`planned`] holds.
-fn planned_history() -> Vec<Value> {
+pub(super) fn planned_history() -> Vec<Value> {
     let mut h = vec![user("start")];
     h.extend(rounds());
     h.push(said_ok());
     h
 }
 
-fn sends(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<EditOut> {
+pub(super) fn sends(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<EditOut> {
     view.read_with(cx, |v, _| v.edit_sends.clone())
 }
 
-fn last(cx: &mut TestAppContext, view: &Entity<AppView>) -> EditOut {
+pub(super) fn last(cx: &mut TestAppContext, view: &Entity<AppView>) -> EditOut {
     sends(cx, view).last().cloned().expect("a hand-back went")
 }
 
 /// Block `name`'s incarnation tag, as the board binds it.
-fn tag(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> String {
+pub(super) fn tag(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> String {
     view.read_with(cx, |v, _| v.block_shown(row(name)).expect("drawn").1.block.tag.to_string())
 }
 
 /// Step `step` of the plan `p` as the board draws it: its state and label.
-fn on_board(cx: &mut TestAppContext, view: &Entity<AppView>, step: &str) -> (String, String) {
+pub(super) fn on_board(cx: &mut TestAppContext, view: &Entity<AppView>, step: &str) -> (String, String) {
     view.read_with(cx, |v, _| {
         let (_, s) = v.block_shown(row("p")).expect("drawn");
         let synaps_client::blocks::Body::Plan(pl) = &s.block.body else { panic!("a plan") };
@@ -93,7 +93,7 @@ fn steps(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
 }
 
 /// This desk's hand-back `body`: its delivery state, if the memo has it.
-fn state(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) -> Option<cards_spec::memo::State> {
+pub(super) fn state(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) -> Option<cards_spec::memo::State> {
     view.read_with(cx, |v, _| {
         let s = v.model.lives[v.panes.cur.live].active.as_ref()?.session_id.clone();
         v.model.memos.edits.get(&s, body).map(|e| e.state)
@@ -102,7 +102,7 @@ fn state(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) -> Option<
 
 /// The hand-back row of user message `text`, as drawn: `p edited r1 ·
 /// words · outcome`.
-fn hand_back_row(cx: &mut TestAppContext, view: &Entity<AppView>, text: &str) -> Option<String> {
+pub(super) fn hand_back_row(cx: &mut TestAppContext, view: &Entity<AppView>, text: &str) -> Option<String> {
     let id =
         view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().iter().rev().find(|i| i.text == text).map(|i| i.id))?;
     assert!(view.read_with(cx, |v, _| v.panes.cur.disp.iter().any(|d| d.id == id)), "its row is in the list");
@@ -116,7 +116,7 @@ fn hand_back_row(cx: &mut TestAppContext, view: &Entity<AppView>, text: &str) ->
 }
 
 /// The row `text`'s hand-back row drawn with `outcome`.
-fn row_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, outcome: &str) -> bool {
+pub(super) fn row_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, outcome: &str) -> bool {
     let Some(id) =
         view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().iter().rev().find(|i| i.text == text).map(|i| i.id))
     else {
@@ -136,7 +136,7 @@ fn row_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
 }
 
 /// The daemon refuses the oldest input this attachment sent.
-fn refused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, reason: &str) {
+pub(super) fn refused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, reason: &str) {
     let (seq, _) = attachment(cx, view);
     view.update(cx, |v, cx| {
         let error = synaps_client::Error::Refused { command: Some("submit".into()), reason: reason.into() };
@@ -147,7 +147,7 @@ fn refused(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
 }
 
 /// The walk up to `to`.
-fn walk_up(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
+pub(super) fn walk_up(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
     for _ in 0..16 {
         if super::walk_tests::at(cx, view) == Some(to) {
             break;
@@ -159,31 +159,31 @@ fn walk_up(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
 }
 
 /// A click on the drawn button `sel`.
-fn button(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) {
+pub(super) fn button(cx: &mut TestAppContext, w: AnyWindowHandle, sel: String) {
     let at = super::blocks_ui_tests::drawn(cx, w, sel).center();
     super::blocks_ui_tests::click(cx, w, at);
 }
 
-fn idle(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn idle(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     heard(cx, w, view, vec![json!({"ev": "idle"})]);
     wait(cx, w, view, 300);
 }
 
 /// The history after the view's holds lands (`messages`), its board
 /// drawn.
-fn lands(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+pub(super) fn lands(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
     then(cx, w, view, messages);
     board(cx, w, view);
     wait(cx, w, view, 300);
 }
 
 /// An agent round of `ops` in the history (a call and its receipt).
-fn agent(tool: &str, ops: Value) -> Vec<Value> {
+pub(super) fn agent(tool: &str, ops: Value) -> Vec<Value> {
     call(tool, ops).into()
 }
 
 /// Take `p`, the walk on the newest block (it), and `keys` pressed.
-fn take_and(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, keys: &[&str]) {
+pub(super) fn take_and(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, keys: &[&str]) {
     walk_take(cx, w, view, 0);
     for k in keys {
         press(cx, w, k);
@@ -676,12 +676,12 @@ fn a_dismissals_notice_rides_the_hand_back(cx: &mut TestAppContext) {
 // ── Shady #115 round 1 ───────────────────────────────────────────────
 
 /// The writer held (a test's): what it is handed waits.
-fn hold(cx: &mut TestAppContext, view: &Entity<AppView>) -> crate::blockfiles::Hold {
+pub(super) fn hold(cx: &mut TestAppContext, view: &Entity<AppView>) -> crate::blockfiles::Hold {
     view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold()
 }
 
 /// The writer let go: what it held is written, and what waited on it goes.
-fn release(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hold: crate::blockfiles::Hold) {
+pub(super) fn release(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hold: crate::blockfiles::Hold) {
     drop(hold);
     view.read_with(cx, |v, _| v.wishes.home.writer.clone()).drain();
     super::rail_wishes_ui_tests::written(cx, view);
@@ -692,12 +692,12 @@ fn release(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, 
 /// A notice that waits for its mark: the note `n` dismissed in the walk
 /// (written), the walk left, the writer held. A hand-back now rides it
 /// once its sent mark is written (§3.5).
-fn notice_waits(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> crate::blockfiles::Hold {
+pub(super) fn notice_waits(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) -> crate::blockfiles::Hold {
     notice_of_waits(cx, w, view, "n")
 }
 
 /// [`notice_waits`], block `name`'s dismissal.
-fn notice_of_waits(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, name: &str) -> crate::blockfiles::Hold {
+pub(super) fn notice_of_waits(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, name: &str) -> crate::blockfiles::Hold {
     enter(cx, w, view);
     walk_up(cx, w, view, At::Block(row(name)));
     press(cx, w, "x");
@@ -709,23 +709,23 @@ fn notice_of_waits(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<Ap
 
 /// The history after the view's holds lands, its board drawn, the
 /// writer held (nothing asked of it is waited for).
-fn lands_held(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+pub(super) fn lands_held(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
     super::answer_tests::land(cx, w, view, messages);
     board(cx, w, view);
     wait(cx, w, view, 300);
 }
 
 /// The session on screen.
-fn sid(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+pub(super) fn sid(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
     view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].active.as_ref().unwrap().session_id.clone())
 }
 
 /// Block `name`'s draft on the session on screen: its text sent, waiting,
 /// and whether it ended.
-fn the_draft(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(Option<String>, bool, bool)> {
+pub(super) fn the_draft(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(Option<String>, bool, bool)> {
     let s = sid(cx, view);
     let id = cards_spec::block::Ref::parse(name).unwrap();
-    view.read_with(cx, |v, _| v.block_drafts.of(&s).find(|d| d.id == id).map(|d| (d.sent.clone(), d.waiting, d.ended.is_some())))
+    view.read_with(cx, |v, _| v.block_drafts.of(&s).find(|d| d.id == id).map(|d| (d.sent.clone(), d.waiting.is_some(), d.ended.is_some())))
 }
 
 /// Shady #115 finding 2 (P1): a hand-back waiting for its notices' marks has
@@ -885,7 +885,7 @@ fn a_waiting_hand_back_is_pre_checked_again_at_the_wire(cx: &mut TestAppContext)
 /// #115 finding 3): input authority (another client owns the input), a
 /// compaction starting, events dropped.
 #[derive(Clone, Copy, Debug)]
-enum Gate {
+pub(super) enum Gate {
     Authority,
     Compacting,
     Dropped,
@@ -893,7 +893,7 @@ enum Gate {
 
 /// The daemon says the session's input is owned by this client plus
 /// `other` (0: this one).
-fn owned_by(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, other: u64) {
+pub(super) fn owned_by(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, other: u64) {
     let (seq, sid) = attachment(cx, view);
     view.update(cx, |v, cx| {
         let client = v.model.lives[v.panes.cur.live].active.as_ref().unwrap().client;
@@ -910,7 +910,7 @@ fn owned_by(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>,
     wait(cx, w, view, 300);
 }
 
-fn close_gate(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, g: Gate) {
+pub(super) fn close_gate(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, g: Gate) {
     match g {
         Gate::Authority => {
             view.update(cx, |v, _| {
@@ -1073,7 +1073,7 @@ fn a_retry_the_connection_didnt_take_moves_only_its_own_entry(cx: &mut TestAppCo
 }
 
 /// The note `n` retitled `title` in its draft's field and handed back.
-fn retitle_note(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, title: &str) {
+pub(super) fn retitle_note(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, title: &str) {
     walk_take(cx, w, view, 1);
     press(cx, w, "t");
     let f = view.read_with(cx, |v, _| v.panes.cur.edit.inputs().0.cloned()).expect("the title's field");
@@ -1090,7 +1090,7 @@ fn retitle_note(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVi
 
 /// The delivery line of this desk's hand-back `body`, as its block says
 /// it (its word, its cause).
-fn delivery(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) -> String {
+pub(super) fn delivery(cx: &mut TestAppContext, view: &Entity<AppView>, body: &str) -> String {
     view.read_with(cx, |v, _| {
         let s = v.model.lives[v.panes.cur.live].active.as_ref().unwrap().session_id.clone();
         let (word, cause) = crate::handback::words(v.model.memos.edits.get(&s, body).expect("its entry"));
@@ -1175,7 +1175,7 @@ fn an_ended_blocks_hand_back_is_in_the_dock_with_copy_and_discard(cx: &mut TestA
 /// The note `n` (its tag `of`) handed back by another desk `k` times,
 /// its text each time (each at r1: they land as they can). None covers
 /// a hand-back of the plan.
-fn other_desks(of: &str, k: usize) -> Vec<Value> {
+pub(super) fn other_desks(of: &str, k: usize) -> Vec<Value> {
     (0..k)
         .flat_map(|k| {
             let text = format!("[block n edited r1] Root cause → text\n{{\"of\":\"{of}\",\"set\":{{\"text\":\"Cause {k}\"}}}}");
@@ -1185,7 +1185,7 @@ fn other_desks(of: &str, k: usize) -> Vec<Value> {
 }
 
 /// Row `text`, scrolled to: whether its outcome line says `outcome`.
-fn drawn_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, outcome: &str) -> bool {
+pub(super) fn drawn_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str, outcome: &str) -> bool {
     let id = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.items().iter().find(|i| i.text == text).map(|i| i.id));
     let Some(ix) = id.and_then(|id| view.read_with(cx, |v, _| v.panes.cur.disp.iter().position(|d| d.id == id))) else { return false };
     super::answer_tests::show(cx, w, view, ix);
@@ -1193,7 +1193,7 @@ fn drawn_says(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView
 }
 
 /// What row `text` says the board did, now.
-fn said_now(cx: &mut TestAppContext, view: &Entity<AppView>, text: &str) -> Option<String> {
+pub(super) fn said_now(cx: &mut TestAppContext, view: &Entity<AppView>, text: &str) -> Option<String> {
     view.read_with(cx, |v, _| {
         let it = v.model.lives[v.panes.cur.live].transcript.items().iter().find(|i| i.text == text).cloned()?;
         v.hand_back_said(&it)
@@ -1308,7 +1308,7 @@ fn compacted_away_is_the_historys_word_on_any_desk(cx: &mut TestAppContext) {
 }
 
 /// The plan `p` taken, `fix` renamed `label`, handed back and taken in.
-fn user_renames_fix(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, label: &str) {
+pub(super) fn user_renames_fix(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, label: &str) {
     take_and(cx, w, view, &["r"]);
     let f = view.read_with(cx, |v, _| v.panes.cur.edit.inputs().0.cloned()).expect("the label's field");
     cx.update_window(w, |_, window, cx| {
@@ -1326,7 +1326,7 @@ fn user_renames_fix(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<A
 }
 
 /// The walk's ring on the plan `p`, then left.
-fn focus_plan(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn focus_plan(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     enter(cx, w, view);
     walk_on(cx, w, view, At::Block(row("p")));
     wait(cx, w, view, 300);
@@ -1403,7 +1403,7 @@ fn what_waits_and_what_was_seen_are_charged_whole(cx: &mut TestAppContext) {
     let of = cards_spec::block::Tag::parse(&tag(cx, &view, "n")).unwrap();
     view.update(cx, |v, _| {
         for k in 0..crate::handback_view::SEEN_MAX + 8 {
-            v.see(&format!("{}-{k}", "s".repeat(60)), of, &format!("steps.{}{k}.label", "a".repeat(20)), 3);
+            v.see(&format!("{}-{k}", "s".repeat(60)), of, &format!("steps.{}{k}.label", "a".repeat(20)), 3, 0);
         }
     });
     let (charged, own, len) = view.read_with(cx, |v, _| (v.changed_seen_bytes(), v.changed_seen_heap(), v.changed_seen.len()));

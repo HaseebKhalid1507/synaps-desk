@@ -159,6 +159,10 @@ pub(crate) struct Refolds {
     pub(crate) done: Option<Refolded>,
     /// Re-folds started (tests).
     pub(crate) started: u64,
+    /// Every re-fold that finishes is past [`cards_spec::board::REFOLD_MAX`]
+    /// (tests: a history that long is too long to build).
+    #[cfg(test)]
+    pub(crate) far: bool,
 }
 
 impl Refolds {
@@ -447,6 +451,8 @@ impl AppView {
     /// input still holds (module docs); then the request that waited runs.
     fn refold_ended(&mut self, live: LiveId, target: Target, read: Read, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
+        #[cfg(test)]
+        let out = if r.far { out.map(|(_, n)| (Err(TooFar), n)) } else { out };
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
         let holds = self.model.lives.get(live).is_some_and(|l| {
             let t = &l.transcript;

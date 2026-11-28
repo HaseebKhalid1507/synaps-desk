@@ -239,11 +239,22 @@ fn a_followed_session_takes_its_hand_backs_along() {
     assert_eq!(h.get("s2", &a).map(|x| x.state), Some(M::Checking), "the new id's, checked on its view");
     let (by, taken) = h.sessions();
     assert!(taken.iter().all(|x| by.contains(x)));
-    // The new id has a memo of its own: nothing moves.
+    // The new id has a memo of its own (Shady #115 R2-2): the one that
+    // comes goes beside it, not merged, none lost and none added; the
+    // incarnation's one flight holds across both.
     let b = h
         .hand_back("s3", &edit(&st, "p", json!({"steps.deploy.stop":true})), &line1("stop"), &Trailer::default(), &t, Some(&d), now)
         .unwrap();
+    let memos = h.len();
     h.follow("s3", "s2", now);
-    assert_eq!(h.get("s3", &b).map(|x| x.state), Some(M::Sending), "stays where it was");
-    assert_eq!(h.get("s2", &a).map(|x| x.state), Some(M::Checking));
+    assert!(h.get("s3", &b).is_none(), "nothing left under the old id");
+    assert_eq!(h.get("s2", &b).map(|x| x.state), Some(M::Checking), "the new id's, checked on its view");
+    assert_eq!(h.get("s2", &a).map(|x| x.state), Some(M::Checking), "its own as it was");
+    assert_eq!((h.len(), h.entries("s2").count()), (memos, 2), "two memos, both there");
+    let tag = st.block(&Ref::parse("p").unwrap()).unwrap().tag;
+    assert!(h.in_flight("s2", &Ref::parse("p").unwrap(), tag).is_some());
+    let third = edit(&st, "p", json!({"steps.fix.label":"Fix it"}));
+    assert_eq!(h.may_hand_back("s2", &third, &line1("rename fix"), &t, Some(&d)), Err(SENDING.into()), "one flight an incarnation");
+    let (by, taken) = h.sessions();
+    assert!(taken.iter().all(|x| by.contains(x)) && !by.contains(&"s3"));
 }

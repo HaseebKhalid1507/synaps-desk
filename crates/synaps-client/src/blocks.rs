@@ -2413,6 +2413,13 @@ impl Worker {
             + self.over.as_ref().map_or(0, |o| o.board.owned_bytes() + o.cards + o.fates.capacity() * std::mem::size_of::<(usize, Fate)>())
     }
 
+    /// Where row `row`'s first event is in the history's journal (a user
+    /// message has one), if the journal has it: what an outcome no mark
+    /// names any more is re-folded at (D8b). A walk of the rows it keeps.
+    pub fn event_of(&self, row: u64) -> Option<usize> {
+        self.rows[..self.hist.min(self.rows.len())].iter().position(|r| *r == Some(row))
+    }
+
     /// What it keeps ([`Retained`]).
     pub fn retained(&self) -> Retained {
         Retained {

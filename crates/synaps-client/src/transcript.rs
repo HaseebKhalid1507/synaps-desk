@@ -759,6 +759,17 @@ impl Transcript {
         &self.live_log
     }
 
+    /// Where row `id`'s message is in the board's input
+    /// ([`crate::blocks::Worker::event_of`]): `None` while a job holds the
+    /// worker (ask again), never waiting for it on this thread.
+    pub fn blocks_event_of(&self, id: u64) -> Option<Option<usize>> {
+        match self.blocks.worker().try_lock() {
+            Ok(w) => Some(w.event_of(id)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().event_of(id)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// What the history's worker keeps ([`crate::blocks::Retained`]).
     pub fn blocks_retained(&self) -> crate::blocks::Retained {
         self.blocks.worker().lock().unwrap_or_else(std::sync::PoisonError::into_inner).retained()

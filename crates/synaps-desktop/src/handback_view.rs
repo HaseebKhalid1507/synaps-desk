@@ -16,7 +16,13 @@
 //!   ([`crate::drafts::Draft::waiting`]), it takes no key and no new hold,
 //!   nothing settles it, and an end (a replace, a compaction) leaves it as
 //!   any draft, its text recoverable. One edit of an incarnation at a
-//!   time counts a wait.
+//!   time counts a wait. The wait names its draft by key and ticket, so
+//!   only it is let go of when it sends nothing (a copied history's draft
+//!   of the same incarnation and body is another's). A store that goes (its
+//!   last pane closed or moved to another's store) takes its waits with it
+//!   ([`AppView::edit_store_left`]): nothing is sent, the draft is held
+//!   again, an entry stays as it was, and the notices ride the next
+//!   message.
 //! - **At the wire** ([`AppView::edit_go`]): the card's gate again (input
 //!   authority, no compaction, no dropped events, the same attachment),
 //!   and for a new edit the pre-check again on the bound board as it is
@@ -45,7 +51,10 @@
 //!   height. An outcome the board no longer keeps (§1.8: the latest 32) is
 //!   re-folded in the one scratch (`Target::Outcome`) when it is free,
 //!   `loading…` until then; what it found is kept for the
-//!   [`OUTCOMES_KEPT`] latest rows ([`KeptOutcome`]).
+//!   [`OUTCOMES_KEPT`] latest rows ([`KeptOutcome`]). Its place is what
+//!   the board still marks (a log line, a record), else its message's
+//!   event in the history's journal: only the re-fold says `too far back`
+//!   (past its reach), never a cache that let the marks go.
 //! - **`compacted away`** (§5.2): a hand-back a compaction carried into
 //!   its successor (`Transcript::carried`: the history's own word) whose
 //!   block isn't there.
@@ -106,6 +115,9 @@ pub(crate) const MOVED_ON: &str = "the block changed while its notices were save
 /// The connection didn't take a hand-back.
 pub(crate) const STOPPED: &str = "not sent · the connection thread has stopped";
 
+/// The pane's store went while a hand-back waited.
+pub(crate) const STORE_LEFT: &str = "the pane closed · nothing was sent";
+
 /// An evicted outcome, re-folding (§1.8).
 pub(crate) const LOADING: &str = "loading…";
 
@@ -127,9 +139,9 @@ pub(crate) enum What {
 
 /// An edit on its way to the wire (its notices' marks first, maybe): its
 /// attachment (`lid`'s `seq`: the session too), its block row and
-/// incarnation, and its body, what the memo matches. The session comes
-/// from the gate at the wire; the edit from the draft. ≤
-/// [`WAIT_MAX_BYTES`] each, ≤ `desires::QUEUE_MAX` of them.
+/// incarnation, its body (what the memo matches), and a new edit's draft,
+/// by key. The session comes from the gate at the wire; the edit from the
+/// draft. ≤ [`WAIT_MAX_BYTES`] each, ≤ `desires::QUEUE_MAX` of them.
 #[derive(Debug)]
 pub(crate) struct EditSend {
     lid: LiveId,
@@ -138,6 +150,7 @@ pub(crate) struct EditSend {
     tag: Tag,
     body: String,
     what: What,
+    key: Option<u64>,
 }
 
 impl EditSend {
@@ -175,14 +188,16 @@ pub(crate) const WAIT_MAX_BYTES: usize = std::mem::size_of::<(u64, EditSend)>()
     + cards_spec::board::BLOCK_MAX_OWNED
     + 2 * std::mem::size_of::<usize>();
 
-/// A `changed your edit` seen: the session, the incarnation, the path, and
-/// the block's revision then (module docs).
+/// A `changed your edit` seen: the session, the incarnation, the path, the
+/// block's revision then, and the history's events the board had read
+/// (module docs).
 #[derive(Debug)]
 pub(crate) struct Seen {
     session: Box<str>,
     tag: Tag,
     path: Box<str>,
     rev: u32,
+    at: usize,
 }
 
 /// A restore pressed while no board was bound (`R`, §3.6): what it was
@@ -254,7 +269,8 @@ impl AppView {
         let st = self.bound_board().and_then(|b| b.board.clone()).ok_or("checking…")?;
         let (edit, l1) = d.handing(&st)?;
         let body = self.admit(lid, &session, &edit, &l1)?;
-        self.send_edit(&session, EditSend { lid, seq, row: crate::blocks::row_id(&id), tag, body, what: What::New { restore: None } }, cx)
+        let s = EditSend { lid, seq, row: crate::blocks::row_id(&id), tag, body, what: What::New { restore: None }, key: Some(key) };
+        self.send_edit(&session, s, cx)
     }
 
     /// The memo's admission of `edit` on store `lid`'s `session` now, and
@@ -289,13 +305,11 @@ impl AppView {
             Some((conv, g, shared)) => self.wishes.desires.ride(&conv, &g, &shared, &s.body, Carry::HandBack).map_err(|r| r.0)?,
         };
         match rode {
-            Riding::Go(ride) => self.edit_go(s, ride, cx),
+            Riding::Go(ride) => self.edit_go(s, ride, None, cx),
             Riding::Wait(ticket) => {
                 // Its draft owns it until the memo does (module docs).
-                if let What::New { restore: None } = &s.what
-                    && let Some(id) = self.block_drafts.of_tag(session, s.tag).map(|d| d.id.clone())
-                {
-                    self.block_drafts.wait(session, &id, s.tag, s.body.clone());
+                if let (What::New { restore: None }, Some(key)) = (&s.what, s.key) {
+                    self.block_drafts.wait(key, ticket, s.body.clone());
                 }
                 debug_assert!(s.heap() + std::mem::size_of::<(u64, EditSend)>() < WAIT_MAX_BYTES, "a wait within its ceiling");
                 self.edit_waits.insert(ticket, s);
@@ -312,27 +326,47 @@ impl AppView {
     }
 
     /// The notices' marks landed for the edit waiting on `ticket`: it goes
-    /// now, `ride` its message, if the wire's checks hold. `false`: not an
-    /// edit's ticket.
-    pub(crate) fn edit_landed(&mut self, ticket: u64, ride: Ride, cx: &mut Context<Self>) -> bool {
-        let Some(s) = self.edit_waits.remove(&ticket) else { return false };
+    /// now, `ride` its message, if the wire's checks hold. No edit waits on
+    /// it (its store went: [`AppView::edit_store_left`]): the notices'
+    /// carrier, if any, for the queue again.
+    pub(crate) fn edit_landed(&mut self, ticket: u64, ride: Ride, cx: &mut Context<Self>) -> Option<u64> {
+        let Some(s) = self.edit_waits.remove(&ticket) else { return ride.carrier };
         let (row, lid) = (s.row, s.lid);
-        if let Err(why) = self.edit_go(s, ride, cx) {
+        if let Err(why) = self.edit_go(s, ride, Some(ticket), cx) {
             let panes: Vec<crate::pane::PaneId> = self.panes.iter().filter(|p| p.live == lid).map(|p| p.id).collect();
             for p in panes {
                 self.in_pane(p, |this| this.edit_says(row, why.clone(), cx));
             }
         }
-        true
+        None
+    }
+
+    /// Store `live` goes, or is made over for another session (module
+    /// docs): each hand-back waiting on it sends nothing. Its wait goes
+    /// now, a new edit's draft held again (its text the user's, the
+    /// session's when it is opened again); a Retry's or a Resend's entry
+    /// was never moved; a restore's draft goes with it (`R` again). Its
+    /// ticket, landing later, has no wait: its notices go back to the
+    /// queue then ([`AppView::wishes_landed`]).
+    pub(crate) fn edit_store_left(&mut self, live: LiveId) {
+        let gone: Vec<u64> = self.edit_waits.iter().filter(|(_, w)| w.lid == live).map(|(t, _)| *t).collect();
+        for ticket in gone {
+            let Some(s) = self.edit_waits.remove(&ticket) else { continue };
+            if let (What::New { restore: None }, Some(key)) = (&s.what, s.key) {
+                self.block_drafts.unwait(key, ticket);
+            }
+            log::info!(target: "synaps_desktop::handback", "hand-back on row {}: its store went while it waited: nothing sent", s.row);
+        }
     }
 
     /// `s` to the wire as `ride` says (its body, the notices then), if the
     /// wire's checks hold (module docs): sent, or nothing moved (its
     /// notices back in the queue, a draft held again, an entry as it was).
-    fn edit_go(&mut self, s: EditSend, ride: Ride, cx: &mut Context<Self>) -> Result<(), String> {
+    /// `ticket`: the wait it was, if it waited.
+    fn edit_go(&mut self, s: EditSend, ride: Ride, ticket: Option<u64>, cx: &mut Context<Self>) -> Result<(), String> {
         let lid = s.lid;
         match self.edit_wire(&s, &ride.text) {
-            Ok((out, session, held)) => {
+            Ok((out, held)) => {
                 log::info!(
                     target: "synaps_desktop::handback",
                     "hand-back on row {}: {} ({} bytes); the desk keeps {} hand-back memos, {} bytes",
@@ -344,8 +378,8 @@ impl AppView {
                 );
                 self.model.lives[lid].edit_sent(out.text.clone());
                 self.ride_went(lid, &out.text, ride.carrier, true);
-                if let Some(id) = held {
-                    self.block_drafts.sent(&session, &id, s.tag, Some(s.body.clone()));
+                if let Some(key) = held {
+                    self.block_drafts.sent(key, Some(s.body.clone()));
                 }
                 #[cfg(test)]
                 self.edit_sends.push(out);
@@ -355,8 +389,8 @@ impl AppView {
             Err(why) => {
                 log::info!(target: "synaps_desktop::handback", "hand-back on row {}: not sent: {why}", s.row);
                 self.ride_went(lid, &ride.text, ride.carrier, false);
-                if let What::New { restore: None } = &s.what {
-                    self.block_drafts.unwait(s.tag, &s.body);
+                if let (What::New { restore: None }, Some(key), Some(ticket)) = (&s.what, s.key, ticket) {
+                    self.block_drafts.unwait(key, ticket);
                 }
                 self.after_card(s.row, cx);
                 Err(why)
@@ -364,9 +398,11 @@ impl AppView {
         }
     }
 
-    /// The wire's checks and the send (module docs): what went, its
-    /// session, and the held draft's id (a new edit's, not a restore's).
-    fn edit_wire(&mut self, s: &EditSend, text: &str) -> Result<(EditOut, String, Option<Ref>), String> {
+    /// The wire's checks and the send (module docs): what went, and the
+    /// held draft's key (a new edit's, not a restore's).
+    fn edit_wire(&mut self, s: &EditSend, text: &str) -> Result<(EditOut, Option<u64>), String> {
+        // Its store first: one gone is never read (module docs).
+        self.model.lives.get(s.lid).ok_or(STORE_LEFT)?;
         let (seq, session) = self.model.card_gate(s.lid)?;
         if seq != s.seq {
             return Err(SESSION_CHANGED.into());
@@ -385,11 +421,15 @@ impl AppView {
                 let draft = match restore {
                     Some(r) => &**r,
                     None => {
-                        let d = self.block_drafts.for_send(&session, s.tag, &s.body).ok_or(crate::lease::CHANGED)?;
+                        let key = s.key.ok_or(crate::lease::CHANGED)?;
+                        let (of, d) = self.block_drafts.by_key(key).ok_or(crate::lease::CHANGED)?;
+                        if of != session || d.tag != s.tag {
+                            return Err(SESSION_CHANGED.into());
+                        }
                         if d.on_wire() || d.sent.as_deref().is_some_and(|b| b != s.body) {
                             return Err(SENDING.into());
                         }
-                        held = Some(d.id.clone());
+                        held = Some(key);
                         d
                     }
                 };
@@ -426,7 +466,7 @@ impl AppView {
             return Err(STOPPED.into());
         }
         self.model.memos.edits.commit(staged);
-        Ok((out, session, held))
+        Ok((out, held))
     }
 
     /// Retry, Resend or Discard (`what` none) of this desk's hand-back
@@ -445,10 +485,9 @@ impl AppView {
             self.after_card(row, cx);
             return;
         };
-        let r = self
-            .model
-            .card_gate(lid)
-            .and_then(|(seq, session)| self.send_edit(&session, EditSend { lid, seq, row, tag, body: body.to_string(), what }, cx));
+        let r = self.model.card_gate(lid).and_then(|(seq, session)| {
+            self.send_edit(&session, EditSend { lid, seq, row, tag, body: body.to_string(), what, key: None }, cx)
+        });
         if let Err(why) = r {
             self.panes.cur.edit.note = Some((row, why));
         }
@@ -493,7 +532,7 @@ impl AppView {
         }
         let (edit, l1) = draft.handing(&st)?;
         let body = self.admit(lid, &session, &edit, &l1)?;
-        let s = EditSend { lid, seq, row, tag: now.tag, body, what: What::New { restore: Some(Box::new(draft)) } };
+        let s = EditSend { lid, seq, row, tag: now.tag, body, what: What::New { restore: Some(Box::new(draft)) }, key: None };
         self.send_edit(&session, s, cx)
     }
 
@@ -515,7 +554,10 @@ impl AppView {
             let mut done = |d: &mut Draft| {
                 let body = d.sent.as_deref().unwrap_or_default();
                 match memo.get(&session, body) {
-                    None => true,
+                    // Its session's memos let it go (in the chat, covered or
+                    // discarded, then evicted): done, unless one still has it
+                    // out, wherever (absent is no proof it went).
+                    None => !memo.flies_anywhere(body),
                     Some(e) if e.in_flight() => false,
                     Some(e) if e.state == State::InChat && e.retired.is_none() => {
                         if d.shown_at.is_none() && crate::handback::shows(t, body) {
@@ -549,7 +591,7 @@ impl AppView {
         let body = d.sent.as_deref()?;
         let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
         let word = match self.model.memos.edits.get(session, body).map(|e| e.state) {
-            _ if d.waiting => "WAITING",
+            _ if d.waiting.is_some() => "WAITING",
             Some(State::Queued) => "QUEUED",
             Some(State::Held) => "HELD",
             Some(State::Checking) => "CHECKING",
@@ -564,7 +606,7 @@ impl AppView {
         let body = d.sent.as_deref()?;
         let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
         Some(match self.model.memos.edits.get(session, body) {
-            Some(e) if !d.waiting => crate::handback::words(e).0.to_string(),
+            Some(e) if d.waiting.is_none() => crate::handback::words(e).0.to_string(),
             _ => "waiting for the rail's notices to be saved".into(),
         })
     }
@@ -729,20 +771,19 @@ impl AppView {
                 None => Err(TOO_FAR),
             };
         }
-        // Its place in the history, from what the board still marks: an
-        // outcome it let go of is re-folded from there.
-        match evicted_at(d, row) {
-            Some(at) => {
-                if d.epoch == epoch {
-                    self.outcome_wanted.set(self.outcome_wanted.get().or(Some((live, row, at))));
-                }
-                Err(LOADING)
-            }
-            // Nothing marks it: a board that has read the whole history
-            // let it go past every mark it keeps.
-            None if d.epoch == epoch && d.rev == t.blocks_rev() && t.in_history(row) => Err(TOO_FAR),
-            None => Ok(None),
+        // Its place in the history, from what the board still marks, else
+        // (a board that has read the whole history let it go past every
+        // mark it keeps) from the history's journal: an outcome it let go
+        // of is re-folded from there. Only the re-fold says too far back.
+        let at = match evicted_at(d, row) {
+            Some(at) => Some(at),
+            None if d.epoch == epoch && d.rev == t.blocks_rev() && t.in_history(row) => None,
+            None => return Ok(None),
+        };
+        if d.epoch == epoch {
+            self.outcome_wanted.set(self.outcome_wanted.get().or(Some((live, row, at))));
         }
+        Err(LOADING)
     }
 
     /// What hand-back row `item` (its user message) says the board did,
@@ -825,10 +866,7 @@ impl AppView {
                     };
                     let rev = self.model.lives.get(live).map_or(0, |l| l.transcript.blocks_rev());
                     debug_assert!(said.as_ref().is_none_or(|(_, c)| std::mem::size_of_val(&**c) <= KEPT_MAX_BYTES), "within B2's ceiling");
-                    if self.outcomes_kept.len() >= OUTCOMES_KEPT {
-                        self.outcomes_kept.remove(0);
-                    }
-                    self.outcomes_kept.push(KeptOutcome { live, epoch, row, rev, said });
+                    self.keep_outcome(KeptOutcome { live, epoch, row, rev, said });
                     log::debug!(
                         target: "synaps_desktop::handback",
                         "an evicted outcome re-folded; {} kept, {} bytes",
@@ -850,9 +888,36 @@ impl AppView {
         if self.outcome_asked.is_some() || walking || self.refolds.busy() {
             return;
         }
-        let Some(epoch) = self.model.lives.get(live).map(|l| l.transcript.blocks_epoch()) else { return };
+        let Some(t) = self.model.lives.get(live).map(|l| &l.transcript) else { return };
+        let (epoch, rev) = (t.blocks_epoch(), t.blocks_rev());
+        // No mark: its message's event, as the worker's journal has it (a
+        // job holds the worker: asked again next frame, never waited for).
+        let at = match at {
+            Some(at) => at,
+            None => match t.blocks_event_of(row) {
+                Some(Some(event)) => Pos::event(event),
+                Some(None) => {
+                    log::info!(target: "synaps_desktop::handback", "a hand-back row the journal doesn't have: nothing to re-fold");
+                    self.keep_outcome(KeptOutcome { live, epoch, row, rev, said: None });
+                    cx.notify();
+                    return;
+                }
+                None => {
+                    cx.notify();
+                    return;
+                }
+            },
+        };
         self.outcome_asked = Some((live, row, at, epoch));
         self.refold(live, Target::Outcome(at), cx);
+    }
+
+    /// Re-folded outcome `k` kept, the oldest going past [`OUTCOMES_KEPT`].
+    fn keep_outcome(&mut self, k: KeptOutcome) {
+        if self.outcomes_kept.len() >= OUTCOMES_KEPT {
+            self.outcomes_kept.remove(0);
+        }
+        self.outcomes_kept.push(k);
     }
 
     /// What the re-folded outcomes keep (bytes): each one's slot and codes.
@@ -882,7 +947,7 @@ impl AppView {
         let seen = self.changed_seen.iter().rev().find(|x| &*x.session == session && x.tag == s.block.tag && &*x.path == path.as_str());
         match seen {
             None => Some(path),
-            Some(x) => overwritten_again(l.transcript.drawn().map(|d| &**d), s, &path, x.rev).then_some(path),
+            Some(x) => overwritten_again(&l.transcript, s, &path, (x.rev, x.at)).then_some(path),
         }
     }
 
@@ -892,20 +957,21 @@ impl AppView {
         let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
         let Some((_, s)) = self.block_drawn(row) else { return };
         let Some(path) = self.changed_your_edit(&s) else { return };
-        self.see(&session, s.block.tag, path.as_str(), s.block.rev);
+        let at = self.model.lives[self.panes.cur.live].transcript.drawn().map_or(0, |d| d.history);
+        self.see(&session, s.block.tag, path.as_str(), s.block.rev, at);
         log::debug!(target: "synaps_desktop::handback", "changed your edit on {}: seen; {} kept, {} bytes", s.block.id, self.changed_seen.len(), self.changed_seen_bytes());
         self.remeasure_block(row);
     }
 
     /// The overwrite of `path` on `session`'s incarnation `tag`, seen at
-    /// revision `rev`: kept in place of the one before, the oldest going
-    /// past [`SEEN_MAX`].
-    pub(crate) fn see(&mut self, session: &str, tag: Tag, path: &str, rev: u32) {
+    /// revision `rev`, the board having read `at` history events: kept in
+    /// place of the one before, the oldest going past [`SEEN_MAX`].
+    pub(crate) fn see(&mut self, session: &str, tag: Tag, path: &str, rev: u32, at: usize) {
         self.changed_seen.retain(|x| !(*x.session == *session && x.tag == tag && *x.path == *path));
         if self.changed_seen.len() >= SEEN_MAX {
             self.changed_seen.remove(0);
         }
-        self.changed_seen.push(Seen { session: session.into(), tag, path: path.into(), rev });
+        self.changed_seen.push(Seen { session: session.into(), tag, path: path.into(), rev, at });
     }
 
     /// What the seen overwrites own on the heap, counted on its own
@@ -942,24 +1008,46 @@ fn evicted_at(d: &Drawn, row: u64) -> Option<Pos> {
         .or_else(|| d.records.iter().find(|(r, m)| m.row == Some(row) && r.author == Author::User && r.at.op.is_none()).map(|(r, _)| r.at))
 }
 
-/// Whether `path` of block `s`, seen overwritten at revision `at`, was
-/// overwritten again since (module docs): it isn't the user's now, and a
-/// user revision of the incarnation after `at` may have written it (it
-/// names it, or more paths than it names); or the board's records no
-/// longer reach back to `at`, and what came between can't be told: it
-/// says so rather than stay silent.
-fn overwritten_again(d: Option<&Drawn>, s: &Shown, path: &Path, at: u32) -> bool {
-    if s.block.user_wrote(path).is_some() || s.block.rev <= at {
+/// Whether `path` of block `s`, seen overwritten at revision `rev` (the
+/// board having read `at` history events), was overwritten again since
+/// (module docs): it isn't the user's now, and a user revision of the
+/// incarnation after `rev` wrote it (its record names it, or more paths
+/// than it names). Where the board's records no longer reach back to
+/// `rev`, the hand-backs since are read from its outcomes: one that wrote
+/// the path (its key applied, or overwritten since) after `at`. Neither
+/// saying so, there was no new overwrite: what a cache let go of is never
+/// read as one.
+fn overwritten_again(t: &synaps_client::Transcript, s: &Shown, path: &Path, (rev, at): (u32, usize)) -> bool {
+    if s.block.user_wrote(path).is_some() || s.block.rev <= rev {
         return false;
     }
-    let Some(d) = d else { return false };
+    let Some(d) = t.drawn() else { return false };
     let recs = || d.records.iter().map(|(r, _)| r).filter(|r| r.tag == s.block.tag);
     let named = |r: &cards_spec::board::Record| {
         let n = r.paths().count();
         r.paths().any(|p| p == path.as_str()) || usize::from(r.changed) > n
     };
-    if recs().any(|r| r.rev > at && r.author == Author::User && named(r)) {
+    if recs().any(|r| r.rev > rev && r.author == Author::User && named(r)) {
         return true;
     }
-    !recs().any(|r| r.rev <= at + 1)
+    if recs().any(|r| r.rev <= rev + 1) {
+        return false;
+    }
+    wrote_since(t, d, s, path, at)
+}
+
+/// Whether a hand-back of block `s` the board `d` keeps the outcome of,
+/// at or after history event `at`, wrote `path`: a key of its edit (its
+/// row's message) applied, or applied and overwritten since.
+fn wrote_since(t: &synaps_client::Transcript, d: &Drawn, s: &Shown, path: &Path, at: usize) -> bool {
+    d.outcomes.iter().filter(|h| h.outcome.id == s.block.id && h.outcome.at > s.block.created && h.outcome.at.event >= at).any(|h| {
+        let Some(item) = h.row.and_then(|r| t.items().iter().find(|i| i.id == r)) else { return false };
+        let Some(edit) = message::parse(message::split(&item.text).0) else { return false };
+        cards_spec::board::keys(&edit).iter().zip(&h.outcome.codes).any(|(k, c)| {
+            let p = match k {
+                cards_spec::board::Key::Item(p) | cards_spec::board::Key::Set(p) | cards_spec::board::Key::Order(p) => p,
+            };
+            p == path && matches!(c, Code::Applied | Code::Overwritten)
+        })
+    })
 }

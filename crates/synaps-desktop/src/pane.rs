@@ -1640,6 +1640,7 @@ impl crate::app::AppView {
         match self.model.lives.ids().into_iter().find(|l| self.panes.showing(*l) == 0) {
             Some(l) => {
                 self.board_out(l);
+                self.edit_store_left(l);
                 self.model.lives[l] = crate::live::Live::default();
                 l
             }
@@ -1657,6 +1658,7 @@ impl crate::app::AppView {
             let _ = c.on(seq).detach();
         }
         self.board_out(live);
+        self.edit_store_left(live);
         if live == crate::live::LiveId::FIRST {
             self.model.lives[live] = crate::live::Live::default();
         } else {

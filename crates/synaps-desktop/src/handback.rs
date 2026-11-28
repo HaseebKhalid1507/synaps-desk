@@ -36,13 +36,22 @@
 //!   memo refuses its oldest sending entry; when that isn't the refused
 //!   one (an entry that timed out to checking), nothing is refused here
 //!   and the clock and views settle it, never another message.
-//! - **Bounded** (§1.8): the memo keeps 32 entries a session, each at most
-//!   [`ENTRY_MAX_BYTES`]; the desk keeps memos for [`SESSIONS_MAX`]
-//!   sessions, a session's memo going once it is empty, and with it what
-//!   it had taken in ([`HandBacks::drop_session`]: one owner for both
-//!   maps). A hand-back on another session past that is refused
-//!   ([`SESSIONS_FULL`]) while every session kept has an entry that can't
-//!   go (one not in the chat or retired); else the memo with none goes.
+//! - **A follow** ([`HandBacks::follow`]): a session that follows to a new
+//!   id (the same conversation) takes its memo along, beside any the new
+//!   id keeps. B4's memos don't merge, so a session may keep more than
+//!   one: each hears the session's events and views, and keeps its own
+//!   entries and caps. A hand-back goes into the memo that keeps its
+//!   incarnation's entries, and one flight an incarnation holds across
+//!   them all. Nothing is left under the old id for a draft to be settled
+//!   against.
+//! - **Bounded** (§1.8): a memo keeps 32 entries, each at most
+//!   [`ENTRY_MAX_BYTES`]; the desk keeps [`SESSIONS_MAX`] memos in all (a
+//!   follow moves them, never adds one), a memo going once it is empty,
+//!   and a session's taken-in list with its last
+//!   ([`HandBacks::drop_session`]: one owner for both maps). A hand-back
+//!   on another session past that is refused ([`SESSIONS_FULL`]) while
+//!   every memo kept has an entry that can't go (one not in the chat or
+//!   retired); else a memo with none goes.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -190,7 +199,10 @@ pub(crate) struct Taken {
 /// The desk's block memos, by session (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct HandBacks {
-    by: HashMap<String, Memo>,
+    /// By session, its memos: its own first, then each one a session that
+    /// followed into it brought (module docs, "A follow"). At most
+    /// [`SESSIONS_MAX`] memos in all.
+    by: HashMap<String, Vec<Memo>>,
     /// By session, its hand-backs taken in (≤ `bm::CAP` each).
     taken: HashMap<String, Vec<Taken>>,
     /// Bumped whenever an entry changes: blocks and rows drawn from one
@@ -200,11 +212,13 @@ pub(crate) struct HandBacks {
     last_sent: Option<Instant>,
 }
 
-/// A send staged on a copy of its session's memo (module docs): the text
-/// to hand the connection, and the memo as it is once that went.
+/// A send staged on a copy of one of its session's memos (module docs):
+/// the text to hand the connection, and the memo as it is once that went.
 #[derive(Debug)]
 pub(crate) struct Staged {
     session: String,
+    /// The memo's place among the session's (`None`: a new one).
+    slot: Option<usize>,
     memo: Memo,
     text: String,
     at: Instant,
@@ -234,15 +248,31 @@ impl HandBacks {
         self.changes
     }
 
-    /// Whether any entry waits on the clock (an echo, a settled view).
-    pub(crate) fn timed(&self) -> bool {
-        self.by.values().flat_map(Memo::entries).any(|e| matches!(e.state, State::Sending | State::Checking))
+    fn memos(&self) -> impl Iterator<Item = &Memo> {
+        self.by.values().flatten()
     }
 
-    /// What they keep (bytes): each entry at its ceiling, and the map's.
+    fn of(&self, session: &str) -> &[Memo] {
+        self.by.get(session).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether any entry waits on the clock (an echo, a settled view).
+    pub(crate) fn timed(&self) -> bool {
+        self.memos().flat_map(Memo::entries).any(|e| matches!(e.state, State::Sending | State::Checking))
+    }
+
+    /// What they keep (bytes): each entry at its ceiling, and the maps'.
     pub(crate) fn bytes(&self) -> usize {
-        self.by.capacity() * std::mem::size_of::<(String, Memo)>()
-            + self.by.iter().map(|(s, m)| s.capacity() + m.entries().len() * ENTRY_MAX_BYTES).sum::<usize>()
+        self.by.capacity() * std::mem::size_of::<(String, Vec<Memo>)>()
+            + self
+                .by
+                .iter()
+                .map(|(s, v)| {
+                    s.capacity()
+                        + v.capacity() * std::mem::size_of::<Memo>()
+                        + v.iter().map(|m| m.entries().len() * ENTRY_MAX_BYTES).sum::<usize>()
+                })
+                .sum::<usize>()
             + self.taken.capacity() * std::mem::size_of::<(String, Vec<Taken>)>()
             + self
                 .taken
@@ -253,25 +283,31 @@ impl HandBacks {
                 .sum::<usize>()
     }
 
+    /// The memos kept, every session's.
     pub(crate) fn len(&self) -> usize {
-        self.by.len()
+        self.by.values().map(Vec::len).sum()
     }
 
-    fn with<R>(&mut self, session: &str, f: impl FnOnce(&mut Memo) -> R) -> Option<R> {
-        let m = self.by.get_mut(session)?;
-        let before = m.entries().to_vec();
-        let r = f(m);
-        if m.entries() != before.as_slice() {
-            self.changes += 1;
+    /// `f` on each of `session`'s memos; one left empty goes, and the
+    /// session with its last ([`HandBacks::drop_session`]).
+    fn each(&mut self, session: &str, mut f: impl FnMut(&mut Memo)) {
+        let Some(v) = self.by.get_mut(session) else { return };
+        for m in v.iter_mut() {
+            let was = m.entries().to_vec();
+            f(m);
+            if m.entries() != was.as_slice() {
+                self.changes += 1;
+            }
         }
-        if m.entries().is_empty() {
+        v.retain(|m| !m.entries().is_empty());
+        if v.is_empty() {
             self.drop_session(session);
         }
-        Some(r)
     }
 
-    /// `session`'s memo goes, and what it had taken in with it: the one way
-    /// a session leaves (module docs), so neither map outlives the other.
+    /// `session`'s memos go, and what it had taken in with them: the one
+    /// way a session leaves (module docs), so neither map outlives the
+    /// other.
     fn drop_session(&mut self, session: &str) {
         self.by.remove(session);
         self.taken.remove(session);
@@ -294,10 +330,45 @@ impl HandBacks {
         self.last_sent.map_or(now, |l| now.max(l + Duration::from_nanos(1)))
     }
 
-    /// `session`'s memo copied, `f` run on it with its view: what
-    /// [`HandBacks::commit`] keeps if the message goes.
-    fn stage<R>(&self, session: &str, t: &Transcript, drawn: Option<&Drawn>, f: impl FnOnce(&mut Memo, &DeskEdits<'_>) -> R) -> (Memo, R) {
-        let mut m = self.by.get(session).cloned().unwrap_or_default();
+    /// Which of `session`'s memos a hand-back of incarnation `of` of `id`
+    /// goes into: the one that keeps its entries (the newest, if two came
+    /// together in a follow), else its own; `None`: it has none yet.
+    fn slot_for(&self, session: &str, id: &Ref, of: Tag) -> Option<usize> {
+        let v = self.of(session);
+        v.iter().rposition(|m| m.entries().iter().any(|e| e.id == *id && e.of == of)).or((!v.is_empty()).then_some(0))
+    }
+
+    /// Which of `session`'s memos keeps hand-back `body`: the one whose
+    /// entry is out, else can still be acted on, else any (two memos that
+    /// met in a follow may each keep the same text).
+    fn slot_of(&self, session: &str, body: &str) -> Option<usize> {
+        let rank = |e: &bm::Entry| (e.in_flight(), e.recoverable());
+        let all = self.of(session).iter().enumerate().filter_map(|(i, m)| m.get(body).map(|e| (i, rank(e))));
+        all.fold(None, |best: Option<(usize, (bool, bool))>, (i, r)| match best {
+            Some((_, b)) if b >= r => best,
+            _ => Some((i, r)),
+        })
+        .map(|(i, _)| i)
+    }
+
+    /// Whether another of `session`'s memos than `slot` has an edit of
+    /// incarnation `of` of `id` in flight: one flight an incarnation (§3.7),
+    /// whichever memo keeps it.
+    fn flies_elsewhere(&self, session: &str, slot: Option<usize>, id: &Ref, of: Tag) -> bool {
+        self.of(session).iter().enumerate().any(|(i, m)| Some(i) != slot && m.in_flight(id, &of).is_some())
+    }
+
+    /// Memo `slot` of `session` copied (a new one: `None`), `f` run on it
+    /// with its view: what [`HandBacks::commit`] keeps if the message goes.
+    fn stage<R>(
+        &self,
+        session: &str,
+        slot: Option<usize>,
+        t: &Transcript,
+        drawn: Option<&Drawn>,
+        f: impl FnOnce(&mut Memo, &DeskEdits<'_>) -> R,
+    ) -> (Memo, R) {
+        let mut m = slot.and_then(|i| self.of(session).get(i)).cloned().unwrap_or_default();
         let edits = self.edits(session, t, drawn);
         let r = f(&mut m, &edits);
         (m, r)
@@ -307,20 +378,28 @@ impl HandBacks {
     /// with nothing sent (a Resend that checks): its memo is the session's
     /// now. A new session's takes the room [`HandBacks::room`] makes.
     pub(crate) fn commit(&mut self, st: Staged) {
-        let Staged { session, memo, at, .. } = st;
-        if self.room(&session).is_err() {
+        let Staged { session, slot, memo, at, .. } = st;
+        if slot.is_none() && self.room(&session).is_err() {
             // Checked as it was staged, on this thread: nothing came between.
             log::warn!(target: "synaps_desktop::handback", "a hand-back's memo had no room as it was committed");
         }
         self.last_sent = Some(self.last_sent.map_or(at, |l| l.max(at)));
-        let same = self.by.get(&session).is_some_and(|m| m.entries() == memo.entries());
-        if !same {
-            self.changes += 1;
+        let v = self.by.entry(session.clone()).or_default();
+        match slot.filter(|&i| i < v.len()) {
+            Some(i) => {
+                if v[i].entries() != memo.entries() {
+                    self.changes += 1;
+                }
+                v[i] = memo;
+            }
+            None => {
+                self.changes += 1;
+                v.push(memo);
+            }
         }
-        if memo.entries().is_empty() {
+        v.retain(|m| !m.entries().is_empty());
+        if v.is_empty() {
             self.drop_session(&session);
-        } else {
-            self.by.insert(session, memo);
         }
     }
 
@@ -337,10 +416,11 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Result<Staged, String> {
-        self.may_room(session)?;
-        let (memo, r) = self.stage(session, t, drawn, |m, e| m.hand_back(edit, &l1.summary(), trailer, e, now));
+        self.may_hand_back(session, edit, l1, t, drawn)?;
+        let slot = self.slot_for(session, &edit.id, edit.of);
+        let (memo, r) = self.stage(session, slot, t, drawn, |m, e| m.hand_back(edit, &l1.summary(), trailer, e, now));
         let text = r.map_err(|r| refusal(&r))?;
-        Ok(Staged { session: session.to_string(), memo, text, at: now })
+        Ok(Staged { session: session.to_string(), slot, memo, text, at: now })
     }
 
     /// A Retry of hand-back `body` (not sent), staged.
@@ -353,8 +433,12 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Option<Staged> {
-        let (memo, text) = self.stage(session, t, drawn, |m, e| m.retry(body, trailer, e, now));
-        Some(Staged { session: session.to_string(), memo, text: text?, at: now })
+        if !self.may_retry(session, body, t, drawn) {
+            return None;
+        }
+        let slot = self.slot_of(session, body);
+        let (memo, text) = self.stage(session, slot, t, drawn, |m, e| m.retry(body, trailer, e, now));
+        Some(Staged { session: session.to_string(), slot, memo, text: text?, at: now })
     }
 
     /// A Resend of hand-back `body` (not confirmed) against the view as it
@@ -368,31 +452,34 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Staging {
-        if !self.by.contains_key(session) {
+        let Some(slot) = self.slot_of(session, body) else { return Staging::No };
+        if self.get(session, body).is_some_and(|e| self.flies_elsewhere(session, Some(slot), &e.id, e.of)) {
             return Staging::No;
         }
-        let (memo, r) = self.stage(session, t, drawn, |m, e| {
+        let (memo, r) = self.stage(session, Some(slot), t, drawn, |m, e| {
             let view = bm::View { edits: e, settled: crate::deliver::settled(t), queued: t.queued_message(), streaming: t.busy() };
             m.resend(body, trailer, &view, now)
         });
         let session = session.to_string();
+        let slot = Some(slot);
         match r {
-            Resend::Send(text) => Staging::Send(Staged { session, memo, text, at: now }),
-            Resend::Checking => Staging::Checking(Staged { session, memo, text: String::new(), at: now }),
+            Resend::Send(text) => Staging::Send(Staged { session, slot, memo, text, at: now }),
+            Resend::Checking => Staging::Checking(Staged { session, slot, memo, text: String::new(), at: now }),
             Resend::No => Staging::No,
         }
     }
 
     /// The daemon refused the input this desk sent as `wire` on `session`
-    /// (module docs): its entry is not sent, if the memo's oldest sending
+    /// (module docs): its entry is not sent, if its memo's oldest sending
     /// entry is it; else nothing changes. Whether it was refused here.
     pub(crate) fn refused(&mut self, session: &str, wire: &str, reason: &str, now: Instant) -> bool {
         let body = message::split(wire).0;
-        let Some(m) = self.by.get(session) else { return false };
-        let Some(i) = m.entries().iter().position(|e| e.text == body && e.retired.is_none() && e.state == State::Sending) else {
+        let sending = |m: &Memo| m.entries().iter().position(|e| e.text == body && e.retired.is_none() && e.state == State::Sending);
+        let Some((k, i)) = self.of(session).iter().enumerate().find_map(|(k, m)| sending(m).map(|i| (k, i))) else {
             log::info!(target: "synaps_desktop::handback", "a refused hand-back isn't sending: its memo settles it");
             return false;
         };
+        let m = &self.of(session)[k];
         let mut c = m.clone();
         c.on(Heard::Refused { reason }, now);
         let hit = m.entries().iter().zip(c.entries()).position(|(a, b)| a != b);
@@ -400,32 +487,39 @@ impl HandBacks {
             log::info!(target: "synaps_desktop::handback", "a refused hand-back isn't its memo's oldest sending: nothing refused here");
             return false;
         }
-        self.by.insert(session.to_string(), c);
+        if let Some(v) = self.by.get_mut(session) {
+            v[k] = c;
+        }
         self.changes += 1;
         true
     }
 
     /// Session `from` followed to a new id `to`, the same conversation (a
-    /// follow, a merge: [`crate::drafts::Drafts::follow`]): its memo is
-    /// `to`'s, as an attach finds it (its history is the daemon's word now),
-    /// so what it had out settles on `to`'s view, its draft with it. A memo
-    /// `to` keeps already stays `to`'s, and `from`'s where it is: B4's memos
-    /// don't merge.
+    /// follow, a merge: [`crate::drafts::Drafts::follow`]): its memos are
+    /// `to`'s, as an attach finds them (its history is the daemon's word
+    /// now), beside any `to` keeps (B4's memos don't merge: each keeps its
+    /// own entries and caps), so what it had out settles on `to`'s view and
+    /// events, its draft with it, and no second edit of an incarnation one
+    /// of them has in flight goes. No memo is added: the count stays.
     pub(crate) fn follow(&mut self, from: &str, to: &str, now: Instant) {
-        if from == to || self.by.contains_key(to) {
+        if from == to {
             return;
         }
-        let Some(m) = self.by.remove(from) else { return };
+        let Some(mut came) = self.by.remove(from) else { return };
         self.taken.remove(from);
-        self.by.insert(to.to_string(), m);
-        self.on(to, Heard::Attached, now);
+        for m in &mut came {
+            m.on(Heard::Attached, now);
+        }
+        let v = self.by.entry(to.to_string()).or_default();
+        v.extend(came);
+        log::info!(target: "synaps_desktop::handback", "hand-backs followed {from} to {to}: {} memos there", v.len());
         self.changes += 1;
     }
 
     /// A session event (a `Refused` is [`HandBacks::refused`]'s: it names
-    /// no text, and the window's wire order does). An attach ends what was
-    /// taken in (its history is the daemon's word now); an `Idle`, the
-    /// turn that took each in.
+    /// no text, and the window's wire order does), heard by each of its
+    /// memos. An attach ends what was taken in (its history is the
+    /// daemon's word now); an `Idle`, the turn that took each in.
     pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
         if let Heard::Refused { .. } = ev {
             return;
@@ -437,9 +531,9 @@ impl HandBacks {
             Heard::Idle => self.taken.get_mut(session).into_iter().flatten().for_each(|k| k.ended = true),
             _ => {}
         }
-        self.with(session, |m| m.on(ev, now));
+        self.each(session, |m| m.on(ev, now));
         if let Heard::Delivered { text } = ev
-            && let Some(e) = self.by.get(session).and_then(|m| m.get(text)).filter(|e| e.state == State::InChat)
+            && let Some(e) = self.get(session, text).filter(|e| e.state == State::InChat)
         {
             let body = e.text.clone();
             let v = self.taken.entry(session.to_string()).or_default();
@@ -454,12 +548,12 @@ impl HandBacks {
     pub(crate) fn tick(&mut self, now: Instant) {
         let ids: Vec<String> = self.by.keys().cloned().collect();
         for s in ids {
-            self.with(&s, |m| m.tick(now));
+            self.each(&s, |m| m.tick(now));
         }
     }
 
     /// `session`'s transcript as it stands (its board `drawn`): each entry
-    /// follows it.
+    /// of each of its memos follows it.
     pub(crate) fn observe(&mut self, session: &str, t: &Transcript, drawn: Option<&Drawn>, now: Instant) {
         if !self.by.contains_key(session) {
             return;
@@ -476,11 +570,12 @@ impl HandBacks {
         let Self { by, taken, changes, .. } = self;
         let edits = DeskEdits::of(t, drawn).with(taken.get(session));
         let view = bm::View { edits: &edits, settled, queued: t.queued_message(), streaming: t.busy() };
-        let Some(m) = by.get_mut(session) else { return };
-        let before = m.entries().to_vec();
-        m.observe(&view, now);
-        if m.entries() != before.as_slice() {
-            *changes += 1;
+        for m in by.get_mut(session).into_iter().flatten() {
+            let before = m.entries().to_vec();
+            m.observe(&view, now);
+            if m.entries() != before.as_slice() {
+                *changes += 1;
+            }
         }
     }
 
@@ -490,34 +585,41 @@ impl HandBacks {
     }
 
     /// Room for a memo of `session`: it has one, there are fewer than
-    /// [`SESSIONS_MAX`], or one with nothing that can't go goes (and what
-    /// it had taken in: [`HandBacks::drop_session`]).
+    /// [`SESSIONS_MAX`] memos, or one with nothing that can't go goes (and
+    /// its session's taken-in list with its last: [`HandBacks::drop_session`]).
     fn room(&mut self, session: &str) -> Result<(), String> {
         self.may_room(session)?;
-        if self.by.contains_key(session) || self.by.len() < SESSIONS_MAX {
+        if self.by.contains_key(session) || self.len() < SESSIONS_MAX {
             return Ok(());
         }
-        if let Some(s) = self.spare() {
-            self.drop_session(&s);
+        if let Some((s, i)) = self.spare() {
+            if let Some(v) = self.by.get_mut(&s) {
+                v.remove(i);
+            }
+            if self.by.get(&s).is_some_and(Vec::is_empty) {
+                self.drop_session(&s);
+            }
         }
         Ok(())
     }
 
     /// Whether [`HandBacks::room`] would make room for `session`.
     fn may_room(&self, session: &str) -> Result<(), String> {
-        if self.by.contains_key(session) || self.by.len() < SESSIONS_MAX || self.spare().is_some() {
+        if self.by.contains_key(session) || self.len() < SESSIONS_MAX || self.spare().is_some() {
             return Ok(());
         }
         Err(SESSIONS_FULL.into())
     }
 
-    /// A kept session whose memo has nothing that can't go.
-    fn spare(&self) -> Option<String> {
-        self.by.iter().find(|(_, m)| !m.entries().iter().any(bm::Entry::recoverable)).map(|(s, _)| s.clone())
+    /// A kept memo with nothing that can't go: its session, its place.
+    fn spare(&self) -> Option<(String, usize)> {
+        self.by.iter().find_map(|(s, v)| v.iter().position(|m| !m.entries().iter().any(bm::Entry::recoverable)).map(|i| (s.clone(), i)))
     }
 
     /// Whether `edit` may be handed back on `session` now (`t` and `drawn`
-    /// its view): exactly what [`HandBacks::hand_back`] admits.
+    /// its view): exactly what [`HandBacks::stage_hand_back`] admits. The
+    /// memo it goes into says, then no other of the session's may have an
+    /// edit of the incarnation in flight.
     pub(crate) fn may_hand_back(
         &self,
         session: &str,
@@ -529,7 +631,13 @@ impl HandBacks {
         self.may_room(session)?;
         let empty = Memo::default();
         let edits = self.edits(session, t, drawn);
-        self.by.get(session).unwrap_or(&empty).may_hand_back(edit, &l1.summary(), &edits).map_err(|r| refusal(&r))
+        let slot = self.slot_for(session, &edit.id, edit.of);
+        let m = slot.and_then(|i| self.of(session).get(i)).unwrap_or(&empty);
+        m.may_hand_back(edit, &l1.summary(), &edits).map_err(|r| refusal(&r))?;
+        if self.flies_elsewhere(session, slot, &edit.id, edit.of) {
+            return Err(SENDING.into());
+        }
+        Ok(())
     }
 
     /// A hand-back of `edit` on `session`, `trailer` riding it, staged and
@@ -552,24 +660,42 @@ impl HandBacks {
         Ok(text)
     }
 
+    /// Whether Retry shows on `body`: its memo's say, and no other of the
+    /// session's has an edit of its incarnation in flight.
     pub(crate) fn may_retry(&self, session: &str, body: &str, t: &Transcript, drawn: Option<&Drawn>) -> bool {
-        self.by.get(session).is_some_and(|m| m.may_retry(body, &self.edits(session, t, drawn)))
+        let Some(k) = self.slot_of(session, body) else { return false };
+        let m = &self.of(session)[k];
+        m.may_retry(body, &self.edits(session, t, drawn))
+            && m.get(body).is_some_and(|e| !self.flies_elsewhere(session, Some(k), &e.id, e.of))
     }
 
+    /// Whether Resend shows on `body`, as [`HandBacks::may_retry`].
     pub(crate) fn may_resend(&self, session: &str, body: &str, t: &Transcript, drawn: Option<&Drawn>) -> bool {
-        self.by.get(session).is_some_and(|m| m.may_resend(body, &self.edits(session, t, drawn)))
+        let Some(k) = self.slot_of(session, body) else { return false };
+        let m = &self.of(session)[k];
+        m.may_resend(body, &self.edits(session, t, drawn))
+            && m.get(body).is_some_and(|e| !self.flies_elsewhere(session, Some(k), &e.id, e.of))
     }
 
     /// Discard (§3.7, `Memo::forget`): the entry goes, nothing else.
     pub(crate) fn forget(&mut self, session: &str, body: &str) -> bool {
-        self.with(session, |m| m.forget(body).is_some()).unwrap_or(false)
+        let Some(k) = self.slot_of(session, body) else { return false };
+        let mut gone = false;
+        let mut i = 0;
+        self.each(session, |m| {
+            if i == k {
+                gone = m.forget(body).is_some();
+            }
+            i += 1;
+        });
+        gone
     }
 
-    /// This desk's entries of incarnation `of` of `id` on `session`,
-    /// oldest first.
+    /// This desk's entries of incarnation `of` of `id` on `session`, memo
+    /// by memo, each oldest first.
     pub(crate) fn of_incarnation<'a>(&'a self, session: &str, id: &Ref, of: Tag) -> impl Iterator<Item = &'a bm::Entry> + 'a {
         let id = id.clone();
-        self.by.get(session).into_iter().flat_map(|m| m.entries()).filter(move |e| e.id == id && e.of == of)
+        self.of(session).iter().flat_map(Memo::entries).filter(move |e| e.id == id && e.of == of)
     }
 
     /// This desk's newest entry of incarnation `of` of `id` (tests).
@@ -578,19 +704,27 @@ impl HandBacks {
         self.of_incarnation(session, id, of).last()
     }
 
-    /// `session`'s entries, oldest first.
+    /// `session`'s entries, memo by memo, each oldest first.
     pub(crate) fn entries<'a>(&'a self, session: &str) -> impl Iterator<Item = &'a bm::Entry> + 'a {
-        self.by.get(session).into_iter().flat_map(|m| m.entries())
+        self.of(session).iter().flat_map(Memo::entries)
     }
 
-    /// The edit of the incarnation in flight, if any (§3.7).
+    /// The edit of the incarnation in flight, if any (§3.7), whichever of
+    /// the session's memos keeps it.
     pub(crate) fn in_flight(&self, session: &str, id: &Ref, of: Tag) -> Option<&bm::Entry> {
-        self.by.get(session)?.in_flight(id, &of)
+        self.of(session).iter().find_map(|m| m.in_flight(id, &of))
     }
 
-    /// The entry of hand-back `body` on `session`.
+    /// The entry of hand-back `body` on `session` (of the memo
+    /// [`HandBacks::slot_of`] names).
     pub(crate) fn get(&self, session: &str, body: &str) -> Option<&bm::Entry> {
-        self.by.get(session)?.get(body)
+        self.of(session).get(self.slot_of(session, body)?)?.get(body)
+    }
+
+    /// Whether some session's memo has hand-back `body` in flight (a draft
+    /// whose own session's memos don't know it is no proof it went).
+    pub(crate) fn flies_anywhere(&self, body: &str) -> bool {
+        self.memos().filter_map(|m| m.get(body)).any(bm::Entry::in_flight)
     }
 }
 

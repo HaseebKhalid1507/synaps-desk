@@ -2452,8 +2452,9 @@ pub struct AppView {
     pub(crate) restore_wanted: Option<crate::handback_view::RestoreWanted>,
     /// Evicted hand-back outcomes re-folded ([`crate::handback_view::OUTCOMES_KEPT`]).
     pub(crate) outcomes_kept: Vec<crate::handback_view::KeptOutcome>,
-    /// An evicted outcome a row drew this frame: its store, row and place.
-    pub(crate) outcome_wanted: std::cell::Cell<Option<(crate::live::LiveId, u64, cards_spec::board::Pos)>>,
+    /// An evicted outcome a row drew this frame: its store, row and place
+    /// (`None`: no mark the board keeps says; the history's journal does).
+    pub(crate) outcome_wanted: std::cell::Cell<Option<(crate::live::LiveId, u64, Option<cards_spec::board::Pos>)>>,
     /// The evicted outcome re-folding: its store, row, place and history.
     pub(crate) outcome_asked: Option<(crate::live::LiveId, u64, cards_spec::board::Pos, u64)>,
     /// What hand-backs would have gone to the daemon (tests).

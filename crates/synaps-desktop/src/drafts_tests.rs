@@ -423,8 +423,8 @@ fn another_edit_since_b_is_told_and_ticks_are_not() {
     let other = b.bound(&events);
     assert_eq!(other.block(&Ref::parse("plan").unwrap()).unwrap().rev, 3);
     let mut d = d;
-    assert!(!d.note_other(&ticked), "the agent's tick");
-    assert!(d.note_other(&other));
+    assert!(!d.note_other(&ticked, None), "the agent's tick");
+    assert!(d.note_other(&other, None));
     assert_eq!(d.other_edit(&other), Some(3));
 }
 
@@ -454,7 +454,7 @@ fn another_edit_is_the_incarnations_whatever_the_board_lets_go() {
     let (b, events) = Board::of_history(&h);
     let many = b.bound(&events);
     assert!(!many.outcomes().any(|o| o.id == d.id), "the board let its outcome go");
-    assert!(d.note_other(&many), "read off the revisions");
+    assert!(d.note_other(&many, None), "read off the revisions");
     assert_eq!(d.other_edit(&many), Some(2));
     // A late hand-back naming the earlier incarnation: nothing here.
     let (st, g) = board(&[plan()]);
@@ -469,13 +469,13 @@ fn another_edit_is_the_incarnations_whatever_the_board_lets_go() {
         "[block plan edited r1] Close the refresh race → skip test\n{{\"of\":\"{old}\",\"set\":{{\"steps.test.state\":\"skipped\"}}}}")}));
     let (b, events) = Board::of_history(&h);
     let late = b.bound(&events);
-    assert!(!d.note_other(&late), "another incarnation's: not this one's");
+    assert!(!d.note_other(&late, None), "another incarnation's: not this one's");
     assert_eq!(d.other_edit(&late), None);
     // Rolled back below it: forgotten.
     let (st, g) = board(&[plan()]);
     let mut d = take(&st, g, "plan");
-    assert!(d.note_other(&other_of(&st)));
-    assert!(d.note_other(&st), "rolled back to B");
+    assert!(d.note_other(&other_of(&st), None));
+    assert!(d.note_other(&st, None), "rolled back to B");
     assert_eq!(d.other_edit(&st), None);
 }
 
@@ -496,10 +496,12 @@ fn a_sent_draft_takes_no_new_hold_and_is_charged_its_body() {
     let (st, g) = board(&[plan()]);
     let mut all = Drafts::default();
     let b = block(&st, "plan");
-    all.take("s", &b, g).unwrap().strike(&id("fix")).unwrap();
+    let d = all.take("s", &b, g).unwrap();
+    d.strike(&id("fix")).unwrap();
+    let key = d.key;
     let before = all.bytes();
     let body = "x".repeat(1000);
-    all.sent("s", &b.id, b.tag, Some(body.clone()));
+    all.sent(key, Some(body.clone()));
     assert!(all.bytes() >= before + 1000);
     assert_eq!(all.take("s", &b, g).err(), Some(crate::handback::SENDING));
     assert_eq!(all.settle_sent("s", &mut |d| d.sent.as_deref() != Some(&body)), Vec::<u64>::new(), "still out");
@@ -516,16 +518,20 @@ fn a_waiting_draft_is_never_settled_and_an_end_keeps_it() {
     let (st, g) = board(&[plan()]);
     let mut all = Drafts::default();
     let b = block(&st, "plan");
-    all.take("s", &b, g).unwrap().strike(&id("fix")).unwrap();
+    let d = all.take("s", &b, g).unwrap();
+    d.strike(&id("fix")).unwrap();
+    let key = d.key;
     let body = "the edit".to_string();
-    all.wait("s", &b.id, b.tag, body.clone());
+    all.wait(key, 7, body.clone());
     assert_eq!(all.settle_sent("s", &mut |_| true), Vec::<u64>::new(), "waiting: never settled");
     assert_eq!(all.take("s", &b, g).err(), Some(crate::handback::SENDING), "no competing hold");
     assert!(all.compacted("s"));
     let d = all.of("s").next().expect("kept through a compaction");
-    assert!(d.waiting && d.sent.as_deref() == Some(body.as_str()));
-    all.unwait(b.tag, &body);
+    assert!(d.waiting == Some(7) && d.sent.as_deref() == Some(body.as_str()));
+    all.unwait(key, 8);
+    assert_eq!(all.of("s").next().map(|d| d.waiting), Some(Some(7)), "another wait's failure lets go of nothing");
+    all.unwait(key, 7);
     let d = all.of("s").next().expect("not sent: kept");
-    assert!(!d.waiting && d.sent.is_none(), "its text the user's again");
+    assert!(d.waiting.is_none() && d.sent.is_none(), "its text the user's again");
     assert!(d.ended.is_some(), "ended as any draft");
 }

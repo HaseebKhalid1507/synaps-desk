@@ -1009,8 +1009,10 @@ impl AppView {
                 Landed::Send { ticket, ride } => {
                     if let Some(w) = self.wishes.waiting.remove(&ticket) {
                         self.send_ride(ticket, w.seq, w.busy, ride);
-                    } else {
-                        self.edit_landed(ticket, ride, cx);
+                    } else if let Some(carrier) = self.edit_landed(ticket, ride, cx) {
+                        // Nothing waits on it any more (a hand-back whose
+                        // store went): its notices ride the next message.
+                        self.wishes.desires.lost(carrier);
                     }
                 }
             }

@@ -1254,6 +1254,12 @@ impl Desires {
         Ok(Riding::Wait(self.next_send))
     }
 
+    /// The desires a carrier holds (tests).
+    #[cfg(test)]
+    pub(crate) fn carried(&self) -> usize {
+        self.book.conversations.values().flat_map(|g| g.values()).flat_map(|s| s.values()).filter(|d| d.carrier.is_some()).count()
+    }
+
     /// `carrier` won't land (a refused send): what it carried rides the
     /// next message at the same version.
     pub(crate) fn lost(&mut self, carrier: u64) {
