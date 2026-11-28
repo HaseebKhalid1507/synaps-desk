@@ -99,6 +99,10 @@ const REUSE_ROWS: usize = 32;
 /// What a tab opened by a create is called until the daemon names it.
 pub(crate) const NEW_SESSION: &str = "New session";
 
+/// The right panel's timer: when it fires, and the store and attachment it
+/// was armed for ([`AppView::arm_warm_tick`]).
+type WarmTick = (Instant, crate::live::LiveId, Option<u64>);
+
 /// A background tab's session as it was last on screen: its transcript and
 /// numbers, and everything the list built from them (rows, folds, measured
 /// heights and scroll position).
@@ -2316,9 +2320,10 @@ pub struct AppView {
     pub(crate) lookout: crate::presence::Lookout,
     /// The watch poll's timer and when it fires ([`AppView::arm_watch_poll`]).
     watch_poll: Option<(Instant, Task<()>)>,
-    /// The right panel's cache countdown: its next redraw (or status ask),
-    /// armed only while the panel shows a countdown ([`crate::warm`]).
-    warm_tick: Option<(Instant, Task<()>)>,
+    /// The right panel's cache countdown: its next redraw (or ask), when,
+    /// and for which store and attachment, armed only while the panel shows
+    /// a countdown ([`AppView::arm_warm_tick`]).
+    warm_tick: Option<(WarmTick, Task<()>)>,
     /// Frames drawn for the window are shown (GPUI's visibility: mapped and
     /// not wholly covered, not minimized). Nothing polls while it is not.
     visible: bool,
@@ -2413,6 +2418,10 @@ pub struct AppView {
     /// its text.
     #[cfg(test)]
     pub(crate) card_sends: Vec<crate::deliver::Outgoing>,
+    /// The right panel's asks handed to the client, by attachment: the UI
+    /// tests' record of each `status` and `cache_expiry`.
+    #[cfg(test)]
+    pub(crate) panel_asks: Vec<(u64, &'static str)>,
     /// The agent cards' answers being made, by session and call
     /// ([`crate::answer::Draft`]).
     pub(crate) card_drafts: HashMap<(String, String), crate::answer::Draft>,
@@ -3053,6 +3062,8 @@ impl AppView {
             halts: 0,
             #[cfg(test)]
             card_sends: Vec::new(),
+            #[cfg(test)]
+            panel_asks: Vec::new(),
             card_drafts: HashMap::new(),
             card_open: HashSet::new(),
             card_changing: HashSet::new(),
@@ -3285,6 +3296,15 @@ impl AppView {
             Effect::Status(seq) => {
                 if let Some(c) = &self.client {
                     let _ = c.on(seq).status();
+                    #[cfg(test)]
+                    self.panel_asks.push((seq, "status"));
+                }
+            }
+            Effect::CacheExpiry(seq) => {
+                if let Some(c) = &self.client {
+                    let _ = c.on(seq).cache_expiry();
+                    #[cfg(test)]
+                    self.panel_asks.push((seq, "cache_expiry"));
                 }
             }
         }
@@ -5097,56 +5117,47 @@ impl AppView {
         self.watch_poll = Some((due, task));
     }
 
-    /// The right panel's countdown redraws when what it says changes (each
-    /// second under ten minutes, each minute above), and the status is asked
-    /// again a little after a keep-warm ping is due: only while the panel
-    /// shows (`shown`) in a visible window. Cold, or nothing counting:
-    /// nothing armed (an idle window draws no frame for it).
+    /// The right panel's countdowns redraw when what they say changes (each
+    /// second under ten minutes, each minute above); what is due is asked
+    /// (a scheduled ping's status, the cache at its countdown's zero, both
+    /// after a sleep: [`Model::panel_wake`]): only while the panel shows
+    /// (`shown`) in a visible window. Nothing counting: nothing armed (an
+    /// idle window draws no frame for it).
+    ///
+    /// The timer is the shown store's and attachment's (Shady #100 F6):
+    /// armed again when either changes, and when it fires, it acts only if
+    /// that store still shows with that attachment, on what is due then
+    /// ([`Model::panel_due`]); otherwise the next frame arms the store that
+    /// shows.
     fn arm_warm_tick(&mut self, shown: bool, cx: &mut Context<Self>) {
         let now = crate::warm::Moment::now();
-        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref().filter(|_| shown && self.visible);
-        let seq = self.model.lives[self.panes.cur.live].attachment();
-        let refresh = warm.and_then(|w| w.refresh_at(now)).filter(|_| seq.is_some() && self.client.is_some());
-        // Woken from a sleep: read again at once (the callback rebases).
-        let slept = warm.is_some_and(|w| w.slept(now)).then_some(now.mono);
-        let due = [warm.and_then(|w| w.next_change(now)), refresh, slept].into_iter().flatten().min();
+        let live = self.panes.cur.live;
+        let seq = self.model.lives[live].attachment().filter(|_| self.client.is_some());
+        let due = (shown && self.visible).then(|| self.model.panel_wake(live, seq, now)).flatten();
         let Some(due) = due else {
             self.warm_tick = None;
             return;
         };
-        if self.warm_tick.as_ref().is_some_and(|(at, _)| *at == due) {
+        let key = (due, live, seq);
+        if self.warm_tick.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
         let task = cx.spawn(async move |this, cx| {
-            let left = due.saturating_duration_since(Instant::now());
+            let left = due.saturating_duration_since(crate::warm::Moment::now().mono);
             if !left.is_zero() {
                 cx.background_executor().timer(left).await;
             }
             let _ = this.update(cx, |v, cx| {
                 v.warm_tick = None;
-                // The machine slept since the answer: what it said is aged
-                // by the sleep, and asked again.
-                let now = crate::warm::Moment::now();
-                let slept = v.model.lives[v.panes.cur.live].stats.warm.as_mut().is_some_and(|w| {
-                    let slept = w.slept(now);
-                    if slept {
-                        w.rebase(now);
-                    }
-                    slept
-                });
-                // A due ping moved the cache's anchor: ask once.
-                if (slept || refresh.is_some_and(|r| now.mono >= r))
-                    && let (Some(c), Some(seq)) = (&v.client, seq)
-                {
-                    let _ = c.on(seq).status();
-                    if let Some(w) = v.model.lives[v.panes.cur.live].stats.warm.as_mut() {
-                        w.next_ping = None;
+                if v.panes.cur.live == live {
+                    for fx in v.model.panel_due(live, seq, crate::warm::Moment::now()) {
+                        v.effect(fx);
                     }
                 }
                 cx.notify();
             });
         });
-        self.warm_tick = Some((due, task));
+        self.warm_tick = Some((key, task));
     }
 
     fn watch_poll_now(&mut self, cx: &mut Context<Self>) {

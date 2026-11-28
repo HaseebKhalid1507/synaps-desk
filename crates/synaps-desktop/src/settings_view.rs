@@ -187,6 +187,10 @@ fn app_pairs(keys: &AppBatch) -> Vec<(&'static str, serde_json::Value)> {
     keys.iter().map(|(k, v)| (*k, v.clone().into())).collect()
 }
 
+/// THIS SESSION's Cache keep-warm row: its mode, read-only until the
+/// client has a keep-warm call of its own (`/keepwarm` is an engine command).
+const KEEPWARM_HELP: &str = "This session's keep-warm, as its status says: off, auto, or stop after <N>h. Change it with /keepwarm in the TUI. — until the daemon answers: SynapsCLI 0.13.0 and later are asked. The pin is another setting.";
+
 /// One row's parts.
 struct Row {
     id: SharedString,
@@ -650,6 +654,10 @@ impl AppView {
 
     /// A read-only value: dim text, no border, then the rail's LOCKED glyph.
     fn locked(value: impl Into<SharedString>, p: &Palette) -> AnyElement {
+        Self::locked_div(value.into(), p).into_any_element()
+    }
+
+    fn locked_div(value: SharedString, p: &Palette) -> Div {
         h_flex()
             .gap(px(10.))
             .items_center()
@@ -657,7 +665,13 @@ impl AppView {
             .max_w(px(CONTROL + 120.))
             .child(mono(value, 13., p.dim).overflow_hidden().text_ellipsis())
             .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
-            .into_any_element()
+    }
+
+    /// A THIS SESSION row's value, read-only, at `session-<key>-value
+    /// <value>` (the right panel's cells are named the same way).
+    fn session_locked(key: &'static str, value: String, p: &Palette) -> AnyElement {
+        let selector = format!("session-{key}-value {value}");
+        Self::locked_div(value.into(), p).debug_selector(move || selector).into_any_element()
     }
 
     /// The control for a CONFIG key: editable through the dash, else its
@@ -687,9 +701,16 @@ impl AppView {
         }
     }
 
-    /// Lines under a CONFIG row: the refusal, or that it waits for a reload.
-    fn config_under(&self, key: &'static str, p: &Palette) -> Vec<AnyElement> {
+    /// Lines under a CONFIG row: what its editor takes when the row's help
+    /// names more ([`settings::editor_note`], at `config-note-<key>`), the
+    /// refusal, or that it waits for a reload.
+    fn config_under(&self, key: &'static str, writable: bool, p: &Palette) -> Vec<AnyElement> {
         let mut out = Vec::new();
+        let editor = writable && self.shown_config().is_some_and(|c| c.exposes(key));
+        if let Some(note) = settings::editor_note(key).filter(|_| editor) {
+            let selector = format!("config-note-{key}");
+            out.push(mono(note, 12., p.dim).whitespace_normal().debug_selector(move || selector).into_any_element());
+        }
         if let Some(Write::Refused(m)) = self.settings.writes.get(key) {
             out.push(mono(m.clone(), 12., p.err).whitespace_normal().into_any_element());
         }
@@ -1254,8 +1275,17 @@ impl AppView {
             "subagent_timeout" => n(v.subagent_timeout, "s"),
             "max_tool_output" => n(v.max_tool_output, "bytes"),
             "bash_timeout" => n(v.bash_timeout, "s"),
+            "bash_max_timeout" => n(v.bash_max_timeout, "s"),
             _ => crate::usage::NONE.into(),
         }
+    }
+
+    /// The session's keep-warm mode, as its last `Status` said
+    /// (`keepwarm.mode`, the effective one; [`crate::warm`]): `—` until it
+    /// answers. Only a daemon with `cache_expiry` (0.13.0+) is asked.
+    fn session_keepwarm(&self) -> String {
+        let warm = self.model.lives[self.panes.cur.live].stats.warm.as_ref();
+        warm.map(|w| w.mode.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| crate::usage::NONE.into())
     }
 
     fn group_session(&self, p: &Palette, cx: &ViewCx, writable: bool, find: &str) -> (SharedString, Vec<AnyElement>) {
@@ -1278,8 +1308,10 @@ impl AppView {
         .find(|t| !t.trim().is_empty())
         .unwrap_or("New session")
         .to_string();
-        let line =
-            format!("“{}” · live values · read-only here until this client can change a running session", crate::app::one_line(&title, 60));
+        let line = format!(
+            "“{}” · live values · its model and thinking change from the composer, this session only; the rest is read-only here",
+            crate::app::one_line(&title, 60)
+        );
         let mut rows = Vec::new();
         for key in settings::SESSION_KEYS {
             let Some(d) = settings::def(key) else { continue };
@@ -1301,14 +1333,14 @@ impl AppView {
                 if let Some(t) = self.applies(key) {
                     under.push(mono(t, 12., p.dim).into_any_element());
                 }
-                under.extend(self.config_under(key, p));
+                under.extend(self.config_under(key, writable, p));
             }
             rows.push(Row {
                 id: format!("session-{key}").into(),
                 label: d.label.into(),
                 key,
                 help: d.help,
-                control: Self::locked(self.session_value(key), p),
+                control: Self::session_locked(key, self.session_value(key), p),
                 tag: None,
                 under,
             });
@@ -1354,13 +1386,15 @@ impl AppView {
                 under: vec![well],
             });
         }
-        if settings::def("cache_keepwarm").is_some_and(|d| settings::matches(find, "Keep-warm", d.key, d.help)) {
+        if settings::matches(find, "Cache keep-warm", "keepwarm", KEEPWARM_HELP)
+            || settings::def("cache_keepwarm").is_some_and(|d| settings::matches(find, d.label, d.key, d.help))
+        {
             rows.push(Row {
                 id: "session-keepwarm".into(),
-                label: "Keep-warm".into(),
+                label: "Cache keep-warm".into(),
                 key: "keepwarm",
-                help: "Pings the prompt cache so it stays warm (/keepwarm off, auto or <N>h). The current mode is not on the wire: set it with /keepwarm in the TUI.",
-                control: Self::locked(crate::usage::NONE, p),
+                help: KEEPWARM_HELP,
+                control: Self::session_locked("keepwarm", self.session_keepwarm(), p),
                 tag: None,
                 under: Vec::new(),
             });
@@ -1415,7 +1449,7 @@ impl AppView {
                     help: d.help,
                     control: self.config_control(key, writable, p, cx),
                     tag: self.applies(key),
-                    under: self.config_under(key, p),
+                    under: self.config_under(key, writable, p),
                 });
             }
             if !rows.is_empty() {

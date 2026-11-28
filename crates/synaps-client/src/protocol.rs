@@ -38,9 +38,9 @@ pub const SAVED_SESSIONS_MAX: u32 = 1000;
 /// watch-sessions replacement of `saved_sessions`). An older daemon
 /// answers the frame with `Error{unknown variant}`.
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
-/// `Welcome.features` entry: the daemon answers `Status{cache: true}` with
-/// when the session's prompt cache expires (`cache`), to the asking client
-/// only. An older daemon is never asked.
+/// `Welcome.features` entry: the daemon answers `SessionQuery::CacheExpiry`
+/// (SynapsCLI #462). An older daemon fails the frame as malformed, so it is
+/// never asked.
 pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
 /// The most rows one `CatalogPage` returns (`wire::CATALOG_PAGE_MAX_LIMIT`;
 /// the client clamps to it).
@@ -349,14 +349,9 @@ impl std::fmt::Debug for SessionCommand {
 pub enum SessionQuery {
     /// Reply value: the session's `api_messages` array.
     Messages,
-    /// Reply value: the session's status object. `cache`: with when the
-    /// prompt cache expires (`cache`), answered to this client only; ask it
-    /// only of a daemon whose `Welcome.features` lists
-    /// [`FEATURE_CACHE_EXPIRY`] (an off flag is not sent: the old bytes).
-    Status {
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        cache: bool,
-    },
+    /// Reply value: the session's status object (`model`, `cost`,
+    /// `keepwarm`, `pinned`, `cache_ttl`).
+    Status,
     /// Reply value: a [`WatchPage`] of worker `handle_id`'s journal from
     /// `since` (the previous page's `next_seq`; 0 = all), or `{"error":
     /// "no subagent <id> in this session"}`. `tool_queue`: include the
@@ -369,6 +364,12 @@ pub enum SessionQuery {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// Reply value: a [`crate::cache_expiry::CacheExpiry`], or a
+    /// [`crate::cache_expiry::QueryError`] (`{"error": {"code", ..}}`).
+    /// Only of a daemon whose `Welcome.features` lists
+    /// [`FEATURE_CACHE_EXPIRY`]: an older one answers
+    /// `Error{"malformed frame: unknown variant `cache_expiry`..."}`.
+    CacheExpiry,
 }
 
 /// One page of a worker's watch journal (`runtime::subagent_watch::WatchPage`,
@@ -720,6 +721,32 @@ pub struct Welcome {
     pub rejected_sessions: usize,
     pub generation: u64,
     pub features: Vec<String>,
+    /// Minted at the daemon's cold start, kept across its reloads. Empty
+    /// from an older daemon.
+    pub boot_id: String,
+}
+
+impl Welcome {
+    /// The daemon lifetime this welcome came from.
+    pub fn life(&self) -> DaemonLife {
+        DaemonLife { boot_id: self.boot_id.clone(), generation: self.generation, pid: self.pid }
+    }
+}
+
+/// One daemon lifetime, as its `Welcome` says: `boot_id` (a cold start
+/// mints a new one), `generation` (a reload counts one up; Unix keeps the
+/// pid over it) and `pid` (tells cold starts apart on a daemon without
+/// `boot_id`). Another value is another daemon process, whose session
+/// actors are made anew, their own counters (keep-warm period ids, prompt
+/// ids) started over. A transport reconnect to the same daemon keeps it.
+/// It is not an actor's identity: an actor ended and made again under the
+/// same id within one lifetime has the same.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DaemonLife {
+    pub boot_id: String,
+    pub generation: u64,
+    pub pid: u32,
 }
 
 #[derive(Deserialize)]
@@ -737,6 +764,8 @@ struct RawWelcome {
     generation: u64,
     #[serde(default)]
     features: Vec<String>,
+    #[serde(default)]
+    boot_id: String,
 }
 
 impl From<RawWelcome> for Welcome {
@@ -751,6 +780,7 @@ impl From<RawWelcome> for Welcome {
             rejected_sessions,
             generation: w.generation,
             features: w.features,
+            boot_id: w.boot_id,
         }
     }
 }
@@ -1132,6 +1162,11 @@ pub struct Attached {
     /// for these prompts is never sent on a later connection. 0 when the
     /// snapshot did not come from a `Client` (decoded by hand).
     pub connection: u64,
+    /// Not on the wire: the daemon lifetime that connection's `Welcome`
+    /// said. Another than an earlier snapshot's of the same session: its
+    /// actor was made anew (a reload, a restart), whatever its counters
+    /// say. Default when the snapshot did not come from a `Client`.
+    pub daemon: DaemonLife,
 }
 
 /// Per list, how many entries of an `Attached` snapshot did not decode.
@@ -1203,6 +1238,7 @@ impl From<RawAttached> for Attached {
             input_owner: a.input_owner,
             rejected: Rejected { pending_prompts: p, clients: c, roster: r },
             connection: 0,
+            daemon: DaemonLife::default(),
         }
     }
 }
@@ -1236,6 +1272,10 @@ pub struct ConversationSnapshot {
     /// (`ConversationTokens`); `Null` from a daemon that predates them.
     #[serde(default)]
     pub keepwarm_tokens: Value,
+    /// What keep-warm pings cost (already in `cost`); 0 from a daemon that
+    /// predates them.
+    #[serde(default)]
+    pub keepwarm_cost: f64,
     /// Events the engine holds, not in the history yet (buffered in a
     /// turn, or kept after a failed turn or compaction until the next
     /// turn's end), as on [`ConversationDigest::pending_events_len`].

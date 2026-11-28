@@ -2,8 +2,9 @@
 //! path that can really write it (`usage-design/spec.md` section 2).
 //!
 //! - APP: `settings.json` on this machine ([`crate::theme`]), always.
-//! - SESSION: the running session. Shown from its `RuntimeView`; read-only
-//!   here until this client can change a running session.
+//! - SESSION: the running session. Shown from its `RuntimeView` (keep-warm
+//!   from its `Status`); read-only here. Its model and thinking change from
+//!   the composer's pickers ([`crate::choice`]), this session only.
 //! - CONFIG: `<base>/config` on the daemon's machine, through synaps-dash's
 //!   `POST /api/config` ([`crate::dash`]): only when the daemon is local and
 //!   the dash says the file is writable. The desktop never writes or
@@ -12,8 +13,8 @@
 //!   local daemon's config holds (`key = value`, last wins, only the TUI's
 //!   own rows kept), never written.
 //!
-//! [`ALL`] is the TUI's `ALL_SETTINGS` (agent-runtime `dev` 0932c7c1,
-//! `crates/agent-tui/src/tui/settings/defs.rs`): its 88 rows, labels and
+//! [`ALL`] is the TUI's `ALL_SETTINGS` (SynapsCLI 0.13.0, `013d1c4`,
+//! `crates/agent-tui/src/tui/settings/defs.rs`): its 89 rows, labels and
 //! help, in its order.
 
 use std::collections::HashMap;
@@ -78,15 +79,16 @@ pub struct Def {
 pub const THINKING: &[&str] = &["off", "adaptive", "low", "medium", "high", "xhigh", "max"];
 
 #[rustfmt::skip]
-pub static ALL: [Def; 88] = [
+pub static ALL: [Def; 89] = [
     Def { key: "model", label: "Model", cat: Cat::Model, ctl: Ctl::Model, help: "Which Claude model to use." },
     Def { key: "thinking", label: "Thinking", cat: Cat::Model, ctl: Ctl::Choice(THINKING), help: "Thinking depth — controls effort on adaptive models, budget on legacy." },
     Def { key: "thinking_display", label: "Thinking display", cat: Cat::Model, ctl: Ctl::Choice(&["summarized", "omitted"]), help: "What Anthropic sends of the model's thinking. summarized (default): the thought's summary streams in, and the reply waits for it, then lands in a burst. omitted: no thinking text, just a timed 'thought' line, and the reply starts sooner and streams evenly (measured on Opus 5.5: ~2 s vs 3–5 s at high effort). Thinking effort is unchanged, and the reasoning still carries over between turns. Switching keeps the prompt cache. Applies to new sessions; workers always send summarized." },
     Def { key: "reasoning_type", label: "Reasoning", cat: Cat::Model, ctl: Ctl::Display, help: "How the active model expresses reasoning depth (derived from exact model capabilities; read-only)." },
     Def { key: "context_window", label: "Context window", cat: Cat::Model, ctl: Ctl::Choice(&["200k", "1m", "auto"]), help: "Override context window limit (auto = model default)." },
-    Def { key: "compaction_model", label: "Compaction model", cat: Cat::Model, ctl: Ctl::Model, help: "Model used for /compact (default: claude-sonnet-4-6)." },
+    Def { key: "compaction_model", label: "Compaction model", cat: Cat::Model, ctl: Ctl::Model, help: "Who writes /compact summaries: match (this chat's model; also empty, auto or default), provider-small (its provider's small model) or a model id. One that can't be used gives way to the chat's own model, with a notice." },
     Def { key: "api_retries", label: "API retries", cat: Cat::Agent, ctl: Ctl::Number, help: "Retries on transient API errors." },
     Def { key: "subagent_thinking", label: "Subagent thinking", cat: Cat::Agent, ctl: Ctl::Choice(&["low", "medium", "high", "xhigh", "max"]), help: "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden." },
+    Def { key: "subagent_model", label: "Subagent model", cat: Cat::Agent, ctl: Ctl::Text, help: "Model for new subagents when a call omits model, e.g. claude-sonnet-4-6 or openai-codex/gpt-5.6-sol; inherit (default) = the foreground model. Naming a model trusts it for workers, as a favorite does; an unknown id refuses those dispatches instead of using the foreground model. Applies to workers started afterwards." },
     Def { key: "subagent_timeout", label: "Subagent timeout", cat: Cat::Agent, ctl: Ctl::Number, help: "Seconds before a dispatched subagent is canceled." },
     Def { key: "subagent_cold_resume_compact_tokens", label: "Cold resume compact", cat: Cat::Agent, ctl: Ctl::Number, help: "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume." },
     Def { key: "subagent_context_management", label: "Subagent rollover", cat: Cat::Agent, ctl: Ctl::Choice(&["auto", "off"]), help: "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive, nothing summarized; the task and recent rounds stay); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards." },
@@ -176,10 +178,19 @@ pub const TERMINAL_ONLY: [&str; 6] =
 /// Derived from the model capability catalog, which the desktop does not have.
 pub const DERIVED: &str = "reasoning_type";
 
-/// The live session's settings, in the TUI's order: the config key that
-/// is their default for new sessions, and its label.
-pub const SESSION_KEYS: [&str; 8] =
-    ["model", "thinking", "context_window", "compaction_model", "api_retries", "subagent_timeout", "max_tool_output", "bash_timeout"];
+/// The live session's settings (its `RuntimeView`'s), in the TUI's order:
+/// the config key that is their default for new sessions, and its label.
+pub const SESSION_KEYS: [&str; 9] = [
+    "model",
+    "thinking",
+    "context_window",
+    "compaction_model",
+    "api_retries",
+    "subagent_timeout",
+    "max_tool_output",
+    "bash_timeout",
+    "bash_max_timeout",
+];
 
 /// DAEMON CONFIG: what synaps-dash exposes of the TUI's rows (its
 /// `CONFIG_KEYS` with a validator), sub-headed by the TUI's categories.
@@ -245,10 +256,12 @@ pub fn to_dash(key: &str, label: &str) -> Option<String> {
 }
 
 /// A config value as shown: the TUI's label; unset is `default` (`auto`
-/// where unset means it).
+/// where unset means it, `inherit` for `subagent_model`: the foreground
+/// model, as the TUI shows it).
 pub fn shown(key: &str, raw: Option<&str>) -> String {
     match raw.map(str::trim).filter(|v| !v.is_empty()) {
         None if auto_is_unset(key) => "auto".into(),
+        None if key == "subagent_model" => "inherit".into(),
         None => "default".into(),
         Some("true") if boolean(key) => "on".into(),
         Some("false") if boolean(key) => "off".into(),
@@ -392,6 +405,19 @@ pub fn check(key: &str, typed: &str) -> Option<String> {
     }
 }
 
+/// What the dash-backed editor of `key` takes where the row's help (the
+/// CLI's, kept as it is) names more, shown beside the editor: synaps-dash's
+/// validator and [`check`] take provider/model or empty (unset) for
+/// `compaction_model`, not its policy words (Shady #107 P3-1).
+pub fn editor_note(key: &str) -> Option<&'static str> {
+    match key {
+        "compaction_model" => Some(
+            "This editor takes provider/model, or empty to unset. match, provider-small, auto and default can be set only in the config file or the TUI for now.",
+        ),
+        _ => None,
+    }
+}
+
 /// A model setting's value checked as the dash does (`provider/model`).
 pub fn model_ok(v: &str) -> bool {
     let ok = |s: &str, extra: &[char]| {
@@ -406,7 +432,7 @@ mod tests {
 
     #[test]
     fn every_tui_row_has_one_place() {
-        assert_eq!(ALL.len(), 88);
+        assert_eq!(ALL.len(), 89, "SynapsCLI 0.13.0's ALL_SETTINGS (013d1c4): 89 rows");
         let config: Vec<&str> = CONFIG_GROUPS.iter().flat_map(|(_, k)| k.iter().copied()).collect();
         assert_eq!(config.len(), 22, "22 rows through the dash");
         for k in &config {
@@ -416,14 +442,49 @@ mod tests {
             assert!(config.contains(&k), "{k}: a session row's default is a CONFIG row");
         }
         let reference: usize = Cat::ORDER.iter().map(|&c| reference(c).count()).sum();
-        assert_eq!(reference, 58, "58 reference rows");
-        // 88 = 22 CONFIG + 58 REFERENCE + theme (APP) + 6 terminal-only + 1 derived.
+        assert_eq!(reference, 59, "59 reference rows");
+        // 89 = 22 CONFIG + 59 REFERENCE + theme (APP) + 6 terminal-only + 1 derived.
         assert_eq!(22 + reference + 1 + TERMINAL_ONLY.len() + 1, ALL.len());
         let mut keys: Vec<&str> = ALL.iter().map(|d| d.key).collect();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), 88, "no key twice");
+        assert_eq!(keys.len(), 89, "no key twice");
         assert!(ALL.iter().all(|d| !secret(d.key)), "no row is a secret");
+        // 0.13.0's new row: Agent, read here (the dash doesn't write it),
+        // where the TUI lists it: after subagent_thinking.
+        let agent: Vec<&str> = super::reference(Cat::Agent).map(|d| d.key).collect();
+        assert!(agent.windows(2).any(|w| w == ["subagent_thinking", "subagent_model"]), "{agent:?}");
+        assert!(!is_config("subagent_model"));
+        // And its reworded help.
+        assert!(def("compaction_model").is_some_and(|d| d.help.starts_with("Who writes /compact summaries: match (this chat's model")));
+        // THIS SESSION: RuntimeView's settings, in the TUI's order, each
+        // with its default for new sessions in CONFIG (checked above).
+        assert_eq!(
+            SESSION_KEYS.as_slice(),
+            &[
+                "model",
+                "thinking",
+                "context_window",
+                "compaction_model",
+                "api_retries",
+                "subagent_timeout",
+                "max_tool_output",
+                "bash_timeout",
+                "bash_max_timeout"
+            ]
+        );
+    }
+
+    /// The TUI's `subagent_model_row_shows_inherit_when_unset`: unset, blank
+    /// or `inherit` is `inherit` (the foreground model); else as written.
+    #[test]
+    fn subagent_model_shows_inherit_when_unset() {
+        for (raw, says) in
+            [(None, "inherit"), (Some("inherit"), "inherit"), (Some("   "), "inherit"), (Some("claude-sonnet-4-6"), "claude-sonnet-4-6")]
+        {
+            assert_eq!(shown("subagent_model", raw), says, "{raw:?}");
+        }
+        assert_eq!(shown("subagent_thinking", None), "default", "only subagent_model inherits");
     }
 
     #[test]

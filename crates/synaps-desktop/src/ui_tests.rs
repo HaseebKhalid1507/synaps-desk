@@ -9519,3 +9519,303 @@ fn a_fold_turned_round_mid_way_takes_over_where_it_is(cx: &mut TestAppContext) {
         assert!((ys[0] - ys.last().copied().unwrap_or(0.)).abs() < 0.5, "back where it was: {ys:?}");
     }
 }
+
+/// The right panel's PROMPT CACHE in each state of SynapsCLI #462's
+/// `cache_expiry` answer, as drawn: the EXPIRES cell says what the answer
+/// says (a countdown "about", the band, cold, no matching request, `—` for
+/// what can't be told), inside its half column; a daemon that can't answer
+/// draws `—`, never `cold`; no answer at all, no section.
+#[gpui_kit::test]
+fn the_cache_panel_says_each_state(cx: &mut TestAppContext) {
+    use serde_json::{Value, json};
+    let (window, view, _events) = open(cx);
+    let show = |cx: &mut TestAppContext, keep_warm: bool, answer: Option<Value>, asked: bool| {
+        view.update(cx, |v, cx| {
+            let now = crate::warm::Moment::now();
+            (v.model.cache_expiry, v.model.expiry_query) = (true, asked);
+            let stats = &mut v.model.lives[v.panes.cur.live].stats;
+            stats.warm =
+                keep_warm.then(|| crate::warm::Warm::from_status(&json!({"keepwarm": {"mode": "auto"}}), now, None, &Default::default()));
+            stats.expiry = answer.map(|c| crate::warm::Expiry::new(synaps_client::decode_query_reply(&c), now));
+            cx.notify();
+        });
+        settle(cx, window, 8);
+    };
+    for (answer, asked, says) in [
+        (Some(json!({"state": "warm", "warm_for_secs": 3030, "proof_ttl_secs": 3600})), true, "about 50m"),
+        (Some(json!({"state": "unknown", "reason": "may_have_expired", "lapse_by_secs": 2400})), true, "expired?"),
+        (Some(json!({"state": "cold", "reason": "expired"})), true, "cold"),
+        (Some(json!({"state": "cold", "reason": "uncached"})), true, "uncached"),
+        (Some(json!({"state": "unknown", "reason": "no_matching_request"})), true, "no match"),
+        (Some(json!({"state": "unknown", "reason": "parked"})), true, "—"),
+        (Some(json!({"state": "lukewarm", "reason": "meteor"})), true, "—"),
+        (Some(json!({"error": {"code": "busy"}})), true, "—"),
+        (None, true, "—"),
+        (None, false, "—"),
+    ] {
+        show(cx, true, answer.clone(), asked);
+        let mut vcx = VisualTestContext::from_window(window, cx);
+        let section = vcx.debug_bounds("right-cache").unwrap_or_else(|| panic!("{answer:?}: the section"));
+        let cell = vcx.debug_bounds(format!("right-cache-expires {says}").leak()).unwrap_or_else(|| panic!("{answer:?}: says {says}"));
+        // The cell is half the section's content (24 px padding a side);
+        // its words, drawn at 17 px display, fit in it.
+        let half = (f32::from(section.size.width) - 48.) / 2.;
+        assert!((f32::from(cell.size.width) - half).abs() < 1., "{says}: half the section ({cell:?} of {section:?})");
+        let w = cx.update_window(window, |_, window, cx| view.read(cx).display_w(says, 17., window)).expect("the window");
+        assert!(w <= half, "{says}: {w} px in {half}");
+    }
+    // Only the cache's answer (the status not in yet): the section, its
+    // keep-warm cells `—`.
+    show(cx, false, Some(json!({"state": "cold", "reason": "expired"})), true);
+    assert!(VisualTestContext::from_window(window, cx).debug_bounds("right-cache-expires cold").is_some());
+    // Neither: no section.
+    show(cx, false, None, true);
+    assert!(VisualTestContext::from_window(window, cx).debug_bounds("right-cache").is_none());
+}
+
+/// The right panel's cache tests' window (Shady #100): the demo session
+/// attached, its daemon answering `cache_expiry`, nothing asked yet. The
+/// window, its view, its client's events (kept) and the attachment.
+fn cache_panel(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppView>, async_channel::Receiver<synaps_client::Event>, u64) {
+    let (window, view, events) = open(cx);
+    let seq = view.update(cx, |v, cx| {
+        v.model.cache_expiry = true;
+        v.model.expiry_query = true;
+        cx.notify();
+        v.model.lives[v.panes.cur.live].attachment().expect("the demo session attached")
+    });
+    settle(cx, window, 8);
+    view.update(cx, |v, _| v.panel_asks.clear());
+    (window, view, events, seq)
+}
+
+/// `evs` from the client, as its pump hands them over, and drawn.
+fn deliver(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, evs: Vec<synaps_client::Event>) {
+    view.update(cx, |v, cx| v.apply_batch(evs, cx));
+    settle(cx, w, 8);
+}
+
+/// The daemon's `cache_expiry` reply `v` to attachment `seq`.
+fn cache_reply(seq: u64, v: serde_json::Value) -> synaps_client::Event {
+    let reply = match synaps_client::decode_query_reply(&v) {
+        Ok(c) => synaps_client::CacheExpiryReply::Answer(c),
+        Err(e) => synaps_client::CacheExpiryReply::Error(e),
+    };
+    synaps_client::Event::CacheExpiry { attach_seq: seq, reply }
+}
+
+/// `secs` go by on this machine's clocks, a second at a time: the right
+/// panel's ([`crate::warm::skew`]) and the test's ([`wait`]), what fell
+/// due each second fired and drawn.
+fn pass(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, secs: u64) {
+    for _ in 0..secs {
+        crate::warm::skew(std::time::Duration::from_secs(1), std::time::Duration::from_secs(1));
+        wait(cx, w, view, 1000);
+    }
+}
+
+/// The right panel's asks since the last look, and none kept.
+fn panel_asks(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<(u64, &'static str)> {
+    view.update(cx, |v, _| std::mem::take(&mut v.panel_asks))
+}
+
+/// Shady #100 F1: the countdown's zero asks once. A `warm` answer whose
+/// last second is under way (`warm_for_secs: 0`, a valid answer of
+/// SynapsCLI #462's) starts no countdown of its own: however many come,
+/// nothing more is asked until a positive one does.
+#[gpui_kit::test]
+fn a_warm_zero_answer_does_not_ask_again(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    assert_eq!(panel_asks(cx, &view), []);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero: once");
+    for k in 0..4 {
+        deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 0}))]);
+        pass(cx, window, &view, 1);
+        assert_eq!(panel_asks(cx, &view), [], "warm-zero answer {k}: nothing more");
+    }
+    // A positive answer (a ping moved the anchor): its own zero, once.
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")]);
+}
+
+/// Shady #100 F2: an answer is the daemon's that gave it. One that
+/// refuses the query (it lists `cache_expiry` for an earlier contract)
+/// leaves the keep-warm and `—`, never the last `cold`; one without the
+/// feature, after a reconnect of the same session, no section at all
+/// (as an older daemon's); and a tab's numbers restored from before
+/// either show no old answer, a daemon that answers again included.
+#[gpui_kit::test]
+fn an_answer_does_not_outlive_the_daemon_s_cache_query(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    let drawn =
+        |cx: &mut TestAppContext, what: &str| VisualTestContext::from_window(window, cx).debug_bounds(what.to_string().leak()).is_some();
+    let connected = |features: &[&str]| {
+        synaps_client::Event::Status(synaps_client::Status::Connected {
+            daemon_version: "0.0.0".into(),
+            profile: None,
+            pid: 1,
+            features: features.iter().map(|f| f.to_string()).collect(),
+        })
+    };
+    let (sid, live) =
+        view.read_with(cx, |v, _| (v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"), v.panes.cur.live));
+    let reattach = || {
+        let ev =
+            crate::demo::attach(&sid, seq).into_iter().find(|e| matches!(e, synaps_client::Event::Attached { .. })).expect("an attach");
+        let synaps_client::Event::Attached { attached, mode, .. } = ev else { unreachable!() };
+        synaps_client::Event::Attached { attach_seq: seq, attached, mode, reconnect: true }
+    };
+    let restore = |cx: &mut TestAppContext, stats: &crate::stats::Stats| {
+        view.update(cx, |v, cx| {
+            let t = std::mem::take(&mut v.model.lives[live].transcript);
+            v.model.switch_in(live, t, stats.clone());
+            cx.notify();
+        });
+        settle(cx, window, 8);
+    };
+    let status = synaps_client::Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto"}}) };
+    deliver(cx, window, &view, vec![status, cache_reply(seq, json!({"state": "cold", "reason": "expired"}))]);
+    assert!(drawn(cx, "right-cache-expires cold"));
+    let kept = view.read_with(cx, |v, _| v.model.lives[live].stats.clone());
+    // Refused: the keep-warm stays, the cache can't be told.
+    deliver(
+        cx,
+        window,
+        &view,
+        vec![synaps_client::Event::CacheExpiry { attach_seq: seq, reply: synaps_client::CacheExpiryReply::Unsupported }],
+    );
+    assert!(!drawn(cx, "right-cache-expires cold"), "refused: not the last answer");
+    assert!(drawn(cx, "right-cache") && drawn(cx, "right-cache-expires —"), "refused: keep-warm and `—`");
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache-expires cold"), "a tab restored from before the refusal");
+    // A daemon without the query; the same session attached again.
+    deliver(cx, window, &view, vec![connected(&[]), reattach()]);
+    assert!(!drawn(cx, "right-cache"), "no feature: no section");
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache"), "no feature: a restored tab neither");
+    // One that answers it again: nothing from before, until it answers.
+    deliver(cx, window, &view, vec![connected(&[synaps_client::FEATURE_CACHE_EXPIRY])]);
+    restore(cx, &kept);
+    assert!(!drawn(cx, "right-cache-expires cold"), "a restored tab's answer is the old daemon's");
+}
+
+/// Shady #100 F4, R2.1: a keep-warm ping in flight is no poll, and its end
+/// is seen however it ends. SynapsCLI emits nothing for a ping that failed
+/// unbilled (refused, or a connection that failed), whether it retries or
+/// ends the period. A ping scheduled: its status, once, after it is due.
+/// In flight: none of it asked for a minute, then looked at once, status
+/// only. Failed unbilled: the look sees the retry, the retry's look the
+/// period ended; then nothing. The same ping still in flight: twice as
+/// long each look, none past the period's TTL. Billed (measured, or sent
+/// and unmeasured: the spend grew, not the tokens): both, once; the same
+/// digest again, nothing.
+#[gpui_kit::test]
+fn a_ping_in_flight_is_seen_to_end_however_it_ends(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    crate::warm::freeze();
+    let sid = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.session.clone().expect("its session"));
+    let status = |period: serde_json::Value| synaps_client::Event::SessionStatus {
+        attach_seq: seq,
+        value: json!({"keepwarm": {"mode": "auto", "active": true, "session_pings": 2, "period": period}}),
+    };
+    let period = |id: u64, next: u64, in_flight: bool| json!({"id": id, "pings": 2, "ledger_usd": 0.5, "ttl_secs": 300, "next_ping_in_secs": next, "in_flight": in_flight});
+    let digest = |kw_read: u64, kw_cost: f64| {
+        let v = json!({"ev": "conversation", "digest": {"messages_len": 4, "messages_hash": 1, "cost": 0.5 + kw_cost,
+            "tokens": {"input": 100, "output": 50, "cache_read": 900 + kw_read, "cache_creation": 100}, "keepwarm_cost": kw_cost,
+            "keepwarm_tokens": {"input": 0, "output": 10, "cache_read": kw_read, "cache_creation": 0}}});
+        let e = synaps_client::protocol::decode_event(&v).expect("a digest");
+        synaps_client::Event::session(seq, sid.clone(), 0, e, std::sync::Arc::new(v))
+    };
+    let next_ping =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.warm.as_ref().and_then(|w| w.next_ping));
+    // Nothing asked until second `secs`: what it asked then.
+    let look = |cx: &mut TestAppContext, secs: u64| {
+        pass(cx, window, &view, secs - 1);
+        assert_eq!(panel_asks(cx, &view), [], "nothing before {secs} s");
+        pass(cx, window, &view, 1);
+        panel_asks(cx, &view)
+    };
+    deliver(
+        cx,
+        window,
+        &view,
+        vec![digest(800, 0.5), status(period(1, 20, false)), cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3600}))],
+    );
+    panel_asks(cx, &view);
+    assert_eq!(look(cx, 30), [(seq, "status")], "scheduled: its status, once, after it is due");
+    deliver(cx, window, &view, vec![status(period(1, 0, true))]);
+    assert_eq!(look(cx, 60), [(seq, "status")], "in flight: no poll; looked at a minute on, status only");
+    // It failed unbilled: no word of it. The look sees the retry.
+    deliver(cx, window, &view, vec![status(period(1, 15, false))]);
+    assert_eq!(look(cx, 30), [(seq, "status")], "the retry's status");
+    deliver(cx, window, &view, vec![status(period(1, 0, true))]);
+    assert_eq!(look(cx, 60), [(seq, "status")], "the retry in flight: looked at");
+    // It failed too, the period ended: seen, and nothing more.
+    deliver(cx, window, &view, vec![status(serde_json::Value::Null)]);
+    assert_eq!(next_ping(cx), None, "the period's end is on screen");
+    pass(cx, window, &view, 600);
+    assert_eq!(panel_asks(cx, &view), [], "ended: nothing");
+    // Another period, its ping stuck in flight: a few looks at most.
+    deliver(cx, window, &view, vec![status(period(2, 0, true))]);
+    let mut looks = Vec::new();
+    for wait in [60, 120, 240] {
+        assert_eq!(look(cx, wait), [(seq, "status")], "after {wait} s");
+        looks.push(wait);
+        deliver(cx, window, &view, vec![status(period(2, 0, true))]);
+    }
+    assert_eq!(looks, [60, 120, 240]);
+    pass(cx, window, &view, 600);
+    assert_eq!(panel_asks(cx, &view), [], "none past the 5m TTL");
+    // Sent and never measured: billed its worst case (the spend, not the
+    // tokens). Then a measured one.
+    deliver(cx, window, &view, vec![digest(800, 0.75)]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "billed unmeasured: both, once");
+    deliver(cx, window, &view, vec![digest(800, 0.75)]);
+    assert_eq!(panel_asks(cx, &view), [], "nothing booked: nothing");
+    deliver(cx, window, &view, vec![digest(1600, 0.9)]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "measured: both, once");
+    deliver(cx, window, &view, vec![digest(1600, 0.9)]);
+    assert_eq!(panel_asks(cx, &view), [], "the same digest: nothing");
+}
+
+/// Shady #100 F5: every fresh ask has its own `stale` retry, the timers'
+/// too. Attach's ask: `stale`, once more, answered. Then the zero's ask:
+/// `stale` is asked once more (not taken as the attach's second), and a
+/// second `stale` is said. The same for the ask after a suspend.
+#[gpui_kit::test]
+fn each_timer_ask_gets_its_own_stale_retry(cx: &mut TestAppContext) {
+    use serde_json::json;
+    let (window, view, _events, seq) = cache_panel(cx);
+    let drawn =
+        |cx: &mut TestAppContext, what: &str| VisualTestContext::from_window(window, cx).debug_bounds(what.to_string().leak()).is_some();
+    let stale = || cache_reply(seq, json!({"error": {"code": "stale"}}));
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the attach's ask: once more");
+    deliver(cx, window, &view, vec![cache_reply(seq, json!({"state": "warm", "warm_for_secs": 2}))]);
+    pass(cx, window, &view, 3);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero's ask");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the zero's ask: once more");
+    assert!(drawn(cx, "right-cache-expires expired?"), "the band stands meanwhile");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [], "not twice");
+    assert!(drawn(cx, "right-cache-expires —"), "said: couldn't check");
+    // Asleep ten minutes: the wake's ask.
+    let status = synaps_client::Event::SessionStatus { attach_seq: seq, value: json!({"keepwarm": {"mode": "auto"}}) };
+    deliver(cx, window, &view, vec![status, cache_reply(seq, json!({"state": "warm", "warm_for_secs": 3000}))]);
+    assert_eq!(panel_asks(cx, &view), []);
+    crate::warm::skew(std::time::Duration::ZERO, std::time::Duration::from_secs(600));
+    // Awake: the countdown's next tick (a minute at most) finds it.
+    pass(cx, window, &view, 60);
+    assert_eq!(panel_asks(cx, &view), [(seq, "status"), (seq, "cache_expiry")], "the wake's ask");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [(seq, "cache_expiry")], "the wake's ask: once more");
+    deliver(cx, window, &view, vec![stale()]);
+    assert_eq!(panel_asks(cx, &view), [], "not twice");
+}

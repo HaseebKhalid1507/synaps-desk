@@ -7437,3 +7437,242 @@ fn each_rail_row_shows_its_own_sessions_cost_and_waiting_whichever_pane_is_focus
         assert!(!shows(cx, format!("rail-waiting {kb} 2")), "{what}: B's row counts none of A's");
     }
 }
+
+/// The right panel's cache tests on a split (Shady #100): two panes
+/// across a window wide enough for the panel, `p0` on A and `p1`
+/// (focused) on A and B, showing B; as [`two_panes`].
+fn two_panes_wide(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (AnyWindowHandle, Entity<AppView>, Client, Kept, crate::pane::PaneId, crate::pane::PaneId) {
+    let (window, view, client, a, attaches, events) = on_a_in(cx, name, attached(A, None), (1920., 1080.));
+    let p0 = view.read_with(cx, |v, _| v.panes.cur.id);
+    key(cx, window, "ctrl-\\");
+    let p1 = view.read_with(cx, |v, _| v.panes.focused);
+    let b = open_b(cx, window, &view, &attaches, &events);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    (window, view, client, (a, b, attaches, events), p0, p1)
+}
+
+/// The daemon answers `cache_expiry` (its `Welcome.features`), nothing
+/// asked yet.
+fn cache_on(cx: &mut TestAppContext, view: &Entity<AppView>) {
+    view.update(cx, |v, _| {
+        v.model.cache_expiry = true;
+        v.model.expiry_query = true;
+        v.panel_asks.clear();
+    });
+}
+
+/// Pane `id`'s store's attachment.
+fn attachment_of(cx: &mut TestAppContext, view: &Entity<AppView>, id: crate::pane::PaneId) -> u64 {
+    view.read_with(cx, |v, _| v.model.lives[v.panes.get(id).expect("the pane").live].attachment().expect("attached"))
+}
+
+/// The daemon's `cache_expiry` reply `v` to attachment `seq`.
+fn cache_reply(seq: u64, v: Value) -> Event {
+    let reply = match synaps_client::decode_query_reply(&v) {
+        Ok(c) => synaps_client::CacheExpiryReply::Answer(c),
+        Err(e) => synaps_client::CacheExpiryReply::Error(e),
+    };
+    Event::CacheExpiry { attach_seq: seq, reply }
+}
+
+/// `evs` from the client, as its pump hands them over, and drawn.
+fn give(cx: &mut TestAppContext, window: AnyWindowHandle, view: &Entity<AppView>, evs: Vec<Event>) {
+    view.update(cx, |v, cx| v.apply_batch(evs, cx));
+    frame(cx, window);
+}
+
+/// `secs` go by on the right panel's clock ([`crate::warm::skew`]) and the
+/// test's, a second at a time, each second's timers fired and drawn.
+fn pass(cx: &mut TestAppContext, window: AnyWindowHandle, secs: u64) {
+    for _ in 0..secs {
+        crate::warm::skew(Duration::from_secs(1), Duration::from_secs(1));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        frame(cx, window);
+    }
+}
+
+/// The right panel's asks since the last look.
+fn panel_asks(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<(u64, &'static str)> {
+    view.update(cx, |v, _| std::mem::take(&mut v.panel_asks))
+}
+
+fn connected(features: &[&str]) -> Event {
+    Event::Status(synaps_client::Status::Connected {
+        daemon_version: "0.0.0".into(),
+        profile: None,
+        pid: 1,
+        features: features.iter().map(|f| f.to_string()).collect(),
+    })
+}
+
+/// Shady #100 F1 on a split: two panes on one session share its store,
+/// its countdown and its one zero ask, whichever is focused; `warm`
+/// answers of zero ask nothing more.
+#[gpui_kit::test]
+fn two_panes_on_one_session_ask_once_at_the_zero(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "cache-zero-split", attached(A, None), (1920., 1080.));
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(ids.len(), 2);
+    let a = attachment_of(cx, &view, ids[0]);
+    assert_eq!(attachment_of(cx, &view, ids[1]), a, "one store, one attachment");
+    cache_on(cx, &view);
+    give(cx, window, &view, vec![cache_reply(a, json!({"state": "warm", "warm_for_secs": 2}))]);
+    pass(cx, window, 3);
+    assert_eq!(panel_asks(cx, &view), [(a, "cache_expiry")], "the zero: once");
+    for (k, focus) in [ids[0], ids[1], ids[0]].into_iter().enumerate() {
+        view.update(cx, |v, cx| v.focus_pane(focus, crate::pane::KeysTo::Pane, cx));
+        give(cx, window, &view, vec![cache_reply(a, json!({"state": "warm", "warm_for_secs": 0}))]);
+        pass(cx, window, 1);
+        assert_eq!(panel_asks(cx, &view), [], "warm-zero answer {k}: nothing more");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #100 R3.1 on a split: two panes on one session share its store
+/// and its ping's look. The ping in flight, three transport reconnects in
+/// its first seconds (the same attachment, a new connection: each asks
+/// both, once; each status says the same ping), the focus moving between
+/// the panes: the one look comes a minute on, status only, and sees the
+/// period ended. Then nothing, whichever pane is focused.
+#[gpui_kit::test]
+fn two_panes_on_one_session_look_at_a_ping_in_flight_once(cx: &mut TestAppContext) {
+    let (window, view, client, _a, _attaches, _events) = on_a_in(cx, "cache-flight-split", attached(A, None), (1920., 1080.));
+    key(cx, window, "ctrl-\\");
+    frame(cx, window);
+    let ids = view.read_with(cx, |v, _| v.panes.ids());
+    assert_eq!(ids.len(), 2);
+    let a = attachment_of(cx, &view, ids[0]);
+    assert_eq!(attachment_of(cx, &view, ids[1]), a, "one store, one attachment");
+    cache_on(cx, &view);
+    crate::warm::freeze();
+    // The daemon its attach came from: each reconnect's is the same one.
+    let daemon = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].stats.daemon.clone());
+    let status = |period: Value| Event::SessionStatus { attach_seq: a, value: json!({"keepwarm": {"mode": "auto", "period": period}}) };
+    let flying = || status(json!({"id": 1, "pings": 2, "ttl_secs": 300, "next_ping_in_secs": 0, "in_flight": true}));
+    let no_match = || cache_reply(a, json!({"state": "unknown", "reason": "no_matching_request"}));
+    give(cx, window, &view, vec![flying(), no_match()]);
+    assert_eq!(panel_asks(cx, &view), []);
+    for (k, focus) in [ids[0], ids[1], ids[0]].into_iter().enumerate() {
+        pass(cx, window, 1);
+        view.update(cx, |v, cx| v.focus_pane(focus, crate::pane::KeysTo::Pane, cx));
+        let mut again = match synaps_client::protocol::decode_frame(&attached(A, None).to_string()).expect("a frame") {
+            synaps_client::protocol::DaemonFrame::Attached(a) => a,
+            other => panic!("{other:?}"),
+        };
+        again.connection = 10 + k as u64;
+        again.daemon = daemon.clone();
+        let ev = Event::Attached { attach_seq: a, attached: again, mode: synaps_client::AttachMode::Mirror, reconnect: true };
+        give(cx, window, &view, vec![ev]);
+        assert_eq!(panel_asks(cx, &view), [(a, "status"), (a, "cache_expiry")], "reconnect {k}: both, once");
+        give(cx, window, &view, vec![flying(), no_match()]);
+        assert_eq!(panel_asks(cx, &view), [], "reconnect {k}'s answers: nothing more");
+    }
+    view.update(cx, |v, cx| v.focus_pane(ids[1], crate::pane::KeysTo::Pane, cx));
+    pass(cx, window, 56);
+    assert_eq!(panel_asks(cx, &view), [], "no poll before a minute");
+    pass(cx, window, 1);
+    assert_eq!(panel_asks(cx, &view), [(a, "status")], "a minute on: the look, once, status only");
+    give(cx, window, &view, vec![status(Value::Null)]);
+    for focus in [ids[0], ids[1]] {
+        view.update(cx, |v, cx| v.focus_pane(focus, crate::pane::KeysTo::Pane, cx));
+        pass(cx, window, 300);
+        assert_eq!(panel_asks(cx, &view), [], "ended: nothing");
+    }
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #100 F2 on a split: a refusal of the query, and a daemon without
+/// it, reach every store, not only the focused pane's: the other pane,
+/// focused, shows no old `cold`.
+#[gpui_kit::test]
+fn a_lost_cache_query_reaches_every_pane(cx: &mut TestAppContext) {
+    let (window, view, client, _kept, p0, p1) = two_panes_wide(cx, "cache-lost");
+    let (a, b) = (attachment_of(cx, &view, p0), attachment_of(cx, &view, p1));
+    cache_on(cx, &view);
+    let answers = || {
+        [a, b]
+            .into_iter()
+            .flat_map(|s| {
+                [
+                    Event::SessionStatus { attach_seq: s, value: json!({"keepwarm": {"mode": "auto"}}) },
+                    cache_reply(s, json!({"state": "cold", "reason": "expired"})),
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    give(cx, window, &view, answers());
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_some(), "B's");
+    // B's connection refuses it.
+    give(cx, window, &view, vec![Event::CacheExpiry { attach_seq: b, reply: synaps_client::CacheExpiryReply::Unsupported }]);
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_none(), "A's: not its last answer");
+    assert!(drawn(cx, window, "right-cache-expires —".into()).is_some(), "A's: can't tell");
+    // A daemon that answers, then one without the query.
+    give(cx, window, &view, [vec![connected(&[synaps_client::FEATURE_CACHE_EXPIRY])], answers()].concat());
+    assert!(drawn(cx, window, "right-cache-expires cold".into()).is_some(), "A's again");
+    give(cx, window, &view, vec![connected(&[])]);
+    view.update(cx, |v, cx| v.focus_pane(p1, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert!(drawn(cx, window, "right-cache".into()).is_none(), "B's: no section");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
+/// Shady #100 F6: the right panel's timer acts on the store and the
+/// attachment it was armed for, while that store shows, and on what is
+/// due then. Armed for A's zero, B focused before the next frame, it
+/// fires: nothing asked, B's countdown untouched (B asks at its own zero),
+/// A asks once shown again. Armed for an answer replaced before it fires:
+/// the new answer's zero is its own.
+#[gpui_kit::test]
+fn the_cache_timer_acts_only_on_what_it_was_armed_for(cx: &mut TestAppContext) {
+    let (window, view, client, _kept, p0, p1) = two_panes_wide(cx, "cache-timer-owner");
+    let (a, b) = (attachment_of(cx, &view, p0), attachment_of(cx, &view, p1));
+    cache_on(cx, &view);
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    // The caret at rest (no frame of its own: none drawn before the timer).
+    cx.executor().advance_clock(Duration::from_secs(11));
+    frame(cx, window);
+    let warm = |seq: u64, secs: u64| cache_reply(seq, json!({"state": "warm", "warm_for_secs": secs}));
+    give(cx, window, &view, vec![warm(a, 2), warm(b, 5)]);
+    assert_eq!(panel_asks(cx, &view), []);
+    // B focused, and A's timer fires before the next frame.
+    view.update(cx, |v, _| {
+        assert!(v.enter_pane(p1));
+        v.panes.focused = p1;
+    });
+    crate::warm::skew(Duration::from_secs(2), Duration::from_secs(2));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(panel_asks(cx, &view), [], "A's timer with B shown: nothing");
+    frame(cx, window);
+    pass(cx, window, 3);
+    assert_eq!(panel_asks(cx, &view), [(b, "cache_expiry")], "B's own zero");
+    view.update(cx, |v, cx| v.focus_pane(p0, crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    assert_eq!(panel_asks(cx, &view), [(a, "cache_expiry")], "A's, shown again");
+    // Armed for A's answer, replaced before it fires.
+    give(cx, window, &view, vec![warm(a, 2)]);
+    view.update(cx, |v, _| {
+        let _ = v.model.apply(warm(a, 10));
+    });
+    crate::warm::skew(Duration::from_secs(2), Duration::from_secs(2));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    frame(cx, window);
+    assert_eq!(panel_asks(cx, &view), [], "the new answer counts down");
+    pass(cx, window, 9);
+    assert_eq!(panel_asks(cx, &view), [(a, "cache_expiry")], "at its own zero");
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}

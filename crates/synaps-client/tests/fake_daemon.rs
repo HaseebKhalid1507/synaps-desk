@@ -70,7 +70,12 @@ struct Fake {
     accepted: mpsc::UnboundedReceiver<Weak<Mutex<OwnedWriteHalf>>>,
     /// Every frame after `Hello` that was not an `Attach`, in order.
     control: mpsc::UnboundedReceiver<Value>,
+    /// What the next connection's `Welcome` says the daemon's lifetime is:
+    /// `boot_id` (empty: not sent), `generation`, `pid`.
+    life: Life,
 }
+
+type Life = Arc<std::sync::Mutex<(String, u64, u32)>>;
 
 /// What the fake daemon is.
 #[derive(Clone, Copy, Default)]
@@ -91,6 +96,8 @@ struct Opts {
     /// With `pages`: before each page reply, a req-less `Error` that is not
     /// the page's; a `before` of `"bad"` is answered `malformed frame`.
     noise: bool,
+    /// `Welcome.features` lists `cache_expiry`.
+    expiry: bool,
 }
 
 /// The fake's saved sessions, newest first: five rows, the third named.
@@ -138,14 +145,29 @@ fn attached_frame(client: u64) -> Value {
 }
 
 fn welcome(opts: Opts) -> Value {
+    welcome_of(opts, &Arc::new(std::sync::Mutex::new((String::new(), 1, 1))))
+}
+
+/// [`welcome`], from the daemon lifetime `life`.
+fn welcome_of(opts: Opts, life: &Life) -> Value {
     let mut features: Vec<&str> = if opts.saved { vec!["owned_sessions", "saved_sessions"] } else { vec!["owned_sessions"] };
     if opts.pages {
         features.push("session_page");
     }
-    json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
+    if opts.expiry {
+        features.push("cache_expiry");
+    }
+    let mut w = json!({"type": "welcome", "protocol_version": 3, "daemon_version": "0.0.0-fake", "pid": 1, "profile": null,
            "sessions": [{"id": SID, "model": "m", "lifecycle": "live", "name": "named-one"},
                         {"id": SID2, "model": "m", "lifecycle": "live", "journal_id": "20261101-000000-bbbb"}],
-           "progressive_tool_disclosure": false, "generation": 1, "features": features})
+           "progressive_tool_disclosure": false, "generation": 1, "features": features});
+    let (boot_id, generation, pid) = life.lock().unwrap().clone();
+    w["generation"] = json!(generation);
+    w["pid"] = json!(pid);
+    if !boot_id.is_empty() {
+        w["boot_id"] = json!(boot_id);
+    }
+    w
 }
 
 /// The fake's `Rename` (`daemon/rename.rs`): `None` = `Refused`, then close.
@@ -188,17 +210,20 @@ impl Fake {
         let (atx, attaches) = mpsc::unbounded_channel();
         let (ctx, accepted) = mpsc::unbounded_channel();
         let (ftx, control) = mpsc::unbounded_channel();
+        let life: Life = Arc::new(std::sync::Mutex::new((String::new(), 1, 1)));
+        let told = life.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (r, w) = stream.into_split();
                 let w: Writer = Arc::new(Mutex::new(w));
                 let _ = ctx.send(Arc::downgrade(&w));
                 let (atx, ftx) = (atx.clone(), ftx.clone());
+                let hi = welcome_of(opts, &told);
                 tokio::spawn(async move {
                     let mut r = BufReader::new(r).lines();
                     let Ok(Some(hello)) = r.next_line().await else { return };
                     let hello: Value = serde_json::from_str(&hello).unwrap();
-                    write(&w, welcome(opts)).await;
+                    write(&w, hi).await;
                     while let Ok(Some(line)) = r.next_line().await {
                         let f: Value = serde_json::from_str(&line).unwrap();
                         if f["type"] != "attach" {
@@ -281,7 +306,7 @@ impl Fake {
                 });
             }
         });
-        Fake { path, attaches, accepted, control }
+        Fake { path, attaches, accepted, control, life }
     }
 
     fn client(&self) -> (Client, async_channel::Receiver<Event>) {
@@ -1223,6 +1248,50 @@ async fn prompts_are_answered_on_the_wire() {
     client.shutdown().unwrap();
 }
 
+/// Each snapshot carries the daemon lifetime its connection's `Welcome`
+/// said: a transport reconnect to the same daemon keeps it; a reload
+/// (`generation`, the pid kept) or a cold start (`boot_id`) is another.
+#[tokio::test]
+async fn a_snapshot_says_which_daemon_lifetime_served_it() {
+    use synaps_client::DaemonLife;
+    let mut fake = Fake::start("daemon-life").await;
+    *fake.life.lock().unwrap() = ("b-1".into(), 3, 40);
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let snapshot = |events: &async_channel::Receiver<Event>| {
+        let events = events.clone();
+        async move {
+            wait(&events, "attached", |e| match e {
+                Event::Attached { attached, .. } => Some(attached.daemon.clone()),
+                _ => None,
+            })
+            .await
+        }
+    };
+    let life = |boot: &str, generation: u64, pid: u32| {
+        let mut l = DaemonLife::default();
+        (l.boot_id, l.generation, l.pid) = (boot.into(), generation, pid);
+        l
+    };
+    let mut conn = fake.next_attach().await;
+    conn.send(attached_frame(2)).await;
+    let first = snapshot(&events).await;
+    assert_eq!(first, life("b-1", 3, 40));
+    for (why, told) in
+        [("a dropped socket, the same daemon", ("b-1", 3, 40)), ("a reload", ("b-1", 4, 40)), ("a cold start", ("b-2", 1, 41))]
+    {
+        *fake.life.lock().unwrap() = (told.0.into(), told.1, told.2);
+        drop(conn);
+        wait(&events, "reattaching", |e| matches!(e, Event::Reattaching { attach_seq, .. } if *attach_seq == seq).then_some(())).await;
+        conn = fake.next_attach().await;
+        conn.send(attached_frame(3)).await;
+        let again = snapshot(&events).await;
+        assert_eq!(again, life(told.0, told.1, told.2), "{why}");
+        assert_eq!(again == first, why.starts_with("a dropped"), "{why}");
+    }
+    client.shutdown().unwrap();
+}
+
 /// An answer is tied to the connection its prompt came on: once the
 /// session has reconnected (a restarted daemon numbers its prompts from 1
 /// again), `answer_on` with the old connection is dropped and refused,
@@ -2006,10 +2075,9 @@ async fn set_wire_shapes_and_replies() {
     assert_eq!(set_reply(&events).await, (seq, "model".into(), Ok(Some(clamp.into()))));
 }
 
-/// The right panel's cache and keep-warm (synaps-desk #68, SynapsCLI #436):
-/// a `status` query on the attachment, its answer by id as
-/// `Event::SessionStatus` (the value as the daemon sent it); another id's
-/// answer is not it.
+/// The right panel's keep-warm (synaps-desk #68): a `status` query on the
+/// attachment, its answer by id as `Event::SessionStatus` (the value as the
+/// daemon sent it); another id's answer is not it.
 #[tokio::test]
 async fn status_query_wire_shape_and_answer() {
     let mut fake = Fake::start("status").await;
@@ -2020,10 +2088,9 @@ async fn status_query_wire_shape_and_answer() {
     let cmd = conn.recv_cmd().await;
     let id = cmd["id"].as_u64().unwrap();
     assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
-    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "status", "cache": true}}));
+    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "status"}}));
     let value = json!({"pinned": false, "keepwarm": {"mode": "auto", "session_pings": 0},
-        "cache_ttl": {"setting": "1h", "resolved": "1h"},
-        "cache": {"ttl": "5m", "ttl_secs": 300, "age_secs": 78, "expires_in_secs": 222, "downgraded": true}});
+        "cache_ttl": {"setting": "1h", "resolved": "1h"}});
     conn.event(40, json!({"ev": "query_result", "id": id ^ 1, "value": {"pinned": true}})).await;
     conn.event(41, json!({"ev": "query_result", "id": id, "value": value})).await;
     let got = wait(&events, "session status", |e| match e {
@@ -2032,4 +2099,92 @@ async fn status_query_wire_shape_and_answer() {
     })
     .await;
     assert_eq!(got, (seq, value));
+}
+
+/// The next `Event::CacheExpiry`; any `Event::Error` before it fails the
+/// test (an older daemon's refusal is no error).
+async fn expiry_reply(events: &async_channel::Receiver<Event>) -> (u64, synaps_client::CacheExpiryReply) {
+    wait(events, "cache expiry", |e| match e {
+        Event::CacheExpiry { attach_seq, reply } => Some((*attach_seq, reply.clone())),
+        Event::Error { error, .. } => panic!("an error: {error:?}"),
+        _ => None,
+    })
+    .await
+}
+
+/// The right panel's prompt cache (SynapsCLI #462): `{"query":
+/// "cache_expiry"}` on the attachment, its answer by id decoded, an error
+/// in its own shape; and a daemon that lists `cache_expiry` but fails the
+/// frame as malformed (an earlier contract's) answers `Unsupported`, with
+/// no error, on a connection that stays up.
+#[tokio::test]
+async fn cache_expiry_wire_shape_answers_errors_and_an_older_daemon() {
+    use synaps_client::{CacheExpiry, CacheExpiryReply, CacheState, QueryErrorCode};
+    let mut fake = Fake::start_with("expiry", Opts { expiry: true, ..Opts::default() }).await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    let ask = |client: &Client| client.on(seq).cache_expiry().unwrap();
+
+    ask(&client);
+    let cmd = conn.recv_cmd().await;
+    let id = cmd["id"].as_u64().unwrap();
+    assert!(id < synaps_client::protocol::RESERVED_QUERY_ID_BASE);
+    assert_eq!(cmd, json!({"cmd": "query", "id": id, "query": {"query": "cache_expiry"}}));
+    let warm = json!({"state": "warm", "warm_for_secs": 3000, "lapse_by_secs": 3000, "proof_ttl_secs": 3600,
+        "requested_ttl_secs": 3600, "proof_cache_tokens": 20000});
+    // Another client's answer under another id is not ours.
+    conn.event(50, json!({"ev": "query_result", "id": id ^ 1, "value": {"state": "cold", "reason": "expired"}})).await;
+    conn.event(51, json!({"ev": "query_result", "id": id, "value": warm})).await;
+    let (s, reply) = expiry_reply(&events).await;
+    let want: CacheExpiry = serde_json::from_value(warm).unwrap();
+    assert_eq!((s, &reply), (seq, &CacheExpiryReply::Answer(want)));
+    let CacheExpiryReply::Answer(c) = reply else { unreachable!() };
+    assert_eq!((c.state, c.warm_for_secs), (CacheState::Warm, Some(3000)));
+
+    // A typed error, and a newer daemon's unknown code.
+    for (k, (code, want)) in [("stale", QueryErrorCode::Stale), ("meteor", QueryErrorCode::Internal)].into_iter().enumerate() {
+        ask(&client);
+        let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+        conn.event(52 + k as u64, json!({"ev": "query_result", "id": id, "value": {"error": {"code": code}}})).await;
+        match expiry_reply(&events).await.1 {
+            CacheExpiryReply::Error(e) => assert_eq!(e.code, want, "{code}"),
+            other => panic!("{code}: {other:?}"),
+        }
+    }
+
+    // A daemon that lists the feature but cannot decode the query.
+    ask(&client);
+    let _ = conn.recv_cmd().await;
+    conn.send(json!({"type": "error", "session_id": SID,
+        "message": "malformed frame: unknown variant `cache_expiry`, expected one of `messages`, `status`"}))
+        .await;
+    assert_eq!(expiry_reply(&events).await, (seq, CacheExpiryReply::Unsupported));
+    // The connection is up: the status still goes out and is answered.
+    client.on(seq).status().unwrap();
+    let id = conn.recv_cmd().await["id"].as_u64().unwrap();
+    conn.event(54, json!({"ev": "query_result", "id": id, "value": {"keepwarm": {"mode": "off"}}})).await;
+    let got = wait(&events, "session status", |e| match e {
+        Event::SessionStatus { value, .. } => Some(value.clone()),
+        Event::Error { error, .. } => panic!("an error: {error:?}"),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, json!({"keepwarm": {"mode": "off"}}));
+}
+
+/// A daemon whose `Welcome.features` lacks `cache_expiry` is never sent
+/// the query (it would fail the frame): `Unsupported` at once, nothing on
+/// the wire.
+#[tokio::test]
+async fn cache_expiry_is_not_sent_to_a_daemon_without_the_feature() {
+    use synaps_client::CacheExpiryReply;
+    let mut fake = Fake::start("expiry-old").await;
+    let (client, events) = fake.client();
+    let seq = client.attach(SID, AttachMode::Mirror).unwrap();
+    let mut conn = attached(&mut fake, &events, 2).await;
+    client.on(seq).cache_expiry().unwrap();
+    assert_eq!(expiry_reply(&events).await, (seq, CacheExpiryReply::Unsupported));
+    client.on(seq).status().unwrap();
+    assert_eq!(conn.recv_cmd().await["query"], json!({"query": "status"}), "the status is the first thing sent");
 }

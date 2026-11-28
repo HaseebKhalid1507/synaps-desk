@@ -48,6 +48,8 @@ mod remember_tests;
 mod reveal_tests;
 #[path = "send_tests.rs"]
 mod send_tests;
+#[path = "settings_tests.rs"]
+mod settings_tests;
 #[path = "walk_tests.rs"]
 mod walk_tests;
 
