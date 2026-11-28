@@ -903,10 +903,6 @@ impl AppView {
     /// its history, and the block says why. A composition's commit is a
     /// `Change` ([`AppView::edit_typed`]).
     fn edit_marked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Fail-first (Shady #114 R2 P2-4): not checked as marked.
-        if std::hint::black_box(true) {
-            return;
-        }
         let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
         let Some(f) = e.field.as_ref() else { return };
         let row = e.row;
@@ -1108,8 +1104,7 @@ impl AppView {
             // the anchor it was taken at, the agent's move of it still
             // waiting). No row has that call (the anchor itself is gone,
             // not renumbered): held where the board draws it now.
-            // Fail-first (Shady #114 R2 P2-3, found): the rows on screen.
-            let t = if std::hint::black_box(true) { l.shown() } else { &l.transcript };
+            let t = &l.transcript;
             for (id, p) in self.block_drafts.places(&session) {
                 if p.there(|r| has_row(t, r)) {
                     continue;
@@ -1217,8 +1212,7 @@ impl AppView {
         // (the session's transcript's: the board's rows, a watch focused
         // or not). Its call gone too: drawn where the agent put it, taken
         // as its place ([`AppView::sync_drafts`]).
-        // Fail-first (Shady #114 R2 P2-3, found): the rows on screen.
-        let t = if std::hint::black_box(true) { l.shown() } else { &l.transcript };
+        let t = &l.transcript;
         let holds: Vec<_> = self
             .block_drafts
             .places(session)

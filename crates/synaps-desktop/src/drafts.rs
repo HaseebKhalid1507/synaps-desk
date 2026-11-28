@@ -845,8 +845,6 @@ impl Place {
     /// there has its call (its anchor is gone, not renumbered); a rail
     /// section's place keeps its slot, no row with it.
     pub(crate) fn renumbered(&self, has: impl Fn(u64) -> bool, by_call: impl Fn(&str) -> Option<u64>) -> Option<Place> {
-        // Fail-first (Shady #114 R2 P2-3): not found by its call.
-        let by_call = |c: &str| if std::hint::black_box(true) { None } else { by_call(c) };
         let find = |row: u64, call: &Option<Arc<str>>| if has(row) { Some(row) } else { call.as_deref().and_then(&by_call) };
         match self {
             Place::Row { item, call, after } => Some(Place::Row { item: find(*item, call)?, call: call.clone(), after: after.clone() }),
@@ -885,10 +883,6 @@ impl Place {
 /// is checked as the others', never taken as kept because it is in its
 /// list.
 pub(crate) fn hold_places(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
-    // Fail-first (Shady #114 R2 P2-1): 8186107's placement.
-    if std::hint::black_box(true) {
-        return hold_places_r1(d, holds);
-    }
     let drawn = |id: &Ref| Place::of(d, id).is_some() || member(d, id);
     if !holds.iter().any(|(id, _)| drawn(id)) {
         return None;
@@ -945,57 +939,6 @@ pub(crate) fn hold_places(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
         }
     }
     (!same_places(d, &x)).then_some(x)
-}
-
-/// Fail-first (Shady #114 R2 P2-1): 8186107's [`hold_places`], on the
-/// new [`Place`] (its block before it: the nearest; its index: how many).
-fn hold_places_r1(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
-    let mut out: Option<Drawn> = None;
-    for (id, place) in holds.iter().rev() {
-        let cur = out.as_ref().unwrap_or(d);
-        let now = Place::of(cur, id);
-        let (after, at) = (place.after().first().cloned(), place.after().len());
-        let after_there = |x: &Drawn| match (place, &after) {
-            (_, None) => false,
-            (Place::Row { item, .. }, Some(a)) => x.rows.get(item).is_some_and(|r| r.blocks.iter().any(|s| &s.block.id == a)),
-            (Place::Rail { slot, .. }, Some(a)) => x.rail[*slot].iter().any(|s| &s.block.id == a),
-        };
-        let in_place = match (place, now.as_ref()) {
-            (Place::Row { item, .. }, Some(n @ Place::Row { item: i, .. })) => {
-                item == i && (n.after().first() == after.as_ref() || !after_there(cur))
-            }
-            (Place::Rail { slot, .. }, Some(n @ Place::Rail { slot: s, .. })) => {
-                slot == s && (n.after().first() == after.as_ref() || !after_there(cur))
-            }
-            _ => false,
-        };
-        if in_place || (now.is_none() && !member(cur, id)) {
-            continue;
-        }
-        let x = out.get_or_insert_with(|| d.clone());
-        let Some((s, _)) = take_out(x, id) else { continue };
-        let there = after_there(x);
-        let k_of = |list: &[synaps_client::blocks::Shown]| match after.as_ref().filter(|_| there) {
-            Some(a) => list.iter().position(|s| &s.block.id == a).map_or(0, |k| k + 1),
-            None if after.is_none() => 0,
-            None => at.min(list.len()),
-        };
-        match place {
-            Place::Row { item, .. } => {
-                let rb = Arc::make_mut(x.rows.entry(*item).or_default());
-                let k = k_of(&rb.blocks);
-                rb.blocks.insert(k, s);
-            }
-            Place::Rail { slot, row, .. } => {
-                let list = &mut x.rail[*slot];
-                let k = k_of(list);
-                list.insert(k, s);
-                let rows = &mut x.rail_rows[*slot];
-                rows.insert(k.min(rows.len()), *row);
-            }
-        }
-    }
-    out
 }
 
 /// Whether boards `a` and `b` draw each block in the same place: each
@@ -1098,10 +1041,6 @@ impl Drafts {
     /// the session is in the dock ([`Drafts::rowed`]), so each can be
     /// reached, its keys or its buttons.
     pub(crate) fn in_row(&self, session: &str, id: &Ref) -> Option<&Draft> {
-        // Fail-first (Shady #114 R2 P2-2): the latest, held or stale.
-        if std::hint::black_box(true) {
-            return self.all.iter().rev().find(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)).map(|(_, d)| d);
-        }
         let mut stale = None;
         for (_, d) in self.all.iter().rev().filter(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)) {
             if d.ended.is_none() {
@@ -1115,10 +1054,6 @@ impl Drafts {
     /// Whether session `session`'s draft `d` is the one drawn in its
     /// block's row ([`Drafts::in_row`]); else it is in the dock.
     pub(crate) fn rowed(&self, session: &str, d: &Draft) -> bool {
-        // Fail-first (Shady #114 R2 P2-2): by its fate, its block's id.
-        if std::hint::black_box(true) {
-            return Fate::in_row(d.ended);
-        }
         self.in_row(session, &d.id).is_some_and(|x| x.key == d.key)
     }
 
