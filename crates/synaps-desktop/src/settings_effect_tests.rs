@@ -594,39 +594,45 @@ fn settings_in_a_pane_not_focused_reads_again_on_activation(cx: &mut TestAppCont
     assert_eq!(dash.reads(), reads + 1, "Settings open, not shown: no read");
 }
 
-/// Settings in a split keeps its config as the session's pane beside it
-/// takes the focus: it is still on screen (Shady #112 round 2: the focused
-/// pane's tabs alone decided). Open behind a tab in a pane on screen, it
-/// keeps it too; folded out of sight, it goes.
-#[gpui_kit::test]
-fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut TestAppContext) {
-    use crate::pane::KeysTo;
-    use crate::tabs::Kind;
-    let (pg, dash) = effect_page(cx, "split-kept", json!({IDLE: "600"}), "0.13.0", json!(600));
-    find(cx, &pg, IDLE);
-    let in_force = "effect daemon.idle_exit_secs = in force";
-    assert!(drawn(cx, pg.w, in_force));
+/// A split beside `kind`'s pane, the new pane focused on the session:
+/// (`kind`'s pane, the new one).
+fn split_beside(cx: &mut TestAppContext, pg: &Page, kind: crate::tabs::Kind) -> (crate::pane::PaneId, crate::pane::PaneId) {
     pg.view.update(cx, |v, _| v.app_settings.split = true);
     {
         use gpui_kit::AppContext as _;
         cx.update_window(pg.w, |_, window, cx| pg.view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
     }
     settle(cx, pg.w, 8);
-    let (left, right) = pg.view.read_with(cx, |v, _| {
-        let left = v.panes.rest.iter().find(|p| p.parked.tabs.view() == Some(Kind::Settings)).expect("Settings, in the other pane");
+    pg.view.read_with(cx, |v, _| {
+        let at = v.panes.rest.iter().find(|p| p.parked.tabs.view() == Some(kind)).expect("the view, in the other pane");
         assert!(v.panes.shown_split() && v.model.tabs.view().is_none(), "the new pane, focused, on the session");
-        (left.id, v.panes.cur.id)
-    });
+        (at.id, v.panes.cur.id)
+    })
+}
+
+fn focus(cx: &mut TestAppContext, pg: &Page, id: crate::pane::PaneId) {
+    pg.view.update(cx, |v, cx| v.focus_pane(id, crate::pane::KeysTo::Pane, cx));
+    settle(cx, pg.w, 8);
+}
+
+/// Settings in a split keeps its config as the session's pane beside it
+/// takes the focus: it is still on screen (Shady #112 round 2: the focused
+/// pane's tabs alone decided). Open behind a tab in a pane on screen, it
+/// keeps it too; folded out of sight, it goes.
+#[gpui_kit::test]
+fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "split-kept", json!({IDLE: "600"}), "0.13.0", json!(600));
+    find(cx, &pg, IDLE);
+    let in_force = "effect daemon.idle_exit_secs = in force";
+    assert!(drawn(cx, pg.w, in_force));
+    let (left, right) = split_beside(cx, &pg, Kind::Settings);
     let reads = dash.reads();
     let config = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.shown_config().map(|c| c.idle_exit_running));
-    let focus = |cx: &mut TestAppContext, id| {
-        pg.view.update(cx, |v, cx| v.focus_pane(id, KeysTo::Pane, cx));
-        settle(cx, pg.w, 8);
-    };
     assert_eq!(config(cx), Some(Some(600)), "split: the session's pane focused, Settings keeps its config");
     assert!(drawn(cx, pg.w, in_force), "and draws it, in the pane not focused");
-    focus(cx, left);
-    focus(cx, right);
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
     assert_eq!(pg.view.read_with(cx, |v, _| v.model.tabs.view()), None, "the session's pane focused again");
     assert_eq!(config(cx), Some(Some(600)), "focused away again: kept");
     assert!(drawn(cx, pg.w, in_force), "drawn");
@@ -640,8 +646,8 @@ fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut
         });
     });
     settle(cx, pg.w, 8);
-    focus(cx, left);
-    focus(cx, right);
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
     assert_eq!(config(cx), Some(Some(600)), "open behind a tab, in a pane on screen: kept");
     // Folded (each frame folds it again or not, by the window's size): the
     // focused pane alone on screen, Settings out of sight.
@@ -649,6 +655,29 @@ fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut
         v.panes.folded = true;
         v.view_shown(cx);
         assert!(v.dash.config.is_none(), "folded out of sight: gone");
+    });
+}
+
+/// Usage in a split keeps its board as the session's pane beside it takes
+/// the focus, as Settings keeps its config; folded out of sight, it goes.
+#[gpui_kit::test]
+fn usage_in_a_split_keeps_its_board_as_the_session_pane_takes_focus(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let pg = super::settings_continuity_tests::window(cx, "usage-split", (1440., 900.));
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    let board = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.usage.board.clone());
+    let first = board(cx).expect("the demo's board, read as Usage opened");
+    let (left, right) = split_beside(cx, &pg, Kind::Usage);
+    assert!(board(cx).is_some_and(|b| std::sync::Arc::ptr_eq(&b, &first)), "split: the session's pane focused, Usage keeps its board");
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
+    assert_eq!(pg.view.read_with(cx, |v, _| v.model.tabs.view()), None, "the session's pane focused again");
+    assert!(board(cx).is_some(), "focused away again: kept");
+    pg.view.update(cx, |v, cx| {
+        v.panes.folded = true;
+        v.view_shown(cx);
+        assert!(v.usage.board.is_none(), "folded out of sight: gone");
     });
 }
 

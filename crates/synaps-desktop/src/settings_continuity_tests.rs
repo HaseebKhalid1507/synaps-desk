@@ -50,7 +50,7 @@ const NARROW: (f32, f32) = (1440., 900.);
 /// in the frame (`app.rs`' `pane_wants`); with the tests' motion clock
 /// pinned that spring never lands, and a test window's draw never ends.
 /// Motion's own case starts from Off.
-fn window(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
+pub(super) fn window(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
     let home = own(&format!("continuity-{name}"));
     let (w, view, events) = open_at(cx, size, crate::theme::Panels::default().text_size);
     cx.update_window(w, |_, window, _| window.activate_window()).expect("the window");

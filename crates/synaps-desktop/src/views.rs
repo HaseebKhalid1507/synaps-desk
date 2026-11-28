@@ -658,16 +658,15 @@ impl AppView {
 
     /// A view came on screen or a tab closed (after the frame that showed
     /// it, never inside a render): what a closed view showed goes, and what
-    /// the one on screen shows is asked for again if stale. Settings' goes
+    /// the one on screen shows is asked for again if stale. A view's goes
     /// only when no pane on screen has it open: a split's other pane may
     /// show it.
     pub(crate) fn view_shown(&mut self, cx: &mut Context<Self>) {
-        let open = |k: Kind| self.model.tabs.iter().any(|t| t.kind == k);
-        if !open(Kind::Usage) {
+        if !self.open_on_screen(Kind::Usage) {
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
         }
-        if !self.tabs_on_screen().any(|t| t.iter().any(|t| t.kind == Kind::Settings)) {
+        if !self.open_on_screen(Kind::Settings) {
             self.settings.reference = None;
             self.settings.writes.clear();
             self.dash.config = None;
@@ -1159,6 +1158,11 @@ impl AppView {
     /// another tab, it isn't.
     fn settings_on_screen(&self) -> bool {
         self.tabs_on_screen().any(|t| t.view() == Some(Kind::Settings))
+    }
+
+    /// `kind` is open in a pane on screen: its visible tab, or behind another.
+    fn open_on_screen(&self, kind: Kind) -> bool {
+        self.tabs_on_screen().any(|t| t.iter().any(|t| t.kind == kind))
     }
 
     /// The tabs of each pane on screen: every pane split, the focused one
