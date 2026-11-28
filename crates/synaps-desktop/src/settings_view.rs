@@ -25,6 +25,7 @@ use crate::fonts::TextPx as _;
 use crate::model::ConnState;
 use crate::rail::State;
 use crate::settings::{self, Cat};
+use crate::settings_find::{self as find, Fields, Found, Hit};
 use crate::theme::{self, Palette};
 use crate::usage::Range;
 use crate::views::{Answer, ViewCx};
@@ -146,8 +147,10 @@ type Saved = (u64, bool, Option<Instant>, Option<u64>);
 
 #[derive(Default)]
 pub(crate) struct SettingsUi {
-    /// The find text, lowercase.
-    pub find: String,
+    /// The find: its query, and what each row of the page was found as,
+    /// with its hits (settings_find.rs). A row is matched when the query or
+    /// its strings change; a draw reads what was found.
+    pub search: RefCell<find::Search>,
     /// Each value shown (by its control): what it was, whether it was being
     /// sent, and when its save's afterglow begins (motion.md §6.8).
     pub saved: RefCell<HashMap<SharedString, Saved>>,
@@ -237,6 +240,10 @@ fn app_pairs(keys: &AppBatch) -> Vec<(&'static str, serde_json::Value)> {
 
 /// THIS SESSION's Cache keep-warm row: its mode, read-only until the
 /// client has a keep-warm call of its own (`/keepwarm` is an engine command).
+/// THIS SESSION's System prompt row.
+const SYSTEM_PROMPT_HELP: &str =
+    "This session's system prompt (/prompt in the TUI). Applying and reloading from disk wait for the client's Set.";
+
 const KEEPWARM_HELP: &str = "This session's keep-warm, as its status says: off, auto, or stop after <N>h. Change it with /keepwarm in the TUI. — until the daemon answers: SynapsCLI 0.13.0 and later are asked. The pin is another setting.";
 
 /// One row's parts.
@@ -248,10 +255,83 @@ struct Row {
     control: AnyElement,
     tag: Option<&'static str>,
     under: Vec<AnyElement>,
+    /// As the find took it (its hits by its number).
+    found: Option<Found>,
 }
 
 fn sans(text: impl Into<SharedString>, size: f32, line: f32, color: Hsla) -> Div {
-    div().text_px(size).line_height(px(line)).text_color(color).child(text.into())
+    sans_in(size, line, color).child(text.into())
+}
+
+/// [`sans`] with no text in it yet.
+fn sans_in(size: f32, line: f32, color: Hsla) -> Div {
+    div().text_px(size).line_height(px(line)).text_color(color)
+}
+
+/// `app::mono` with no text in it yet.
+fn mono_in(size: f32, color: Hsla) -> Div {
+    div().font_family(fonts::MONO).text_px(size).text_color(color).whitespace_nowrap()
+}
+
+/// A text's hit runs (one field's, from a find), at most a row's 8: those
+/// within `from..to` of the field, moved to start at `at` in the text
+/// drawn; sorted, an overlap merged (`StyledText` takes them so).
+#[derive(Clone, Copy, Default)]
+struct Runs {
+    at: [(u16, u16); find::HITS_PER_ROW],
+    n: u8,
+}
+
+impl Runs {
+    fn of(hits: &[Hit], field: u8, from: usize, to: usize, at: usize) -> Runs {
+        let mut r = Runs::default();
+        for h in hits.iter().filter(|h| h.field == field) {
+            let (s, e) = (usize::from(h.start), usize::from(h.end));
+            if s < from || e > to || usize::from(r.n) == r.at.len() {
+                continue;
+            }
+            r.at[usize::from(r.n)] = ((s - from + at) as u16, (e - from + at) as u16);
+            r.n += 1;
+        }
+        r.at[..usize::from(r.n)].sort_unstable();
+        let mut k = 0;
+        for i in 0..usize::from(r.n) {
+            let (s, e) = r.at[i];
+            if k > 0 && s < r.at[k - 1].1 {
+                r.at[k - 1].1 = r.at[k - 1].1.max(e);
+            } else {
+                r.at[k] = (s, e);
+                k += 1;
+            }
+        }
+        r.n = k as u8;
+        r
+    }
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        self.at[..usize::from(self.n)].iter().map(|&(s, e)| usize::from(s)..usize::from(e))
+    }
+}
+
+/// `el` with `text` in it, its hit runs in `you` (PLAN §1.7). `said`: its
+/// selector (tests) names them, `hits {name} {field} = a|b`.
+fn lit(el: Div, text: SharedString, runs: Runs, you: Hsla, said: Option<(SharedString, &'static str)>) -> Div {
+    if runs.is_empty() {
+        return el.child(text);
+    }
+    let style = HighlightStyle { color: Some(you), ..Default::default() };
+    let el = match said {
+        Some((name, field)) => {
+            let text = text.clone();
+            el.debug_selector(move || format!("hits {name} {field} = {}", runs.iter().map(|r| &text[r]).collect::<Vec<_>>().join("|")))
+        }
+        None => el,
+    };
+    el.child(StyledText::new(text).with_highlights(runs.iter().map(move |r| (r, style))))
 }
 
 /// The value a session row shows.
@@ -437,12 +517,39 @@ impl AppView {
         self.set_panels_pub(p, cx);
     }
 
-    /// The find field changed.
+    /// The find field changed: its query (at most 16 words in 256 bytes).
     pub(crate) fn settings_find(&mut self, text: String, cx: &mut Context<Self>) {
-        let f = text.trim().to_lowercase();
-        if f != self.settings.find {
-            self.settings.find = f;
+        if self.settings.search.get_mut().set(find::Query::parse(&text)) {
             self.views_changed(cx);
+        }
+    }
+
+    /// A row of the page's own strings, to the find: found or not, with
+    /// its rank and hits. With no query, every row.
+    fn take(&self, f: &Fields<'static>) -> Option<Found> {
+        self.settings.search.borrow_mut().take(f)
+    }
+
+    /// [`Self::take`] for a row of strings made for this draw (a fact, a
+    /// provider, a plugin).
+    fn take_made(&self, f: &Fields) -> Option<Found> {
+        self.settings.search.borrow_mut().take_made(f)
+    }
+
+    /// THIS APP's row `id`, its control and what is under it built only
+    /// when the find takes it.
+    fn app_row(
+        &self,
+        rows: &mut Vec<Row>,
+        id: &'static str,
+        label: &'static str,
+        key: &'static str,
+        help: &'static str,
+        build: impl FnOnce() -> (AnyElement, Vec<AnyElement>),
+    ) {
+        if let Some(found) = self.take(&Fields::new(label, key, help)) {
+            let (control, under) = build();
+            rows.push(Row { id: id.into(), label: label.into(), key, help, control, tag: None, under, found: Some(found) });
         }
     }
 
@@ -818,7 +925,23 @@ impl AppView {
 
     fn render_row(&self, r: Row, first: bool, p: &Palette, cx: &ViewCx) -> AnyElement {
         let open = self.settings.open_help == Some(r.key);
-        let help: SharedString = if open { r.help.into() } else { settings::first_sentence(r.help).into() };
+        let search = self.settings.search.borrow();
+        let hits = r.found.map_or(&[][..], |f| search.hits_of(f.row));
+        // Its help: all of it when open; else the first sentence, or the
+        // sentence that holds the find's first hit past it (with `…`).
+        let lead = settings::first_sentence(r.help);
+        let past = hits.iter().filter(|h| h.field == find::HELP).map(|h| usize::from(h.start)).min().filter(|&at| at >= lead.len());
+        let (help, help_runs): (SharedString, Runs) = match past {
+            _ if open => (r.help.into(), Runs::of(hits, find::HELP, 0, r.help.len(), 0)),
+            Some(at) => {
+                let s = settings::sentence_at(r.help, at);
+                (format!("… {}", &r.help[s.clone()]).into(), Runs::of(hits, find::HELP, s.start, s.end, "… ".len()))
+            }
+            None => (lead.into(), Runs::of(hits, find::HELP, 0, lead.len(), 0)),
+        };
+        let (label_runs, key_runs) = (Runs::of(hits, find::LABEL, 0, r.label.len(), 0), Runs::of(hits, find::KEY, 0, r.key.len(), 0));
+        drop(search);
+        let name: SharedString = if r.key.is_empty() { r.id.clone() } else { r.key.into() };
         let key = r.key;
         let more = r.help.len() > settings::first_sentence(r.help).len();
         let line = h_flex()
@@ -841,13 +964,21 @@ impl AppView {
                         h_flex()
                             .gap(px(10.))
                             .items_baseline()
-                            .child(sans(r.label, 14., 22., p.ink))
-                            .when(!key.is_empty(), |d| d.child(mono(key, 12., p.dim))),
+                            .when(!label_runs.is_empty() || !key_runs.is_empty(), |d| {
+                                let name = name.clone();
+                                d.debug_selector(move || format!("hit-{name}"))
+                            })
+                            .child(lit(sans_in(14., 22., p.ink), r.label, label_runs, p.you, Some((name.clone(), "label"))))
+                            .when(!key.is_empty(), |d| d.child(lit(mono_in(12., p.dim), key.into(), key_runs, p.you, Some((name, "key"))))),
                     )
                     .when(!r.help.is_empty(), |d| {
                         // Its selector says the text it was handed (tests).
                         let said = help.clone();
-                        d.child(sans(help, 13., 20., p.dim).whitespace_normal().debug_selector(move || format!("help-text {key} = {said}")))
+                        d.child(
+                            lit(sans_in(13., 20., p.dim), help, help_runs, p.you, None)
+                                .whitespace_normal()
+                                .debug_selector(move || format!("help-text {key} = {said}")),
+                        )
                     })
                     .when_some(r.tag, |d, t| d.child(mono(t, 12., p.dim).mt(px(2.)).debug_selector(move || format!("tag {key} = {t}")))),
             )
@@ -869,7 +1000,7 @@ impl AppView {
 
     fn group_head(&self, ix: usize, title: SharedString, line: SharedString, p: &Palette, cx: &ViewCx) -> Div {
         let more = ix == 4;
-        let open = self.settings.more_open || !self.settings.find.is_empty();
+        let open = self.settings.more_open || !self.settings.search.borrow().query().is_empty();
         v_flex()
             .pt(px(40.))
             .pb(px(8.))
@@ -904,7 +1035,10 @@ impl AppView {
         let col = (pane - 48.).clamp(320., COLUMN);
         let index = pane >= INDEX_FROM;
         let left = if index { ((pane - col) / 2.).max(INDEX + 48.) } else { ((pane - col) / 2.).max(24.) };
-        let find = self.settings.find.clone();
+        let (on, said, note) = {
+            let s = self.settings.search.borrow();
+            (!s.query().is_empty(), s.query().text().to_string(), s.query().note())
+        };
         let wrap = |inner: AnyElement| h_flex().w_full().pl(px(left)).child(div().w(px(col)).flex_none().child(inner)).into_any_element();
         let mut blocks: Vec<AnyElement> = Vec::with_capacity(8);
         // Title and find.
@@ -916,50 +1050,78 @@ impl AppView {
                 .child(display("S E T T I N G S", fonts::size::D_L, p.header))
                 .child(div().flex_1())
                 .child(
-                    h_flex()
-                        .w(px(CONTROL))
-                        .h(px(28.))
-                        .px(px(10.))
-                        .items_center()
-                        .border_1()
-                        .border_color(p.edge)
-                        .debug_selector(|| "settings-find".into())
+                    div()
+                        .relative()
                         .child(
-                            div()
-                                .flex_1()
-                                .font_family(crate::fonts::MONO)
-                                .text_px(13.)
-                                .child(Input::new(&self.settings_find).appearance(false)),
-                        ),
+                            h_flex()
+                                .w(px(CONTROL))
+                                .h(px(28.))
+                                .px(px(10.))
+                                .items_center()
+                                .border_1()
+                                .border_color(p.edge)
+                                .debug_selector(|| "settings-find".into())
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_family(crate::fonts::MONO)
+                                        .text_px(13.)
+                                        .child(Input::new(&self.settings_find).appearance(false)),
+                                ),
+                        )
+                        // A query cut to its first 16 words or 256 bytes says
+                        // so, under the field (taking no room from the page).
+                        .when_some(note, |d, n| {
+                            d.child(
+                                mono(n, 12., p.dim)
+                                    .absolute()
+                                    .top(px(32.))
+                                    .right(px(0.))
+                                    .debug_selector(move || format!("settings-find-note {n}")),
+                            )
+                        }),
                 )
                 .into_any_element(),
         ));
         let gate = self.config_gate();
-        let groups = [
-            self.group_connection(p, &find),
-            self.group_app(p, cx, &find),
-            self.group_session(p, cx, gate.is_ok(), &find),
-            self.group_config(p, cx, &gate, &find),
-            self.group_more(p, &find),
-            self.group_providers(p, &find),
-            self.group_plugins(p, &find),
-        ];
+        let walk = || {
+            [
+                self.group_connection(p),
+                self.group_app(p, cx),
+                self.group_session(p, cx, gate.is_ok()),
+                self.group_config(p, cx, &gate),
+                self.group_more(p),
+                self.group_providers(p),
+                self.group_plugins(p),
+            ]
+        };
+        // The find's walk over the rows (settings_find.rs): a row is matched
+        // only when the query or its strings changed. When the walk finds
+        // the other way right (rows as typed came or went), the page walks
+        // again, from what was found.
+        self.settings.search.borrow_mut().begin();
+        let mut groups = walk();
+        if self.settings.search.borrow_mut().end() {
+            self.settings.search.borrow_mut().begin();
+            groups = walk();
+            self.settings.search.borrow_mut().end();
+        }
         let mut shown_groups = Vec::new();
         for (ix, (line, rows)) in groups.into_iter().enumerate() {
-            if !find.is_empty() && rows.is_empty() {
+            if on && rows.is_empty() {
                 continue;
             }
             shown_groups.push(ix);
             let mut g = self.group_head(ix, GROUPS[ix].into(), line, p, cx);
-            let folded = ix == 4 && !self.settings.more_open && find.is_empty();
+            let folded = ix == 4 && !self.settings.more_open && !on;
             if !folded {
                 g = g.children(rows);
             }
             blocks.push(wrap(g.into_any_element()));
         }
-        if !find.is_empty() && shown_groups.is_empty() {
-            let nothing = sans(format!("Nothing matches “{find}”."), 13., 20., p.dim).pt(px(40.));
-            blocks.push(wrap(nothing.debug_selector(|| format!("settings-nothing {find}")).into_any_element()));
+        if on && shown_groups.is_empty() {
+            let nothing = sans(format!("Nothing matches “{said}”."), 13., 20., p.dim).pt(px(40.));
+            blocks.push(wrap(nothing.debug_selector(|| format!("settings-nothing {said}")).into_any_element()));
         }
         blocks.push(div().h(px(64.)).into_any_element());
         // The group at the top of the view (child 0 is the title). A scroll
@@ -998,8 +1160,10 @@ impl AppView {
 
     // ── the groups: (header line, rows) ────────────────────────────────
 
-    fn info_row(label: &'static str, value: impl Into<SharedString>, first: bool, p: &Palette) -> AnyElement {
+    /// A fact: its label and value, the find's hits in them (`hits`).
+    fn info_row(label: &'static str, value: impl Into<SharedString>, first: bool, hits: &[Hit], p: &Palette) -> AnyElement {
         let value = value.into();
+        let (lr, vr) = (Runs::of(hits, find::LABEL, 0, label.len(), 0), Runs::of(hits, find::VALUE, 0, value.len(), 0));
         h_flex()
             .debug_selector(|| format!("fact {label} = {value}"))
             .w_full()
@@ -1008,12 +1172,12 @@ impl AppView {
             .gap(px(24.))
             .items_center()
             .when(!first, |d| d.border_t_1().border_color(p.hair))
-            .child(sans(label, 14., 22., p.ink).w(px(180.)).flex_none())
-            .child(mono(value, 13., p.prose).flex_1().min_w_0().whitespace_normal())
+            .child(lit(sans_in(14., 22., p.ink), label.into(), lr, p.you, Some((label.into(), "label"))).w(px(180.)).flex_none())
+            .child(lit(mono_in(13., p.prose), value, vr, p.you, Some((label.into(), "value"))).flex_1().min_w_0().whitespace_normal())
             .into_any_element()
     }
 
-    fn group_connection(&self, p: &Palette, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_connection(&self, p: &Palette) -> (SharedString, Vec<AnyElement>) {
         let d = self.model.daemon.as_ref();
         let socket = self.dash.socket.as_ref().map(|s| s.display().to_string()).unwrap_or_else(|| crate::usage::NONE.into());
         let kind = match (&self.dash.local, d) {
@@ -1077,16 +1241,15 @@ impl AppView {
             ("synaps-dash", dash),
             ("Telemetry sources", sources),
         ];
-        let rows = rows
-            .into_iter()
-            .filter(|(l, v)| settings::matches(find, l, "", v))
-            .enumerate()
-            .map(|(i, (l, v))| Self::info_row(l, v, i == 0, p))
-            .collect();
+        let mut rows: Vec<(Found, &'static str, String)> =
+            rows.into_iter().filter_map(|(l, v)| self.take_made(&Fields::fact(l, &v)).map(|f| (f, l, v))).collect();
+        rows.sort_by_key(|(f, ..)| f.rank);
+        let search = self.settings.search.borrow();
+        let rows = rows.into_iter().enumerate().map(|(i, (f, l, v))| Self::info_row(l, v, i == 0, search.hits_of(f.row), p)).collect();
         (line.into(), rows)
     }
 
-    fn group_app(&self, p: &Palette, cx: &ViewCx, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_app(&self, p: &Palette, cx: &ViewCx) -> (SharedString, Vec<AnyElement>) {
         let path =
             theme::settings_path().map(|p| crate::named::home_short(&p.display().to_string())).unwrap_or_else(|| "no config folder".into());
         let scheme = cx.global::<theme::Scheme>();
@@ -1117,56 +1280,56 @@ impl AppView {
         } else {
             scheme.choice.theme.clone()
         };
-        rows.push(Row {
-            id: "app-theme".into(),
-            label: "Theme".into(),
-            key: "theme",
-            help: "One of the Synaps TUI's themes. Following the Synaps config shows the theme its `theme =` names.",
-            control: match pinned(self.theme_source, "--theme", theme::ENV_THEME) {
-                Some(why) => Self::locked("theme", format!("{} · {why}", scheme.choice.theme), p),
-                None => h_flex()
-                    .gap(px(12.))
-                    .items_center()
-                    .child({
-                        let shown = SharedString::from(theme_value);
-                        let said = shown.clone();
-                        mono(shown, 13., p.prose).debug_selector(move || format!("value theme = {said}"))
-                    })
-                    .child(open_picker("app-theme-pick"))
-                    .into_any_element(),
+        self.app_row(
+            &mut rows,
+            "app-theme",
+            "Theme",
+            "theme",
+            "One of the Synaps TUI's themes. Following the Synaps config shows the theme its `theme =` names.",
+            || {
+                let control = match pinned(self.theme_source, "--theme", theme::ENV_THEME) {
+                    Some(why) => Self::locked("theme", format!("{} · {why}", scheme.choice.theme), p),
+                    None => h_flex()
+                        .gap(px(12.))
+                        .items_center()
+                        .child({
+                            let shown = SharedString::from(theme_value);
+                            let said = shown.clone();
+                            mono(shown, 13., p.prose).debug_selector(move || format!("value theme = {said}"))
+                        })
+                        .child(open_picker("app-theme-pick"))
+                        .into_any_element(),
+                };
+                (control, Vec::new())
             },
-            tag: None,
-            under: Vec::new(),
-        });
+        );
         let accent = scheme.choice.accent.map(theme::to_hex).unwrap_or_else(|| "none (the theme's)".into());
-        rows.push(Row {
-            id: "app-accent".into(),
-            label: "Accent".into(),
-            key: "accent",
-            help: "Replaces the theme's “you” and focus colours; never a state.",
-            control: match pinned(self.accent_source, "--accent", theme::ENV_ACCENT) {
-                Some(why) => Self::locked("accent", format!("{accent} · {why}"), p),
-                None => h_flex()
-                    .gap(px(12.))
-                    .items_center()
-                    .child({
-                        let shown = SharedString::from(accent);
-                        let said = shown.clone();
-                        mono(shown, 13., p.prose).debug_selector(move || format!("value accent = {said}"))
-                    })
-                    .child(open_picker("app-accent-pick"))
-                    .into_any_element(),
+        self.app_row(
+            &mut rows,
+            "app-accent",
+            "Accent",
+            "accent",
+            "Replaces the theme's “you” and focus colours; never a state.",
+            || {
+                let control = match pinned(self.accent_source, "--accent", theme::ENV_ACCENT) {
+                    Some(why) => Self::locked("accent", format!("{accent} · {why}"), p),
+                    None => h_flex()
+                        .gap(px(12.))
+                        .items_center()
+                        .child({
+                            let shown = SharedString::from(accent);
+                            let said = shown.clone();
+                            mono(shown, 13., p.prose).debug_selector(move || format!("value accent = {said}"))
+                        })
+                        .child(open_picker("app-accent-pick"))
+                        .into_any_element(),
+                };
+                (control, Vec::new())
             },
-            tag: None,
-            under: Vec::new(),
-        });
+        );
         let size = self.panels.text_size.to_string();
-        rows.push(Row {
-            id: "app-text".into(),
-            label: "Text size".into(),
-            key: "text_size",
-            help: "The centre pane's text, in px (Ctrl+= and Ctrl+- step it).",
-            control: self.choice(
+        self.app_row(&mut rows, "app-text", "Text size", "text_size", "The centre pane's text, in px (Ctrl+= and Ctrl+- step it).", || {
+            let control = self.choice(
                 "text-size",
                 Pick::TextSize,
                 theme::TEXT_STEPS.iter().map(|s| SharedString::from(s.to_string())).collect(),
@@ -1174,76 +1337,75 @@ impl AppView {
                 None,
                 p,
                 cx,
-            ),
-            tag: None,
-            under: Vec::new(),
+            );
+            (control, Vec::new())
         });
         let motion = cx.try_global::<crate::motion::Setting>().copied().unwrap_or_default();
         let level = crate::motion::Level::current(cx);
-        rows.push(Row {
-            id: "app-motion".into(),
-            label: "Motion".into(),
-            key: "motion",
-            help: "Full, reduced (no movement, short fades) or off (nothing animates). Follows the system until you choose.",
-            control: match motion.lock {
-                Some(crate::motion::Lock::Flag) => Self::locked("motion", format!("{} · set by --motion for this run", level.key()), p),
-                Some(crate::motion::Lock::NoBootFx) => {
-                    Self::locked("motion", format!("off · set by ${}", crate::motion::ENV_NO_BOOT_FX), p)
-                }
-                None => self.choice(
-                    "motion",
-                    Pick::Motion,
-                    crate::motion::Level::ALL.iter().map(|l| SharedString::from(l.key())).collect(),
-                    Some(level.key()),
+        self.app_row(
+            &mut rows,
+            "app-motion",
+            "Motion",
+            "motion",
+            "Full, reduced (no movement, short fades) or off (nothing animates). Follows the system until you choose.",
+            || {
+                let control = match motion.lock {
+                    Some(crate::motion::Lock::Flag) => Self::locked("motion", format!("{} · set by --motion for this run", level.key()), p),
+                    Some(crate::motion::Lock::NoBootFx) => {
+                        Self::locked("motion", format!("off · set by ${}", crate::motion::ENV_NO_BOOT_FX), p)
+                    }
+                    None => self.choice(
+                        "motion",
+                        Pick::Motion,
+                        crate::motion::Level::ALL.iter().map(|l| SharedString::from(l.key())).collect(),
+                        Some(level.key()),
+                        None,
+                        p,
+                        cx,
+                    ),
+                };
+                (control, Vec::new())
+            },
+        );
+        self.app_row(
+            &mut rows,
+            "app-notify",
+            "Card notifications",
+            NOTIFY,
+            "An OS notification when an agent waits on a card while the window, or its session, is not in front.",
+            || {
+                let control = self.choice(
+                    NOTIFY,
+                    Pick::Notify,
+                    vec!["on".into(), "off".into()],
+                    Some(if self.app_settings.quiet { "off" } else { "on" }),
                     None,
                     p,
                     cx,
-                ),
+                );
+                (control, Vec::new())
             },
-            tag: None,
-            under: Vec::new(),
-        });
-        rows.push(Row {
-            id: "app-notify".into(),
-            label: "Card notifications".into(),
-            key: NOTIFY,
-            help: "An OS notification when an agent waits on a card while the window, or its session, is not in front.",
-            control: self.choice(
-                NOTIFY,
-                Pick::Notify,
-                vec!["on".into(), "off".into()],
-                Some(if self.app_settings.quiet { "off" } else { "on" }),
-                None,
-                p,
-                cx,
-            ),
-            tag: None,
-            under: Vec::new(),
-        });
-        // Forget while anything may be there: off (the file unread), a
-        // choice remembered, the file there (an unreadable one too), or a
-        // removal or a sweep that failed, said under the row.
-        let forget: AnyElement = if !self.recall.offers_forget() {
-            mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
-        } else {
-            div()
-                .id("recall-forget")
-                .debug_selector(|| "recall-forget".into())
-                .cursor_pointer()
-                .child(mono("forget remembered choices", 12., p.dim))
-                .hover(|d| d.text_color(p.ink))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.forget_card_choices(cx);
-                    this.views_changed(cx);
-                }))
-                .into_any_element()
-        };
-        rows.push(Row {
-            id: "app-recall".into(),
-            label: "Remember card choices".into(),
-            key: crate::recall::SETTING,
-            help: "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. The highlight is only a starting point: nothing is ticked or sent for you, and Enter sends what's ticked (on a one-choice card, the option highlighted). Only which option you picked is kept, on this machine, never a note or a field's text.",
-            control: h_flex()
+        );
+        self.app_row(&mut rows, "app-recall", "Remember card choices", crate::recall::SETTING, "When an agent asks the same card question again in the same folder, the card starts with your last choice highlighted, marked “last time”. The highlight is only a starting point: nothing is ticked or sent for you, and Enter sends what's ticked (on a one-choice card, the option highlighted). Only which option you picked is kept, on this machine, never a note or a field's text.", || {
+            // Forget while anything may be there: off (the file unread), a
+            // choice remembered, the file there (an unreadable one too), or a
+            // removal or a sweep that failed, said under the row.
+            let forget: AnyElement = if !self.recall.offers_forget() {
+                mono("nothing remembered", 12., p.dim).debug_selector(|| "recall-none".into()).into_any_element()
+            } else {
+                div()
+                    .id("recall-forget")
+                    .debug_selector(|| "recall-forget".into())
+                    .cursor_pointer()
+                    .child(mono("forget remembered choices", 12., p.dim))
+                    .hover(|d| d.text_color(p.ink))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.forget_card_choices(cx);
+                        this.views_changed(cx);
+                    }))
+                    .into_any_element()
+            };
+            let control = h_flex()
                 .gap(px(12.))
                 .items_center()
                 .child(forget)
@@ -1256,9 +1418,8 @@ impl AppView {
                     p,
                     cx,
                 ))
-                .into_any_element(),
-            tag: None,
-            under: self
+                .into_any_element();
+            (control, self
                 .recall
                 .not_removed()
                 .map(|why| {
@@ -1268,98 +1429,86 @@ impl AppView {
                         .into_any_element()
                 })
                 .into_iter()
-                .collect(),
+                .collect())
         });
         for (rail, label, key, id) in
             [(true, "Sessions rail", "rail_collapsed", "app-rail"), (false, "Right panel", "right_collapsed", "app-right")]
         {
-            let folded = if rail { self.panels.rail_collapsed } else { self.panels.right_collapsed };
-            let width = if rail { self.panels.rail_width } else { self.panels.right_width };
-            let mut control = h_flex().gap(px(12.)).items_center();
-            if width.is_some() {
-                control = control.child(
-                    div()
-                        .id(if rail { "rail-reset" } else { "right-reset" })
-                        .debug_selector(move || if rail { "rail-reset" } else { "right-reset" }.into())
-                        .cursor_pointer()
-                        .child(mono("reset width", 12., p.dim))
-                        .hover(|d| d.text_color(p.ink))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let mut pn = this.panels;
-                            if rail {
-                                pn.rail_width = None;
-                            } else {
-                                pn.right_width = None;
-                            }
-                            this.set_panels_pub(pn, cx);
-                        })),
-                );
-            }
-            let what = if rail { Pick::Rail } else { Pick::Right };
-            control = control.child(self.choice(
-                id,
-                what,
-                vec!["shown".into(), "folded".into()],
-                Some(if folded { "folded" } else { "shown" }),
-                None,
-                p,
-                cx,
-            ));
-            rows.push(Row {
-                id: id.into(),
-                label: label.into(),
-                key,
-                help: if rail {
-                    "Shown or folded to its strip (Ctrl+B); its dragged width."
-                } else {
-                    "Shown or folded to its strip (Ctrl+Alt+B); its dragged width."
-                },
-                control: control.into_any_element(),
-                tag: None,
-                under: Vec::new(),
+            let help = if rail {
+                "Shown or folded to its strip (Ctrl+B); its dragged width."
+            } else {
+                "Shown or folded to its strip (Ctrl+Alt+B); its dragged width."
+            };
+            self.app_row(&mut rows, id, label, key, help, || {
+                let folded = if rail { self.panels.rail_collapsed } else { self.panels.right_collapsed };
+                let width = if rail { self.panels.rail_width } else { self.panels.right_width };
+                let mut control = h_flex().gap(px(12.)).items_center();
+                if width.is_some() {
+                    control = control.child(
+                        div()
+                            .id(if rail { "rail-reset" } else { "right-reset" })
+                            .debug_selector(move || if rail { "rail-reset" } else { "right-reset" }.into())
+                            .cursor_pointer()
+                            .child(mono("reset width", 12., p.dim))
+                            .hover(|d| d.text_color(p.ink))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut pn = this.panels;
+                                if rail {
+                                    pn.rail_width = None;
+                                } else {
+                                    pn.right_width = None;
+                                }
+                                this.set_panels_pub(pn, cx);
+                            })),
+                    );
+                }
+                let what = if rail { Pick::Rail } else { Pick::Right };
+                control = control.child(self.choice(
+                    id,
+                    what,
+                    vec!["shown".into(), "folded".into()],
+                    Some(if folded { "folded" } else { "shown" }),
+                    None,
+                    p,
+                    cx,
+                ));
+                (control.into_any_element(), Vec::new())
             });
         }
-        rows.push(Row {
-            id: "app-label".into(),
-            label: "Daemon label".into(),
-            key: "daemon_label",
-            help: "Names a remote daemon in headers, since its Welcome carries no host name.",
-            control: self.field(
-                Edit::DaemonLabel,
-                self.app_settings.daemon_label.clone().unwrap_or_else(|| "none".into()).into(),
-                "",
-                false,
-                p,
-                cx,
-            ),
-            tag: None,
-            under: Vec::new(),
-        });
-        rows.push(Row {
-            id: "app-dash".into(),
-            label: "Dash URL".into(),
-            key: "dash_url",
-            help: "A remote daemon's synaps-dash, through a forwarded port on 127.0.0.1 (other hosts are refused). Empty: a local daemon's own URL file, --dash, or $SYNAPS_DASH_URL. A token pasted with it is kept for this run only, never saved. Never writes config.",
-            control: self.field(
+        self.app_row(
+            &mut rows,
+            "app-label",
+            "Daemon label",
+            "daemon_label",
+            "Names a remote daemon in headers, since its Welcome carries no host name.",
+            || {
+                let control = self.field(
+                    Edit::DaemonLabel,
+                    self.app_settings.daemon_label.clone().unwrap_or_else(|| "none".into()).into(),
+                    "",
+                    false,
+                    p,
+                    cx,
+                );
+                (control, Vec::new())
+            },
+        );
+        self.app_row(&mut rows, "app-dash", "Dash URL", "dash_url", "A remote daemon's synaps-dash, through a forwarded port on 127.0.0.1 (other hosts are refused). Empty: a local daemon's own URL file, --dash, or $SYNAPS_DASH_URL. A token pasted with it is kept for this run only, never saved. Never writes config.", || {
+            let control = self.field(
                 Edit::DashUrl,
                 self.app_settings.dash_url.as_deref().map(crate::dash::strip_token).unwrap_or_else(|| "discover".into()).into(),
                 "",
                 false,
                 p,
                 cx,
-            ),
-            tag: None,
-            under: Vec::new(),
+            );
+            (control, Vec::new())
         });
         let mut hosts: Vec<SharedString> = vec!["all".into()];
         hosts.extend(self.usage.chips.iter().map(|h| SharedString::from(h.clone())));
         let host = self.app_settings.usage_host.clone().unwrap_or_else(|| "all".into());
-        rows.push(Row {
-            id: "app-usage".into(),
-            label: "Usage opens on".into(),
-            key: "usage_range",
-            help: "The range and host Usage shows when it opens.",
-            control: v_flex()
+        self.app_row(&mut rows, "app-usage", "Usage opens on", "usage_range", "The range and host Usage shows when it opens.", || {
+            let control = v_flex()
                 .gap(px(8.))
                 .items_end()
                 .child(self.choice(
@@ -1372,13 +1521,12 @@ impl AppView {
                     cx,
                 ))
                 .child(self.choice("usage-host", Pick::Host, hosts, Some(&host), None, p, cx))
-                .into_any_element(),
-            tag: None,
-            under: Vec::new(),
+                .into_any_element();
+            (control, Vec::new())
         });
+        rows.sort_by_key(|r| r.found.map_or(0, |f| f.rank));
         let rows: Vec<AnyElement> = rows
             .into_iter()
-            .filter(|r| settings::matches(find, &r.label, r.key, r.help))
             .enumerate()
             .map(|(i, mut r)| {
                 if let Some((_, n)) = self.settings.app_note.as_ref().filter(|(k, _)| k.contains(&r.key)) {
@@ -1419,10 +1567,10 @@ impl AppView {
         warm.map(|w| w.mode.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| crate::usage::NONE.into())
     }
 
-    fn group_session(&self, p: &Palette, cx: &ViewCx, writable: bool, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_session(&self, p: &Palette, cx: &ViewCx, writable: bool) -> (SharedString, Vec<AnyElement>) {
         let target = self.model.tabs.current().filter(|_| self.model.lives[self.panes.cur.live].active.is_some());
         let Some(tab) = target else {
-            let rows = if settings::matches(find, "open a session to change these", "", "") {
+            let rows = if self.take(&Fields::new("open a session to change these", "", "")).is_some() {
                 vec![sans("Open a session to see these.", 13., 20., p.dim).py(px(12.)).into_any_element()]
             } else {
                 Vec::new()
@@ -1446,9 +1594,7 @@ impl AppView {
         let mut rows = Vec::new();
         for key in settings::SESSION_KEYS {
             let Some(d) = settings::def(key) else { continue };
-            if !settings::matches(find, d.label, key, d.help) {
-                continue;
-            }
+            let Some(found) = self.take(&Fields::new(d.label, key, d.help)) else { continue };
             let mut under = Vec::new();
             if self.shown_config().is_some_and(|c| c.exposes(key)) {
                 under.push(
@@ -1474,9 +1620,10 @@ impl AppView {
                 control: Self::session_locked(key, self.session_value(key), p),
                 tag: None,
                 under,
+                found: Some(found),
             });
         }
-        if settings::matches(find, "System prompt", "system_prompt", "system prompt") {
+        if let Some(found) = self.take(&Fields::new("System prompt", "system_prompt", SYSTEM_PROMPT_HELP)) {
             let prompt = self.model.lives[self.panes.cur.live].stats.view.as_ref().and_then(|v| v.system_prompt.clone());
             let well = match prompt {
                 Some(text) => {
@@ -1513,7 +1660,7 @@ impl AppView {
                 id: "session-system".into(),
                 label: "System prompt".into(),
                 key: "system_prompt",
-                help: "This session's system prompt (/prompt in the TUI). Applying and reloading from disk wait for the client's Set.",
+                help: SYSTEM_PROMPT_HELP,
                 control: Self::locked(
                     "system_prompt",
                     if self.model.lives[self.panes.cur.live].stats.view.as_ref().is_some_and(|v| v.system_prompt.is_some()) {
@@ -1525,11 +1672,16 @@ impl AppView {
                 ),
                 tag: None,
                 under: vec![well],
+                found: Some(found),
             });
         }
-        if settings::matches(find, "Cache keep-warm", "keepwarm", KEEPWARM_HELP)
-            || settings::def("cache_keepwarm").is_some_and(|d| settings::matches(find, d.label, d.key, d.help))
-        {
+        // Found by its own words, else (unlit) by the config key's it shows.
+        // Both are taken, whatever is found: a walk takes the same rows.
+        let own = self.take(&Fields::new("Cache keep-warm", "keepwarm", KEEPWARM_HELP));
+        let by_key = settings::def("cache_keepwarm")
+            .and_then(|d| self.settings.search.borrow_mut().take_unlit(&Fields::new(d.label, d.key, d.help)));
+        let keepwarm = own.or(by_key);
+        if let Some(found) = keepwarm {
             rows.push(Row {
                 id: "session-keepwarm".into(),
                 label: "Cache keep-warm".into(),
@@ -1538,15 +1690,17 @@ impl AppView {
                 control: Self::session_locked("keepwarm", self.session_keepwarm(), p),
                 tag: None,
                 under: Vec::new(),
+                found: Some(found),
             });
         }
+        rows.sort_by_key(|r| r.found.map_or(0, |f| f.rank));
         let rows = rows.into_iter().enumerate().map(|(i, r)| self.render_row(r, i == 0, p, cx)).collect();
         (line.into(), rows)
     }
 
     /// DAEMON CONFIG; its header says where the values come from and, when
     /// they cannot be written, why (the gate's first unproven link).
-    fn group_config(&self, p: &Palette, cx: &ViewCx, gate: &Result<(), String>, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_config(&self, p: &Palette, cx: &ViewCx, gate: &Result<(), String>) -> (SharedString, Vec<AnyElement>) {
         // The file the dash wrote, else the one read here.
         let path = self
             .shown_config()
@@ -1580,9 +1734,7 @@ impl AppView {
                     continue;
                 }
                 let Some(d) = settings::def(key) else { continue };
-                if !settings::matches(find, d.label, key, d.help) {
-                    continue;
-                }
+                let Some(found) = self.take(&Fields::new(d.label, key, d.help)) else { continue };
                 rows.push(Row {
                     id: format!("config-{key}").into(),
                     label: d.label.into(),
@@ -1591,8 +1743,10 @@ impl AppView {
                     control: self.config_control(key, writable, p, cx),
                     tag: self.applies(key),
                     under: self.config_under(key, writable, p),
+                    found: Some(found),
                 });
             }
+            rows.sort_by_key(|r| r.found.map_or(0, |f| f.rank));
             if !rows.is_empty() {
                 out.push(Self::sub_head(cat.title(), p));
                 out.extend(rows.into_iter().enumerate().map(|(i, r)| self.render_row(r, i == 0, p, cx)));
@@ -1601,16 +1755,19 @@ impl AppView {
         (line.into(), out)
     }
 
-    fn group_more(&self, p: &Palette, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_more(&self, p: &Palette) -> (SharedString, Vec<AnyElement>) {
         let mut out = Vec::new();
         for cat in Cat::ORDER {
+            let mut found: Vec<(Found, &settings::Def)> =
+                settings::reference(cat).filter_map(|d| self.take(&Fields::new(d.label, d.key, d.help)).map(|f| (f, d))).collect();
+            found.sort_by_key(|(f, _)| f.rank);
+            let search = self.settings.search.borrow();
             let mut lines = Vec::new();
-            for d in settings::reference(cat) {
-                if !settings::matches(find, d.label, d.key, d.help) {
-                    continue;
-                }
+            for (f, d) in found {
                 let value = self.reference_shown(d.key);
                 let first = lines.is_empty();
+                let hits = search.hits_of(f.row);
+                let (lr, kr) = (Runs::of(hits, find::LABEL, 0, d.label.len(), 0), Runs::of(hits, find::KEY, 0, d.key.len(), 0));
                 lines.push(
                     h_flex()
                         .debug_selector(|| format!("reference {} = {value}", d.key))
@@ -1619,10 +1776,22 @@ impl AppView {
                         .gap(px(12.))
                         .items_center()
                         .when(!first, |d| d.border_t_1().border_color(p.hair))
-                        .child(sans(d.label, 14., 22., p.ink).flex_none())
-                        .child(mono(d.key, 12., p.dim).flex_1().min_w_0().overflow_hidden().text_ellipsis())
+                        .child(lit(sans_in(14., 22., p.ink), d.label.into(), lr, p.you, Some((d.key.into(), "label"))).flex_none())
+                        .child(
+                            lit(mono_in(12., p.dim), d.key.into(), kr, p.you, Some((d.key.into(), "key")))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis(),
+                        )
                         .child(mono(value, 13., p.dim).flex_none().max_w(px(220.)).overflow_hidden().text_ellipsis())
                         .child(crate::glyph::session_mark(State::Locked, crate::glyph::Ground::Canvas, p))
+                        // Its line has a selector of its own: the hit mark is
+                        // a child out of the flow (no room, no gap).
+                        .when(!lr.is_empty() || !kr.is_empty(), |l| {
+                            let key = d.key;
+                            l.child(div().absolute().debug_selector(move || format!("hit-{key}")))
+                        })
                         .into_any_element(),
                 );
             }
@@ -1641,53 +1810,73 @@ impl AppView {
         (format!("{n} keys · edit with /settings in the TUI on the daemon's machine · {source}").into(), out)
     }
 
-    fn group_providers(&self, p: &Palette, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_providers(&self, p: &Palette) -> (SharedString, Vec<AnyElement>) {
+        let on = !self.settings.search.borrow().query().is_empty();
         let rows: Vec<AnyElement> = match self.shown_config() {
-            Some(c) if !c.providers.is_empty() => c
-                .providers
-                .iter()
-                .filter(|v| settings::matches(find, &v.name, &v.kind, &v.source))
-                .enumerate()
-                .map(|(i, v)| {
-                    let mut s = format!("{} · from {}", v.kind, v.source);
-                    if let Some(n) = &v.note {
-                        s.push_str(&format!(" · {n}"));
-                    }
-                    Self::info_row_owned(v.name.clone(), s, i == 0, p)
-                })
-                .collect(),
-            Some(_) if find.is_empty() => vec![sans("No providers configured.", 13., 20., p.dim).py(px(8.)).into_any_element()],
-            None if find.is_empty() => vec![sans(crate::usage::NONE, 13., 20., p.dim).py(px(8.)).into_any_element()],
+            Some(c) if !c.providers.is_empty() => {
+                let mut found: Vec<(Found, String, String)> = c
+                    .providers
+                    .iter()
+                    .filter_map(|v| {
+                        let mut s = format!("{} · from {}", v.kind, v.source);
+                        if let Some(n) = &v.note {
+                            s.push_str(&format!(" · {n}"));
+                        }
+                        self.take_made(&Fields::fact(&v.name, &s)).map(|f| (f, v.name.clone(), s))
+                    })
+                    .collect();
+                found.sort_by_key(|(f, ..)| f.rank);
+                let search = self.settings.search.borrow();
+                found
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (f, name, s))| Self::info_row_owned(name, s, i == 0, search.hits_of(f.row), p))
+                    .collect()
+            }
+            Some(_) if !on => vec![sans("No providers configured.", 13., 20., p.dim).py(px(8.)).into_any_element()],
+            None if !on => vec![sans(crate::usage::NONE, 13., 20., p.dim).py(px(8.)).into_any_element()],
             _ => Vec::new(),
         };
         ("read-only · keys and installs are managed in the TUI · never a key".into(), rows)
     }
 
-    fn group_plugins(&self, p: &Palette, find: &str) -> (SharedString, Vec<AnyElement>) {
+    fn group_plugins(&self, p: &Palette) -> (SharedString, Vec<AnyElement>) {
+        let on = !self.settings.search.borrow().query().is_empty();
         let rows: Vec<AnyElement> = match self.shown_config() {
-            Some(c) if !c.plugins.is_empty() => c
-                .plugins
-                .iter()
-                .filter(|v| settings::matches(find, &v.name, &v.scope, &v.description))
-                .enumerate()
-                .map(|(i, v)| {
-                    let s = format!(
-                        "{}{} · {}",
-                        if v.enabled { "enabled" } else { "disabled" },
-                        v.version.as_deref().map(|x| format!(" · v{x}")).unwrap_or_default(),
-                        v.scope
-                    );
-                    Self::info_row_owned(v.name.clone(), s, i == 0, p)
-                })
-                .collect(),
-            Some(_) if find.is_empty() => vec![sans("No plugins installed.", 13., 20., p.dim).py(px(8.)).into_any_element()],
-            None if find.is_empty() => vec![sans(crate::usage::NONE, 13., 20., p.dim).py(px(8.)).into_any_element()],
+            Some(c) if !c.plugins.is_empty() => {
+                // Its description isn't drawn: found by it, never lit in it.
+                let mut found: Vec<(Found, String, String)> = c
+                    .plugins
+                    .iter()
+                    .filter_map(|v| {
+                        let s = format!(
+                            "{}{} · {}",
+                            if v.enabled { "enabled" } else { "disabled" },
+                            v.version.as_deref().map(|x| format!(" · v{x}")).unwrap_or_default(),
+                            v.scope
+                        );
+                        let f = Fields { help: &v.description, ..Fields::fact(&v.name, &s) };
+                        self.take_made(&f).map(|f| (f, v.name.clone(), s))
+                    })
+                    .collect();
+                found.sort_by_key(|(f, ..)| f.rank);
+                let search = self.settings.search.borrow();
+                found
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (f, name, s))| Self::info_row_owned(name, s, i == 0, search.hits_of(f.row), p))
+                    .collect()
+            }
+            Some(_) if !on => vec![sans("No plugins installed.", 13., 20., p.dim).py(px(8.)).into_any_element()],
+            None if !on => vec![sans(crate::usage::NONE, 13., 20., p.dim).py(px(8.)).into_any_element()],
             _ => Vec::new(),
         };
         ("read-only · keys and installs are managed in the TUI".into(), rows)
     }
 
-    fn info_row_owned(label: String, value: String, first: bool, p: &Palette) -> AnyElement {
+    fn info_row_owned(label: String, value: String, first: bool, hits: &[Hit], p: &Palette) -> AnyElement {
+        let (lr, vr) = (Runs::of(hits, find::LABEL, 0, label.len(), 0), Runs::of(hits, find::VALUE, 0, value.len(), 0));
+        let name = SharedString::from(label.clone());
         h_flex()
             .debug_selector(|| format!("fact {label} = {value}"))
             .w_full()
@@ -1696,8 +1885,14 @@ impl AppView {
             .gap(px(24.))
             .items_center()
             .when(!first, |d| d.border_t_1().border_color(p.hair))
-            .child(sans(label, 14., 22., p.ink).w(px(180.)).flex_none().overflow_hidden().text_ellipsis())
-            .child(mono(value, 13., p.dim).flex_1().min_w_0().whitespace_normal())
+            .child(
+                lit(sans_in(14., 22., p.ink), name.clone(), lr, p.you, Some((name.clone(), "label")))
+                    .w(px(180.))
+                    .flex_none()
+                    .overflow_hidden()
+                    .text_ellipsis(),
+            )
+            .child(lit(mono_in(13., p.dim), value.into(), vr, p.you, Some((name, "value"))).flex_1().min_w_0().whitespace_normal())
             .into_any_element()
     }
 }

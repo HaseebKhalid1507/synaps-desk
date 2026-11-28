@@ -70,7 +70,7 @@ fn find(cx: &mut TestAppContext, pg: &Page, text: &str) {
     vcx.simulate_keystrokes(&format!("end {}", ["backspace"; 64].join(" ")));
     vcx.simulate_input(text);
     settle(cx, pg.w, 8);
-    assert_eq!(pg.view.read_with(cx, |v, _| v.settings.find.clone()), text, "the find box");
+    assert_eq!(pg.view.read_with(cx, |v, _| v.settings.search.borrow().query().text().to_string()), text, "the find box");
 }
 
 /// `key`'s row shown alone (the find box), and its tag.

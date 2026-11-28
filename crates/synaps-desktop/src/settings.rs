@@ -296,19 +296,22 @@ pub fn first_sentence(help: &str) -> &str {
     help
 }
 
-/// A row matches the find text (lowercase) by its label, key or help.
-/// Allocates nothing (it runs for every row on every frame of a find).
-pub fn matches(find: &str, label: &str, key: &str, help: &str) -> bool {
-    find.is_empty() || [label, key, help].iter().any(|s| contains_lower(s, find))
-}
-
-/// `hay` contains `needle` (lowercase), ignoring case.
-fn contains_lower(hay: &str, needle: &str) -> bool {
-    if hay.is_ascii() && needle.is_ascii() {
-        let (h, n) = (hay.as_bytes(), needle.as_bytes());
-        return n.len() <= h.len() && h.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b));
+/// The bytes of the help's sentence that holds byte `byte` (a find's hit),
+/// its sentences as [`first_sentence`] ends them.
+pub fn sentence_at(help: &str, byte: usize) -> std::ops::Range<usize> {
+    let (mut start, mut from) = (0, 0);
+    while let Some(i) = help[from..].find(". ") {
+        let end = from + i + 1;
+        from = end + 1;
+        if help[..end].ends_with("e.g.") || help[..end].ends_with("i.e.") {
+            continue;
+        }
+        if byte < end {
+            return start..end;
+        }
+        start = from;
     }
-    hay.to_lowercase().contains(needle)
+    start..help.len()
 }
 
 /// `key = value` lines, the last of a key winning, as Synaps' parser and
@@ -546,6 +549,12 @@ mod tests {
                 assert!(range(k).is_some(), "{k}: every CONFIG number has the dash's range");
             }
         }
+    }
+
+    /// The page's find of a row (settings_find.rs, PR 3; `matches` before).
+    fn matches(find: &str, label: &str, key: &str, help: &str) -> bool {
+        use crate::settings_find::{Fields, Query, find as found};
+        found(&Query::parse(find), &Fields::new(label, key, help), &mut Vec::new()).is_some()
     }
 
     #[test]
