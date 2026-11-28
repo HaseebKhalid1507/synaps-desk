@@ -446,11 +446,13 @@ pub(crate) fn build(
     open: &HashSet<u64>,
     subs: &Subagents,
 ) -> Vec<Disp> {
-    build_with(items, day, from, busy, open, subs, false)
+    build_with(items, day, from, busy, open, subs, false, &crate::blocks::Pinned::new())
 }
 
 /// [`build`], `board`: the transcript's board draws its block calls, so a
-/// block call it hasn't drawn yet draws no row either ([`crate::blocks::silent`]).
+/// block call it hasn't drawn yet draws no row either ([`crate::blocks::silent`]);
+/// `pinned`: the agent's rail sections the user put into it, after their
+/// creating call's own blocks ([`crate::blocks::rows`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_with(
     items: &[Item],
@@ -460,6 +462,7 @@ pub(crate) fn build_with(
     open: &HashSet<u64>,
     subs: &Subagents,
     board: bool,
+    pinned: &crate::blocks::Pinned,
 ) -> Vec<Disp> {
     let mut out = Vec::new();
     let mut agent = from > 0
@@ -493,7 +496,7 @@ pub(crate) fn build_with(
                 out.push(row(Kind::Ask, gap(i), if agent { Who::None } else { Who::Agent }));
                 agent = true;
                 // A converted card's block, under its receipt (§1.5).
-                crate::blocks::rows(items, i..i + 1, &mut out, &mut agent, true);
+                crate::blocks::rows(items, i..i + 1, &mut out, &mut agent, true, pinned);
                 i += 1;
             }
             ItemKind::User => {
@@ -529,7 +532,7 @@ pub(crate) fn build_with(
                 // after the run (§1.2), and the run is the rest.
                 let shows = |k: usize| !crate::blocks::silent(&items[k], board);
                 let Some(first_row) = (start..end).find(|&k| shows(k)) else {
-                    crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
+                    crate::blocks::rows(items, start..end, &mut out, &mut agent, false, pinned);
                     i = end;
                     continue;
                 };
@@ -570,7 +573,7 @@ pub(crate) fn build_with(
                         who: if k == first_row { who } else { Who::None },
                     }));
                 }
-                crate::blocks::rows(items, start..end, &mut out, &mut agent, false);
+                crate::blocks::rows(items, start..end, &mut out, &mut agent, false, pinned);
                 i = end;
             }
             // An event: a message the agent answers, as a user's is (a

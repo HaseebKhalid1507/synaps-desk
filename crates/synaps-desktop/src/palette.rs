@@ -91,6 +91,9 @@ pub(crate) enum AppAct {
     Equalise,
     ClosePane,
     JoinPanes,
+    /// `x`, `u` or `p` on the block walked when the palette opened (D7's
+    /// keys, [`AppView::wish_at`]).
+    BlockWish(crate::walk::Wish),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -670,6 +673,9 @@ impl AppView {
             self.close_picker(window, cx);
         }
         self.palette_back = window.focused(cx).filter(|f| *f != self.palette_input.focus_handle(cx));
+        // The block walked now: the walk ends as the keys go to the
+        // palette, its commands act on it as painted.
+        self.palette_walked = self.walked().map(|(at, painted)| (self.panes.cur.id, at, painted));
         let (goto, commands) = self.palette_entries(cx);
         self.palette_gen = self.palette_sig(cx);
         self.palette = Some(Palette::new(mode, goto, commands));
@@ -698,6 +704,7 @@ impl AppView {
         if self.palette.take().is_none() {
             return;
         }
+        self.palette_walked = None;
         match self.palette_back.take() {
             Some(h) => window.focus(&h, cx),
             None => window.focus(&self.focus, cx),
@@ -890,6 +897,7 @@ impl AppView {
             (AppAct::ChangeThinking, "Change thinking…", None, "this session only".into(), (!attached).then_some("no session on screen")),
         ];
         let mut apps = Vec::from(apps);
+        apps.extend(self.block_entries());
         apps.extend(self.pane_entries(mac));
         let mut commands = Vec::new();
         for (i, (act, title, key, meta, off)) in apps.into_iter().enumerate() {
@@ -952,6 +960,7 @@ impl AppView {
             }
             _ => String::new(),
         };
+        let walked = self.palette_walked.take();
         self.close_palette(window, cx);
         if let Some(why) = e.off {
             self.panes.cur.watch_note = Some(why);
@@ -969,6 +978,11 @@ impl AppView {
                 if let Some(r) = self.tray.rows.iter().find(|r| r.id == id) {
                     let who = crate::wtabs::Who::new(r.id, r.name.clone(), r.call.clone());
                     self.watch_worker(&who, cx);
+                }
+            }
+            Act::App(AppAct::BlockWish(wish)) => {
+                if let Some((pane, at, painted)) = walked {
+                    self.in_pane(pane, |this| this.wish_at(at, painted, wish, window, cx));
                 }
             }
             Act::App(a) => self.app_act(a, window, cx),
@@ -1068,7 +1082,47 @@ impl AppView {
             }
             AppAct::ClosePane => self.close_pane_tabs(),
             AppAct::JoinPanes => self.join_panes(cx),
+            // The palette's pick acts on its walked block ([`AppView::palette_pick`]).
+            AppAct::BlockWish(_) => {}
         }
+    }
+
+    /// The walk's keys on the block walked when the palette opened (D7):
+    /// `x`, `u`, `p`, as its keys act (on a tombstone, `x` and `u` only).
+    fn block_entries(&self) -> Vec<AppEntry> {
+        use crate::walk::Wish;
+        let walked = self.palette_walked.filter(|(pane, ..)| self.panes.iter().any(|p| p.id == *pane));
+        let off = |wish: Wish| -> Option<&'static str> {
+            match walked {
+                None => Some("walk to a block first · Ctrl+G"),
+                Some((.., painted)) if painted.tomb.is_some() && wish == Wish::Pin => Some("a tombstone: x or u"),
+                Some(_) => None,
+            }
+        };
+        let k = |key: &'static str| -> Option<SharedString> { Some(key.into()) };
+        vec![
+            (
+                AppAct::BlockWish(Wish::Dismiss),
+                "Dismiss the walked block",
+                k("x"),
+                "tells the agent with your next message".into(),
+                off(Wish::Dismiss),
+            ),
+            (
+                AppAct::BlockWish(Wish::Show),
+                "Show the walked block again",
+                k("u"),
+                "tells the agent with your next message".into(),
+                off(Wish::Show),
+            ),
+            (
+                AppAct::BlockWish(Wish::Pin),
+                "Pin the walked block",
+                k("p"),
+                "into the rail or the transcript, or back".into(),
+                off(Wish::Pin),
+            ),
+        ]
     }
 
     /// Why Equalise would do nothing with more than one pane (Shady #44

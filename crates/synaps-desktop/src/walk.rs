@@ -48,13 +48,15 @@
 //!   ([`PastBody`]). `x` dismisses, `u` shows again, `p` pins, `m`
 //!   moves a rail section to the other slot: D6b's desires and stores
 //!   (#103), through [`BlockDesires`] (`crate::rail_wishes::Stores`
-//!   answers it), where this desk draws what they do: `x` and `u` on the
-//!   agent's rail sections, `p` on a transcript block (into the rail, and
-//!   back), `m` on a rail section. The transcript's own tombstone and pin
-//!   stub aren't drawn yet: `x` and `u` on a transcript block, and `p` on
-//!   an agent's rail section, do nothing, and the hover doesn't offer
-//!   them ([`BlockDesires::offers`]). `e` (take) and `R` (restore) are
-//!   D8's: nothing yet.
+//!   answers it), where this desk draws what they do: `x` and `u` on any
+//!   block (a dismissed rail section is hidden, a transcript block draws
+//!   its tombstone, which is walked to and takes only `x` and `u`), `p`
+//!   on a transcript block (into the rail, its stub left) and on an
+//!   agent's rail section (into the transcript, at its creating call),
+//!   and back, `m` on a rail section ([`BlockDesires::offers`]). The
+//!   palette's block commands (`x`, `u`, `p`) act on the block walked
+//!   when it opened, as painted ([`AppView::wish_at`]). `e` (take) and
+//!   `R` (restore) are D8's: nothing yet.
 //! - **Undo** (§3.5): Ctrl+Z (Cmd+Z) in the walk undoes the last local
 //!   action, one level per block: a fold (a key's or a click's, in the
 //!   transcript or the rail), and through [`BlockDesires::undo`] a pin, a
@@ -256,7 +258,8 @@ impl WalkMode {
 /// (its effective placement: a section's slot as the rail lays it out,
 /// the user's pin or slot move included; a transcript block's,
 /// [`BlockDesires::placed`]), and the token of the tombstone it was
-/// painted as (D6b's soft dismissal), if it was.
+/// painted as (D6b's: a rail section's soft dismissal, a transcript
+/// block's dismissal or soft one), if it was.
 pub(crate) struct Aim<'a> {
     #[cfg_attr(not(test), expect(dead_code, reason = "D7's tests' stand-in reads it"))]
     pub session: &'a str,
@@ -624,7 +627,12 @@ impl AppView {
                 let s = crate::lease::find_any(d, row).filter(|(_, g)| g.is_none())?.0.clone();
                 self.model.lives[self.panes.cur.live].active.as_ref()?;
                 let conv = self.conversation(self.panes.cur.live);
-                Some(Found { place: self.block_desires().placed(&conv, &s.block), s, tomb: None })
+                // Its transcript tombstone's token, as the board has it.
+                let tomb = match self.look_on(d, &s) {
+                    crate::rail_wishes::Look::Tomb { token, .. } => Some(token),
+                    _ => None,
+                };
+                Some(Found { place: self.block_desires().placed(&conv, &s.block), s, tomb })
             }
             At::Rail(row) => {
                 let lay = self.rail_of(self.panes.cur.live, d);
@@ -644,10 +652,21 @@ impl AppView {
     /// there, or changed.
     fn walk_target(&self) -> Option<(std::sync::Arc<Drawn>, Found)> {
         let w = self.panes.cur.walk.walk.as_ref()?;
-        let painted = w.painted.get()?;
+        self.target_at(w.at, w.painted.get()?)
+    }
+
+    /// Target `at` as `painted`, if the bound board still holds it so.
+    fn target_at(&self, at: At, painted: Painted) -> Option<(std::sync::Arc<Drawn>, Found)> {
         let board = self.bound_board()?;
-        let f = self.find_on(&board, w.at)?;
+        let f = self.find_on(&board, at)?;
         (f.s.bound.as_ref().is_some_and(|b| b.tag == painted.tag) && f.tomb == painted.tomb).then_some((board, f))
+    }
+
+    /// The walked block in the pane acted on, as its ring last painted it
+    /// (the palette's commands act on it, [`AppView::wish_at`]).
+    pub(crate) fn walked(&self) -> Option<(At, Painted)> {
+        let w = self.panes.cur.walk.walk.as_ref()?;
+        Some((w.at, w.painted.get()?))
     }
 
     /// The walked block, if its ring was painted on it since it came there
@@ -680,7 +699,9 @@ impl AppView {
             self.walk_says(at, CHANGED, window, cx);
             return;
         };
-        if f.tomb.is_none() {
+        // A tombstone or a stub draws no body to fold.
+        let line = matches!(at, At::Block(_)) && self.drawn_look(&f.s) != crate::rail_wishes::Look::Full;
+        if f.tomb.is_none() && !line {
             self.fold_now(at, &f.s, cx);
         }
     }
@@ -719,8 +740,16 @@ impl AppView {
     /// walked block's painted target ([`BlockDesires`]); on a tombstone,
     /// `x` and `u` only.
     fn walk_wish(&mut self, wish: Wish, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(at) = self.walk_painted_at() else { return };
-        let Some((board, f)) = self.walk_target() else {
+        let Some((at, painted)) = self.walked() else { return };
+        self.wish_at(at, painted, wish, window, cx);
+    }
+
+    /// `wish` on target `at` as `painted` (the walk's key, the palette's
+    /// command on the block walked when it opened): only if the bound
+    /// board still holds it so, else nothing and the note; on a
+    /// tombstone, `x` and `u` only. Its undo kept.
+    pub(crate) fn wish_at(&mut self, at: At, painted: Painted, wish: Wish, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((board, f)) = self.target_at(at, painted) else {
             self.walk_says(at, CHANGED, window, cx);
             return;
         };
@@ -1198,7 +1227,10 @@ impl AppView {
             v.push((Hover::Rev, "rev"));
         }
         if d.offers(Wish::Pin, &s.block, rail) {
-            v.push((Hover::Pin, "rail"));
+            // An agent's section goes into the transcript; anything else
+            // into the rail, or back out of it.
+            let into = rail && matches!(s.block.place, Place::Rail(_));
+            v.push((Hover::Pin, if into { "transcript" } else { "rail" }));
         }
         if rail && d.offers(Wish::Slot, &s.block, rail) {
             v.push((Hover::Slot, "⇅"));
@@ -1226,14 +1258,22 @@ impl AppView {
                     self.walk_rev(at, &board, &f.s, true, cx);
                 }
             }
-            Hover::Pin | Hover::Slot | Hover::Dismiss => {
+            Hover::Pin | Hover::Slot | Hover::Dismiss | Hover::Show(_) => {
                 let wish = match act {
                     Hover::Pin => Wish::Pin,
                     Hover::Slot => Wish::Slot,
+                    Hover::Show(_) => Wish::Show,
                     _ => Wish::Dismiss,
                 };
                 let Some(board) = self.bound_board() else { return };
                 let Some(f) = self.find_on(&board, at) else { return };
+                // A tombstone's click acts on the one it was painted as.
+                if let Hover::Show(token) = act
+                    && f.tomb != Some(token)
+                {
+                    self.walk_says(at, CHANGED, window, cx);
+                    return;
+                }
                 if let Some(token) = self.wish_now(at, wish, &board, &f, window, cx) {
                     self.panes.cur.walk.push(Undo { at, tag: f.s.block.tag, act: Undid::Wish(wish, token) });
                 }
@@ -1359,6 +1399,8 @@ pub(crate) enum Hover {
     Slot,
     Fold,
     Dismiss,
+    /// A transcript tombstone's click (`u`), its token as painted.
+    Show(u64),
 }
 
 /// A past revision as drawn (§3.6): its label, a later revision landed

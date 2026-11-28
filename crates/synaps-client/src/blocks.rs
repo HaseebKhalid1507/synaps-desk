@@ -2169,6 +2169,10 @@ pub struct Drawn {
     /// that aren't group members, in its list's order (the agent's
     /// placement order), a group with its members.
     pub rail: [Vec<Shown>; 2],
+    /// Each of [`Drawn::rail`]'s blocks' creating call's row, in the same
+    /// order (none: that call draws no row): where the desk draws one the
+    /// user put into the transcript (§3.5's `p`).
+    pub rail_rows: [Vec<Option<u64>>; 2],
     /// The history's block calls that committed since the rows last took
     /// them, their rows and fates: each row keeps its fate once taken
     /// ([`HistoryBlocks::took`] with `committed_to`, how many so far).
@@ -2682,6 +2686,7 @@ impl Worker {
         }
         let rail =
             [block::Slot::Upper, block::Slot::End].map(|slot| view.list(Place::Rail(slot)).iter().filter_map(shown).collect::<Vec<_>>());
+        let rail_rows = [0, 1].map(|k| rail[k].iter().map(|s| row(s.block.created.event)).collect::<Vec<_>>());
         // Its blocks are copies of the boards' (each block once at most):
         // B2's count of their blocks bounds them, heap included (its
         // own: a block's item ids and last writers are B2's to read).
@@ -2731,6 +2736,7 @@ impl Worker {
             + rows.capacity() * (std::mem::size_of::<(u64, Arc<RowBlocks>)>() + 1)
             + rows.values().map(|r| r.own_bytes()).sum::<usize>()
             + rail.iter().map(Shown::list_bytes).sum::<usize>()
+            + rail_rows.iter().map(|r| r.capacity() * std::mem::size_of::<Option<u64>>()).sum::<usize>()
             + blocks
             + ARC
             + committed.len() * std::mem::size_of::<(u64, Fate)>()
@@ -2742,6 +2748,7 @@ impl Worker {
             events: self.journal.len(),
             rows,
             rail,
+            rail_rows,
             committed,
             committed_to: self.committed_from + self.committed.len() as u64,
             live: view.live(),

@@ -465,8 +465,8 @@ fn hover_actions_draw_over_the_header_and_nothing_reflows(cx: &mut TestAppContex
     assert!(acts.right() <= h.right() + px(0.5) && acts.top() >= h.top() && acts.bottom() <= h.bottom(), "over the header's end");
     assert!(has(cx, w, format!("hover-act {b} rev")) && has(cx, w, format!("hover-act {b} fold")));
     assert!(
-        !has(cx, w, format!("hover-act {b} ×")) && has(cx, w, format!("hover-act {b} rail")),
-        "D6b's: a transcript block's pin, no × (its tombstone isn't drawn yet)"
+        has(cx, w, format!("hover-act {b} ×")) && has(cx, w, format!("hover-act {b} rail")),
+        "D6b's: a transcript block's pin and × (its tombstone draws)"
     );
     // c has one revision: no rev.
     let at_ = head(cx, w, "c");
@@ -920,8 +920,9 @@ fn u_ends_a_soft_tombstone_and_x_dismisses_it(cx: &mut TestAppContext) {
 }
 
 /// The hover offers D6b's actions where this desk draws them: a transcript
-/// block `rail` (a pin), never `×`; an agent's rail section `⇅` and `×`,
-/// never `rail`; a pinned one's section `rail` (out again). They act.
+/// block `rail` (a pin) and `×` (its tombstone); an agent's rail section
+/// `transcript` (into it), `⇅` and `×`; a pinned one's section `rail` (out
+/// again). They act.
 #[gpui_kit::test]
 fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
     let (w, view) = walked(cx);
@@ -930,7 +931,7 @@ fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
     let at_ = head(cx, w, "c");
     mouse(cx, w, at_, "move");
     wait(cx, w, &view, 300);
-    assert!(has(cx, w, format!("hover-act {c} rail")) && !has(cx, w, format!("hover-act {c} ×")));
+    assert!(has(cx, w, format!("hover-act {c} rail")) && has(cx, w, format!("hover-act {c} ×")));
     let pin = drawn(cx, w, format!("hover-act {c} rail")).center();
     click(cx, w, pin);
     landed(cx, w, &view);
@@ -943,13 +944,22 @@ fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
     let r1 = row("r1");
     rail_head(cx, "r1");
     assert!(has(cx, w, format!("hover-act {r1} ⇅")) && has(cx, w, format!("hover-act {r1} ×")));
-    assert!(!has(cx, w, format!("hover-act {r1} rail")), "an agent's section: no pin");
+    assert!(
+        has(cx, w, format!("hover-act {r1} transcript")) && !has(cx, w, format!("hover-act {r1} rail")),
+        "an agent's section: into the transcript"
+    );
     rail_head(cx, "c");
     assert!(has(cx, w, format!("hover-act {c} rail")), "a pinned one's: out again");
     let unpin = drawn(cx, w, format!("hover-act {c} rail")).center();
     click(cx, w, unpin);
     landed(cx, w, &view);
     assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
+    rail_head(cx, "r1");
+    let into = drawn(cx, w, format!("hover-act {r1} transcript")).center();
+    click(cx, w, into);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "out of the rail");
+    assert!(has(cx, w, format!("block-head {r1}")), "into the transcript");
 }
 
 // ── D6b's undo: its scope, its two stores, the caps, the order ────────
@@ -989,16 +999,15 @@ fn said(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
     view.read_with(cx, |v, _| v.wishes.said.clone()).unwrap_or_default()
 }
 
-/// Shady #106 P2-1: Ctrl+Z is refused where its key isn't offered. A
-/// dismissal asked and cancelled before it was written (`x`, `u`, the
-/// writer held), the section then moved by the agent into the transcript
-/// (the same incarnation): undoing that `u` would dismiss a transcript
-/// block, which this desk doesn't draw dismissed. Nothing changes, no
-/// notice rides the next message; there `x` and `u` do nothing, and the
-/// hover doesn't offer `×`.
+/// Shady #106 P2-1, with the transcript's tombstones drawn: Ctrl+Z acts
+/// where its block draws now. A dismissal asked and cancelled before it
+/// was written (`x`, `u`, the writer held), the section then moved by the
+/// agent into the transcript (the same incarnation): undoing that `u`
+/// dismisses it there, and the transcript draws its tombstone; the notice
+/// rides the next message, as drawn.
 #[cfg(unix)]
 #[gpui_kit::test]
-fn ctrl_z_is_refused_where_its_key_isnt_offered(cx: &mut TestAppContext) {
+fn ctrl_z_follows_its_block_into_the_transcript(cx: &mut TestAppContext) {
     let (w, view) = walked(cx);
     rail_blocks(cx, w, &view);
     enter(cx, w, &view);
@@ -1014,30 +1023,303 @@ fn ctrl_z_is_refused_where_its_key_isnt_offered(cx: &mut TestAppContext) {
     ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
     wait(cx, w, &view, 1000);
     assert_eq!(sec(cx, &view, "r1"), None, "the agent moved it into the transcript");
-    let before = mark(cx, &view, "r1");
     walk_again(cx, w, &view);
     press(cx, w, "ctrl-z");
     landed(cx, w, &view);
-    assert_eq!(desires(cx, &view), 0, "no dismissal of a transcript block");
-    assert_eq!(mark(cx, &view, "r1"), before, "its presentation as it was");
-    assert!(said(cx, &view).contains("moved where this desk doesn't draw that"), "refused: {}", said(cx, &view));
-    // There its own keys do nothing, and the hover doesn't offer them.
-    walk_again(cx, w, &view);
-    walk_to(cx, w, &view, At::Block(row("r1")));
-    press(cx, w, "x");
-    press(cx, w, "u");
-    landed(cx, w, &view);
-    assert_eq!(desires(cx, &view), 0, "x and u: nothing");
-    let r1 = row("r1");
-    let at_ = head(cx, w, "r1");
-    mouse(cx, w, at_, "move");
-    wait(cx, w, &view, 300);
-    assert!(has(cx, w, format!("hover-acts {r1}")) && !has(cx, w, format!("hover-act {r1} ×")), "no ×");
+    assert_eq!(desires(cx, &view), 1, "dismissed where it draws now");
+    assert!(has(cx, w, tomb_of("r1")), "its tombstone in the transcript");
     press(cx, w, "escape");
     view.update(cx, |v, cx| assert!(v.enter("go on".into(), cx)));
     landed(cx, w, &view);
     let sent = view.read_with(cx, |v, _| v.wishes.outbox.clone());
-    assert_eq!(sent.last().map(String::as_str), Some("go on"), "no notice rode: {sent:?}");
+    assert!(sent.last().is_some_and(|m| m.starts_with("go on\n[block r1 v") && m.ends_with(" dismissed]")), "it rode: {sent:?}");
+}
+
+// ── the transcript's tombstones and stubs (§3.5, D6b × D7) ──────────
+
+/// Block `name`'s transcript tombstone, dismissed (its debug selector).
+fn tomb_of(name: &str) -> String {
+    format!("block-tomb {} ◇ {name} · dismissed · u show", row(name))
+}
+
+/// Block `name`'s transcript pin stub, `more` after its words.
+fn stub_of(name: &str, more: &str) -> String {
+    format!("block-stub {} ◇ {name} · in the rail · p{more}", row(name))
+}
+
+/// The last message sent, after `text` is: what rode it.
+fn send(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, text: &str) -> String {
+    if walking(cx, w, view) {
+        press(cx, w, "escape");
+    }
+    view.update(cx, |v, cx| assert!(v.enter(text.into(), cx)));
+    landed(cx, w, view);
+    view.read_with(cx, |v, _| v.wishes.outbox.last().cloned()).unwrap_or_default()
+}
+
+/// A one-line row's height at the pane's text step: §3.5's 24 px.
+fn line_h(cx: &mut TestAppContext, view: &Entity<AppView>) -> gpui_kit::Pixels {
+    view.read_with(cx, |v, _| px((24. * v.panes.cur.metrics_last.get().expect("drawn").r).round()))
+}
+
+/// What the pane's painted quads within `b` draw: an outline, a rounded
+/// corner (the app's look has neither, `cards_d_tests`), and their fills.
+fn quads_in(cx: &mut TestAppContext, w: AnyWindowHandle, b: gpui_kit::Bounds<gpui_kit::Pixels>) -> (bool, bool, Vec<gpui_kit::Hsla>) {
+    cx.update_window(w, |_, window, _| {
+        let k = window.scale_factor();
+        let (x0, y0) = (f32::from(b.origin.x) * k - 0.5, f32::from(b.origin.y) * k - 0.5);
+        let (x1, y1) = (f32::from(b.right()) * k + 0.5, f32::from(b.bottom()) * k + 0.5);
+        let inside = |q: &gpui_kit::Bounds<gpui_kit::ScaledPixels>| {
+            q.origin.x.0 >= x0 && q.origin.y.0 >= y0 && (q.origin.x + q.size.width).0 <= x1 && (q.origin.y + q.size.height).0 <= y1
+        };
+        let qs: Vec<_> = window.painted_quads().iter().filter(|q| inside(&q.bounds)).cloned().collect();
+        let outline = qs.iter().any(|q| {
+            let bw = q.border_widths;
+            [bw.top, bw.right, bw.bottom, bw.left].iter().any(|x| x.0 > 0.01)
+        });
+        let round = qs.iter().any(|q| {
+            let c = q.corner_radii;
+            [c.top_left, c.top_right, c.bottom_right, c.bottom_left].iter().any(|r| r.0 > 0.01)
+        });
+        (outline, round, qs.iter().filter_map(|q| q.background.as_solid()).collect())
+    })
+    .expect("the window")
+}
+
+/// `x` on a transcript block dismisses it there (§3.5): once written it
+/// shrinks to its 24 px tombstone, `◇ c · dismissed · u show`, square, no
+/// outline, on the card's ground; Ctrl+Z cancels it unsent. Done again,
+/// the next message tells the agent what the transcript draws, and the
+/// tombstone stays; `u` on it shows the block again, and the next message
+/// tells the agent that too.
+#[gpui_kit::test]
+fn x_and_u_on_a_transcript_block_draw_what_they_tell_the_agent(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    let c = row("c");
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(c)));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert!(has(cx, w, tomb_of("c")), "its tombstone");
+    assert!(!has(cx, w, format!("block-head {c}")), "nothing of the block");
+    assert_eq!(desires(cx, &view), 1, "a desire, written");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, tomb_of("c")), "undone: the block");
+    assert_eq!(desires(cx, &view), 0, "never sent: cancelled");
+    walk_on(cx, w, &view, At::Block(c));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    let tomb = drawn(cx, w, tomb_of("c"));
+    assert!((tomb.size.height - line_h(cx, &view)).abs() < px(0.5), "24 px: {tomb:?}");
+    press(cx, w, "escape");
+    wait(cx, w, &view, 300);
+    let card = cx.update(|cx| crate::theme::palette(cx).card_d);
+    let (outline, round, fills) = quads_in(cx, w, tomb);
+    assert!(!outline && !round, "square, no outline");
+    assert!(fills.contains(&card), "on the card's ground: {fills:?}");
+    // v2: the cancelled one's version is never minted again.
+    assert_eq!(send(cx, w, &view, "go on"), "go on\n[block c v2 dismissed]", "told as drawn");
+    assert!(has(cx, w, tomb_of("c")), "still its tombstone");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Block(c));
+    assert!(ring(cx, w, c), "a tombstone is walked to");
+    press(cx, w, "u");
+    landed(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, tomb_of("c")), "shown again");
+    assert_eq!(send(cx, w, &view, "and on"), "and on\n[block c v3 shown]", "told as drawn");
+    restart(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {c}")), "a restart keeps it");
+}
+
+/// The hover's `×` on a transcript block dismisses it as `x` does; the
+/// tombstone's click is its `u`, checked as a hover action is: the block
+/// draws again, and no notice of a dismissal that never went rides the
+/// next message (nothing to tell).
+#[gpui_kit::test]
+fn a_transcript_tombstones_click_shows_its_block(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    let c = row("c");
+    let at_ = head(cx, w, "c");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-act {c} ×")), "offered");
+    let x = drawn(cx, w, format!("hover-act {c} ×")).center();
+    click(cx, w, x);
+    landed(cx, w, &view);
+    assert!(has(cx, w, tomb_of("c")), "its tombstone");
+    away(cx, w);
+    wait(cx, w, &view, 300);
+    let at_ = drawn(cx, w, tomb_of("c")).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {c}")) && !has(cx, w, tomb_of("c")), "shown again");
+    assert_eq!(desires(cx, &view), 0, "unsent: cancelled");
+    assert_eq!(send(cx, w, &view, "go on"), "go on", "nothing to tell");
+}
+
+/// `p` on a transcript block pins it into the rail (§3.5) and leaves its
+/// 24 px stub in the transcript, `◇ c · in the rail · p`; the agent moving
+/// it since adds `· the agent moved it`. The stub's click is its `p`: back
+/// in the transcript. Nothing of it is told to the agent.
+#[gpui_kit::test]
+fn a_pin_leaves_its_stub_in_the_transcript(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let c = row("c");
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(c)));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    assert!(has(cx, w, stub_of("c", "")) && !has(cx, w, format!("block-head {c}")), "its stub in the transcript");
+    let stub = drawn(cx, w, stub_of("c", ""));
+    assert!((stub.size.height - line_h(cx, &view)).abs() < px(0.5), "24 px: {stub:?}");
+    press(cx, w, "escape");
+    wait(cx, w, &view, 300);
+    let (outline, round, _) = quads_in(cx, w, stub);
+    assert!(!outline && !round, "square, no outline");
+    ops(cx, w, &view, "toolu_mc", json!([{"op":"move","id":"c","target":"transcript"}]));
+    wait(cx, w, &view, 1000);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "the pin outranks the agent's move");
+    assert!(has(cx, w, stub_of("c", " · the agent moved it")), "the stub says so");
+    let at_ = drawn(cx, w, stub_of("c", " · the agent moved it")).center();
+    click(cx, w, at_);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
+    assert!(has(cx, w, format!("block-head {c}")), "the block, where the agent has it");
+    assert_eq!(send(cx, w, &view, "go on"), "go on", "presentation: nothing told");
+}
+
+/// `p` on an agent's rail section puts it into the transcript (§3.5), at
+/// its creating call: the rail no longer draws it (nor counts it
+/// dismissed), the transcript draws the block, and the walk reaches it
+/// there; `p` again gives it back to the rail, Ctrl+Z undoes that, and a
+/// restart keeps it. Nothing of it is told to the agent.
+#[gpui_kit::test]
+fn p_puts_an_agents_rail_section_into_the_transcript_and_back(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let r1 = row("r1");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(r1));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "out of the rail");
+    assert_eq!(view.read_with(cx, |v, _| v.rail_layout().map(|(_, l)| l.dismissed)), Some(0), "not dismissed");
+    assert!(has(cx, w, format!("block-head {r1}")), "drawn in the transcript");
+    let (r1_ix, c_ix) = view.read_with(cx, |v, _| {
+        let ix = |r: u64| v.panes.cur.disp.iter().position(|d| d.id == r).expect("a row");
+        (ix(r1), ix(row("c")))
+    });
+    assert!(r1_ix > c_ix, "at its creating call, after the run before it: {r1_ix} vs {c_ix}");
+    assert_eq!(send(cx, w, &view, "go on"), "go on", "presentation: nothing told");
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(r1));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "back in the rail, the agent's");
+    assert!(view.read_with(cx, |v, _| v.block_shown(r1).is_none()), "gone from the transcript");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "undone: in the transcript again");
+    assert!(view.read_with(cx, |v, _| v.block_shown(r1).is_some()));
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "a restart keeps it");
+    assert!(view.read_with(cx, |v, _| v.block_shown(r1).is_some()));
+    // The hover offers it back where it draws.
+    let at_ = head(cx, w, "r1");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-act {r1} rail")) && has(cx, w, format!("hover-act {r1} ×")));
+    let back = drawn(cx, w, format!("hover-act {r1} rail")).center();
+    click(cx, w, back);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "back by the hover");
+}
+
+/// A section put into the transcript is one of its rows to the lease
+/// (§6.2): hovered, the agent replacing it waits under the pointer, and
+/// the release draws it.
+#[gpui_kit::test]
+fn a_section_put_into_the_transcript_is_under_the_lease(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let r1 = row("r1");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(r1));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    tail(cx, w, &view);
+    assert!(has(cx, w, format!("block-head {r1}")), "in the transcript");
+    let t0 = view.read_with(cx, |v, _| v.block_shown(r1).expect("its row").1.block.tag);
+    let at_ = head(cx, w, "r1");
+    mouse(cx, w, at_, "move");
+    ops(cx, w, &view, "toolu_rr", json!([{"op":"replace","id":"r1","kind":"note","body":{"text":"R one again"}}]));
+    assert!(waiting(cx, &view), "the board waits under the pointer");
+    assert_eq!(view.read_with(cx, |v, _| v.block_shown(r1).expect("its row").1.block.tag), t0, "the old one still drawn");
+    press(cx, w, "escape");
+    wait(cx, w, &view, 300);
+    assert!(!waiting(cx, &view), "a key released the lease");
+    assert_ne!(view.read_with(cx, |v, _| v.block_shown(r1).expect("its row").1.block.tag), t0, "the new incarnation drawn");
+}
+
+/// The palette's commands are the walk's keys on the block walked when it
+/// opened (the walk ends as the keys go to the palette): `x` dismisses it,
+/// drawn as its tombstone and told as drawn; without a walk they say how
+/// to get one.
+#[gpui_kit::test]
+fn the_palettes_block_commands_act_on_the_walked_block(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view) = walked(cx);
+    let entry = |cx: &mut TestAppContext, title: &str| {
+        view.read_with(cx, |v, cx| {
+            let (_, cmds) = v.palette_entries(cx);
+            cmds.iter().find(|e| e.title.as_ref() == title).map(|e| e.off.clone())
+        })
+    };
+    let dismiss = "Dismiss the walked block";
+    assert_eq!(entry(cx, dismiss), Some(Some("walk to a block first · Ctrl+G".into())), "no walk: off");
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(Mode::Commands, window, cx))).expect("the window");
+    wait(cx, w, &view, 300);
+    assert!(!walking(cx, w, &view), "the keys went to the palette");
+    assert_eq!(entry(cx, dismiss), Some(None), "offered on the walked block");
+    view.update(cx, |v, _| {
+        let p = v.palette.as_mut().expect("open");
+        p.set_query("dismiss the walked");
+    });
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.palette_pick(window, cx))).expect("the window");
+    landed(cx, w, &view);
+    assert!(view.read_with(cx, |v, _| v.palette.is_none()), "closed");
+    assert!(has(cx, w, tomb_of("c")), "dismissed: its tombstone");
+    assert_eq!(send(cx, w, &view, "go on"), "go on\n[block c v1 dismissed]", "told as drawn");
+    // On its tombstone: `u` shows it, `p` isn't offered.
+    let pick = |cx: &mut TestAppContext, query: &str| {
+        cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(Mode::Commands, window, cx))).expect("the window");
+        wait(cx, w, &view, 300);
+        view.update(cx, |v, _| v.palette.as_mut().expect("open").set_query(query));
+        cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.palette_pick(window, cx))).expect("the window");
+        landed(cx, w, &view);
+    };
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Block(row("c")));
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(Mode::Commands, window, cx))).expect("the window");
+    wait(cx, w, &view, 300);
+    assert_eq!(entry(cx, "Pin the walked block"), Some(Some("a tombstone: x or u".into())), "a tombstone: no pin");
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.close_palette(window, cx))).expect("the window");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Block(row("c")));
+    pick(cx, "show the walked");
+    assert!(has(cx, w, format!("block-head {}", row("c"))) && !has(cx, w, tomb_of("c")), "shown again");
+    assert_eq!(send(cx, w, &view, "and on"), "and on\n[block c v2 shown]", "told as drawn");
+    // `p` on a transcript block: its stub.
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Block(row("c")));
+    pick(cx, "pin the walked");
+    assert!(has(cx, w, stub_of("c", "")), "pinned: its stub");
 }
 
 /// Soft dismissals of `ids` carried into the pane's conversation (a
@@ -1313,9 +1595,17 @@ fn a_failed_undo_leaves_a_placement_made_since(cx: &mut TestAppContext) {
     let undone = mark(cx, &view, "r1");
     ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
     wait(cx, w, &view, 1000);
-    walk_again(cx, w, &view);
-    walk_to(cx, w, &view, At::Block(row("r1")));
-    press(cx, w, "p");
+    // There it draws its tombstone (the dismissal draws until the undo is
+    // written), which takes `x` and `u` only: the newer placement is the
+    // store's own pin.
+    assert!(has(cx, w, tomb_of("r1")), "a tombstone in the transcript");
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let (_, s) = v.block_shown(row("r1")).expect("its row");
+        assert!(v.wishes.pres.pin(&conv, &s.block).is_ok());
+        v.pump_wishes(cx);
+        cx.notify();
+    });
     wait(cx, w, &view, 300);
     let pinned = mark(cx, &view, "r1");
     assert_ne!(pinned, undone, "p: a newer placement");

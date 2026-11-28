@@ -2372,6 +2372,9 @@ pub struct AppView {
     pub(crate) palette: Option<crate::palette::Palette>,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_back: Option<FocusHandle>,
+    /// The block walked when the palette opened: its commands' target
+    /// ([`crate::palette`]'s block commands), as painted.
+    pub(crate) palette_walked: Option<(crate::pane::PaneId, crate::walk::At, crate::walk::Painted)>,
     pub(crate) palette_sel: Cell<Option<usize>>,
     pub(crate) palette_scroll: ScrollHandle,
     pub(crate) palette_gen: u64,
@@ -3042,6 +3045,7 @@ impl AppView {
             palette: None,
             palette_input: i.palette_input,
             palette_back: None,
+            palette_walked: None,
             palette_sel: Cell::new(None),
             palette_scroll: ScrollHandle::new(),
             palette_gen: 0,
@@ -6825,6 +6829,7 @@ impl AppView {
         if std::mem::take(&mut self.panes.cur.full_rebuild) || stray {
             splice = Some(Splice { start: 0, old_len: self.panes.cur.rows.len(), new_len: n });
         }
+        let pinned_from = self.sync_pinned();
         let items = self.model.lives[self.panes.cur.live].shown().items();
         let from = match &splice {
             Some(sp) => {
@@ -6887,12 +6892,16 @@ impl AppView {
                     }
                     self.panes.cur.fold_slack.set(None);
                 }
-                sp.start
+                pinned_from.map_or(sp.start, |p| p.min(sp.start))
             }
             None if busy != self.panes.cur.synced_busy => items.len(),
             // A prompt's row came, went or changed (it rebuilds from its turn).
             None if crate::authorize::built(&self.panes.cur.disp) != self.prompt_rows() => items.len(),
+            // The rail's sections the user put into the transcript changed
+            // (§3.5's `p`): rebuilt from the first row that has them.
+            None if pinned_from.is_some() => pinned_from.unwrap_or(0),
             None => {
+                self.sync_looks();
                 self.sync_counts();
                 return self.sync_subagents();
             }
@@ -6921,6 +6930,7 @@ impl AppView {
                 self.fx.col(self.panes.cur.id).born(d.motion_key(), now + crate::motion::stagger(k));
             }
         }
+        self.sync_looks();
         self.sync_counts();
         self.sync_subagents();
     }
@@ -7227,6 +7237,7 @@ impl AppView {
             &self.panes.cur.open_runs,
             self.model.lives[self.panes.cur.live].shown_subagents(),
             board,
+            &self.panes.cur.pinned_in,
         );
         let new = crate::cards::mark_edges(crate::authorize::with_prompts(new, &prompts, start));
         self.panes.cur.summaries.update(&new, items, &self.panes.cur.rows);
@@ -7293,7 +7304,8 @@ impl AppView {
                             shown.busy(),
                             &self.panes.cur.open_runs,
                             self.model.lives[self.panes.cur.live].shown_subagents(),
-                            board
+                            board,
+                            &self.panes.cur.pinned_in,
                         ),
                         &prompts,
                         0

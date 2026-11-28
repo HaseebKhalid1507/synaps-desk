@@ -8,7 +8,16 @@
 //!   it (`N dismissed · show` in its footer); a soft dismissal (carried
 //!   across a compaction) is its tombstone, `dismissed before compaction ·
 //!   u show`, its token the id's visibility version as drawn; the user's
-//!   placements draw first in their slots.
+//!   placements draw first in their slots; an agent's section the user
+//!   put into the transcript (`p`) isn't drawn (nor counted) here.
+//! - **What the transcript draws** ([`Stores::look`], §3.5): a block
+//!   dismissed shrinks to its 24 px tombstone, `◇ tests · dismissed · u
+//!   show` (a soft one's, `dismissed before compaction · u show`), its
+//!   token the id's desire and effective version as drawn; one pinned into
+//!   the rail leaves its stub, `◇ plan · in the rail · p` (`· the agent
+//!   moved it`); an agent's rail section the user put there draws as a
+//!   block at its creating call ([`AppView::pinned_in`]). A tombstone's
+//!   click is its `u`, a stub's its `p`.
 //! - **The rail's actions** (a section header's hover actions, the footer,
 //!   a tombstone): `×` dismisses (on a soft one, a real notice of the new
 //!   generation, and the tombstone ends), `⇅` moves it to the other slot
@@ -17,11 +26,13 @@
 //!   board first, as D6a's targets are.
 //! - **D7's keys** (`x u p m`, the hover's `×` `rail` `⇅`, and their undo)
 //!   are D7's seam, answered here ([`Stores`]'s `BlockDesires`) where this
-//!   desk draws what they do: `x` and `u` on the agent's rail sections
-//!   (`u` on a soft tombstone ends it), `p` on a transcript block (into
-//!   the rail's upper slot, and `p` again back), `m` on a rail section.
-//!   Elsewhere nothing, and the hover doesn't offer it: the transcript's
-//!   tombstone and pin stub aren't drawn yet. Ctrl+Z puts back what one
+//!   desk draws what they do: `x` and `u` on any block (the rail hides a
+//!   dismissed section, the transcript draws its tombstone; `u` on a soft
+//!   tombstone ends it, on a dismissed one shows it), `p` on a transcript
+//!   block (into the rail's upper slot, its stub left) and on an agent's
+//!   rail section (into the transcript), and `p` again back, `m` on a rail
+//!   section; the palette's block commands are the same keys on the block
+//!   walked when it opened. Ctrl+Z puts back what one
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
 //!   tombstone ended; and only where its key is offered now (a block the
@@ -80,6 +91,26 @@ use crate::walk::{Aim, Asked, BlockDesires, Wish};
 
 /// A soft dismissal's tombstone (§3.5).
 pub(crate) const SOFT: &str = "dismissed before compaction · u show";
+/// A dismissed transcript block's tombstone (§3.5), after its id.
+pub(crate) const DISMISSED: &str = "dismissed · u show";
+/// A transcript block pinned into the rail: its stub (§3.5), after its id.
+pub(crate) const IN_THE_RAIL: &str = "in the rail · p";
+/// The stub's word once the agent placed it elsewhere since the pin.
+pub(crate) const AGENT_MOVED: &str = "the agent moved it";
+
+/// How a transcript row's block draws on this desk (§3.5, [`Stores::look`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Look {
+    /// As the board has it.
+    Full,
+    /// A fixed one-line tombstone: `◇ tests · dismissed · u show`, or a
+    /// soft one's words; its token the id's visibility as drawn (a key or
+    /// a click acts only on that one).
+    Tomb { text: Arc<str>, token: u64 },
+    /// A transcript block pinned into the rail: its one-line stub,
+    /// `◇ plan · in the rail · p` (`· the agent moved it`).
+    Stub { text: Arc<str> },
+}
 /// Carriers remembered as sent, at most: the oldest is forgotten first
 /// (its notices then ride again at the same version; a second copy is
 /// stale).
@@ -339,7 +370,12 @@ impl Stores {
             if out.seen.contains_key(id) {
                 continue;
             }
-            if self.desires.dismissed(conv, &g, id, shared) {
+            // An agent's section the user put into the transcript: drawn
+            // there (its tombstone, if dismissed), not here, and not
+            // counted here.
+            if in_rail && matches!(self.pres.placed(conv, &s.block).place, Place::Transcript(_)) {
+                out.seen.insert(id.clone(), Seen::Hidden);
+            } else if self.desires.dismissed(conv, &g, id, shared) {
                 out.seen.insert(id.clone(), Seen::Hidden);
                 out.dismissed += usize::from(in_rail);
                 if in_rail {
@@ -363,6 +399,37 @@ impl Stores {
 }
 
 impl Stores {
+    /// How block `s`, drawn in conversation `conv`'s transcript from board
+    /// `d`, draws on this desk (§3.5): dismissed (this desk's desire, else
+    /// the shared record), its tombstone, `◇ tests · dismissed · u show`,
+    /// its token its desire and its effective version as drawn; softly
+    /// dismissed (across a compaction), the rail's words; pinned into the
+    /// rail, its stub; else the block.
+    pub(crate) fn look(&self, conv: &str, d: &Drawn, s: &Shown) -> Look {
+        let Ref::Block(id) = &s.block.id else { return Look::Full };
+        let Some(g) = d.generation else { return Look::Full };
+        let shared = &d.visibility;
+        if self.desires.dismissed(conv, &g, id, shared) {
+            let wish = self.desires.desire(conv, &g, id).map(|w| (w.version, w.dismissed));
+            let token = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (wish, shared.effective_version(id)).hash(&mut h);
+                h.finish()
+            };
+            return Look::Tomb { text: format!("◇ {id} · {DISMISSED}").into(), token };
+        }
+        if self.pres.soft(conv, id) {
+            return Look::Tomb { text: format!("◇ {id} · {SOFT}").into(), token: u64::from(shared.effective_version(id)) };
+        }
+        let placed = self.pres.placed(conv, &s.block);
+        if placed.by_user && matches!(placed.place, Place::Rail(_)) {
+            let moved = if placed.agent_moved { format!(" · {AGENT_MOVED}") } else { String::new() };
+            return Look::Stub { text: format!("◇ {id} · {IN_THE_RAIL}{moved}").into() };
+        }
+        Look::Full
+    }
+
     /// `aim`'s change made by `f` (it says what happened), kept to undo:
     /// its presentation before and after, and its desire after, if `f`
     /// made one (its generation, its id).
@@ -399,10 +466,12 @@ impl Stores {
             return Asked::Off;
         }
         self.said = None;
-        if !dismiss && aim.tomb.is_some() {
+        let shared = aim.drawn.visibility.clone();
+        // A soft tombstone's `u` ends it; a dismissed one's (the
+        // transcript's) is a Show.
+        if !dismiss && aim.tomb.is_some() && self.pres.soft(aim.conv, id) && !self.desires.dismissed(aim.conv, &g, id, &shared) {
             return self.keep(aim, None, |s| Ok(s.pres.unsoft(aim.conv, id)));
         }
-        let shared = aim.drawn.visibility.clone();
         self.keep(aim, Some((g, id.clone())), |s| {
             let asked = if dismiss { s.desires.dismiss(aim.conv, &g, id, &shared) } else { s.desires.show(aim.conv, &g, id, &shared) };
             match asked {
@@ -424,14 +493,14 @@ impl BlockDesires for Stores {
         true
     }
 
-    fn offers(&self, wish: Wish, b: &Block, rail: bool) -> bool {
+    fn offers(&self, wish: Wish, _b: &Block, rail: bool) -> bool {
         match wish {
-            // The rail draws a dismissal; the transcript's tombstone isn't
-            // drawn yet.
-            Wish::Dismiss | Wish::Show => matches!(b.place, Place::Rail(_)),
-            // A transcript block into the rail, and back; nothing draws an
-            // agent's rail section in the transcript yet.
-            Wish::Pin => matches!(b.place, Place::Transcript(_)),
+            // The rail hides a dismissal (its footer counts it), the
+            // transcript draws its tombstone.
+            Wish::Dismiss | Wish::Show => true,
+            // A transcript block into the rail (its stub stays), an
+            // agent's section into the transcript, and back.
+            Wish::Pin => true,
             Wish::Slot => rail,
         }
     }
@@ -611,6 +680,95 @@ pub(crate) fn tells(riding: &[(BlockId, Notice, u32)]) -> Option<String> {
 }
 
 impl AppView {
+    /// How block `s` draws in the pane acted on's transcript, on board `d`
+    /// ([`Stores::look`]; D7's stand-in draws every block).
+    pub(crate) fn look_on(&self, d: &Drawn, s: &Shown) -> Look {
+        #[cfg(test)]
+        if self.desires.is_some() {
+            return Look::Full;
+        }
+        self.wishes.look(&self.conversation(self.panes.cur.live), d, s)
+    }
+
+    /// How block `s` draws in the pane acted on's transcript now: on the
+    /// board its rows draw.
+    pub(crate) fn drawn_look(&self, s: &Shown) -> Look {
+        match self.model.lives[self.panes.cur.live].transcript.drawn() {
+            Some(d) => self.look_on(d, s),
+            None => Look::Full,
+        }
+    }
+
+    /// The agent's rail sections the user put into store `live`'s
+    /// transcript (§3.5's `p`), on board `d`, by their creating call's row
+    /// ([`crate::blocks::Pinned`]).
+    pub(crate) fn pinned_in(&self, live: LiveId, d: &Drawn) -> crate::blocks::Pinned {
+        let mut out = crate::blocks::Pinned::new();
+        let conv = self.conversation(live);
+        let desk = self.block_desires();
+        for (list, rows) in d.rail.iter().zip(&d.rail_rows) {
+            for (s, row) in list.iter().zip(rows) {
+                if let Some(row) = row
+                    && matches!(desk.placed(&conv, &s.block), Place::Transcript(_))
+                {
+                    out.entry(*row).or_default().push(s.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The pane acted on's sections put into its transcript, as its board
+    /// has them now (its session's own transcript; a worker's view has
+    /// none): what changed since the list was built takes them, and the
+    /// first item whose row has them, then or now, is where it's built
+    /// again from.
+    pub(crate) fn sync_pinned(&mut self) -> Option<usize> {
+        let live = self.panes.cur.live;
+        let l = &self.model.lives[live];
+        let board = l.shown().has_blocks() && l.watch.focused().is_none();
+        let now = match l.transcript.drawn().filter(|_| board).cloned() {
+            Some(d) => self.pinned_in(live, &d),
+            None => crate::blocks::Pinned::new(),
+        };
+        if now == self.panes.cur.pinned_in {
+            return None;
+        }
+        let rows: std::collections::HashSet<u64> = now.keys().chain(self.panes.cur.pinned_in.keys()).copied().collect();
+        let items = self.model.lives[live].shown().items();
+        let first = items.iter().position(|it| rows.contains(&it.id)).unwrap_or(items.len());
+        self.panes.cur.pinned_in = now;
+        Some(first)
+    }
+
+    /// The pane acted on's block rows this desk draws in one line (a
+    /// tombstone, a stub), against the board its rows draw: a row whose
+    /// look changed since its last measure is measured again (its height
+    /// is its look's).
+    pub(crate) fn sync_looks(&mut self) {
+        let d = self.model.lives[self.panes.cur.live].transcript.drawn().cloned();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
+        let mut now = HashMap::new();
+        let mut changed = Vec::new();
+        for (ix, row) in self.panes.cur.disp.iter().enumerate() {
+            let crate::turns::Kind::Block { at } = row.kind else { continue };
+            let look = match (&d, items.get(row.item).and_then(|it| crate::blocks::row_block(it, at, &self.panes.cur.pinned_in))) {
+                (Some(d), Some(s)) => self.look_on(d, s),
+                _ => Look::Full,
+            };
+            if self.panes.cur.looks.get(&row.id).unwrap_or(&Look::Full) != &look {
+                changed.push(ix);
+            }
+            if look != Look::Full {
+                now.insert(row.id, look);
+            }
+        }
+        self.panes.cur.looks = now;
+        for ix in changed {
+            self.panes.cur.list.remeasure_items(ix..ix + 1);
+        }
+    }
+
     /// Store `live`'s conversation: its journal (a daemon that names none:
     /// its session).
     pub(crate) fn conversation(&self, live: LiveId) -> String {
