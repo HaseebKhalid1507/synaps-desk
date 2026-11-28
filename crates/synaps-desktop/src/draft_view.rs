@@ -58,10 +58,11 @@
 //!   field, and one draft is edited in one field on the desk (opening it
 //!   in another pane closes the first, its text the draft's). The kit's
 //!   undo history is cleared once the changes it may hold pass
-//!   [`FIELD_HISTORY_MAX`] (each counted at its text before and after),
-//!   the text and caret kept. A field holds at most its draft's value, so
-//!   at most [`crate::drafts::DRAFT_MAX_BYTES`], and its history twice
-//!   that, plus one change.
+//!   [`FIELD_HISTORY_MAX`] (each counted as the kit keeps it, the text it
+//!   took out and the text it put in, [`kept_of`]), the text and caret
+//!   kept. A field holds at most its draft's value, so at most
+//!   [`crate::drafts::DRAFT_MAX_BYTES`], and its history twice that,
+//!   plus one change.
 //! - **Stale and orphaned.** A draft whose incarnation ended draws in its
 //!   row with the header's `the agent rewrote this block (r1)` or `this
 //!   block is gone`, and one with no row here (gone from the transcript,
@@ -116,8 +117,8 @@ pub(crate) const KEEPS_WORKING: &str = "the agent keeps working";
 /// Not a kind the user edits.
 pub(crate) const NOT_EDITABLE: &str = "this block isn't editable";
 
-/// The changes a field's undo history may hold (bytes: each at its text
-/// before and after) before it is cleared ([`Field::history`]).
+/// The changes a field's undo history may hold (bytes: each as the kit
+/// keeps it, [`kept_of`]) before it is cleared ([`Field::history`]).
 pub(crate) const FIELD_HISTORY_MAX: usize = 2 * crate::drafts::DRAFT_MAX_BYTES;
 
 /// A field's text past its characters' cap.
@@ -174,15 +175,62 @@ pub(crate) struct Field {
     /// characters, 2: past the draft's room), said at the next frame.
     pub refused: Rc<Cell<u8>>,
     /// What the kit's undo history may hold since it was last cleared
-    /// (bytes, [`FIELD_HISTORY_MAX`]): a composition's marked text too
-    /// ([`AppView::edit_marked`]).
+    /// (bytes, [`FIELD_HISTORY_MAX`]): each change as the kit keeps it
+    /// ([`kept_of`], [`Field::saw`]), a composition's too.
     pub history: usize,
     /// Its text as last seen (bytes, and a hash of it and its marked
-    /// range), and whether a composition was under way then.
+    /// range).
     seen: (usize, u64),
-    composing: bool,
     _sub: Subscription,
     _watch: Subscription,
+}
+
+/// What the kit's undo history keeps of one change to a field's text
+/// (bytes): the text the change took out and the text it put in
+/// (gpui-base 0.9.1 `push_history`, state.rs:3359–3404, into
+/// `UndoManager::record_transaction`, undo_manager.rs:100–118; a
+/// composition's changes kept together until it ends, 144–162). The text
+/// was `before` bytes and is `after`; `marked`: `Some` bytes of it marked
+/// now, a preedit (`replace_and_mark_text_in_range`, 4892–5033), which
+/// took out exactly what its marked text replaced. Any other change takes
+/// out at most the text before it and puts in at most the text after: a
+/// composition's commit (`replace_text_in_range`, 4636–4889) takes out
+/// its marked text, not the text the composition began on, and puts in
+/// the candidate, whatever their lengths.
+pub(crate) fn kept_of(before: usize, after: usize, marked: Option<usize>) -> usize {
+    match marked {
+        Some(m) => (before + m).saturating_sub(after) + m,
+        None => before + after,
+    }
+}
+
+impl Field {
+    /// Its text seen now, `v`, `marked` its marked range (UTF-16, the
+    /// kit's): the change from the text last seen counted in
+    /// [`Self::history`] as the kit keeps it ([`kept_of`]), once, by
+    /// whichever of its `Change` and its notify sees it first (each comes
+    /// for a change; a preedit, and a composition cancelled by an empty
+    /// one, come with a notify only). The same text and marked range seen
+    /// again counts nothing (a notify with nothing changed). Whether it
+    /// was new.
+    fn saw(&mut self, v: &str, marked: &Option<std::ops::Range<usize>>) -> bool {
+        let look = seen_hash(v, marked);
+        if self.seen.1 == look {
+            return false;
+        }
+        let mark = marked.as_ref().map(|r| utf16_bytes(v, r));
+        self.history += kept_of(self.seen.0, v.len(), mark);
+        self.seen = (v.len(), look);
+        true
+    }
+
+    /// Its text set to `value`, its undo history cleared and no
+    /// composition left (the kit's `set_value`, state.rs:1281–1303):
+    /// nothing counted.
+    fn cleared(&mut self, value: &str) {
+        self.history = 0;
+        self.seen = (value.len(), seen_hash(value, &None));
+    }
 }
 
 /// What the field says of a composition refused because its history
@@ -773,7 +821,7 @@ impl AppView {
             let watch = cx.observe_in(&e, window, move |this: &mut Self, _, window, cx| {
                 this.in_pane(pane, |this| this.edit_marked(window, cx));
             });
-            Field { of, line: None, long: Some(e), room, refused, history: 0, seen, composing: false, _sub: sub, _watch: watch }
+            Field { of, line: None, long: Some(e), room, refused, history: 0, seen, _sub: sub, _watch: watch }
         } else {
             // No text past its cap is taken, typed, pasted or marked: the
             // kit refuses it, and the block says why at the next frame.
@@ -811,7 +859,7 @@ impl AppView {
             let watch = cx.observe_in(&e, window, move |this: &mut Self, _, window, cx| {
                 this.in_pane(pane, |this| this.edit_marked(window, cx));
             });
-            Field { of, line: Some(e), long: None, room, refused, history: 0, seen, composing: false, _sub: sub, _watch: watch }
+            Field { of, line: Some(e), long: None, room, refused, history: 0, seen, _sub: sub, _watch: watch }
         };
         if let Some(ed) = self.panes.cur.edit.at.as_mut() {
             ed.field = Some(field);
@@ -829,14 +877,16 @@ impl AppView {
     /// The open field's text `v`, as typed: the draft's, as the draft took
     /// it. The field holds what the draft holds: cut or refused there, the
     /// field that was edited gets the draft's value back, in this event,
-    /// the caret kept, and the block says why (module docs). Its undo
-    /// history is cleared once it may hold [`FIELD_HISTORY_MAX`].
+    /// the caret kept, and the block says why (module docs). The change is
+    /// counted as the kit keeps it ([`Field::saw`]: a composition's commit
+    /// at its marked text and the candidate), and its undo history is
+    /// cleared once it may hold [`FIELD_HISTORY_MAX`].
     fn edit_typed(&mut self, v: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
         let Some(of) = e.field.as_ref().map(|f| f.of.clone()) else { return };
         let row = e.row;
         let held = |this: &Self| this.editing_draft().and_then(|d| field_value(&d.view(), &of)).unwrap_or_default();
-        let before = held(self);
+        let seen = self.field_now(window, cx);
         let done = match (&of, self.editing_draft_mut()) {
             (FieldOf::Label(i), Some(d)) => d.rename(i, v),
             (FieldOf::Title, Some(d)) => d.note(true, v),
@@ -853,7 +903,9 @@ impl AppView {
         let set = match self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) {
             Some(f) => {
                 f.room.set(room);
-                f.history += before.len() + v.len();
+                if let Some((fv, marked)) = seen {
+                    f.saw(&fv, &marked);
+                }
                 now != v || f.history > FIELD_HISTORY_MAX
             }
             None => false,
@@ -872,7 +924,7 @@ impl AppView {
     /// most at the end), its undo history cleared (the kit's `set_value`).
     fn field_set(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) else { return };
-        f.history = 0;
+        f.cleared(value);
         let (line, long) = (f.line.clone(), f.long.clone());
         if let Some(l) = line {
             l.update(cx, |s, cx| {
@@ -890,43 +942,38 @@ impl AppView {
         }
     }
 
-    /// The open field as an IME marks text in it (its notify): the kit
-    /// sends no `Change` for marked text, checks only a one-line field's,
-    /// and keeps each preedit in its undo history (gpui-base 0.9.1,
-    /// `replace_and_mark_text_in_range`), so each is checked here as it
-    /// comes, counted as the kit keeps it: the text it took out and the
-    /// text it marked. Marked text past the field's characters (a text
-    /// area's are within the draft's room, asserted with [`COMPOSED_LONG`];
-    /// a line's past either the kit refuses), or a composition whose
-    /// history would pass [`FIELD_HISTORY_MAX`], is refused: the field
-    /// gets the draft's value back, which ends the composition and clears
-    /// its history, and the block says why. A composition's commit is a
-    /// `Change` ([`AppView::edit_typed`]).
+    /// The open field's text and its marked range (UTF-16, the kit's).
+    fn field_now(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<(String, Option<std::ops::Range<usize>>)> {
+        let f = self.panes.cur.edit.at.as_ref()?.field.as_ref()?;
+        match (f.line.clone(), f.long.clone()) {
+            (Some(l), _) => Some((l.read(cx).value().to_string(), l.update(cx, |s, cx| s.marked_text_range(window, cx)))),
+            (None, Some(a)) => Some((a.read(cx).value().to_string(), a.update(cx, |s, cx| s.marked_text_range(window, cx)))),
+            (None, None) => None,
+        }
+    }
+
+    /// The open field notified (an IME marks text in it, or any change):
+    /// the kit sends no `Change` for marked text, checks only a one-line
+    /// field's, and keeps each preedit in its undo history (gpui-base
+    /// 0.9.1, `replace_and_mark_text_in_range`), so each is checked here
+    /// as it comes, counted as the kit keeps it ([`Field::saw`]: the text
+    /// it took out and the text it marked; the commit or cancel that ends
+    /// it, at the marked text it took out). Marked text past the field's
+    /// characters (a text area's are within the draft's room, asserted
+    /// with [`COMPOSED_LONG`]; a line's past either the kit refuses), or a
+    /// composition whose history would pass [`FIELD_HISTORY_MAX`], is
+    /// refused: the field gets the draft's value back, which ends the
+    /// composition and clears its history, and the block says why. A
+    /// composition's commit is a `Change` ([`AppView::edit_typed`]).
     fn edit_marked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
-        let Some(f) = e.field.as_ref() else { return };
+        let Some((v, marked)) = self.field_now(window, cx) else { return };
+        let Some(e) = self.panes.cur.edit.at.as_mut() else { return };
         let row = e.row;
-        let (v, marked) = match (f.line.clone(), f.long.clone()) {
-            (Some(l), _) => (l.read(cx).value(), l.update(cx, |s, cx| s.marked_text_range(window, cx))),
-            (None, Some(a)) => (a.read(cx).value(), a.update(cx, |s, cx| s.marked_text_range(window, cx))),
-            (None, None) => return,
-        };
-        let look = seen_hash(&v, &marked);
-        let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) else { return };
-        if f.seen.1 == look {
+        let Some(f) = e.field.as_mut() else { return };
+        if !f.saw(&v, &marked) {
             return;
         }
-        let (was, before) = (f.composing, f.seen.0);
-        f.seen = (v.len(), look);
-        f.composing = marked.is_some();
-        if !was && marked.is_none() {
-            return;
-        }
-        let mark = marked.as_ref().map_or(0, |r| utf16_bytes(&v, r));
-        f.history += (before + mark).saturating_sub(v.len()) + mark;
-        if marked.is_none() {
-            return;
-        }
+        let Some(mark) = marked.as_ref().map(|r| utf16_bytes(&v, r)) else { return };
         let of = f.of.clone();
         let why = if v.chars().count() > of.chars() {
             at_most(of.chars())
@@ -938,10 +985,6 @@ impl AppView {
         let held = self.editing_draft().and_then(|d| field_value(&d.view(), &of)).unwrap_or_default();
         log::info!(target: "synaps_desktop::drafts", "draft {row}: a composition refused ({} bytes marked): {why}", mark);
         self.field_set(&held, window, cx);
-        if let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) {
-            f.seen = (held.len(), seen_hash(&held, &None));
-            f.composing = false;
-        }
         self.edit_says(row, why, cx);
         self.remeasure_draft(row);
     }
@@ -1100,10 +1143,11 @@ impl AppView {
                 _ => false,
             };
             // A held block whose row its history numbered anew (a
-            // reattach): its place there, its row found by its call (§3.4:
-            // the anchor it was taken at, the agent's move of it still
-            // waiting). No row has that call (the anchor itself is gone,
-            // not renumbered): held where the board draws it now.
+            // reattach, a cold reload): its place there, its row found by
+            // its call (§3.4: the anchor it was taken at, the agent's move
+            // of it still waiting), whatever row has its number now. No
+            // row has that call (the anchor itself is gone, not
+            // renumbered): held where the board draws it now.
             let t = &l.transcript;
             for (id, p) in self.block_drafts.places(&session) {
                 if p.there(|r| has_row(t, r), |c| row_of_call(t, c)) {
@@ -1208,22 +1252,16 @@ impl AppView {
     ) -> std::sync::Arc<synaps_client::blocks::Drawn> {
         let l = &self.model.lives[live];
         let Some(session) = l.active.as_ref().map(|a| a.session_id.as_str()) else { return d };
-        // A row its history numbered anew (a reattach): found by its call
-        // (the session's transcript's: the board's rows, a watch focused
-        // or not). Its call gone too: drawn where the agent put it, taken
-        // as its place ([`AppView::sync_drafts`]).
+        // Its rows found by their calls (the session's transcript's: the
+        // board's rows, a watch focused or not), numbered anew or not. Its
+        // call gone: drawn where the agent put it, taken as its place
+        // ([`AppView::sync_drafts`]).
         let t = &l.transcript;
         let holds: Vec<_> = self
             .block_drafts
             .places(session)
             .into_iter()
-            .filter_map(|(id, p)| {
-                if p.there(|r| has_row(t, r), |c| row_of_call(t, c)) {
-                    Some((id, p))
-                } else {
-                    p.renumbered(|r| has_row(t, r), |c| row_of_call(t, c)).map(|q| (id, q))
-                }
-            })
+            .filter_map(|(id, p)| p.renumbered(|r| has_row(t, r), |c| row_of_call(t, c)).map(|q| (id, q)))
             .collect();
         if holds.is_empty() {
             return d;

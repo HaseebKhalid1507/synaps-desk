@@ -785,8 +785,8 @@ impl Draft {
 /// `move` and `collapse` of it wait in drawing until the hold ends): its
 /// list (a transcript row's blocks, or a rail slot's sections), and the
 /// blocks before it there, nearest first (none: it was first). Its
-/// rows' calls name them across a reattach, which numbers rows anew
-/// ([`Place::renumbered`]).
+/// rows' calls name them across a reattach or a cold reload, which number
+/// rows anew ([`Place::renumbered`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Place {
     /// Among the blocks anchored at transcript row `item`, its call
@@ -829,24 +829,28 @@ impl Place {
         self
     }
 
-    /// Whether its rows are in a transcript that has row `has` (none
-    /// numbered anew since it was taken). Fail-first (Shady #114 R3
-    /// P2-2): the call's row `_by_call` finds is not asked, as at 6ce4784.
-    pub(crate) fn there(&self, has: impl Fn(u64) -> bool, _by_call: impl Fn(&str) -> Option<u64>) -> bool {
-        match self {
-            Place::Row { item, .. } => has(*item),
-            Place::Rail { row, .. } => row.is_none_or(has),
-        }
+    /// Whether its rows are where they were in a transcript that has row
+    /// `has` and finds a call's row (`by_call`): none numbered anew since
+    /// it was taken ([`Self::renumbered`]).
+    pub(crate) fn there(&self, has: impl Fn(u64) -> bool, by_call: impl Fn(&str) -> Option<u64>) -> bool {
+        self.renumbered(has, by_call).is_some_and(|q| &q == self)
     }
 
     /// This place in a transcript that has row `has` and finds a call's
-    /// row (`by_call`): its row's id there, found by its call when a
-    /// reattach numbered its rows anew (§3.4: the anchor it was taken at,
-    /// never where the agent's deferred move put it). `None`: no row
-    /// there has its call (its anchor is gone, not renumbered); a rail
-    /// section's place keeps its slot, no row with it.
+    /// row (`by_call`): its row's id there, found by its call (§3.4: the
+    /// anchor it was taken at, never where the agent's deferred move put
+    /// it). A reattach numbers rows anew, and so does a cold reload (a
+    /// tab's transcript evicted from the cache is replayed into a new
+    /// one, its numbers from 1 again): a number may name another row
+    /// then, so a row with a call is found by it alone, whatever row has
+    /// its number; a row with none, by its number. `None`: no row there
+    /// has its call (its anchor is gone, not renumbered); a rail section's
+    /// place keeps its slot, no row with it.
     pub(crate) fn renumbered(&self, has: impl Fn(u64) -> bool, by_call: impl Fn(&str) -> Option<u64>) -> Option<Place> {
-        let find = |row: u64, call: &Option<Arc<str>>| if has(row) { Some(row) } else { call.as_deref().and_then(&by_call) };
+        let find = |row: u64, call: &Option<Arc<str>>| match call.as_deref() {
+            Some(c) => by_call(c),
+            None => has(row).then_some(row),
+        };
         match self {
             Place::Row { item, call, after } => Some(Place::Row { item: find(*item, call)?, call: call.clone(), after: after.clone() }),
             Place::Rail { slot, row, call, after } => {
