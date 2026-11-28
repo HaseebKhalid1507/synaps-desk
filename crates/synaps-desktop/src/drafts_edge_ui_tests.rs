@@ -1235,3 +1235,27 @@ fn a_compositions_preedits_count_in_its_fields_history(cx: &mut TestAppContext) 
     assert!(label_of(cx, &view, "fix").contains("かな"), "committed: the draft's");
     assert_eq!(line_value(cx, &f), label_of(cx, &view, "fix"));
 }
+
+/// R2 P2-4, for the mutants: a field notifies with nothing changed (its
+/// caret's blink, a redraw) while a composition is under way: nothing is
+/// counted, and it goes on; the next preedit counts what the kit keeps of
+/// it, once.
+#[gpui_kit::test]
+fn a_notify_with_nothing_changed_counts_nothing_in_a_composition(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "r");
+    let f = line(cx, &view).expect("the label's field");
+    mark_in(cx, w, &f, "かな");
+    let h = history(cx, &view);
+    assert!(marked(cx, w, &f) && h >= "かな".len(), "counted: {h}");
+    for _ in 0..20 {
+        f.update(cx, |_, cx| cx.notify());
+        settle(cx, w, 2);
+    }
+    wait(cx, w, &view, 2000);
+    assert_eq!(history(cx, &view), h, "nothing changed: nothing counted");
+    assert!(marked(cx, w, &f), "the composition goes on");
+    mark_in(cx, w, &f, "かなa");
+    assert_eq!(history(cx, &view), h + "かな".len() + "かなa".len(), "the next preedit: what it took out and what it marked");
+}

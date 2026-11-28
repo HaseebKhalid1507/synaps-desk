@@ -536,6 +536,35 @@ fn held_blocks_are_put_back_whatever_order_their_drafts_were_made() {
     assert_eq!(rows_of(&kept, 1), ["d", "a", "b", "c"], "three, newest first");
 }
 
+/// R2 P2-1, for the mutants: places taken on boards that differ (the
+/// agent moved other blocks between the takes). `a` taken from `[z, a]`,
+/// `b` from `[y, a, b]`; both moved to the rail, the list `[y, z]`: `b`
+/// waits for `a`, whatever order they come in, so `[y, z, a, b]`, never
+/// `b` after `y` for `a` not being back yet. Two that wait on each other
+/// (`a` taken after `b`, `b` after `a`): both drawn, once, the first as if
+/// the other were gone. A guard: 8186107's placement gets these by its
+/// index fallback.
+#[test]
+fn a_held_block_whose_place_is_after_another_held_one_waits_for_it() {
+    let (st, _) = notes(&["a", "b", "x", "y", "z"]);
+    let pa = (r("a"), Place::of(&listed(&st, &["z", "a"], &[]), &r("a")).expect("drawn"));
+    let pb = (r("b"), Place::of(&listed(&st, &["y", "a", "b"], &[]), &r("b")).expect("drawn"));
+    let now = listed(&st, &["y", "z"], &["a", "b"]);
+    for holds in [vec![pa.clone(), pb.clone()], vec![pb.clone(), pa.clone()]] {
+        let kept = hold_places(&now, &holds).expect("put back");
+        assert_eq!(rows_of(&kept, 1), ["y", "z", "a", "b"], "{:?} first", holds[0].0);
+        assert!(kept.rail[1].is_empty());
+    }
+    let qa = (r("a"), Place::of(&listed(&st, &["b", "a"], &[]), &r("a")).expect("drawn"));
+    let qb = (r("b"), Place::of(&listed(&st, &["a", "b"], &[]), &r("b")).expect("drawn"));
+    let now = listed(&st, &["x"], &["a", "b"]);
+    for (holds, want) in [(vec![qa.clone(), qb.clone()], ["a", "b", "x"]), (vec![qb, qa], ["b", "a", "x"])] {
+        let kept = hold_places(&now, &holds).expect("put back");
+        assert_eq!(rows_of(&kept, 1), want, "waiting on each other: both drawn, once");
+        assert!(kept.rail[1].is_empty());
+    }
+}
+
 /// Shady #114 R2 P2-2: `S`'s changed draft of `plan`'s first incarnation,
 /// stale (the agent replaced it), and `T`'s changed one of the new
 /// incarnation, held, meet in a follow, either made first. Both kept;
