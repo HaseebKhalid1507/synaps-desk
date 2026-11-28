@@ -90,6 +90,26 @@ enum Entry {
     Soft(BlockId),
 }
 
+impl Entry {
+    /// Whether it is `r`'s.
+    fn of(&self, r: &Ref) -> bool {
+        match self {
+            Entry::Placed { r: x, .. } => x == r,
+            Entry::Soft(id) => matches!(r, Ref::Block(b) if b == id),
+        }
+    }
+}
+
+/// An undo refused: the caps would drop what it puts back at once.
+pub(crate) const NO_ROOM: &str = "no room to put it back: it would be the first to go";
+
+/// A book with an undo's entries put back ([`Presentation::restored`]).
+pub(crate) struct Restored(Book);
+
+/// What the user set for one block in one conversation ([`Presentation::mark`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mark(Vec<Kept>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Kept {
     entry: Entry,
@@ -207,6 +227,8 @@ impl Stored for Book {
                     None => bad += 1,
                 }
             }
+            // A counter behind its entries (an older desk's undo): past them.
+            conv.seq = conv.seq.max(conv.entries.iter().map(|k| k.seq).max().unwrap_or(0));
             book.conversations.insert(key.clone(), conv);
         }
         Ok((book, bad))
@@ -219,6 +241,15 @@ impl Stored for Book {
 }
 
 impl Book {
+    /// `conv` touched now: the most recently touched.
+    fn stamp(&mut self, conv: &str) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let newest = self.conversations.values().map(|c| c.touched).max().unwrap_or(0);
+        if let Some(c) = self.conversations.get_mut(conv) {
+            c.touched = now.max(newest + 1);
+        }
+    }
+
     /// The caps (module docs): the oldest entries of a conversation past
     /// its own, then the least recently touched conversations past the
     /// file's.
@@ -524,8 +555,49 @@ impl Presentation {
         v.into_iter().map(|(_, r, s)| (r, s)).collect()
     }
 
+    /// What the user set for `r` in `conv`: its pin or slot move and its
+    /// soft dismissal, each as kept (an undo's before and after, D7).
+    pub(crate) fn mark(&self, conv: &str, r: &Ref) -> Mark {
+        Mark(self.book.conversations.get(conv).map(|c| c.entries.iter().filter(|k| k.entry.of(r)).cloned().collect()).unwrap_or_default())
+    }
+
+    /// `r`'s entries in `conv` put back to `was` (D7's undo: only while
+    /// they are still what the action left, [`Presentation::mark`]), or
+    /// why not, nothing changed: the caps would drop what it puts back.
+    pub(crate) fn put_back(&mut self, conv: &str, r: &Ref, was: &Mark) -> Result<(), String> {
+        let next = self.restored(conv, r, was)?;
+        self.install(next);
+        Ok(())
+    }
+
+    /// The book with `r`'s entries in `conv` put back to `was`, fitted to
+    /// the caps ([`Presentation::put_back`], not made yet), or why not:
+    /// the caps drop what it puts back (its entries keep their order, and
+    /// the oldest goes first).
+    pub(crate) fn restored(&self, conv: &str, r: &Ref, was: &Mark) -> Result<Restored, String> {
+        let mut next = self.book.clone();
+        let c = next.conversations.entry(conv.to_string()).or_default();
+        c.entries.retain(|k| !k.entry.of(r));
+        c.entries.extend(was.0.iter().cloned());
+        // The counter past what came back (an emptied conversation's
+        // starts again): what the user does next sorts after it.
+        c.seq = c.seq.max(was.0.iter().map(|k| k.seq).max().unwrap_or(0));
+        next.stamp(conv);
+        next.fit();
+        let kept = next.conversations.get(conv).map(|c| c.entries.iter().filter(|k| k.entry.of(r)).cloned().collect());
+        if Mark(kept.unwrap_or_default()) != *was {
+            return Err(NO_ROOM.into());
+        }
+        Ok(Restored(next))
+    }
+
+    /// A book [`Presentation::restored`] made, made memory's.
+    pub(crate) fn install(&mut self, next: Restored) {
+        self.book = next.0;
+        self.seq += 1;
+    }
+
     /// `p` on `b` (module docs): what it does now.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D7's `p`"))]
     pub(crate) fn pin(&mut self, conv: &str, b: &Block) -> Result<Placed, String> {
         Self::movable(conv, b)?;
         let on_rail = matches!(self.placed(conv, b).place, Place::Rail(_));
@@ -661,11 +733,7 @@ impl Presentation {
     /// `conv` changed: its touch time, the caps, and one more change to
     /// write.
     fn touch(&mut self, conv: &str) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        let newest = self.book.conversations.values().map(|c| c.touched).max().unwrap_or(0);
-        if let Some(c) = self.book.conversations.get_mut(conv) {
-            c.touched = now.max(newest + 1);
-        }
+        self.book.stamp(conv);
         self.book.fit();
         self.seq += 1;
     }

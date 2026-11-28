@@ -97,7 +97,7 @@ fn landed(a: &mut Desires, asked: Result<Ask, Refused>, conv: &str, id: &BlockId
                 .into_iter()
                 .rev()
                 .find_map(|l| match l {
-                    Landed::Wish { conv: c, id: i, done } if c == conv && i == *id => Some(done),
+                    Landed::Wish { conv: c, id: i, done, .. } if c == conv && i == *id => Some(done),
                     _ => None,
                 })
                 .expect("its write landed");
@@ -908,7 +908,11 @@ fn a_landing_keeps_what_memory_changed_since() {
     assert!(a.desire(J, &g, &id("tests")).is_none(), "settled: dropped in memory");
     assert_eq!(a.dismiss(J, &g, &id("notes"), &h.vis()), Ok(Ask::Saving), "decided after that snapshot");
     let landed = a.landed(w.run());
-    assert_eq!(landed, [Landed::Wish { conv: J.into(), id: id("plan"), done: Ok(Done::Wished(2)) }], "plan's only");
+    let notes = a.queued(J, &g, &id("notes")).expect("notes' write still queued");
+    assert!(
+        matches!(&landed[..], [Landed::Wish { conv, id: i, ticket, done: Ok(Done::Wished(2)) }] if conv == J && *i == id("plan") && *ticket != notes),
+        "plan's only: {landed:?}"
+    );
     assert!(a.desire(J, &g, &id("tests")).is_none(), "the plan's snapshot had tests: still dropped");
     assert!(a.desire(J, &g, &id("plan")).is_some());
     assert!(a.pending(J, &g, &id("notes")) && !a.dismissed(J, &g, &id("notes"), &h.vis()), "not in it: still pending");
@@ -1500,6 +1504,50 @@ fn a_wish_out_across_a_generation_switch_is_retired() {
         assert_eq!(b.len(), 0, "{how}: a restart");
         b.settle_now(J, &g2, &h.vis(), &[]);
         assert_eq!(b.len(), 0);
+    }
+}
+
+/// Each queued write has a ticket of its own (Shady #106, round 3): the
+/// same through every wish on its id until it lands (its landing names
+/// it, and lands it alone, never a wish on the id since), gone once it is
+/// retired (another generation's settle, a compaction, a discard), and
+/// never given again.
+#[test]
+fn a_queued_write_keeps_its_ticket_until_it_lands_or_is_retired() {
+    let h = H::with(&["tests", "plan"]);
+    let (g1, g2) = (generation(), Generation::of(&json!({"role":"user","content":"another start"})));
+    let d = dir("tickets");
+    let mut a = desires(&d);
+    a.settle_now(J, &g1, &h.vis(), &[]);
+    assert_eq!(a.dismiss(J, &g1, &id("tests"), &h.vis()), Ok(Ask::Saving));
+    let t1 = a.queued(J, &g1, &id("tests")).expect("queued");
+    assert_eq!(a.show(J, &g1, &id("tests"), &h.vis()), Ok(Ask::Saving));
+    assert_eq!(a.queued(J, &g1, &id("tests")), Some(t1), "the same write");
+    assert_eq!(a.dismiss(J, &g1, &id("plan"), &h.vis()), Ok(Ask::Saving));
+    let t2 = a.queued(J, &g1, &id("plan")).expect("queued");
+    assert_ne!(t1, t2, "a write each");
+    let w = a.next_write().expect("its write");
+    assert_eq!(a.dismiss(J, &g1, &id("tests"), &h.vis()), Ok(Ask::Saving), "after that snapshot");
+    let tickets =
+        |l: &[Landed]| l.iter().filter_map(|l| if let Landed::Wish { ticket, .. } = l { Some(*ticket) } else { None }).collect::<Vec<_>>();
+    assert_eq!(tickets(&a.landed(w.run())), [t2], "plan's alone");
+    assert_eq!(a.queued(J, &g1, &id("tests")), Some(t1), "tests' still waits, its own");
+    let mut seen = vec![t1, t2];
+    for how in ["switch", "compaction", "discard"] {
+        let g = if how == "switch" { &g1 } else { &g2 };
+        if how != "switch" {
+            assert_eq!(a.dismiss(J, g, &id("tests"), &h.vis()), Ok(Ask::Saving), "{how}");
+        }
+        let t = a.queued(J, g, &id("tests")).expect("queued");
+        assert!(how == "switch" || !seen.contains(&t), "{how}: never given again");
+        seen.push(t);
+        match how {
+            "switch" => _ = a.settle(J, &g2, &h.vis(), &[]),
+            "compaction" => _ = a.compacted(J, &g2, &h.vis()),
+            _ => _ = a.discard(J),
+        }
+        assert_eq!((a.queued(J, g, &id("tests")), a.queued_wishes()), (None, 0), "{how}: retired");
+        assert!(tickets(&flush(&mut a)).is_empty(), "{how}: never landed");
     }
 }
 

@@ -76,7 +76,7 @@ fn status(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<String> {
         v.panes.cur.walk.walk.as_ref()?;
         Some(match v.panes.cur.walk.walk.as_ref().and_then(|w| w.rev.as_ref()) {
             Some(_) => "rev".into(),
-            None => crate::walk::status_keys(v.desires.wired(), cfg!(target_os = "macos")),
+            None => crate::walk::status_keys(v.block_desires().wired(), cfg!(target_os = "macos")),
         })
     })
 }
@@ -146,7 +146,7 @@ fn ctrl_g_walks_from_the_newest_block_in_view_and_esc_returns_to_the_composer(cx
     assert_eq!(keys_at(cx, w, &view), (false, false), "neither the composer's nor the window's");
     let s = status(cx, &view).expect("the status line");
     assert!(has(cx, w, format!("walk-status {s}")), "the status line drawn: {s}");
-    assert!(s.contains("j k walk") && s.contains("esc composer") && !s.contains("dismiss"), "{s}");
+    assert!(s.contains("j k walk") && s.contains("esc composer") && s.contains("x dismiss · u show · p pin · m slot"), "D6b's, wired: {s}");
     press(cx, w, "k");
     assert_eq!(at(cx, &view), Some(At::Block(row("b"))));
     wait(cx, w, &view, 300);
@@ -464,7 +464,10 @@ fn hover_actions_draw_over_the_header_and_nothing_reflows(cx: &mut TestAppContex
     let h = drawn(cx, w, format!("block-head {b}"));
     assert!(acts.right() <= h.right() + px(0.5) && acts.top() >= h.top() && acts.bottom() <= h.bottom(), "over the header's end");
     assert!(has(cx, w, format!("hover-act {b} rev")) && has(cx, w, format!("hover-act {b} fold")));
-    assert!(!has(cx, w, format!("hover-act {b} ×")) && !has(cx, w, format!("hover-act {b} rail")), "D6b's not wired");
+    assert!(
+        !has(cx, w, format!("hover-act {b} ×")) && has(cx, w, format!("hover-act {b} rail")),
+        "D6b's: a transcript block's pin, no × (its tombstone isn't drawn yet)"
+    );
     // c has one revision: no rev.
     let at_ = head(cx, w, "c");
     mouse(cx, w, at_, "move");
@@ -680,6 +683,7 @@ impl Asks {
 #[gpui_kit::test]
 fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     let (w, view) = walked(cx);
+    view.update(cx, |v, _| v.desires = Some(Box::new(crate::walk::NoDesires)));
     enter(cx, w, &view);
     for k in ["x", "u", "p", "m"] {
         press(cx, w, k);
@@ -687,7 +691,7 @@ fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     assert!(walking(cx, w, &view) && !folded(cx, &view, "c") && note(cx, &view).is_none(), "not wired: nothing");
     press(cx, w, "escape");
     let asks = Asks::default();
-    view.update(cx, |v, _| v.desires = Box::new(asks.clone()));
+    view.update(cx, |v, _| v.desires = Some(Box::new(asks.clone())));
     enter(cx, w, &view);
     assert!(status(cx, &view).is_some_and(|s| s.contains("x dismiss · u show · p pin · m slot")));
     let sid = attachment(cx, &view).1;
@@ -709,6 +713,745 @@ fn dismiss_show_pin_and_slot_go_to_d6bs_desires(cx: &mut TestAppContext) {
     *asks.1.borrow_mut() = Some("a write failed".into());
     press(cx, w, "u");
     assert_eq!(note(cx, &view), Some((row("c"), crate::walk::REFUSED)), "refused: the note");
+}
+
+// ── D6b's stores behind the seam ──────────────────────────────────────
+
+/// Two agent sections, `r1` and `r2`, in the rail's upper slot.
+fn rail_blocks(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    ops(
+        cx,
+        w,
+        view,
+        "toolu_rb",
+        json!([
+            {"op":"put","id":"r1","kind":"note","target":"rail","slot":"upper","body":{"text":"R one"}},
+            {"op":"put","id":"r2","kind":"note","target":"rail","slot":"upper","body":{"text":"R two"}}
+        ]),
+    );
+    wait(cx, w, view, 1000);
+}
+
+/// Section `name` as the rail lays it out now: its slot, whether the user
+/// placed it, whether it draws as a tombstone.
+fn sec(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(Slot, bool, bool)> {
+    let id = Ref::parse(name).expect("an id");
+    view.read_with(cx, |v, _| {
+        let (_, l) = v.rail_layout()?;
+        l.section(&id).map(|s| (s.slot, s.user, matches!(s.state, crate::agent_rail::State::Tombstone(_))))
+    })
+}
+
+/// D6b's writes landed (a dismissal draws once it is written), and the
+/// frames after.
+fn landed(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    super::rail_wishes_ui_tests::written(cx, view);
+    wait(cx, w, view, 300);
+    super::rail_wishes_ui_tests::written(cx, view);
+}
+
+fn desires(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
+    view.read_with(cx, |v, _| v.wishes.desires.len())
+}
+
+/// The desk restarts on the same files (the old one's locks let go): what
+/// it draws is what they kept.
+fn restart(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    landed(cx, w, view);
+    let (d, p) = view.read_with(cx, |v, _| (v.wishes.desires.path().map(Into::into), v.wishes.pres.path().map(Into::into)));
+    view.update(cx, |v, _| v.wishes = crate::rail_wishes::Stores::at_launch());
+    let home = crate::rail_wishes::Home::take(d, p);
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    landed(cx, w, view);
+    assert!(view.read_with(cx, |v, _| v.wishes.desires.owns_file() && v.wishes.pres.owns_file()), "the files are its own");
+}
+
+/// `x` on an agent's rail section is D6b's dismissal: the section goes
+/// once it is written, the zone counts it, and a restart keeps it; Ctrl+Z
+/// cancels one no notice of which went, and the section comes back.
+#[gpui_kit::test]
+fn x_dismisses_a_rail_section_and_ctrl_z_cancels_it_unsent(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "dismissed: the section goes");
+    assert_eq!(view.read_with(cx, |v, _| v.rail_layout().map(|(_, l)| l.dismissed)), Some(1), "the zone counts it");
+    assert_eq!(desires(cx, &view), 1, "a desire, written");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "undone: back");
+    assert_eq!(desires(cx, &view), 0, "never sent: cancelled");
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "a restart keeps it");
+    assert_eq!(desires(cx, &view), 1);
+}
+
+/// A dismissal whose notice went isn't undone by Ctrl+Z (`u` shows it
+/// again): the section stays dismissed, and the rail says why.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_dismissal_whose_notice_went_isnt_undone(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    press(cx, w, "escape");
+    view.update(cx, |v, cx| assert!(v.enter("go on".into(), cx)));
+    landed(cx, w, &view);
+    let sent = view.read_with(cx, |v, _| v.wishes.outbox.clone());
+    assert!(sent.last().is_some_and(|m| m.starts_with("go on\n[block r1 v") && m.ends_with(" dismissed]")), "it rode: {sent:?}");
+    enter(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "still dismissed");
+    let said = view.read_with(cx, |v, _| v.wishes.said.clone()).unwrap_or_default();
+    assert!(said.contains("its notice went"), "{said}");
+}
+
+/// `m` moves a rail section to the other slot, written to the file (a
+/// restart keeps it); Ctrl+Z puts back the agent's placement.
+#[gpui_kit::test]
+fn m_moves_a_rail_section_and_ctrl_z_puts_it_back(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::End, true, false)), "the end slot, the user's");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "undone: the agent's");
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "m");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::End, true, false)), "a restart keeps it");
+}
+
+/// `p` on a transcript block pins it into the rail's upper slot (a
+/// restart keeps it); `p` on its rail section takes it out again, and
+/// Ctrl+Z puts the pin back (its section found wherever the board has it).
+#[gpui_kit::test]
+fn p_pins_a_transcript_block_into_the_rail_and_back(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    walk_on(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "undone: pinned again");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "a restart keeps it");
+}
+
+/// The walk finds a transcript block where this desk draws it (D6b's
+/// placement, `BlockDesires::placed`): pinned into the rail, its
+/// transcript row is placed in the rail's upper slot, and `m` on it moves
+/// its rail section.
+#[gpui_kit::test]
+fn a_pinned_blocks_row_is_placed_where_its_pin_is(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let (_, s) = v.block_shown(row("c")).expect("drawn");
+        assert!(v.wishes.pres.pin(&conv, &s.block).is_ok());
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    let place = view.read_with(cx, |v, _| v.bound_board().and_then(|d| v.find_on(&d, At::Block(row("c")))).map(|f| f.place));
+    assert_eq!(place, Some(Place::Rail(Slot::Upper)), "its row, placed where its pin is");
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::End, true, false)), "its pin, moved");
+}
+
+/// `u` on a soft tombstone ends it, and Ctrl+Z puts it back; `x` on one
+/// sends a real notice of the new generation, and the tombstone ends.
+#[gpui_kit::test]
+fn u_ends_a_soft_tombstone_and_x_dismisses_it(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let ids = ["r1", "r2"].map(|i| cards_spec::block::BlockId::parse(i).expect("an id"));
+        v.wishes.pres.compacted("before-compaction", &conv, &ids);
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "a soft tombstone");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "u");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "it ends");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "undone: the tombstone again");
+    walk_on(cx, w, &view, At::Rail(row("r2")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r2"), None, "dismissed");
+    assert_eq!(desires(cx, &view), 1, "a real notice's desire");
+    let soft = view.read_with(cx, |v, _| {
+        let conv = v.conversation(v.panes.cur.live);
+        v.wishes.pres.soft(&conv, &cards_spec::block::BlockId::parse("r2").expect("an id"))
+    });
+    assert!(!soft, "its tombstone ended");
+}
+
+/// The hover offers D6b's actions where this desk draws them: a transcript
+/// block `rail` (a pin), never `×`; an agent's rail section `⇅` and `×`,
+/// never `rail`; a pinned one's section `rail` (out again). They act.
+#[gpui_kit::test]
+fn the_hover_offers_d6bs_actions_where_they_draw(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    let c = row("c");
+    let at_ = head(cx, w, "c");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-act {c} rail")) && !has(cx, w, format!("hover-act {c} ×")));
+    let pin = drawn(cx, w, format!("hover-act {c} rail")).center();
+    click(cx, w, pin);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "pinned into the rail");
+    let rail_head = |cx: &mut TestAppContext, name: &str| {
+        let at_ = drawn(cx, w, format!("agent-head {}", row(name))).center();
+        mouse(cx, w, at_, "move");
+        wait(cx, w, &view, 300);
+    };
+    let r1 = row("r1");
+    rail_head(cx, "r1");
+    assert!(has(cx, w, format!("hover-act {r1} ⇅")) && has(cx, w, format!("hover-act {r1} ×")));
+    assert!(!has(cx, w, format!("hover-act {r1} rail")), "an agent's section: no pin");
+    rail_head(cx, "c");
+    assert!(has(cx, w, format!("hover-act {c} rail")), "a pinned one's: out again");
+    let unpin = drawn(cx, w, format!("hover-act {c} rail")).center();
+    click(cx, w, unpin);
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "out of the rail");
+}
+
+// ── D6b's undo: its scope, its two stores, the caps, the order ────────
+
+/// The walk to `to`, back (`k`) or on (`j`).
+fn walk_to(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
+    for _ in 0..16 {
+        if at(cx, view) == Some(to) {
+            break;
+        }
+        press(cx, w, "k");
+    }
+    walk_on(cx, w, view, to);
+}
+
+/// The walk has the keys (entered again if it ended).
+fn walk_again(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    if !walking(cx, w, view) {
+        enter(cx, w, view);
+    }
+}
+
+/// What the user set for `name` in the pane's conversation (its marks).
+fn mark(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> crate::presentation::Mark {
+    view.read_with(cx, |v, _| v.wishes.pres.mark(&v.conversation(v.panes.cur.live), &Ref::parse(name).expect("an id")))
+}
+
+/// The writer let go: what it held runs, and lands.
+fn release(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, hold: crate::blockfiles::Hold) {
+    drop(hold);
+    view.read_with(cx, |v, _| v.wishes.home.writer.clone()).drain();
+    landed(cx, w, view);
+}
+
+/// What the rail's footer says last.
+fn said(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, _| v.wishes.said.clone()).unwrap_or_default()
+}
+
+/// Shady #106 P2-1: Ctrl+Z is refused where its key isn't offered. A
+/// dismissal asked and cancelled before it was written (`x`, `u`, the
+/// writer held), the section then moved by the agent into the transcript
+/// (the same incarnation): undoing that `u` would dismiss a transcript
+/// block, which this desk doesn't draw dismissed. Nothing changes, no
+/// notice rides the next message; there `x` and `u` do nothing, and the
+/// hover doesn't offer `×`.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn ctrl_z_is_refused_where_its_key_isnt_offered(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    let writer = view.read_with(cx, |v, _| v.wishes.home.writer.clone());
+    let hold = writer.hold();
+    press(cx, w, "x");
+    wait(cx, w, &view, 300);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "not written yet: it still draws");
+    press(cx, w, "u");
+    release(cx, w, &view, hold);
+    assert_eq!(desires(cx, &view), 0, "cancelled before it was written");
+    ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
+    wait(cx, w, &view, 1000);
+    assert_eq!(sec(cx, &view, "r1"), None, "the agent moved it into the transcript");
+    let before = mark(cx, &view, "r1");
+    walk_again(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "no dismissal of a transcript block");
+    assert_eq!(mark(cx, &view, "r1"), before, "its presentation as it was");
+    assert!(said(cx, &view).contains("moved where this desk doesn't draw that"), "refused: {}", said(cx, &view));
+    // There its own keys do nothing, and the hover doesn't offer them.
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("r1")));
+    press(cx, w, "x");
+    press(cx, w, "u");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "x and u: nothing");
+    let r1 = row("r1");
+    let at_ = head(cx, w, "r1");
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-acts {r1}")) && !has(cx, w, format!("hover-act {r1} ×")), "no ×");
+    press(cx, w, "escape");
+    view.update(cx, |v, cx| assert!(v.enter("go on".into(), cx)));
+    landed(cx, w, &view);
+    let sent = view.read_with(cx, |v, _| v.wishes.outbox.clone());
+    assert_eq!(sent.last().map(String::as_str), Some("go on"), "no notice rode: {sent:?}");
+}
+
+/// Soft dismissals of `ids` carried into the pane's conversation (a
+/// compaction's), written.
+fn softly(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ids: &[String]) {
+    view.update(cx, |v, cx| {
+        let conv = v.conversation(v.panes.cur.live);
+        let ids: Vec<_> = ids.iter().map(|i| cards_spec::block::BlockId::parse(i).expect("an id")).collect();
+        v.wishes.pres.compacted("before-compaction", &conv, &ids);
+        v.pump_wishes(cx);
+        cx.notify();
+    });
+    landed(cx, w, view);
+}
+
+fn is_soft(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> bool {
+    view.read_with(cx, |v, _| {
+        v.wishes.pres.soft(&v.conversation(v.panes.cur.live), &cards_spec::block::BlockId::parse(name).expect("an id"))
+    })
+}
+
+/// `r1` and `r2` soft tombstones, and `x` on `r1`'s: its dismissal
+/// written, its tombstone ended.
+fn x_on_a_tombstone(cx: &mut TestAppContext) -> W {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    softly(cx, w, &view, &["r1".into(), "r2".into()]);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None, "dismissed");
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "a desire, and its tombstone ended");
+    (w, view)
+}
+
+/// Shady #106 P2-2: Ctrl+Z of `x` on a soft tombstone is both stores'
+/// (the dismissal cancelled, the tombstone back). The disk refusing the
+/// desire's write puts the presentation back too: both as `x` left them,
+/// in memory, on the rail and in the files; its token gone.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn an_undo_whose_desire_isnt_written_leaves_both_stores_as_its_key_did(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "r1"), None, "still dismissed");
+    assert_eq!(desires(cx, &view), 1, "the dismissal, as x left it");
+    assert!(!is_soft(cx, &view, "r1"), "and its tombstone, as x left it: ended");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "its token went: nothing again");
+    // The disk back as x wrote it: a restart reads both as x left them.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"));
+}
+
+/// Shady #106 P2-2: the same undo, its write late: until it lands the
+/// rail draws what `x` left; then both stores, the rail and the files are
+/// what was before `x`, together.
+#[gpui_kit::test]
+fn a_late_undo_puts_both_stores_back_together(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert_eq!(sec(cx, &view, "r1"), None, "not written yet: the dismissal draws");
+    release(cx, w, &view, hold);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "undone: its tombstone");
+    assert!(desires(cx, &view) == 0 && is_soft(cx, &view, "r1"), "both stores");
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, true)), "and the files");
+    assert_eq!(desires(cx, &view), 0);
+}
+
+/// Shady #106 P2-2, round 2: what a failed undo write needs kept is
+/// never dropped for room. `r1`'s undo held (its cancel a write away),
+/// then `x` and Ctrl+Z on `r2`'s tombstone again and again, past
+/// [`UNDO_KEPT`](crate::rail_wishes::UNDO_KEPT) (two wishes waiting all
+/// along), and the disk refuses the writes: `r1` both as `x` left it, `r2`
+/// as before its first `x`; in memory, on the rail and in the files, and
+/// no token left to undo.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_failed_undo_keeps_both_stores_together_however_many_undos_follow(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(sec(cx, &view, "r1").is_none() && is_soft(cx, &view, "r1"), "its tombstone back, the dismissal drawn until written");
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Rail(row("r2")));
+    for n in 0..=crate::rail_wishes::UNDO_KEPT {
+        press(cx, w, "x");
+        wait(cx, w, &view, 20);
+        assert!(!is_soft(cx, &view, "r2"), "x {n}: r2's tombstone ended: {}", said(cx, &view));
+        press(cx, w, "ctrl-z");
+        wait(cx, w, &view, 20);
+        assert!(is_soft(cx, &view, "r2"), "undo {n}: back: {}", said(cx, &view));
+    }
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "r1"), None, "r1 still dismissed");
+    assert_eq!(desires(cx, &view), 1, "r1's dismissal as x left it, none of r2's");
+    assert!(!is_soft(cx, &view, "r1"), "and r1's tombstone as x left it: ended");
+    assert_eq!(sec(cx, &view, "r2"), Some((Slot::Upper, false, true)), "r2 as before its first x");
+    assert!(is_soft(cx, &view, "r2"));
+    walk_again(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"), "no token left: nothing again");
+    // The disk back as x wrote it: a restart reads it all so.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(sec(cx, &view, "r1"), None);
+    assert_eq!(sec(cx, &view, "r2"), Some((Slot::Upper, false, true)));
+    assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"));
+}
+
+/// The rail demo's history (`first` its first message: its generation),
+/// `plan`'s dismissal shared: a notice of it in the history.
+fn plan_shared(first: Option<&str>) -> Vec<Value> {
+    let mut h = synaps_client::synthetic::rail_history();
+    if let Some(first) = first {
+        h[0] = json!({"role": "user", "content": first});
+    }
+    h.push(json!({"role": "user", "content": "noted\n[block plan v1 dismissed]"}));
+    h.push(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}));
+    h
+}
+
+/// The footer's `show`, clicked (come a moment after the board, D6a's
+/// guard).
+fn footer_show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    wait(cx, w, view, 700);
+    let show = drawn(cx, w, "agent-footer 1 dismissed · show".into()).center();
+    click(cx, w, show);
+    wait(cx, w, view, 300);
+    away(cx, w);
+}
+
+/// Shady #106 P2-2, round 3: an undo's recovery is its own write's, by
+/// that write's ticket. `plan` soft, its dismissal shared; the footer's
+/// Show saved (its tombstone draws), `x` on the tombstone saved (the Show
+/// cancelled to none, the tombstone ended), and Ctrl+Z with the writer
+/// held (the Show again, the tombstone back). The history's generation
+/// switches, retiring that write; then the footer's Show in the new one,
+/// and the disk refuses: that Show changed no presentation, so the
+/// tombstone stays, in memory and in the files.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_retired_undos_recovery_never_acts_on_another_generations_write(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    history_now(cx, w, &view, plan_shared(None));
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "plan"), None, "shared: dismissed");
+    softly(cx, w, &view, &["plan".into()]);
+    footer_show(cx, w, &view);
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 1, "a local show");
+    assert_eq!(sec(cx, &view, "plan").map(|s| s.2), Some(true), "shown: its soft tombstone");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("plan")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 0 && !is_soft(cx, &view, "plan"), "the show cancelled, the tombstone ended");
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(is_soft(cx, &view, "plan"), "the tombstone back");
+    assert_eq!(view.read_with(cx, |v, _| (v.wishes.undoing(), v.wishes.desires.queued_wishes())), (1, 1), "its show a write away");
+    // Another generation: the undo's write retired.
+    history_now(cx, w, &view, plan_shared(Some("another start")));
+    wait(cx, w, &view, 300);
+    let kept = mark(cx, &view, "plan");
+    footer_show(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.wishes.desires.queued_wishes()), 1, "the new generation's show, a write away");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(desires(cx, &view), 0, "the show not kept");
+    assert_eq!(sec(cx, &view, "plan"), None, "dismissed, as shared");
+    assert_eq!(mark(cx, &view, "plan"), kept, "the show's failure touched no presentation");
+    assert!(is_soft(cx, &view, "plan"), "its soft dismissal stays");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert!(is_soft(cx, &view, "plan"), "and in the files");
+}
+
+/// Shady #106 P2-2, round 3: an undo's recovery goes with its write, and
+/// only its own: retired by another generation's settle, or by a
+/// compaction, it goes too (records never outnumber the writes queued),
+/// and nothing is put back.
+fn a_retired_write_retires_its_recovery(cx: &mut TestAppContext, how: &str) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    let counts = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.wishes.undoing(), v.wishes.desires.queued_wishes()));
+    assert_eq!(counts(cx), (1, 1), "the undo's cancel a write away, and its recovery");
+    let marks = |cx: &mut TestAppContext| (is_soft(cx, &view, "r1"), is_soft(cx, &view, "r2"));
+    assert_eq!(marks(cx), (true, true), "r1's tombstone back");
+    match how {
+        "switch" => {
+            let mut h = synaps_client::synthetic::blocks_history();
+            h[0] = json!({"role": "user", "content": "another start"});
+            history_now(cx, w, &view, h);
+        }
+        _ => {
+            let batch = compaction_onto(cx, &view, "j-next", synaps_client::synthetic::blocks_history());
+            view.update(cx, |v, cx| v.apply_batch(batch, cx));
+            cx.run_until_parked();
+            wait(cx, w, &view, 300);
+        }
+    }
+    assert_eq!(counts(cx), (0, 0), "{how}: the write retired, its recovery too");
+    let before = view.read_with(cx, |v, _| v.wishes.pres.mark("j-next", &Ref::parse("r1").expect("an id")));
+    release(cx, w, &view, hold);
+    assert_eq!(counts(cx), (0, 0), "{how}");
+    if how == "switch" {
+        assert_eq!(marks(cx), (true, true), "{how}: nothing put back");
+    } else {
+        let after = view.read_with(cx, |v, _| v.wishes.pres.mark("j-next", &Ref::parse("r1").expect("an id")));
+        assert_eq!(after, before, "{how}: nothing put back");
+    }
+}
+
+#[gpui_kit::test]
+fn a_generation_switch_retires_an_undos_recovery_with_its_write(cx: &mut TestAppContext) {
+    a_retired_write_retires_its_recovery(cx, "switch");
+}
+
+#[gpui_kit::test]
+fn a_compaction_retires_an_undos_recovery_with_its_write(cx: &mut TestAppContext) {
+    a_retired_write_retires_its_recovery(cx, "compaction");
+}
+
+/// Shady #106 P2-2, round 3: `r1` hidden while its undo's write waits
+/// (the dismissal `x` saved draws until then), the agent moves it into
+/// the transcript, and `p` pins it there: a newer placement. The disk
+/// refusing the undo's write leaves that placement, in memory and in the
+/// files (its key left the mark another one).
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_failed_undo_leaves_a_placement_made_since(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(sec(cx, &view, "r1").is_none() && is_soft(cx, &view, "r1"), "hidden until written, its tombstone back");
+    let undone = mark(cx, &view, "r1");
+    ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
+    wait(cx, w, &view, 1000);
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("r1")));
+    press(cx, w, "p");
+    wait(cx, w, &view, 300);
+    let pinned = mark(cx, &view, "r1");
+    assert_ne!(pinned, undone, "p: a newer placement");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(desires(cx, &view), 1, "r1's dismissal, as x left it");
+    assert_eq!(mark(cx, &view, "r1"), pinned, "the pin stays");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(mark(cx, &view, "r1"), pinned, "and in the files");
+}
+
+/// The pane's conversation's presentation entries.
+fn entries(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
+    view.read_with(cx, |v, _| {
+        let conv = v.conversation(v.panes.cur.live);
+        (0..=crate::presentation::ENTRIES_MAX)
+            .filter(|i| v.wishes.pres.soft(&conv, &cards_spec::block::BlockId::parse(&format!("s{i}")).expect("an id")))
+            .count()
+            + v.wishes.pres.user_rail(&conv).len()
+    })
+}
+
+/// Shady #106 P2-3: Ctrl+Z puts back what it says, or nothing. At the
+/// conversation's cap (64 entries), `c`'s pin the oldest: pane 1 unpins
+/// it, pane 2 (the same conversation) pins `b` into the room, and pane
+/// 1's Ctrl+Z would put back an entry the cap drops at once. Refused, and
+/// said why: nothing changed.
+#[gpui_kit::test]
+fn an_undo_the_caps_would_drop_is_refused_and_changes_nothing(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX, "at the cap, c's pin the oldest");
+    walk_on(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "unpinned");
+    // Pane 2, on the same conversation: `b` pinned into the room.
+    press(cx, w, "escape");
+    let first = view.read_with(cx, |v, _| v.panes.focused);
+    split(cx, w, &view);
+    tail(cx, w, &view);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("b")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b pinned");
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX);
+    // Pane 1's Ctrl+Z.
+    let c1 = view.read_with(cx, |v, _| v.panes.iter().find(|p| p.id == first).map(|p| p.composer.clone()).expect("pane 1"));
+    cx.update_window(w, |_, window, cx| c1.update(cx, |s, cx| s.focus(window, cx))).expect("the window");
+    settle(cx, w, 8);
+    wait(cx, w, &view, 100);
+    assert_eq!(view.read_with(cx, |v, _| v.panes.focused), first, "pane 1");
+    enter(cx, w, &view);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), None, "not pinned again");
+    assert!(said(cx, &view).contains("no room to put it back"), "refused, said: {}", said(cx, &view));
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b as it was");
+    assert_eq!(entries(cx, &view), crate::presentation::ENTRIES_MAX, "every entry as it was");
+}
+
+/// Shady #106 P2-3: an undo of both stores at the cap (`x` on a soft
+/// tombstone, its soft entry the oldest, a carry filling the room since)
+/// is refused before either store changes: the dismissal stays.
+#[gpui_kit::test]
+fn an_undo_of_both_stores_the_caps_would_drop_changes_neither(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    rail_blocks(cx, w, &view);
+    softly(cx, w, &view, &["r1".into()]);
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("r1")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert!(sec(cx, &view, "r1").is_none() && desires(cx, &view) == 1 && !is_soft(cx, &view, "r1"), "dismissed");
+    softly(cx, w, &view, &[format!("s{}", crate::presentation::ENTRIES_MAX)]);
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 1, "the dismissal stays");
+    assert!(sec(cx, &view, "r1").is_none() && !is_soft(cx, &view, "r1"), "neither store changed");
+    assert!(said(cx, &view).contains("no room to put it back"), "refused, said: {}", said(cx, &view));
+}
+
+/// Shady #106 P2-4: an undo that brings an emptied conversation back
+/// keeps its counter past what it puts back. `c` pinned and moved twice
+/// (its entry the conversation's third), unpinned (the conversation
+/// gone), Ctrl+Z; after a restart `b` pinned into the same slot sorts
+/// after `c`, and `c`, the older, is the first the cap drops.
+#[gpui_kit::test]
+fn an_undo_keeps_the_conversations_order_past_a_restart(cx: &mut TestAppContext) {
+    let (w, view) = walked(cx);
+    enter(cx, w, &view);
+    assert_eq!(at(cx, &view), Some(At::Block(row("c"))));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::End, true, false)));
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "m");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)));
+    walk_to(cx, w, &view, At::Rail(row("c")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    assert!(sec(cx, &view, "c").is_none() && entries(cx, &view) == 0, "unpinned: the conversation's last");
+    press(cx, w, "ctrl-z");
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "c"), Some((Slot::Upper, true, false)), "undone");
+    press(cx, w, "escape");
+    restart(cx, w, &view);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("b")));
+    press(cx, w, "p");
+    landed(cx, w, &view);
+    let rail = view.read_with(cx, |v, _| v.wishes.pres.user_rail(&v.conversation(v.panes.cur.live)));
+    let (c, b) = (Ref::parse("c").expect("an id"), Ref::parse("b").expect("an id"));
+    assert_eq!(rail, [(c, Slot::Upper), (b, Slot::Upper)], "c, the older, first");
+    // One past the cap: the oldest goes.
+    let fill: Vec<String> = (1..crate::presentation::ENTRIES_MAX).map(|i| format!("s{i}")).collect();
+    softly(cx, w, &view, &fill);
+    assert_eq!(sec(cx, &view, "c"), None, "c went first");
+    assert_eq!(sec(cx, &view, "b"), Some((Slot::Upper, true, false)), "b stays");
 }
 
 // ── the op log ────────────────────────────────────────────────────────
@@ -1119,7 +1862,7 @@ fn the_walk_finds_its_targets_where_this_desk_draws_them(cx: &mut TestAppContext
     let asks = Asks::default();
     view.update(cx, |v, cx| {
         v.agent_rail.vis = Some(Rc::new(Placed { placed: vec![(id("a"), Slot::Upper), (id("r1"), Slot::End)], tomb: id("r2") }));
-        v.desires = Box::new(asks.clone());
+        v.desires = Some(Box::new(asks.clone()));
         cx.notify();
     });
     wait(cx, w, &view, 1000);

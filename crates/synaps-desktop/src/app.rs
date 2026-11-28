@@ -2441,9 +2441,10 @@ pub struct AppView {
     /// Every key's presses: an entered card's keys act on new ones only
     /// ([`crate::ask_keys::Presses`]).
     pub(crate) ask_presses: crate::ask_keys::Presses,
-    /// D6b's side of the walk's shared and stored keys ([`crate::walk::BlockDesires`]):
-    /// nothing wired until D6b (#103) lands.
-    pub(crate) desires: Box<dyn crate::walk::BlockDesires>,
+    /// Tests: a stand-in for D6b's side of the walk's shared and stored
+    /// keys ([`crate::walk::BlockDesires`]; else D6b's stores, `wishes`).
+    #[cfg(test)]
+    pub(crate) desires: Option<Box<dyn crate::walk::BlockDesires>>,
     /// The op log, open ([`crate::oplog`], D7).
     pub(crate) oplog: Option<crate::oplog::OpLog>,
     /// The sessions' archives (D7, §5.2: [`crate::oplog::Archives`]), and
@@ -3070,7 +3071,8 @@ impl AppView {
             card_tick: None,
             memo_seen: 0,
             ask_presses: Default::default(),
-            desires: Box::new(crate::walk::NoDesires),
+            #[cfg(test)]
+            desires: None,
             oplog: None,
             archives: Default::default(),
             captures: Vec::new(),
