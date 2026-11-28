@@ -444,6 +444,35 @@ fn as_typed(q: &Query, f: &Fields) -> u16 {
     (0..q.n).filter(|&i| word_place(q.word(i), f, false).is_some()).fold(0, |m, i| m | 1 << i)
 }
 
+// The matcher's work and the walks over the rows, on this thread (a test's
+// own): tests read them.
+#[cfg(test)]
+thread_local! {
+    static MATCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count(c: &'static std::thread::LocalKey<std::cell::Cell<u64>>) {
+    c.with(|c| c.set(c.get() + 1));
+}
+
+/// Rows matched on this thread so far (a row's words against its strings).
+#[cfg(test)]
+pub(crate) fn matched() -> u64 {
+    MATCHED.with(|c| c.get())
+}
+
+/// Walks over the rows begun on this thread so far.
+#[cfg(test)]
+pub(crate) fn walks() -> u64 {
+    WALKS.with(|c| c.get())
+}
+
+/// What the search keeps of a row.
+#[cfg(test)]
+pub(crate) type Item = Found;
+
 /// The page's search: its query, the rows found in a pass over the rows
 /// ([`Search::results`]) and their hits. Both lists are reserved once, at
 /// the first query, to their caps (PLAN §3.6) and never grow past them: a
@@ -487,6 +516,8 @@ impl Search {
     /// [`take`]: Search::take
     /// [`scanned`]: Search::scanned
     pub(crate) fn begin(&mut self) -> bool {
+        #[cfg(test)]
+        count(&WALKS);
         if !self.query.is_empty() && self.hits.capacity() == 0 {
             self.results.reserve_exact(MAX_ROWS);
             self.hits.reserve_exact(MAX_HITS);
@@ -519,6 +550,8 @@ impl Search {
         if self.query.is_empty() {
             return Some(Found { row: u16::MAX, rank: 0 });
         }
+        #[cfg(test)]
+        count(&MATCHED);
         if self.scanning {
             self.seen |= as_typed(&self.query, f);
             return None;
@@ -547,6 +580,18 @@ impl Search {
             self.take(f);
         }
         &self.results
+    }
+
+    /// Each row of `rows` found, as the page takes them: its index and rank.
+    #[cfg(test)]
+    pub(crate) fn found_in(&mut self, rows: &[Fields]) -> Vec<(usize, Rank)> {
+        if self.begin() {
+            for f in rows {
+                self.take(f);
+            }
+            self.scanned();
+        }
+        rows.iter().enumerate().filter_map(|(i, f)| self.take(f).map(|x| (i, x.rank))).collect()
     }
 
     /// The rows found in this pass, in their order.
@@ -669,20 +714,20 @@ mod tests {
     }
 
     /// The keys found by `query` over `rows`, in rank order (the page's
-    /// order among equals), as the page takes its rows: scan, then each.
+    /// order among equals), as the page takes its rows.
     fn found(rows: &[Owned], query: &str) -> Vec<String> {
-        let f = fields(rows);
         let mut s = Search::default();
         s.set(q(query));
-        if s.begin() {
-            for r in &f {
-                s.take(r);
-            }
-            s.scanned();
-        }
-        let mut by: Vec<(Rank, usize)> = f.iter().enumerate().filter_map(|(i, r)| s.take(r).map(|x| (x.rank, i))).collect();
-        by.sort_by_key(|&(r, _)| r);
-        by.into_iter().map(|(_, i)| rows[i].key.clone()).collect()
+        let mut by = s.found_in(&fields(rows));
+        by.sort_by_key(|&(_, r)| r);
+        by.into_iter().map(|(i, _)| rows[i].key.clone()).collect()
+    }
+
+    /// A field's hits, as byte ranges (start, end), in order.
+    fn ranges(hits: &[Hit], field: u8) -> Vec<(usize, usize)> {
+        let mut r: Vec<_> = hits.iter().filter(|h| h.field == field).map(|h| (usize::from(h.start), usize::from(h.end))).collect();
+        r.sort_unstable();
+        r
     }
 
     /// `w`'s first half, to a character.
@@ -852,8 +897,10 @@ mod tests {
         // Past the inventory: 85 more plugins.
         rows.extend((0..85).map(|i| row(&format!("plugin-x{i}"), "", "Reads, edits and tests: one more plugin, past the cap.", "")));
         let f = fields(&rows);
+        let all = s.found_in(&f);
+        assert!(all.len() > MAX_ROWS && all.iter().any(|&(i, _)| i >= MAX_ROWS), "rows past the cap still found: {}", all.len());
         let n = s.run(&f).len();
-        assert_eq!(n, MAX_ROWS, "listed to the cap");
+        assert!(n <= MAX_ROWS, "listed to the cap: {n}");
         assert_eq!(s.capacities(), (MAX_ROWS, MAX_HITS), "and no growth");
         let worst: String = "e a t o i n s r l c u d p m h g ".into();
         s.set(q(&worst));
@@ -884,9 +931,10 @@ mod tests {
         assert_eq!(s.capacities(), (MAX_ROWS, MAX_HITS));
         assert_eq!(
             s.retained(),
-            size_of::<Search>() + MAX_ROWS * size_of::<Found>() + MAX_HITS * size_of::<Hit>(),
-            "the query, results and hits"
+            size_of::<Search>() + MAX_ROWS * size_of::<Item>() + MAX_HITS * size_of::<Hit>(),
+            "the query, its items and hits"
         );
+        assert!(size_of::<Item>() <= 32, "PLAN §3.6: an item is at most 32 B");
         assert!(size_of::<Search>() <= size_of::<Query>() + 64, "the query inline, nothing else of size");
     }
 
@@ -905,15 +953,131 @@ mod tests {
         assert_eq!((said(&f, &hits, LABEL), said(&f, &hits, KEY)), (vec!["A".to_string(), "a".to_string()], vec!["a".to_string()]));
     }
 
-    /// Not in PLAN v3.2's list: what keeps the continuity suite's `bash`
-    /// to the bash rows.
+    /// Not in PLAN v3.2's list: exact first. When some row has every word
+    /// as typed (or by its alias), only such rows are found: what keeps the
+    /// continuity suite's `bash` to the bash rows. When none does, a word
+    /// of 4 or more may be one edit off, in any row.
     #[test]
-    fn a_word_found_as_typed_is_not_read_as_a_typo() {
+    fn exact_results_come_first() {
         let rows =
             vec![row("Dash URL", "dash_url", "", ""), row("Bash timeout", "bash_timeout", "", ""), row("synaps-dash", "", "", "answers")];
         assert_eq!(found(&rows, "bash"), ["bash_timeout"], "not Dash URL, one edit off");
         assert_eq!(found(&rows, "dahs"), ["dash_url", ""], "no row has dahs: one edit");
-        assert_eq!(found(&rows, "bash dahs"), Vec::<String>::new(), "each word on its own: both must hit one row");
+        assert_eq!(found(&rows, "bash dahs"), ["dash_url", ""], "no row has both as typed: each may be one edit off");
+    }
+
+    /// A row with a word as typed but not the query takes no typo away
+    /// from another row (review P2-2).
+    #[test]
+    fn a_typo_is_read_past_an_unrelated_row() {
+        let def = |k: &str| settings::def(k).map(|d| row(d.label, d.key, d.help, "")).expect("a def");
+        let mut rows = vec![def("compaction_exclude"), def("context_window")];
+        assert!(rows[0].help.starts_with("Content "), "a row with content as typed");
+        assert_eq!(found(&rows, "content window"), ["context_window"], "content, one edit from context");
+        rows.push(row("Notes", "notes", "Content of every kind, as typed.", ""));
+        assert_eq!(found(&rows, "content window"), ["context_window"], "a row more takes nothing away");
+        let all = inventory();
+        let has = |query: &str, key: &str| found(&all, query).iter().any(|k| k == key);
+        assert!(has("content window", "context_window"), "the whole inventory");
+        assert!(has("base timeout", "bash_timeout"), "not taken away by Request compression's base URL");
+        assert!(has("bash timout", "bash_timeout"), "a word as typed and a typo");
+        assert!(has("colour thme", "theme"), "an alias and a typo");
+        assert!(has("bash", "bash_timeout") && !has("bash", "dash_url"), "exact first");
+    }
+
+    /// Every place a word reads in a field is lit, from the field's start:
+    /// leftmost first, never overlapping (as `str::match_indices`), at most
+    /// 8 a row. The best place only ranks (review P2-3).
+    #[test]
+    fn every_occurrence_is_lit_from_the_fields_start() {
+        let lit = |label: &str, w: &str| one(Fields::new(label, "", ""), w).map(|(_, h)| ranges(&h, LABEL)).unwrap_or_default();
+        assert_eq!(lit("Subagent timeout", "t"), [(7, 8), (9, 10), (15, 16)], "the t in Subagent too");
+        assert_eq!(lit("xfoo foo", "foo"), [(1, 4), (5, 8)], "the one before the word start");
+        assert_eq!(lit("xcatxcat cat", "cat"), [(1, 4), (5, 8), (9, 12)], "each before it");
+        assert_eq!(lit("banana", "ana"), [(1, 4)], "never overlapping");
+        assert_eq!(lit(&"t".repeat(12), "t"), (0..8).map(|i| (i, i + 1)).collect::<Vec<_>>(), "the first 8");
+        let rank = |label: &str| one(Fields::new(label, "", ""), "foo").map(|(r, _)| r);
+        assert_eq!(rank("xfoo foo"), rank("bar foo"), "ranked by its word start");
+    }
+
+    /// A field is read to its first 65,535 bytes (a hit's `u16`), cut back
+    /// to a character: every hit slices the field. A word the cut ends
+    /// inside is no typo; a word the cut leaves whole may be (review P2-4).
+    #[test]
+    fn the_field_cap_cuts_at_a_character() {
+        const CAP: usize = u16::MAX as usize;
+        let slices = |f: &str, hits: &[Hit]| hits.iter().all(|h| f.get(usize::from(h.start)..usize::from(h.end)).is_some());
+        for c in ['é', '中', '𠀀'] {
+            for k in 1..c.len_utf8() {
+                // `c` begins `k` bytes before the cap: the cap is inside it.
+                let at = CAP - k;
+                let label = format!("{}caf{c} tail", " ".repeat(at - 3));
+                assert!(!label.is_char_boundary(CAP));
+                for w in ["caf", "caff", "cafe", "cafx"].map(String::from).into_iter().chain([format!("caf{c}"), c.to_string()]) {
+                    if let Some((_, hits)) = one(Fields::new(&label, "", &label), &w) {
+                        assert!(slices(&label, &hits), "{c} {k} bytes before the cap, {w}: {hits:?}");
+                    }
+                }
+                let f = Fields::new(&label, "", "");
+                assert_eq!(one(f, "caf").map(|(_, h)| ranges(&h, LABEL)), Some(vec![(at - 3, at)]), "{c}: as typed, before the cut");
+                assert!(one(f, "caff").is_none(), "{c}: the word the cut ends inside is no typo");
+                assert!(one(f, &c.to_string()).is_none(), "{c}: past the cut");
+            }
+        }
+        let label = format!("{}cafe more", " ".repeat(CAP - 4));
+        assert_eq!(
+            one(Fields::new(&label, "", ""), "caff").map(|(_, h)| ranges(&h, LABEL)),
+            Some(vec![(CAP - 4, CAP)]),
+            "whole at the cut"
+        );
+    }
+
+    /// One edit is one character's (a substitution, an insertion, a
+    /// deletion or two neighbours swapped), past ASCII too; a word ends at
+    /// a character that is neither a letter nor a digit, `—` too (review
+    /// P3-1).
+    #[test]
+    fn one_edit_counts_characters() {
+        let typo = |label: &str, w: &str| {
+            let f = Fields::new(label, "", "");
+            one(f, w).map(|(_, h)| said(&f, &h, LABEL))
+        };
+        let word = |w: &str| Some(vec![w.to_string()]);
+        assert_eq!(typo("abcd", "abcé"), word("abcd"), "a substitution");
+        assert_eq!(typo("abcd", "abcéd"), word("abcd"), "an insertion");
+        assert_eq!(typo("abcéd", "abcd"), word("abcéd"), "a deletion");
+        assert_eq!(typo("abéd", "abdé"), word("abéd"), "two neighbours swapped");
+        assert_eq!(typo("naïve", "naive"), word("naïve"), "i for ï");
+        assert_eq!(typo("abcd", "abéé"), None, "two edits");
+        assert_eq!(typo("abcd", "ébcdé"), None, "two insertions");
+        assert_eq!(typo("Read—timeout", "timout"), word("timeout"), "— ends a word");
+        let rank = |label: &str| one(Fields::new(label, "", ""), "timeout").map(|(r, _)| r);
+        assert_eq!(rank("Read—timeout"), rank("Read timeout"), "a word starts after —");
+    }
+
+    /// A row is matched once a query, and again only when its text
+    /// changes: walking the same rows again matches none (review P2-1).
+    #[test]
+    fn a_row_is_matched_once_per_query_or_text() {
+        let mut rows = inventory();
+        let mut s = Search::default();
+        s.set(q("thinkng"));
+        let first = s.found_in(&fields(&rows));
+        assert!(!first.is_empty(), "a typo, found");
+        let m = matched();
+        for _ in 0..3 {
+            assert_eq!(s.found_in(&fields(&rows)), first, "the same rows found");
+        }
+        assert_eq!(matched(), m, "the same query over the same rows: no row matched again");
+        let last = rows.len() - 1;
+        rows[last].label = "plugin-thinking-tools".into();
+        let again = s.found_in(&fields(&rows));
+        assert_eq!(matched() - m, 1, "only the row whose text changed");
+        assert!(again.iter().any(|&(i, _)| i == last), "found by its new text");
+        let m = matched();
+        s.set(q("thinking"));
+        s.found_in(&fields(&rows));
+        assert_eq!(matched() - m, rows.len() as u64, "a new query: each row once");
     }
 
     #[test]
@@ -924,9 +1088,11 @@ mod tests {
         assert_eq!(&help[settings::sentence_at(help, help.find("Third").unwrap())], "Third.");
     }
 
-    /// The release bench (PLAN §3.6): 1,000 queries over the largest
-    /// legitimate inventory, each a keystroke's whole search (its scan
-    /// too); p50, p99 and the slowest. On bella:
+    /// The matcher's release bench (PLAN §3.6): 1,000 queries over the
+    /// largest legitimate inventory, each a new query's match over every
+    /// row; p50, p99 and the slowest. The matcher only: the page's whole
+    /// keystroke (match, sort and build) is `settings_find_keystroke_bench`
+    /// (settings_find_tests.rs). On bella:
     /// `cargo test --release -p synaps-desktop -- --ignored settings_find_bench --nocapture`.
     #[test]
     #[ignore]
