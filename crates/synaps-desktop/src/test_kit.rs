@@ -26,12 +26,20 @@ mod card_sync_tab_tests;
 mod cards_d_tests;
 #[path = "change_tests.rs"]
 mod change_tests;
+#[path = "drafts_edge_ui_tests.rs"]
+mod drafts_edge_ui_tests;
+#[path = "drafts_ui_tests.rs"]
+mod drafts_ui_tests;
 #[path = "settings_effect_tests.rs"]
 mod effect_tests;
 #[path = "entry_tests.rs"]
 mod entry_tests;
 #[path = "gate_clock_tests.rs"]
 mod gate_clock_tests;
+#[path = "handback_edge_ui_tests.rs"]
+mod handback_edge_ui_tests;
+#[path = "handback_ui_tests.rs"]
+mod handback_ui_tests;
 #[path = "hang_tests.rs"]
 mod hang_tests;
 #[path = "held_tests.rs"]

@@ -282,18 +282,24 @@ impl Live {
         self.in_flight.push(Target::Card(card), text);
     }
 
+    /// A hand-back's `text` went to the daemon (blocks.md §3.7): its echo
+    /// or refusal is its memo's.
+    pub(crate) fn edit_sent(&mut self, text: String) {
+        self.in_flight.push(Target::Edit, text);
+    }
+
     /// A refusal: the oldest unconfirmed text was refused (the daemon
     /// handles input in order, and earlier echoes confirmed the rest).
-    /// A composer's goes back to it; a card's is the card's: `true` (its
-    /// memo hears the refusal, [`crate::deliver`]).
-    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> bool {
+    /// A composer's goes back to it; a card's answer or a hand-back is its
+    /// memo's: that input, which the memos route by (its card, its text:
+    /// [`crate::deliver::Memos::refused`]), never by their own clocks.
+    pub(crate) fn give_back_oldest(&mut self, effects: &mut Vec<Effect>) -> Option<Input> {
         match self.in_flight.pop_front() {
             Some(Input { to: Target::Pane(pane), body, .. }) => {
                 effects.push(Effect::Restore(pane, body));
-                false
+                None
             }
-            Some(Input { to: Target::Card(_), .. }) => true,
-            None => false,
+            other => other,
         }
     }
 
@@ -341,6 +347,9 @@ pub(crate) enum Target {
     /// An agent card of the store's session (synaps-cards §3.5): its
     /// answer is never given to a composer.
     Card(cards_spec::CardId),
+    /// A block edit handed back (blocks.md §3.7, D8b): its memo's, as a
+    /// card's answer is its card's.
+    Edit,
 }
 
 /// One input in flight: what sent it, the user's text (what goes back to

@@ -130,11 +130,11 @@
 //! (`collapse` with `run`, §1.3).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
-use cards_spec::board::{Board, Event, Place, State, Visibility};
+use cards_spec::board::{Board, EditOutcome, Event, Place, State, Visibility};
 use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
@@ -181,6 +181,9 @@ struct Shared {
     took: AtomicU64,
     /// What its worker keeps, roughly (bytes), as of its last job.
     bytes: AtomicUsize,
+    /// A desk holds a draft over this history's board (D8, §3.2): its
+    /// jobs publish the bound board itself ([`Drawn::board`]).
+    keep_bound: AtomicBool,
 }
 
 /// The history's events, read message by message ([`HistoryBlocks::message`]),
@@ -256,6 +259,18 @@ impl HistoryBlocks {
     /// Its worker ([`Worker`]): the board's work on this history.
     pub fn worker(&self) -> &Arc<Mutex<Worker>> {
         &self.worker
+    }
+
+    /// Whether its boards keep the bound board itself ([`Drawn::board`]):
+    /// while a desk holds a draft over it (D8's pre-check, §3.2). The
+    /// next job's board follows; one finished before doesn't.
+    pub fn keep_bound(&self, on: bool) {
+        self.shared.keep_bound.store(on, Ordering::Relaxed);
+    }
+
+    /// See [`HistoryBlocks::keep_bound`].
+    pub fn keeps_bound(&self) -> bool {
+        self.shared.keep_bound.load(Ordering::Relaxed)
     }
 
     /// What it keeps (bytes, heap included): the staged events and their
@@ -341,9 +356,11 @@ impl HistoryBlocks {
                 if ends {
                     push(Event::ResultsEnd, None);
                 }
-                // Its text, if the host's rule leaves it one string.
+                // Its text, if the host's rule leaves it one string, on its
+                // row: a hand-back's outcome is drawn there (D8b).
+                let user = rows.iter().find(|i| i.kind == ItemKind::User).map(|i| i.id);
                 for e in fold::events(std::slice::from_ref(m)).into_iter().filter(|e| matches!(e, Event::User { .. })) {
-                    push(e, None);
+                    push(e, user);
                 }
             }
             _ => {
@@ -1874,6 +1891,9 @@ struct Cursor {
 #[derive(Clone, Debug)]
 pub struct Input {
     pub epoch: u64,
+    /// The transcript's input revision it is (`Transcript::blocks_rev`):
+    /// what a board folded from it says it has read ([`Drawn::rev`]).
+    pub rev: u64,
     pub generation: block::Generation,
     /// The staged chunks: the history's events from `from` on, and their
     /// bytes, heap included.
@@ -1908,6 +1928,7 @@ impl Input {
         // string): folded again once the history lands, as any live turn.
         Some(Input {
             epoch: history.epoch,
+            rev: 0,
             generation: history.generation.or(log.first).unwrap_or_else(|| block::Generation::of(&Value::Null)),
             chunks: history.staged.iter().cloned().collect(),
             staged: history.staged_bytes,
@@ -2157,6 +2178,10 @@ pub struct Drawn {
     /// The input it was folded from: its history, the history's events,
     /// and all its events (the live turn's after them).
     pub epoch: u64,
+    /// The input revision it was folded from ([`Input::rev`]): a board at
+    /// or past the revision a message showed at has read it (D8b: a
+    /// hand-back's draft draws until then, whatever outcomes it keeps).
+    pub rev: u64,
     /// Its conversation generation (§1.2): the same history, folded again
     /// (a resync), has the same; a cleared or compacted one another.
     pub generation: Option<block::Generation>,
@@ -2193,12 +2218,27 @@ pub struct Drawn {
     pub log: Arc<[(Logged, Mark)]>,
     pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
+    /// What each hand-back still kept did (§3.7's application layer, B2's
+    /// outcomes, ≤ `board::OUTCOMES_MAX`: an evicted one is re-folded,
+    /// `Target::Outcome`), with its user message's row (what its row draws)
+    /// and its body's hash ([`body_hash`]: a steer the engine drained has
+    /// no row until its history lands). D8b's. A copy of the board's,
+    /// counted at B2's count of them.
+    pub outcomes: Arc<[Handed]>,
+    /// The bound board itself (§1.7: the committed fold and the open
+    /// batch's bound calls, never a pending op), while a desk holds a
+    /// draft over it ([`HistoryBlocks::keep_bound`]): what the desk's
+    /// pre-check runs B2's guards on (`State::precheck`, §3.2). The job
+    /// builds it for every board and keeps it only then, moved, never
+    /// copied; at most B2's working set (≤ 1 MiB), counted in `bytes` at
+    /// B2's count of it.
+    pub board: Option<Arc<State>>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates, its op log, records and
     /// tombstones, its visibility maps ([`vis_owned`]: `settled`, which its
     /// worker holds too, counted in both; `visibility` once more unless it
-    /// is `settled`'s). A row's
+    /// is `settled`'s), and the bound board when it is kept. A row's
     /// [`Arc`] of it is its.
     pub bytes: usize,
 }
@@ -2371,6 +2411,13 @@ impl Worker {
             + self.board.owned_bytes()
             + self.cards.1
             + self.over.as_ref().map_or(0, |o| o.board.owned_bytes() + o.cards + o.fates.capacity() * std::mem::size_of::<(usize, Fate)>())
+    }
+
+    /// Where row `row`'s first event is in the history's journal (a user
+    /// message has one), if the journal has it: what an outcome no mark
+    /// names any more is re-folded at (D8b). A walk of the rows it keeps.
+    pub fn event_of(&self, row: u64) -> Option<usize> {
+        self.rows[..self.hist.min(self.rows.len())].iter().position(|r| *r == Some(row))
     }
 
     /// What it keeps ([`Retained`]).
@@ -2648,7 +2695,11 @@ impl Worker {
         // The fates of the live turn's batches and the open one's.
         let mut calls = o.fates.clone();
         fates(events, o.batch.start, events.len(), true, |p, f| calls.push((p, f)));
-        let drawn = self.drawn(input, &view, &bound, &calls);
+        let mut drawn = self.drawn(input, &view, &bound, &calls);
+        if input.shared.keep_bound.load(Ordering::Relaxed) {
+            drawn.bytes += ARC + std::mem::size_of::<State>() + bound.owned_by_owner().iter().sum::<usize>();
+            drawn.board = Some(Arc::new(bound));
+        }
         input.shared.bytes.store(self.bytes(), Ordering::Relaxed);
         Some(drawn)
     }
@@ -2727,9 +2778,26 @@ impl Worker {
         let log: Arc<[(Logged, Mark)]> = lines.iter().map(|l| ((*l).clone(), mark(l.at.event))).collect();
         let records: Arc<[(Record, Mark)]> = recs.iter().map(|r| ((*r).clone(), mark(r.at.event))).collect();
         let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
-        let [_, tombs, recs, _, _, _, logs] = view.owned_by_owner();
+        let outcomes: Arc<[Handed]> = view
+            .outcomes()
+            .map(|o| {
+                let body = match self.journal.get(o.at.event) {
+                    Some(Event::User { text }) => body_hash(cards_spec::block::message::split(text).0),
+                    _ => 0,
+                };
+                Handed { outcome: o.clone(), row: row(o.at.event), body }
+            })
+            .collect();
+        let [_, tombs, recs, _, _, outs, logs] = view.owned_by_owner();
         let calls = CALL_IDS_MAX - room;
-        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Mark>() + calls + 3 * ARC;
+        let kept = tombs
+            + recs
+            + logs
+            + outs
+            + (log.len() + records.len()) * std::mem::size_of::<Mark>()
+            + outcomes.len() * (std::mem::size_of::<Handed>() - std::mem::size_of::<EditOutcome>())
+            + calls
+            + 4 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
             + vis_owned(self.settled_heap)
             + visibility.as_ref().map_or(0, |_| vis_owned(vis_heap(view)))
@@ -2743,6 +2811,7 @@ impl Worker {
             + kept;
         Drawn {
             epoch: input.epoch,
+            rev: input.rev,
             generation: Some(input.generation),
             history: input.history_len,
             events: self.journal.len(),
@@ -2757,9 +2826,30 @@ impl Worker {
             log,
             records,
             tombstones,
+            outcomes,
+            board: None,
             bytes,
         }
     }
+}
+
+/// A hand-back's outcome as a board drew it ([`Drawn::outcomes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handed {
+    pub outcome: EditOutcome,
+    /// Its user message's row, once it has one.
+    pub row: Option<u64>,
+    /// Its body's [`body_hash`].
+    pub body: u64,
+}
+
+/// An edit message's body (its text without notice lines), hashed: what
+/// a desk matches its own hand-back to its outcome by.
+pub fn body_hash(body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
 }
 
 /// The bound board's block, if it is the same incarnation as `b`.

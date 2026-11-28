@@ -1560,7 +1560,7 @@ impl Model {
         }
         match to {
             crate::live::Target::Pane(pane) => Some(Effect::Unsent { pane, session, text }),
-            crate::live::Target::Card(_) => None,
+            crate::live::Target::Card(_) | crate::live::Target::Edit => None,
         }
     }
 
@@ -1584,7 +1584,7 @@ impl Model {
                     // A card's answer, echoed: its memo hears it (a
                     // driver's echo can't be told here: no state of that
                     // session is kept).
-                    if let Some(crate::live::Input { to: Target::Card(_), body, .. }) = texts.remove(k) {
+                    if let Some(crate::live::Input { to: Target::Card(_) | Target::Edit, body, .. }) = texts.remove(k) {
                         memos.on(session, cards_spec::memo::Event::Echo { text: &body, driver: false }, now);
                     }
                 }
@@ -1595,8 +1595,8 @@ impl Model {
                     Some(crate::live::Input { to: Target::Pane(pane), body: text, .. }) => {
                         effects.push(Effect::Unsent { pane, session: session.clone(), text })
                     }
-                    Some(crate::live::Input { to: Target::Card(_), .. }) => {
-                        memos.on(session, cards_spec::memo::Event::Refused { reason: &error.to_string() }, now);
+                    Some(input @ crate::live::Input { to: Target::Card(_) | Target::Edit, .. }) => {
+                        memos.refused(session, &input, &error.to_string(), now);
                     }
                     None => {}
                 }
@@ -2233,9 +2233,11 @@ impl Model {
                 if answer || matches!(&error, Error::Refused { command: None, .. }) {
                     self.lives[lid].answered.clear();
                 }
-                if refused_input(&error) && self.lives[lid].give_back_oldest(&mut effects) {
-                    // A card's answer: not sent (§3.5), Retry.
-                    self.card_refused(lid, &error.to_string());
+                if refused_input(&error)
+                    && let Some(input) = self.lives[lid].give_back_oldest(&mut effects)
+                {
+                    // A card's answer, a hand-back: not sent (§3.5, §3.7), Retry.
+                    self.input_refused(lid, &input, &error.to_string());
                 }
                 self.lives[lid].last_error = Some(error.to_string());
             }

@@ -749,7 +749,7 @@ fn demo_history(seq: u64) -> Vec<Value> {
 }
 
 /// The session's digest of `messages`, the engine's slot holding `queued`.
-fn slot_digest(messages: &[Value], queued: Option<&str>) -> Value {
+pub(super) fn slot_digest(messages: &[Value], queued: Option<&str>) -> Value {
     json!({"ev": "conversation", "digest": {"messages_len": messages.len(),
         "messages_hash": synaps_client::history::messages_hash(messages), "queued_message": queued}})
 }

@@ -448,6 +448,11 @@ pub struct Transcript {
     /// Compactions applied since it was made (the journal moved to its
     /// successor): D6b carries the predecessor's dismissals across.
     compactions: u64,
+    /// The history is a compaction's successor: its first message is the
+    /// summary ([`is_compaction_summary`]). The history's own word, the
+    /// same for a desk that saw the compaction and one that attached
+    /// after it (D8b's `compacted away`).
+    successor: bool,
     /// `api_messages` folded so far, and where their items end.
     history_len: usize,
     history_end: usize,
@@ -612,6 +617,33 @@ impl Transcript {
         self.compactions
     }
 
+    /// Whether row `id` is one of the history's (not the live turn's).
+    pub fn in_history(&self, id: u64) -> bool {
+        self.items[..self.history_end.min(self.items.len())].iter().any(|i| i.id == id)
+    }
+
+    /// Whether row `id` is a message a compaction carried into this
+    /// history, its successor (synaps-cards blocks.md §5.2: a queued
+    /// message moves there): a history row before any of the agent's in
+    /// a history whose first message is the summary. Nothing of this
+    /// generation came before it, so a block it names that isn't there
+    /// was the predecessor's. From the history alone: the same on a late
+    /// attach as on the desk that saw the compaction.
+    pub fn carried(&self, id: u64) -> bool {
+        if !self.successor {
+            return false;
+        }
+        for it in &self.items[..self.history_end.min(self.items.len())] {
+            if it.id == id {
+                return true;
+            }
+            if matches!(it.kind, ItemKind::Assistant | ItemKind::Thinking | ItemKind::Tool) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// A turn is running.
     pub fn busy(&self) -> bool {
         self.busy
@@ -661,7 +693,22 @@ impl Transcript {
     /// The board's input now ([`crate::blocks::Input`]): `None` with no
     /// block call in the history or the live turn.
     pub fn blocks_input(&self) -> Option<crate::blocks::Input> {
-        crate::blocks::Input::of(&self.blocks, &self.live_log)
+        crate::blocks::Input::of(&self.blocks, &self.live_log).map(|mut i| {
+            i.rev = self.blocks_rev;
+            i
+        })
+    }
+
+    /// Whether the board's jobs keep the bound board itself, from the next
+    /// one on ([`crate::blocks::HistoryBlocks::keep_bound`]): while a draft
+    /// is held over this history's board (D8's pre-check).
+    pub fn blocks_keep_bound(&self, on: bool) {
+        self.blocks.keep_bound(on);
+    }
+
+    /// See [`Transcript::blocks_keep_bound`].
+    pub fn blocks_keeps_bound(&self) -> bool {
+        self.blocks.keeps_bound()
     }
 
     /// A block call in the history or the live turn: the board draws them.
@@ -710,6 +757,17 @@ impl Transcript {
     #[doc(hidden)]
     pub fn blocks_live(&self) -> &crate::blocks::LiveLog {
         &self.live_log
+    }
+
+    /// Where row `id`'s message is in the board's input
+    /// ([`crate::blocks::Worker::event_of`]): `None` while a job holds the
+    /// worker (ask again), never waiting for it on this thread.
+    pub fn blocks_event_of(&self, id: u64) -> Option<Option<usize>> {
+        match self.blocks.worker().try_lock() {
+            Ok(w) => Some(w.event_of(id)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().event_of(id)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// What the history's worker keeps ([`crate::blocks::Retained`]).
@@ -1461,6 +1519,7 @@ impl Transcript {
     /// Events not delivered yet go last, whatever their anchors.
     fn fold_with_notes(&mut self, messages: &[Value], notes: Vec<Item>, reuse: &mut Reuse) {
         self.after_summary = false;
+        self.successor = messages.first().is_some_and(is_compaction_summary);
         self.cards = crate::cards::HistoryCards::default();
         self.blocks = crate::blocks::HistoryBlocks::default();
         self.live_log = self.live_log.renewed();
@@ -2194,7 +2253,10 @@ impl Transcript {
             // come as `External` and `steering_delivered`, never so.
             // An agent card's answer (its grammar, synaps-cards §3.3): its
             // card says where it is (queued, then answered), never its JSON.
-            SessionEvent::Steered { text, .. } if cards_spec::message::parse(text).is_some() => {}
+            // A card's answer, a block's hand-back: their own rows say.
+            SessionEvent::Steered { text, .. }
+                if cards_spec::message::parse(text).is_some()
+                    || cards_spec::block::message::parse(cards_spec::block::message::split(text).0).is_some() => {}
             SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
             SessionEvent::SystemNotice { text } => {
                 // Events were dropped here ([`Transcript::resyncing`]): the

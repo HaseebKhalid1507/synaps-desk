@@ -626,3 +626,74 @@ fn a_boards_marks_share_their_calls_ids_within_a_budget() {
     assert!(d.records[without].1.row.is_some(), "its row kept");
     assert!(d.records.iter().rev().take(256).all(|(_, m)| m.call.is_some()), "the newest records keep theirs");
 }
+
+/// D8's pre-check (§3.2): while a desk holds a draft over the history's
+/// board ([`HistoryBlocks::keep_bound`]), its jobs publish the bound board
+/// itself, charged in the board's bytes at B2's count of it; off, none, and
+/// nothing charged. The bound board holds no pending op.
+#[test]
+fn the_bound_board_is_kept_only_while_a_draft_holds_it_and_charged() {
+    let h = blocks_history();
+    let hb = read(&h);
+    let run = |hb: &HistoryBlocks| Worker::default().run(&Input::of(hb, &LiveLog::default()).unwrap(), &mut || true).expect("done");
+    let off = run(&hb);
+    assert!(off.board.is_none(), "no draft: no bound board kept");
+    hb.keep_bound(true);
+    assert!(hb.keeps_bound());
+    let on = run(&hb);
+    let b = on.board.as_deref().expect("kept");
+    let owned: usize = b.owned_by_owner().iter().sum();
+    assert!(owned > 0);
+    assert!(on.bytes >= off.bytes + owned, "charged: {} vs {} + {owned}", on.bytes, off.bytes);
+    assert!(b.live() > 0, "the board's blocks");
+    assert!(b.blocks().all(|blk| !blk.pending), "bound: no pending op");
+    hb.keep_bound(false);
+    assert!(run(&hb).board.is_none(), "let go: the next job keeps none");
+}
+
+/// D8b: a hand-back's outcome (§3.7, B2's per key) is published with its
+/// user message's row and its body's hash ([`body_hash`]: a desk's own
+/// hand-back is matched by its body, whatever notices rode it), and
+/// charged at B2's count of the outcomes.
+#[test]
+fn a_hand_backs_outcome_is_published_with_its_row_and_its_body() {
+    let ops = json!([{"op":"put","id":"p","kind":"plan","title":"Plan","body":{"steps":[{"id":"fix","label":"Fix","state":"todo"}]}}]);
+    let mut h = vec![json!({"role": "user", "content": "go"})];
+    h.extend(call_of("toolu_p", ops));
+    let before = drawn_with_rows(&h);
+    let tag = before.rail.iter().flatten().chain(before.rows.values().flat_map(|r| &r.blocks)).next().expect("p").block.tag;
+    let body = format!("[block p edited r1] Plan → skip fix\n{{\"of\":\"{tag}\",\"set\":{{\"steps.fix.state\":\"skipped\"}}}}");
+    let text = format!("{body}\n[block q v1 dismissed]");
+    h.push(json!({"role": "user", "content": text}));
+    let mut hb = HistoryBlocks::default();
+    let mut row = 0u64;
+    let mut user_row = None;
+    for m in &h {
+        let rows: Vec<Item> = if m["role"] == "user" && m["content"].is_string() {
+            let mut t = crate::transcript::Transcript::new();
+            let ev = crate::protocol::decode_event(
+                &json!({"ev": "turn_started", "turn_baseline": 0, "trigger": "user", "user_text": m["content"]}),
+            )
+            .expect("an event");
+            t.apply(&ev);
+            let mut it = t.items()[0].clone();
+            row += 1;
+            it.id = row;
+            user_row = Some(row);
+            vec![it]
+        } else {
+            m["content"]
+                .as_array()
+                .map(|b| b.iter().filter(|b| b["type"] == "tool_use").map(|b| tool_row(&mut row, b["id"].as_str().unwrap())).collect())
+                .unwrap_or_default()
+        };
+        hb.message(m, &rows);
+    }
+    let d = Worker::default().run(&Input::of(&hb, &LiveLog::default()).unwrap(), &mut || true).expect("done");
+    assert_eq!(d.outcomes.len(), 1);
+    let o = &d.outcomes[0];
+    assert_eq!(o.row, user_row, "its user message's row");
+    assert_eq!(o.body, body_hash(&body), "its body's, the notice left out");
+    assert_eq!(o.outcome.codes, [cards_spec::board::Code::Applied]);
+    assert!(d.bytes > before.bytes + std::mem::size_of::<Handed>(), "charged: {} vs {}", d.bytes, before.bytes);
+}

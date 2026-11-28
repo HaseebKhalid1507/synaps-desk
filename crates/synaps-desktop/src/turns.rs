@@ -333,6 +333,10 @@ pub(crate) enum Kind {
     /// A user message that answers a card: the user's turn, drawn as one
     /// slim line, not the message's two ([`crate::ask`]).
     Answer,
+    /// A user message that is a block edit (blocks.md §3.3, D8b): a
+    /// hand-back's row, line 1's words and what the board says it did
+    /// ([`crate::handback_view`]).
+    HandBack,
     /// A block the agent keeps (synaps-cards `docs/blocks.md` §1.2): the
     /// `at`th of those anchored at its item's call, drawn after the run
     /// that call is in (or after its card), never inside it
@@ -489,6 +493,11 @@ pub(crate) fn build_with(
         match it.kind {
             ItemKind::User if crate::ask::answers(it) => {
                 out.push(row(Kind::Answer, if i == 0 { Gap::First } else { Gap::Turn }, Who::You));
+                agent = false;
+                i += 1;
+            }
+            ItemKind::User if !it.is_note() && crate::handback::is_edit(&it.text) => {
+                out.push(row(Kind::HandBack, if i == 0 { Gap::First } else { Gap::Turn }, Who::You));
                 agent = false;
                 i += 1;
             }
@@ -1730,6 +1739,7 @@ impl AppView {
             Kind::Prompt => self.render_authorize(d, &p, &m, cx),
             Kind::Ask => self.render_ask(item, d.id, &p, &m, cx),
             Kind::Answer => self.render_answer(item, d.id, &p, &m),
+            Kind::HandBack => self.render_hand_back(item, d.id, &p, &m),
             Kind::Block { at } => self.render_block(item, at, d.id, &p, &m, cx),
         };
         // A run is one card (cards4/proposal.md §3): each of its rows draws
@@ -3069,6 +3079,7 @@ mod tests {
                 Kind::Prompt => "prompt",
                 Kind::Ask => "ask",
                 Kind::Answer => "answer",
+                Kind::HandBack => "hand-back",
                 Kind::Block { .. } => "block",
             })
             .collect()

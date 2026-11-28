@@ -860,7 +860,7 @@ impl AppView {
 
     /// Store `live`'s conversation, and its board as drawn (its
     /// generation and records: what a click is made on).
-    fn wish_board(&self, live: LiveId) -> Option<(String, Generation, Arc<Visibility>)> {
+    pub(crate) fn wish_board(&self, live: LiveId) -> Option<(String, Generation, Arc<Visibility>)> {
         let d = self.model.lives[live].transcript.drawn()?;
         Some((self.conversation(live), d.generation?, d.visibility.clone()))
     }
@@ -1009,6 +1009,10 @@ impl AppView {
                 Landed::Send { ticket, ride } => {
                     if let Some(w) = self.wishes.waiting.remove(&ticket) {
                         self.send_ride(ticket, w.seq, w.busy, ride);
+                    } else if let Some(carrier) = self.edit_landed(ticket, ride, cx) {
+                        // Nothing waits on it any more (a hand-back whose
+                        // store went): its notices ride the next message.
+                        self.wishes.desires.lost(carrier);
                     }
                 }
             }

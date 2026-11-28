@@ -425,7 +425,6 @@ pub(crate) enum Carry {
     /// Typed text while a turn runs.
     Steer,
     /// A block edit handed back, or restored (D8), or its Resend.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D8's hand-back carries notices"))]
     HandBack,
     /// A card answer: all grammar, never a notice (§3.5).
     Answer,
@@ -1253,6 +1252,12 @@ impl Desires {
             picks: picked,
         });
         Ok(Riding::Wait(self.next_send))
+    }
+
+    /// The desires a carrier holds (tests).
+    #[cfg(test)]
+    pub(crate) fn carried(&self) -> usize {
+        self.book.conversations.values().flat_map(|g| g.values()).flat_map(|s| s.values()).filter(|d| d.carrier.is_some()).count()
     }
 
     /// `carrier` won't land (a refused send): what it carried rides the

@@ -606,7 +606,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn after_card(&mut self, row: u64, cx: &mut Context<Self>) {
+    pub(crate) fn after_card(&mut self, row: u64, cx: &mut Context<Self>) {
         self.memo_seen = self.model.memos.changes();
         self.remeasure_row(row);
         self.arm_card_tick(cx);
@@ -622,13 +622,13 @@ impl AppView {
         let Some(c) = self.client.as_ref() else {
             match self.synthetic_tx.clone().filter(|_| self.synthetic) {
                 Some(tx) => self.synthetic_answer(live, out, tx, cx),
-                None => self.model.card_unsent(live, "offline"),
+                None => self.model.card_unsent(live, &out.card, "offline"),
             }
             return;
         };
         let sent = if out.busy { c.on(out.seq).steer(out.text.clone()) } else { c.on(out.seq).submit(out.text.clone()) };
         if sent.is_err() {
-            self.model.card_unsent(live, "the connection thread has stopped");
+            self.model.card_unsent(live, &out.card, "the connection thread has stopped");
             return;
         }
         log::debug!(target: "synaps_desktop::send", "card {}: {} ({} chars)", out.card, if out.busy { "steer" } else { "submit" }, out.text.chars().count());
@@ -692,7 +692,9 @@ impl AppView {
         self.memo_seen = n;
         for pane in self.panes.iter_mut() {
             for (ix, d) in pane.disp.iter().enumerate() {
-                if d.kind == Kind::Ask {
+                // A card, a block (its hand-back's delivery line, its
+                // draft's), a hand-back's row.
+                if matches!(d.kind, Kind::Ask | Kind::Block { .. } | Kind::HandBack) {
                     pane.list.remeasure_items(ix..ix + 1);
                 }
             }

@@ -70,6 +70,11 @@ pub(crate) const GLOW_KEYS: u64 = 0x7B10 << 48;
 pub(crate) const DIFF_LINES: usize = 12;
 pub(crate) const NOTE_LINES: usize = 6;
 
+/// A string's hash, as a painted item carries it (D8's editable parts).
+pub(crate) fn hash_of(s: &str) -> u64 {
+    hash(s)
+}
+
 fn hash(v: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
@@ -420,6 +425,13 @@ impl AppView {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_block(&self, item: &Item, at: u16, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> AnyElement {
         let Some(s) = row_block(item, at, &self.panes.cur.pinned_in) else { return div().into_any_element() };
+        // Held on this desk (D8, §3.2): its draft over `B`, in its place.
+        if let Some(d) = self.row_draft(s) {
+            // The walk passes over it as over its block: `e` takes it again.
+            let ring = self.walk_ring(crate::walk::At::Block(id), s.block.tag, None, p);
+            let el = div().relative().w_full().child(self.render_draft(d, id, p, m, cx)).children(ring).into_any_element();
+            return crate::lease::SlideY::new(&self.panes.cur.lease, &self.fx, id, el).into_any_element();
+        }
         let g = Geo::of(m);
         if let Some(line) = self.block_line(s, id, &g, p, m, cx) {
             return line;
@@ -491,6 +503,8 @@ impl AppView {
             )
             .child(head)
             .children(body)
+            // This desk's hand-back of it, while it says something (D8b).
+            .children(self.edit_delivery(s, id, p, m, cx))
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
             // The walk's ring (D7): its keys act once it is painted.
             .children(self.walk_ring(crate::walk::At::Block(id), tag, None, p))
@@ -659,7 +673,11 @@ impl AppView {
     /// lines at most. Nothing moves when it comes or goes, and the title
     /// keeps its room (decision #5 of #101).
     fn block_says(&self, id: u64, g: &Geo, ground: Hsla, p: &Palette, m: &Metrics) -> Option<Div> {
-        let n = self.panes.cur.lease.note.filter(|n| n.0 == id).map(|n| n.1)?;
+        // The lease's note, else a take's or a draft key's (D8).
+        let n: String = match self.panes.cur.lease.note.filter(|n| n.0 == id) {
+            Some(n) => n.1.to_string(),
+            None => self.panes.cur.edit.note.as_ref().filter(|n| n.0 == id)?.1.clone(),
+        };
         // Its width: its text's on one line (an estimate) within 60 % of
         // the header; else two lines, within 85 %.
         let head = self.panes.cur.layout.column - g.spine - 2. * g.pad;
@@ -674,7 +692,10 @@ impl AppView {
                     .line_height(px((g.head / 2.).floor()))
                     .text_color(p.acc)
                     .whitespace_normal()
-                    .debug_selector(move || format!("block-says {id} {n}"))
+                    .debug_selector({
+                        let n = n.clone();
+                        move || format!("block-says {id} {n}")
+                    })
                     .child(n),
             ),
         )
@@ -824,6 +845,30 @@ impl AppView {
                         }),
                 )
             })
+            .when_some(past.is_none().then(|| self.changed_your_edit(s)).flatten(), |d, path| {
+                // The agent overwrote the user's (§3.4 step 6), until the
+                // user next focuses it; the path on hover.
+                let tip = format!("changed your edit: {}", path.as_str());
+                d.child(
+                    div()
+                        .id(("block-changed", id))
+                        .flex_shrink(4.)
+                        .min_w(px(m.meta * 2.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px(px(4.))
+                        .bg(p.well_d)
+                        .font_family(fonts::MONO)
+                        .text_px(m.meta)
+                        .text_color(p.acc)
+                        .debug_selector({
+                            let t = format!("block-changed {id} {}", path.as_str());
+                            move || t.clone()
+                        })
+                        .child("changed your edit")
+                        .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)),
+                )
+            })
             .child(div().flex_1().min_w(px(8.)))
             .when(fit.rev || past.is_some(), |d| {
                 // A past revision's label gives way before the title's
@@ -960,6 +1005,13 @@ impl AppView {
         let gid = id ^ self.past_salt(id);
         let glow = |field: u64, v: u64, c: Hsla| self.fx.glow(motion::key(GLOW_KEYS, gid ^ field.rotate_left(13)), v, c);
         let pb = px((6. * m.r).round());
+        // Its editable parts (D8, §3.2): a click takes it, then acts. Only
+        // a top-level block's, bound, and not a past revision's.
+        let tag = s.block.tag;
+        let editable = group.is_none() && s.bound.is_some() && self.walk_past(id).is_none();
+        let part = |el: Stateful<Div>, part: crate::draft_view::Part| -> AnyElement {
+            if editable { self.editable_part(el.cursor_pointer(), id, tag, part, cx).into_any_element() } else { el.into_any_element() }
+        };
         match &s.block.body {
             Body::Plan(pl) => {
                 let mut col = v_flex().w_full().pb(pb).debug_selector(move || format!("block-steps {id}"));
@@ -989,21 +1041,29 @@ impl AppView {
                             .font_family(fonts::SANS)
                             .text_px(m.label)
                             .debug_selector(move || format!("block-step {id} {step_id}"))
-                            .child(div().flex_none().child(glyph::indicator(
-                                &self.fx,
-                                life,
-                                p.card_d,
-                                p,
-                                self.fx.col(self.panes.cur.id).change(
-                                    motion::Tag::Outcome,
-                                    gid ^ (sid & 0xFFFF_FFFF) << 8,
-                                    life.code(),
+                            .child(part(
+                                div().id(("block-strike", sid ^ id)).flex_none().child(glyph::indicator(
+                                    &self.fx,
+                                    life,
+                                    p.card_d,
+                                    p,
+                                    self.fx.col(self.panes.cur.id).change(
+                                        motion::Tag::Outcome,
+                                        gid ^ (sid & 0xFFFF_FFFF) << 8,
+                                        life.code(),
+                                        None,
+                                    ),
                                     None,
-                                ),
-                                None,
-                            )))
-                            .child(
+                                )),
+                                crate::draft_view::Part::Strike(sid),
+                            ))
+                            .child(part(
                                 div()
+                                    .id(("block-label", sid ^ id))
+                                    .debug_selector({
+                                        let s = st.id.to_string();
+                                        move || format!("block-label {id} {s}")
+                                    })
                                     .min_w_0()
                                     .flex_shrink(1.)
                                     .overflow_hidden()
@@ -1011,7 +1071,8 @@ impl AppView {
                                     .text_color(label_c)
                                     .when(st.state == StepState::Skipped, |d| d.line_through())
                                     .child(crate::ask::shown(&st.label, cards_spec::Lines::Single)),
-                            )
+                                crate::draft_view::Part::Label(sid),
+                            ))
                             .child(div().flex_1().min_w(px(8.)))
                             .when_some(st.note.as_ref().filter(|_| fit.notes), |d, n| {
                                 d.child(
@@ -1116,7 +1177,15 @@ impl AppView {
                     .w_full()
                     .pb(pb)
                     .debug_selector(move || format!("block-note {id}"))
-                    .child(div().w_full().overflow_hidden().when(cut == Some(true), |d| d.h(px(g.line * NOTE_LINES as f32))).child(body))
+                    .child(part(
+                        div()
+                            .id(("block-text", id))
+                            .w_full()
+                            .overflow_hidden()
+                            .when(cut == Some(true), |d| d.h(px(g.line * NOTE_LINES as f32)))
+                            .child(body),
+                        crate::draft_view::Part::Text,
+                    ))
                     .when_some(cut, |d, cut| {
                         d.child(
                             div()

@@ -70,6 +70,12 @@ pub(crate) struct Work {
     /// A finished board that waits for a pane's pointer lease to end
     /// ([`crate::lease`]).
     pub(crate) waiting: Option<Arc<Drawn>>,
+    /// Boards that landed, drawn or waiting (a draft's footer is judged
+    /// again on each: [`crate::draft_view`]).
+    pub(crate) landed: u64,
+    /// Where its session's drafts keep their blocks, as last asked for (a
+    /// change asks for a job: [`AppView::sync_drafts`]).
+    pub(crate) places: u64,
     /// A step's budget, if not [`STEP`] (tests: none, a slice a step).
     #[cfg(test)]
     pub(crate) budget: Option<Duration>,
@@ -83,6 +89,12 @@ impl Work {
         self.job = None;
         self.asked = None;
         self.waiting = None;
+    }
+
+    /// Its next frame asks for a board again, its input moved or not (D8:
+    /// the bound board kept, or let go, from that job on).
+    pub(crate) fn again(&mut self) {
+        self.asked = None;
     }
 
     /// Its transcript's board, revision `rev`, is the one drawn: nothing to
@@ -147,6 +159,26 @@ pub(crate) struct Refolds {
     pub(crate) done: Option<Refolded>,
     /// Re-folds started (tests).
     pub(crate) started: u64,
+    /// Every re-fold that finishes is past [`cards_spec::board::REFOLD_MAX`]
+    /// (tests: a history that long is too long to build).
+    #[cfg(test)]
+    pub(crate) far: bool,
+}
+
+impl Refolds {
+    /// Whether the one scratch is taken: a re-fold runs or waits, or one
+    /// finished is kept for its request.
+    pub(crate) fn busy(&self) -> bool {
+        self.running.is_some() || self.next.is_some() || self.done.is_some()
+    }
+
+    /// Whether store `live`'s re-fold to `target` still stands: running
+    /// (not stopped), next, or finished and kept.
+    pub(crate) fn wants(&self, live: LiveId, target: Target) -> bool {
+        self.running.as_ref().is_some_and(|j| (j.live, j.target) == (live, target) && !j.stop.load(Ordering::Relaxed))
+            || self.next == Some((live, target))
+            || self.done.as_ref().is_some_and(|d| (d.live, d.target) == (live, target))
+    }
 }
 
 struct Running {
@@ -314,6 +346,7 @@ impl AppView {
             l.board.waiting = None;
             if l.transcript.drawn().is_some() {
                 l.transcript.set_drawn(None);
+                l.board.landed += 1;
             }
             return;
         };
@@ -418,6 +451,8 @@ impl AppView {
     /// input still holds (module docs); then the request that waited runs.
     fn refold_ended(&mut self, live: LiveId, target: Target, read: Read, out: Option<Folded>, cx: &mut Context<Self>) {
         let r = &mut self.refolds;
+        #[cfg(test)]
+        let out = if r.far { out.map(|(_, n)| (Err(TooFar), n)) } else { out };
         let stopped = r.running.take().is_none_or(|j| j.stop.load(Ordering::Relaxed));
         let holds = self.model.lives.get(live).is_some_and(|l| {
             let t = &l.transcript;
