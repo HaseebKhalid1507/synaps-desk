@@ -8,13 +8,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui_kit::component::input::{InputEditsEvent, Paste, Redo, SelectAll, Undo};
-use gpui_kit::{Action, AnyWindowHandle, AppContext as _, ClipboardItem, Entity, EntityId, TestAppContext, VisualTestContext};
+use gpui_kit::{
+    Action, AnyWindowHandle, AppContext as _, ClipboardItem, Entity, EntityId, EntityInputHandler as _, TestAppContext, VisualTestContext,
+};
 
 use super::keys_tests::press;
 use super::settings_continuity_tests::{NARROW, Page, click, drawn, find, open_settings, page};
 use super::settle;
 use crate::app::AppView;
-use crate::settings_editor::{CLEARED, FIND_BUDGET, FIND_CAP, Field, VALUE_BUDGET, VALUE_CAP};
+use crate::settings_editor::{CLEARED, EditGuard, FIND_BUDGET, FIND_CAP, Field, VALUE_BUDGET, VALUE_CAP};
 
 // ── the fixture ───────────────────────────────────────────────────────
 
@@ -42,6 +44,31 @@ fn text(cx: &mut TestAppContext, pg: &Page, f: Field) -> String {
 
 fn charge(cx: &mut TestAppContext, pg: &Page, f: Field) -> u32 {
     pg.view.update(cx, |v, _| v.field_guard(f).charge())
+}
+
+/// An IME's preedit of `text` into field `f`, through the input handler
+/// the platform calls (`replace_and_mark_text_in_range`, over what is
+/// marked, else the selection), then two frames.
+fn mark(cx: &mut TestAppContext, pg: &Page, f: Field, text: &str) {
+    let i = input(cx, pg, f);
+    cx.update_window(pg.w, |_, window, cx| i.update(cx, |s, cx| s.replace_and_mark_text_in_range(None, text, None, window, cx)))
+        .expect("the window");
+    cx.run_until_parked();
+    settle(cx, pg.w, 2);
+}
+
+/// The composition committed as `text` (`replace_text_in_range`).
+fn commit(cx: &mut TestAppContext, pg: &Page, f: Field, text: &str) {
+    let i = input(cx, pg, f);
+    cx.update_window(pg.w, |_, window, cx| i.update(cx, |s, cx| s.replace_text_in_range(None, text, window, cx))).expect("the window");
+    cx.run_until_parked();
+    settle(cx, pg.w, 2);
+}
+
+/// Field `f`'s marked range (UTF-16), if a composition is under way.
+fn marked(cx: &mut TestAppContext, pg: &Page, f: Field) -> Option<std::ops::Range<usize>> {
+    let i = input(cx, pg, f);
+    cx.update_window(pg.w, |_, window, cx| i.update(cx, |s, cx| s.marked_text_range(window, cx))).expect("the window")
 }
 
 /// The dash URL field open, holding `value`.
@@ -379,6 +406,46 @@ fn kit_history_is_what_the_plan_assumes(cx: &mut TestAppContext) {
     assert_eq!(text(cx, &pg, Field::Value), "qr", "refused");
     act(cx, pg.w, Undo);
     assert_eq!(text(cx, &pg, Field::Value), "q", "the edit before it undone");
+    // A composition (Shady #116 B1): no edit event for its preedits, each
+    // kept until it ends, though its commit reports one whole-text span; a
+    // cancel reports nothing. On the value field, its budget lifted: 40
+    // distinct 4,096 B preedits over a 4,096 B value hold well past what
+    // the commit's span says (2 × 8,192 + a step).
+    for cancel in [false, true] {
+        let pg = url_field(cx, "kit-compose", &nth(0, VALUE_CAP));
+        pg.view.update(cx, |v, _| v.settings_input_guard = EditGuard::new(VALUE_CAP, u32::MAX));
+        let i = input(cx, &pg, Field::Value);
+        let seen: Rc<RefCell<Vec<(usize, usize, usize)>>> = Rc::default();
+        let s2 = seen.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&i, move |_, ev: &InputEditsEvent, _| {
+                s2.borrow_mut().extend(ev.edits().iter().map(|(e, _)| (e.start_byte, e.old_end_byte, e.new_end_byte)));
+            })
+        });
+        act(cx, pg.w, SelectAll);
+        let before = held(cx, &pg);
+        for k in 0..40 {
+            mark(cx, &pg, Field::Value, &nth(k + 1, VALUE_CAP));
+        }
+        assert!(seen.borrow().is_empty(), "no edit event for a preedit");
+        let kept = held(cx, &pg) - before;
+        eprintln!("KIT-COMPOSITION: 40 preedits of 4,096 B hold {kept} B");
+        assert!(kept > 40 * VALUE_CAP as isize, "each preedit kept: {kept} B");
+        if cancel {
+            mark(cx, &pg, Field::Value, "");
+            assert_eq!(
+                (text(cx, &pg, Field::Value), marked(cx, &pg, Field::Value)),
+                (String::new(), None),
+                "a cancel: the marked text out"
+            );
+            assert!(seen.borrow().is_empty(), "a cancel reports nothing");
+        } else {
+            commit(cx, &pg, Field::Value, "done");
+            assert_eq!(*seen.borrow(), [(0, VALUE_CAP, 4)], "its commit: one span, the whole text");
+            act(cx, pg.w, Undo);
+            assert!(text(cx, &pg, Field::Value) == nth(0, VALUE_CAP), "one undo: the whole composition");
+        }
+    }
     // The fixed part.
     let t = fixed_per_step(cx);
     eprintln!("KIT-FIXED: T = {t} B a step, {} B for 1,000 steps", 1000 * t);
@@ -449,6 +516,143 @@ fn a_paste_at_the_budget_rebuilds_first_and_stays_undoable(cx: &mut TestAppConte
     assert!(text(cx, &pg, Field::Value) == nth(4, VALUE_CAP), "then pasted");
     act(cx, pg.w, Undo);
     assert!(text(cx, &pg, Field::Value) == nth(3, VALUE_CAP), "one undo: the value before the paste");
+}
+
+/// How a composition ends ([`a_composition_holds_its_fields_budget`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// Committed, and the history held then measured.
+    Commit,
+    /// Committed, then one undo and one redo.
+    Undone,
+    /// Cancelled (an empty preedit), and the history measured.
+    Cancel,
+}
+
+/// Shady #116 B1: an IME composition holds its field's budget. The kit
+/// sends no edit event for a preedit but keeps each one in the
+/// composition's transaction until it ends, and the commit's event says one
+/// whole-text span. On each field, a composition over its whole text (at
+/// the cap) of 100 distinct preedits at the cap, alternating ASCII and
+/// three-byte characters, frames drawn between: after each, the charge
+/// within the budget, the text the preedit, still marked; the field
+/// rebuilt on the way. Then committed (or cancelled): what the history
+/// holds within the charge plus the kit's fixed part a step, each preedit
+/// a step; and one undo of the commit leaves what a cancel would (the
+/// history before it was cleared, as its note says), one redo the commit.
+#[gpui_kit::test]
+fn a_composition_holds_its_fields_budget(cx: &mut TestAppContext) {
+    crate::heap::mine();
+    let t = fixed_per_step(cx);
+    for (f, cap, budget) in [(Field::Value, VALUE_CAP, VALUE_BUDGET), (Field::Find, FIND_CAP, FIND_BUDGET)] {
+        let preedit = |k: usize| if k.is_multiple_of(2) { nth(k, cap) } else { "あ".repeat(cap / 3) };
+        for end in [End::Commit, End::Undone, End::Cancel] {
+            let pg = match f {
+                Field::Value => url_field(cx, "compose", &nth(0, cap)),
+                Field::Find => {
+                    let pg = find_field(cx, "compose");
+                    paste(cx, pg.w, &nth(0, cap));
+                    pg
+                }
+            };
+            act(cx, pg.w, SelectAll);
+            let (mut steps, mut rebuilds) = (0isize, 0);
+            for k in 1..=100 {
+                let was = input(cx, &pg, f).entity_id();
+                mark(cx, &pg, f, &preedit(k));
+                steps += 1;
+                if input(cx, &pg, f).entity_id() != was {
+                    rebuilds += 1;
+                    steps = 1;
+                }
+                let c = charge(cx, &pg, f);
+                assert!(c <= budget, "{f:?} {end:?}, preedit {k}: charge {c} > {budget}");
+                assert!(text(cx, &pg, f) == preedit(k), "{f:?} {end:?}, preedit {k}: the text is the preedit");
+                let n = preedit(k).encode_utf16().count();
+                assert_eq!(marked(cx, &pg, f), Some(0..n), "{f:?} {end:?}, preedit {k}: still marked");
+            }
+            let fin = format!("{}!", nth(7, cap - 1));
+            let was = input(cx, &pg, f).entity_id();
+            match end {
+                End::Commit | End::Undone => commit(cx, &pg, f, &fin),
+                End::Cancel => mark(cx, &pg, f, ""),
+            }
+            let left = if end == End::Cancel { String::new() } else { fin.clone() };
+            assert!(text(cx, &pg, f) == left && marked(cx, &pg, f).is_none(), "{f:?} {end:?}: ended");
+            if input(cx, &pg, f).entity_id() != was {
+                // The commit's own charge passed the budget: rebuilt after it.
+                rebuilds += 1;
+                steps = 0;
+            }
+            if end == End::Undone {
+                // What a cancel leaves (the whole text was marked over); or,
+                // the commit having rebuilt the field, nothing to undo.
+                let undone = if steps == 0 { fin.clone() } else { String::new() };
+                act(cx, pg.w, Undo);
+                eprintln!("COMPOSITION {f:?} undone: the commit rebuilt the field: {}", steps == 0);
+                assert!(text(cx, &pg, f) == undone, "{f:?}: one undo, what a cancel leaves, or nothing past a rebuild");
+                act(cx, pg.w, Redo);
+                assert!(text(cx, &pg, f) == fin, "{f:?}: one redo, the commit");
+                assert!(rebuilds > 0, "{f:?} {end:?}: the budget was reached");
+                continue;
+            }
+            let charged = charge(cx, &pg, f) as isize;
+            let h = history(cx, &pg, f);
+            eprintln!("COMPOSITION {f:?} {end:?}: {h} B held, charge {charged}, {steps} steps, {rebuilds} rebuilds");
+            assert!(h <= charged + t * (steps + 1), "{f:?} {end:?}: {h} B > the charge {charged} + {t} × {}", steps + 1);
+            assert!(rebuilds > 0, "{f:?} {end:?}: the budget was reached");
+        }
+    }
+}
+
+/// Shady #116 B2: a paste whose charge passes the budget rebuilds first and
+/// is made on the new input: its caret, at the paste's end, is in the
+/// field's view two frames on, as an ordinary paste's is. On each field,
+/// from scroll zero (short pastes after long ones up to the budget), a
+/// long paste: the text, the caret's byte range and one undo as before.
+#[gpui_kit::test]
+fn a_rebuild_first_paste_shows_its_caret(cx: &mut TestAppContext) {
+    for (f, cap, budget) in [(Field::Value, VALUE_CAP, VALUE_BUDGET), (Field::Find, FIND_CAP, FIND_BUDGET)] {
+        let pg = match f {
+            Field::Value => url_field(cx, "reveal", "a"),
+            Field::Find => {
+                let pg = find_field(cx, "reveal");
+                paste(cx, pg.w, "a");
+                pg
+            }
+        };
+        let short = ["a", "b"];
+        let mut i = 0;
+        while charge(cx, &pg, f) + EditGuard::charge_of(1, cap, false) <= budget {
+            paste(cx, pg.w, &nth(i + 1, cap));
+            paste(cx, pg.w, short[(i + 1) % 2]);
+            i += 1;
+        }
+        let was = input(cx, &pg, f).entity_id();
+        let before = text(cx, &pg, f);
+        let zero = input(cx, &pg, f).read_with(cx, |s, _| s.scroll_offset());
+        assert_eq!(zero.x, gpui_kit::px(0.), "{f:?}: from scroll zero");
+        let long = nth(99, cap);
+        paste(cx, pg.w, &long);
+        settle(cx, pg.w, 2);
+        assert_ne!(input(cx, &pg, f).entity_id(), was, "{f:?}: rebuilt first");
+        assert!(text(cx, &pg, f) == long, "{f:?}: then pasted");
+        let i = input(cx, &pg, f);
+        assert_eq!(i.read_with(cx, |s, _| s.selected_range()), cap..cap, "{f:?}: the caret at its end");
+        let g = i.read_with(cx, |s, _| s.prepaint_caret_geometry()).expect("a caret drawn");
+        let (caret, view) = (g.cursor_bounds(), g.input_bounds());
+        eprintln!("REVEAL {f:?}: caret {caret:?}, the field {view:?}");
+        assert!(
+            caret.left() >= view.left() && caret.right() <= view.right(),
+            "{f:?}: the caret in the field's view: caret x {:?}..{:?}, the field {:?}..{:?}",
+            caret.left(),
+            caret.right(),
+            view.left(),
+            view.right()
+        );
+        act(cx, pg.w, Undo);
+        assert_eq!(text(cx, &pg, f), before, "{f:?}: one undo, the value before it");
+    }
 }
 
 /// The value field's close leaves no history: by commit, Esc, a blur and
