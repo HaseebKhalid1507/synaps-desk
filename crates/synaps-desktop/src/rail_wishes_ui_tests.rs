@@ -623,6 +623,63 @@ fn a_file_not_set_aside_is_written_over_only_once_discarded(cx: &mut TestAppCont
     assert!(!has_sec(cx, &view, "plan"));
 }
 
+/// Shady #108 R2-P2-1, in the window: it closes while the launch's sweeps
+/// are out (the writer busy: neither sweep's word has landed), a
+/// dismissal and a move in memory. Its last writes go behind the sweeps,
+/// and the app's quit runs them all, the window hearing none: sweeps that
+/// couldn't set the files aside (every name they may take a folder) leave
+/// both as they were, though the window never heard so. Set aside, the
+/// same close writes memory over them.
+fn closed_before_the_sweeps_word(cx: &mut TestAppContext, free: bool) {
+    let (w, view) = rail(cx);
+    let (path, ppath) = files(&format!("closed-early-{free}"));
+    let text = crate::desires::tests::hand_written((0..100).map(|i| (crate::desires::tests::J.to_string(), format!("b{i:03}"), false)));
+    let ptext = "not a presentation";
+    std::fs::write(&path, &text).expect("the file");
+    std::fs::write(&ppath, ptext).expect("the file");
+    for p in [&path, &ppath] {
+        let names = crate::desires::tests::aside_names(p);
+        names.iter().enumerate().filter(|(n, _)| !free || *n != 3).for_each(|(_, a)| std::fs::create_dir(a).expect("a folder"));
+    }
+    let writer = crate::blockfiles::Writer::queued();
+    let home = crate::rail_wishes::Home::with(Some(path.clone()), Some(ppath.clone()), writer.clone());
+    let busy = writer.hold();
+    view.update(cx, |v, cx| v.start_wishes(home, cx));
+    cx.run_until_parked();
+    let had = desires(cx, &view);
+    action(cx, w, "plan", "agent-x");
+    action(cx, w, "cause", "agent-slot");
+    cx.run_until_parked();
+    assert_eq!(desires(cx, &view), had + 1, "a dismissal in memory");
+    let moved = view.read_with(cx, |v, _| v.wishes.pres.user_rail(&v.conversation(v.panes.cur.live)).len());
+    assert_eq!(moved, 1, "a move in memory");
+    assert!(view.read_with(cx, |v, _| v.wishes.desires.out() && v.wishes.pres.out()), "the sweeps out");
+    assert!(view.read_with(cx, |v, _| v.wishes.desires.held().is_none() && v.wishes.pres.held().is_none()), "no word landed");
+    view.update(cx, |v, _| v.flush_wishes());
+    drop(busy);
+    assert!(writer.shutdown(), "the app's quit: what the writer holds, run");
+    let now = (std::fs::read(&path).expect("the file"), std::fs::read(&ppath).expect("the file"));
+    let aside = |p: &std::path::Path| std::fs::read(crate::blockfiles::aside_name(p, 3)).expect("set aside");
+    if free {
+        assert!(aside(&path) == text.as_bytes() && aside(&ppath) == ptext.as_bytes(), "set aside");
+        let (d, p) = (String::from_utf8(now.0).expect("text"), String::from_utf8(now.1).expect("text"));
+        assert!(d.contains(r#""plan":{"d":1"#) && p.contains("cause"), "then memory, whole, written over them: {d} {p}");
+    } else {
+        let kept = (now.0 == text.as_bytes(), now.1 == ptext.as_bytes());
+        assert_eq!(kept, (true, true), "never written over (desires, presentation)");
+    }
+}
+
+#[gpui_kit::test]
+fn a_close_before_the_sweeps_word_writes_over_no_file_not_set_aside(cx: &mut TestAppContext) {
+    closed_before_the_sweeps_word(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_close_before_the_sweeps_word_writes_over_a_file_set_aside(cx: &mut TestAppContext) {
+    closed_before_the_sweeps_word(cx, true);
+}
+
 /// R3-P2-5: the footer's `show` acts on the set it drew, never on a count
 /// alike: pressed over `1 dismissed` (plan), held while the rail changes
 /// to another `1 dismissed` (cause), it does nothing, and says so.

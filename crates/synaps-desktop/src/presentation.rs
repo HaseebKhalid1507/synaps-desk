@@ -50,12 +50,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cards_spec::block::{BlockId, Ref, Slot};
 use cards_spec::board::{Block, Place, State};
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, Left, NotOwned, Owned, Stored};
+use crate::blockfiles::{self, Gate, Left, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "blocks.json";
@@ -335,6 +336,9 @@ pub(crate) struct Write {
     path: PathBuf,
     /// The file's lock, held until the write ran ([`blockfiles::Owned`]).
     owner: Owned,
+    /// Whether the file may be written over, as its sweeps decide where
+    /// they run ([`Gate`]).
+    gate: Arc<Gate>,
     /// `None`: the sweep (the first write); else memory, whole.
     text: Option<String>,
 }
@@ -353,8 +357,8 @@ impl Write {
     /// The write, on whatever thread runs it ([`crate::blockfiles`]).
     pub(crate) fn run(self) -> Landing {
         let done = match &self.text {
-            None => blockfiles::sweep::<Book>(&self.path),
-            Some(text) => blockfiles::write(&self.path, text).map(|()| None),
+            None => self.gate.sweep::<Book>(&self.path),
+            Some(text) => self.gate.write(&self.path, text).map(|()| None),
         };
         drop(self.owner);
         Landing { ticket: self.ticket, seq: self.seq, sweep: self.text.is_none(), done }
@@ -377,6 +381,10 @@ pub(crate) struct Presentation {
     out: Option<u64>,
     next_ticket: u64,
     sweep: bool,
+    /// Whether the file may be written over, decided where the writes run
+    /// ([`Gate`]): what [`Presentation::held`] says once a sweep's word
+    /// landed.
+    gate: Arc<Gate>,
     /// A sweep that couldn't set the file aside: why, and the change count
     /// it ran at. Nothing is written over the file meanwhile (memory only),
     /// and each change runs the sweep again ([`Presentation::held`]).
@@ -421,6 +429,7 @@ impl Presentation {
         Presentation {
             path,
             sweep: owner.is_ok(),
+            gate: Gate::new(owner.is_ok()),
             owner,
             book,
             seq: 0,
@@ -456,7 +465,7 @@ impl Presentation {
         };
         self.next_ticket += 1;
         self.out = Some(self.next_ticket);
-        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, text })
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, gate: self.gate.clone(), text })
     }
 
     /// The file and its lock, owned.
@@ -482,14 +491,16 @@ impl Presentation {
 
     /// The window's last write, or the app's: memory whole if it changed
     /// since the file has, whatever write is out (the writer runs this one
-    /// after it); no one hears how it went.
+    /// after it). It writes only if the file may be written over once what
+    /// runs before it ran ([`Gate`]): a sweep out whose word never lands
+    /// decides it. No one hears how it went.
     pub(crate) fn last_write(&mut self) -> Option<Write> {
         let (path, owner) = self.file()?;
-        if self.seq <= self.written || self.held.is_some() {
+        if self.seq <= self.written {
             return None;
         }
         self.next_ticket += 1;
-        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, text: Some(self.book.text()) })
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, gate: self.gate.clone(), text: Some(self.book.text()) })
     }
 
     /// Tests: a write out (handed to the writer, not landed).
@@ -517,6 +528,7 @@ impl Presentation {
     #[cfg(test)]
     pub(crate) fn swept(&mut self) {
         self.sweep = false;
+        self.gate.open();
     }
 
     /// Why the file isn't written over, if it isn't: a sweep couldn't set
@@ -532,6 +544,7 @@ impl Presentation {
             return false;
         }
         self.discarded = true;
+        self.gate.discard();
         // Memory isn't what the file has: a snapshot is due.
         self.seq += 1;
         self.written = 0;

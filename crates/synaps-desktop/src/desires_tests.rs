@@ -1143,6 +1143,97 @@ fn a_file_that_cant_be_set_aside_is_never_written_over() {
     }
 }
 
+/// Shady #108 R2-P2-1: the window's last write, handed over while the
+/// launch's sweep is out (its word not landed, and never to: the window
+/// closed), waits on that sweep where the writes run. A sweep that couldn't
+/// set the file aside (every name it may take a folder) leaves it as it
+/// was; one that set it aside, or had nothing to (a file that reads
+/// whole), lets memory whole be written over it. Past the counts (copied
+/// aside) and past the bound (moved).
+#[test]
+fn the_last_write_waits_on_the_sweep_out_before_it() {
+    let g = generation();
+    let h = H::default();
+    let over = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    let too_big = hand_written((0..3000).map(|i| (format!("c{i:04}"), format!("b{i:04}"), false)));
+    let whole = hand_written((0..3).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    let mut wrong = Vec::new();
+    for (name, text, free) in [
+        ("over", &over, Some(false)),
+        ("over-set-aside", &over, Some(true)),
+        ("too-big", &too_big, Some(false)),
+        ("too-big-set-aside", &too_big, Some(true)),
+        ("whole", &whole, None),
+    ] {
+        let d = dir(&format!("last-behind-{name}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, text).unwrap();
+        let names = aside_names(&path);
+        if free.is_some() {
+            names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        }
+        if free == Some(true) {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        let mut a = Desires::load(Some(path.clone()));
+        let kept = a.len();
+        let sweep = a.next_write().expect("the launch's sweep");
+        assert_eq!(a.dismiss("other", &g, &id("tests"), &h.vis()), Ok(Ask::Saving), "{name}");
+        assert!(a.next_write().is_none(), "{name}: the sweep out, the change behind it");
+        let last = a.last_write().expect("memory changed: the window's last write");
+        drop(a);
+        drop(sweep.run());
+        drop(last.run());
+        let done = match free {
+            Some(false) => std::fs::read(&path).unwrap() == text.as_bytes() && names.iter().all(|n| n.is_dir()),
+            Some(true) => std::fs::read(&names[3]).unwrap() == text.as_bytes() && in_file(&d).len() == kept + 1,
+            None => in_file(&d).len() == kept + 1,
+        };
+        if !done {
+            wrong.push(name);
+        }
+    }
+    // Every case, then what went wrong: not set aside, never written over;
+    // set aside (or nothing to), memory whole written over it.
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// Shady #108 R2-P2-1, a file held (its sweep's word landed: not set
+/// aside): a change runs the sweep again, and the window's last write
+/// handed over behind it writes memory whole only if that sweep set the
+/// file aside; else nothing.
+#[test]
+fn the_last_write_behind_a_held_files_sweep_waits_on_it() {
+    let g = generation();
+    let h = H::default();
+    let text = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), false)));
+    for free in [false, true] {
+        let d = dir(&format!("last-held-{free}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, &text).unwrap();
+        let names = aside_names(&path);
+        names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        let mut a = desires(&d);
+        assert!(a.held().is_some(), "held");
+        let kept = a.len();
+        if free {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        assert_eq!(a.dismiss("other", &g, &id("tests"), &h.vis()), Ok(Ask::Saving));
+        let sweep = a.next_write().expect("the sweep again");
+        let last = a.last_write().expect("memory changed: the window's last write");
+        drop(a);
+        drop(sweep.run());
+        drop(last.run());
+        if free {
+            assert!(std::fs::read(&names[3]).unwrap() == text.as_bytes(), "set aside");
+            assert_eq!(in_file(&d).len(), kept + 1, "then memory, whole, written over it");
+        } else {
+            assert!(std::fs::read(&path).unwrap() == text.as_bytes(), "never written over");
+        }
+    }
+}
+
 /// Shady #108 P2-2: a file set aside never goes over another recovery
 /// file: `.bad` taken by an older one, it goes to `.bad.1`; the same file
 /// again (a launch with no change since) is where it already is.

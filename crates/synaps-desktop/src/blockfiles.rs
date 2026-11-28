@@ -51,10 +51,13 @@
 //! takes it, or the sweep can't read it, the sweep says so (never "set
 //! aside") and the store keeps to memory ([`sweep`]'s `Err`): it tries the
 //! sweep again at its next change, and writes the file once a sweep set it
-//! aside, or once the user discarded it.
+//! aside, or once the user discarded it. That is decided where the writes
+//! run, not by what the UI thread heard ([`Gate`]): a snapshot handed to
+//! the writer before a sweep's word landed (a window's last, at its end)
+//! runs after that sweep, and writes only if it said yes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -459,6 +462,55 @@ pub(crate) fn own_once_free(path: &Path) -> Result<Owned, NotOwned> {
             Err(NotOwned::Held) if t.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(5)),
             o => return o,
         }
+    }
+}
+
+/// Whether a store's file may be written over (module docs), decided where
+/// its writes run: by its sweeps ([`sweep`]'s `Ok`: yes; `Err`: no), else
+/// by the user's discard (yes from then, whatever a sweep says). Shut
+/// until a sweep said yes. Every write of the store holds it, so a
+/// snapshot handed over before a sweep's word reached the UI thread waits
+/// on that sweep's word, not on the UI thread's.
+#[derive(Debug)]
+pub(crate) struct Gate(AtomicU8);
+
+const SHUT: u8 = 0;
+const OPEN: u8 = 1;
+const DISCARDED: u8 = 2;
+
+impl Gate {
+    /// A store's: shut if a sweep is to run first (`sweep`), else open (a
+    /// store that never writes its file).
+    pub(crate) fn new(sweep: bool) -> Arc<Gate> {
+        Arc::new(Gate(AtomicU8::new(if sweep { SHUT } else { OPEN })))
+    }
+
+    /// [`sweep`] at `path`, its word kept: open if the file may be written
+    /// over, else shut (discarded: still open).
+    pub(crate) fn sweep<S: Stored>(&self, path: &Path) -> Result<Option<String>, String> {
+        let done = sweep::<S>(path);
+        let to = if done.is_ok() { OPEN } else { SHUT };
+        let _ = self.0.try_update(Ordering::SeqCst, Ordering::SeqCst, |was| (was != DISCARDED).then_some(to));
+        done
+    }
+
+    /// [`write`] at `path`, if it may be written over; else why not.
+    pub(crate) fn write(&self, path: &Path, text: &str) -> Result<(), String> {
+        match self.0.load(Ordering::SeqCst) {
+            SHUT => Err(format!("{}: not set aside, so not written over", name(path))),
+            _ => write(path, text),
+        }
+    }
+
+    /// The user's: the file written over from now, set aside or not.
+    pub(crate) fn discard(&self) {
+        self.0.store(DISCARDED, Ordering::SeqCst);
+    }
+
+    /// Tests: nothing to sweep.
+    #[cfg(test)]
+    pub(crate) fn open(&self) {
+        let _ = self.0.compare_exchange(SHUT, OPEN, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 

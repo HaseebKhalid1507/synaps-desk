@@ -595,6 +595,96 @@ fn a_file_that_cant_be_set_aside_is_never_written_over() {
     }
 }
 
+/// Shady #108 R2-P2-1, the presentation's file too: the window's last
+/// write, handed over while the launch's sweep is out (its word never
+/// lands: the window closed), waits on that sweep where the writes run.
+/// Not set aside (every name a folder): the file as it was. Set aside, or
+/// nothing to: memory whole written over it. Past the counts (copied) and
+/// past the bound (moved).
+#[test]
+fn the_last_write_waits_on_the_sweep_out_before_it() {
+    let mut h = H::default();
+    h.ops(json!([note("plan", "x")]));
+    let s = h.state();
+    let ids = |n: u64| (0..n).map(|i| (format!("s{i:02}"), i + 1)).collect::<Vec<_>>();
+    let over = hand_written((0..300u64).map(|c| (format!("c{c:03}"), c + 1, ids(1))));
+    let too_big = hand_written((0..1000u64).map(|c| (format!("c{c:03}"), c + 1, ids(ENTRIES_MAX as u64))));
+    let whole = hand_written((0..3u64).map(|c| (format!("c{c:03}"), c + 1, ids(1))));
+    let mut wrong = Vec::new();
+    for (name, text, free) in [
+        ("over", &over, Some(false)),
+        ("over-set-aside", &over, Some(true)),
+        ("too-big", &too_big, Some(false)),
+        ("too-big-set-aside", &too_big, Some(true)),
+        ("whole", &whole, None),
+    ] {
+        let d = dir(&format!("p-last-behind-{name}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, text).unwrap();
+        let names = crate::desires::tests::aside_names(&path);
+        if free.is_some() {
+            names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        }
+        if free == Some(true) {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        let mut p = Presentation::load(Some(path.clone()));
+        let sweep = p.next_write().expect("the launch's sweep");
+        p.pin(J, s.block(&r("plan")).expect("live")).unwrap();
+        assert!(p.next_write().is_none(), "{name}: the sweep out, the pin behind it");
+        let last = p.last_write().expect("memory changed: the window's last write");
+        drop(p);
+        drop(sweep.run());
+        drop(last.run());
+        let done = match free {
+            Some(false) => std::fs::read(&path).unwrap() == text.as_bytes() && names.iter().all(|n| n.is_dir()),
+            Some(true) => std::fs::read(&names[3]).unwrap() == text.as_bytes() && reread(&d).book.conversations.contains_key(J),
+            None => reread(&d).book.conversations.contains_key(J),
+        };
+        if !done {
+            wrong.push(name);
+        }
+    }
+    // Every case, then what went wrong: not set aside, never written over;
+    // set aside (or nothing to), memory whole written over it.
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// Shady #108 R2-P2-1, a presentation file held: a change runs the sweep
+/// again, and the window's last write handed over behind it writes memory
+/// whole only if that sweep set the file aside; else nothing.
+#[test]
+fn the_last_write_behind_a_held_files_sweep_waits_on_it() {
+    let mut h = H::default();
+    h.ops(json!([note("plan", "x")]));
+    let s = h.state();
+    let text = hand_written((0..300u64).map(|c| (format!("c{c:03}"), c + 1, vec![("s00".to_string(), 1)])));
+    for free in [false, true] {
+        let d = dir(&format!("p-last-held-{free}"));
+        let path = d.join(FILE);
+        std::fs::write(&path, &text).unwrap();
+        let names = crate::desires::tests::aside_names(&path);
+        names.iter().for_each(|n| std::fs::create_dir(n).unwrap());
+        let mut p = presentation(&d);
+        assert!(p.held().is_some(), "held");
+        if free {
+            std::fs::remove_dir(&names[3]).unwrap();
+        }
+        p.pin(J, s.block(&r("plan")).expect("live")).unwrap();
+        let sweep = p.next_write().expect("the sweep again");
+        let last = p.last_write().expect("memory changed: the window's last write");
+        drop(p);
+        drop(sweep.run());
+        drop(last.run());
+        if free {
+            assert!(std::fs::read(&names[3]).unwrap() == text.as_bytes(), "set aside");
+            assert!(reread(&d).book.conversations.contains_key(J), "then memory, whole, written over it");
+        } else {
+            assert!(std::fs::read(&path).unwrap() == text.as_bytes(), "never written over");
+        }
+    }
+}
+
 /// A pipe where the file goes isn't opened (opening one waits for a
 /// writer, forever): its read says so at once.
 #[cfg(unix)]

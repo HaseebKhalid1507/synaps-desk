@@ -95,13 +95,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use cards_spec::block::message::{self, NOTICE_IDS_MAX, Notice, NoticeLine, Trailer, VERSION_MAX, Visibility as Seen};
 use cards_spec::block::{BlockId, Generation};
 use cards_spec::board::Visibility;
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, Left, NotOwned, Owned, Stored};
+use crate::blockfiles::{self, Gate, Left, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "block-desires.json";
@@ -377,6 +378,9 @@ pub(crate) struct Write {
     /// until the write ran ([`blockfiles::Owned`]).
     path: Option<PathBuf>,
     owner: Option<Owned>,
+    /// Whether the file may be written over, as its sweeps decide where
+    /// they run ([`Gate`]).
+    gate: Arc<Gate>,
     work: Work,
 }
 
@@ -405,8 +409,8 @@ impl Write {
         let sweep = matches!(self.work, Work::Sweep);
         let done = match (&self.path, self.work) {
             (None, _) => Ok(None),
-            (Some(p), Work::Sweep) => blockfiles::sweep::<Book>(p),
-            (Some(p), Work::Snapshot(text)) => blockfiles::write(p, &text).map(|()| None),
+            (Some(p), Work::Sweep) => self.gate.sweep::<Book>(p),
+            (Some(p), Work::Snapshot(text)) => self.gate.write(p, &text).map(|()| None),
         };
         drop(self.owner);
         Landing { ticket: self.ticket, seq: self.seq, sweep, done }
@@ -558,6 +562,9 @@ pub(crate) struct Desires {
     next_ticket: u64,
     /// The sweep still to run (the owner's first write).
     sweep: bool,
+    /// Whether the file may be written over, decided where the writes run
+    /// ([`Gate`]): what [`Desires::held`] says once a sweep's word landed.
+    gate: Arc<Gate>,
     /// A sweep that couldn't set the file aside: why, and the change count
     /// it ran at. Nothing is written over the file meanwhile (memory only),
     /// and each change runs the sweep again ([`Desires::held`]).
@@ -602,6 +609,7 @@ impl Desires {
         Desires {
             path,
             sweep: owner.is_ok(),
+            gate: Gate::new(owner.is_ok()),
             owner,
             book,
             known: BTreeMap::new(),
@@ -658,7 +666,7 @@ impl Desires {
         };
         self.next_ticket += 1;
         self.out = Some(self.next_ticket);
-        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, work })
+        Some(Write { ticket: self.next_ticket, seq: self.seq, path, owner, gate: self.gate.clone(), work })
     }
 
     /// The file and its lock, owned; else neither (memory only).
@@ -671,10 +679,12 @@ impl Desires {
 
     /// The window's last write, or the app's (it closes, it quits): memory
     /// whole if it changed since the file has, whatever write is out (the
-    /// writer runs this one after it). What it does is no one's to hear.
+    /// writer runs this one after it). It writes only if the file may be
+    /// written over once what runs before it ran ([`Gate`]): a sweep out
+    /// whose word never lands decides it. What it does is no one's to hear.
     pub(crate) fn last_write(&mut self) -> Option<Write> {
         let (Some(path), Some(owner)) = self.file() else { return None };
-        if self.seq <= self.written || self.held.is_some() {
+        if self.seq <= self.written {
             return None;
         }
         self.next_ticket += 1;
@@ -683,6 +693,7 @@ impl Desires {
             seq: self.seq,
             path: Some(path),
             owner: Some(owner),
+            gate: self.gate.clone(),
             work: Work::Snapshot(self.book.text()),
         })
     }
@@ -710,6 +721,7 @@ impl Desires {
     #[cfg(test)]
     pub(crate) fn swept(&mut self) {
         self.sweep = false;
+        self.gate.open();
     }
 
     /// Why the file isn't written over, if it isn't: a sweep couldn't set
@@ -725,6 +737,7 @@ impl Desires {
             return false;
         }
         self.discarded = true;
+        self.gate.discard();
         // Memory isn't what the file has: a snapshot is due.
         self.seq += 1;
         self.written = 0;
