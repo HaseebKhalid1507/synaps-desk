@@ -1673,7 +1673,34 @@ pub(crate) mod test_home {
     }
 
     pub fn var(k: &str) -> Option<OsString> {
-        matches!(k, "XDG_CONFIG_HOME" | "APPDATA" | "HOME").then(|| root().join(k).into_os_string())
+        let base = OWN.with(|o| o.borrow().clone()).unwrap_or_else(|| root().to_path_buf());
+        matches!(k, "XDG_CONFIG_HOME" | "APPDATA" | "HOME").then(|| base.join(k).into_os_string())
+    }
+
+    thread_local! {
+        static OWN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// A test's own config folder, while it holds this: the settings file
+    /// every other test shares is not its (a GPUI test runs its tasks, the
+    /// background ones too, on its thread, so its saves land here). What
+    /// it reads back is then what it saved, never another test's write of
+    /// the same key at the same moment (`agent_rail_tests` saves
+    /// `right_width`, `remember_tests` `cards.remember`).
+    pub struct Own(pub PathBuf);
+
+    /// [`Own`] under [`root`], named `name`, empty: its settings file.
+    pub fn own(name: &str) -> Own {
+        let dir = root().join("own").join(format!("{name}-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        OWN.with(|o| *o.borrow_mut() = Some(dir));
+        Own(super::settings_path().expect("a settings file"))
+    }
+
+    impl Drop for Own {
+        fn drop(&mut self) {
+            OWN.with(|o| *o.borrow_mut() = None);
+        }
     }
 
     /// A test resolved the user's real settings file (or folder): it stops

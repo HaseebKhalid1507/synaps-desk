@@ -449,17 +449,23 @@ impl AppView {
             }
             drop(places);
             let sink = self.seg_places.clone();
-            let mut seg = h_flex().relative().h(px(28.)).border_1().border_color(p.edge).child({
-                let sink = sink.clone();
-                canvas(
-                    move |b, _, _| {
-                        sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0()
-            });
+            let mut seg = h_flex()
+                .relative()
+                .h(px(28.))
+                .border_1()
+                .border_color(p.edge)
+                .debug_selector(|| format!("choice {id} = {}", current.unwrap_or("none")))
+                .child({
+                    let sink = sink.clone();
+                    canvas(
+                        move |b, _, _| {
+                            sink.borrow_mut().insert(at, (f32::from(b.origin.x), f32::from(b.size.width)));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                });
             for (i, o) in opts.into_iter().enumerate() {
                 let on = current == Some(o.as_ref());
                 let sink = sink.clone();
@@ -482,6 +488,7 @@ impl AppView {
                 seg = seg.child(
                     div()
                         .id((id, i))
+                        .debug_selector(|| format!("choice {id} {o}"))
                         .relative()
                         .h_full()
                         .px(px(12.))
@@ -519,6 +526,7 @@ impl AppView {
                 list = list.child(
                     h_flex()
                         .id((id, 100 + i))
+                        .debug_selector(|| format!("option {id} {o}"))
                         .h(px(26.))
                         .px(px(10.))
                         .items_center()
@@ -535,6 +543,7 @@ impl AppView {
             .child(
                 h_flex()
                     .id(id)
+                    .debug_selector(move || format!("dropdown {id}"))
                     .w(px(CONTROL))
                     .h(px(28.))
                     .px(px(10.))
@@ -544,7 +553,10 @@ impl AppView {
                     .cursor_pointer()
                     .child({
                         let k = self.saved_glow(&SharedString::from(id), &shown, sending.is_some());
-                        mono(shown, 13., if sending.is_some() { p.dim } else { crate::motion::mix(p.prose, p.ink, k) }).flex_1()
+                        let said = shown.clone();
+                        mono(shown, 13., if sending.is_some() { p.dim } else { crate::motion::mix(p.prose, p.ink, k) })
+                            .flex_1()
+                            .debug_selector(move || format!("choice {id} = {said}"))
                     })
                     .child(mono(if open { "↑" } else { "↓" }, 12., p.dim))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -630,9 +642,17 @@ impl AppView {
         } else {
             let k = self.saved_glow(&id, &value, sending);
             let color = if sending { p.dim } else { crate::motion::mix(p.prose, p.ink, k) };
-            mono(value, 13., color).flex_1().min_w_0().overflow_hidden().text_ellipsis().into_any_element()
+            let said = (id.clone(), value.clone());
+            mono(value, 13., color)
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .debug_selector(move || format!("{} = {}", said.0, said.1))
+                .into_any_element()
         };
         h_flex()
+            .debug_selector(|| id.to_string())
             .id(id)
             .w(px(CONTROL))
             .h(px(28.))
@@ -652,9 +672,11 @@ impl AppView {
             .into_any_element()
     }
 
-    /// A read-only value: dim text, no border, then the rail's LOCKED glyph.
-    fn locked(value: impl Into<SharedString>, p: &Palette) -> AnyElement {
-        Self::locked_div(value.into(), p).into_any_element()
+    /// A read-only value: dim text, no border, then the rail's LOCKED glyph
+    /// (at `locked <key> = <value>`).
+    fn locked(key: &str, value: impl Into<SharedString>, p: &Palette) -> AnyElement {
+        let value = value.into();
+        Self::locked_div(value.clone(), p).debug_selector(move || format!("locked {key} = {value}")).into_any_element()
     }
 
     fn locked_div(value: SharedString, p: &Palette) -> Div {
@@ -684,11 +706,11 @@ impl AppView {
             _ => None,
         };
         if snap.is_none() {
-            return Self::locked(self.reference_shown(key), p);
+            return Self::locked(key, self.reference_shown(key), p);
         }
         let shown = settings::shown(key, raw);
         if !writable {
-            return Self::locked(shown, p);
+            return Self::locked(key, shown, p);
         }
         let id: &'static str = settings::def(key).map_or("config", |d| d.key);
         match settings::config_choices(key) {
@@ -712,7 +734,7 @@ impl AppView {
             out.push(mono(note, 12., p.dim).whitespace_normal().debug_selector(move || selector).into_any_element());
         }
         if let Some(Write::Refused(m)) = self.settings.writes.get(key) {
-            out.push(mono(m.clone(), 12., p.err).whitespace_normal().into_any_element());
+            out.push(mono(m.clone(), 12., p.err).whitespace_normal().debug_selector(|| format!("refused {key} = {m}")).into_any_element());
         }
         if let Some(c) = self.shown_config().filter(|c| c.pending.iter().any(|k| k == key)) {
             out.push(mono(format!("saved · applies after: {}", c.reload_cmd), 12., p.warn).whitespace_normal().into_any_element());
@@ -738,6 +760,7 @@ impl AppView {
             .child(
                 v_flex()
                     .id("help")
+                    .debug_selector(move || format!("help {key}"))
                     .flex_1()
                     .min_w_0()
                     .gap(px(2.))
@@ -753,12 +776,19 @@ impl AppView {
                             .child(sans(r.label, 14., 22., p.ink))
                             .when(!key.is_empty(), |d| d.child(mono(key, 12., p.dim))),
                     )
-                    .when(!r.help.is_empty(), |d| d.child(sans(help, 13., 20., p.dim).whitespace_normal()))
+                    .when(!r.help.is_empty(), |d| {
+                        d.child(
+                            sans(help, 13., 20., p.dim)
+                                .whitespace_normal()
+                                .debug_selector(move || format!("help-text {key} {}", if open { "full" } else { "first" })),
+                        )
+                    })
                     .when_some(r.tag, |d, t| d.child(mono(t, 12., p.dim).mt(px(2.)))),
             )
             .child(div().flex_none().flex().justify_end().child(r.control));
         // Under it, full width: a session row's default, a refusal, a reload.
         v_flex()
+            .debug_selector(|| format!("row {}", r.id))
             .id(r.id)
             .w_full()
             .min_h(px(44.))
@@ -780,6 +810,7 @@ impl AppView {
             .child(
                 h_flex()
                     .id(("group-head", ix))
+                    .debug_selector(move || format!("group {ix}"))
                     .gap(px(10.))
                     .items_baseline()
                     .when(more, |d| {
@@ -791,7 +822,10 @@ impl AppView {
                     .when(more, |d| d.child(mono(if open { "−" } else { "+" }, 13., p.dim)))
                     .child(display(title, fonts::size::D_M, p.header)),
             )
-            .child(mono(line, 12., p.dim).whitespace_normal())
+            .child({
+                let said = line.clone();
+                mono(line, 12., p.dim).whitespace_normal().debug_selector(move || format!("group-line {ix} = {said}"))
+            })
     }
 
     fn sub_head(title: &'static str, p: &Palette) -> AnyElement {
@@ -814,9 +848,23 @@ impl AppView {
                 .items_center()
                 .child(display("S E T T I N G S", fonts::size::D_L, p.header))
                 .child(div().flex_1())
-                .child(h_flex().w(px(CONTROL)).h(px(28.)).px(px(10.)).items_center().border_1().border_color(p.edge).child(
-                    div().flex_1().font_family(crate::fonts::MONO).text_px(13.).child(Input::new(&self.settings_find).appearance(false)),
-                ))
+                .child(
+                    h_flex()
+                        .w(px(CONTROL))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .items_center()
+                        .border_1()
+                        .border_color(p.edge)
+                        .debug_selector(|| "settings-find".into())
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family(crate::fonts::MONO)
+                                .text_px(13.)
+                                .child(Input::new(&self.settings_find).appearance(false)),
+                        ),
+                )
                 .into_any_element(),
         ));
         let gate = self.config_gate();
@@ -843,7 +891,8 @@ impl AppView {
             blocks.push(wrap(g.into_any_element()));
         }
         if !find.is_empty() && shown_groups.is_empty() {
-            blocks.push(wrap(sans(format!("Nothing matches “{find}”."), 13., 20., p.dim).pt(px(40.)).into_any_element()));
+            let nothing = sans(format!("Nothing matches “{find}”."), 13., 20., p.dim).pt(px(40.));
+            blocks.push(wrap(nothing.debug_selector(|| format!("settings-nothing {find}")).into_any_element()));
         }
         blocks.push(div().h(px(64.)).into_any_element());
         // The group at the top of the view (child 0 is the title). A scroll
@@ -861,11 +910,12 @@ impl AppView {
                     // The group in view: a you bar on its left (design.md §5).
                     div()
                         .id(("settings-index", ix))
+                        .debug_selector(move || format!("settings-index {ix}"))
                         .relative()
                         .py(px(5.))
                         .pl(px(10.))
                         .cursor_pointer()
-                        .when(on, |d| d.child(crate::glyph::bar(p.you_mark)))
+                        .when(on, |d| d.child(crate::glyph::bar(p.you_mark).debug_selector(move || format!("settings-index-bar {ix}"))))
                         .child(display(GROUPS[ix], 12., if on { p.ink } else { p.dim }))
                         .hover(|d| d.text_color(p.ink))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -882,7 +932,9 @@ impl AppView {
     // ── the groups: (header line, rows) ────────────────────────────────
 
     fn info_row(label: &'static str, value: impl Into<SharedString>, first: bool, p: &Palette) -> AnyElement {
+        let value = value.into();
         h_flex()
+            .debug_selector(|| format!("fact {label} = {value}"))
             .w_full()
             .min_h(px(36.))
             .py(px(8.))
@@ -981,6 +1033,7 @@ impl AppView {
             // The outlined button (design.md §8.12).
             div()
                 .id(id)
+                .debug_selector(move || id.into())
                 .h(px(28.))
                 .px(px(16.))
                 .flex()
@@ -1003,11 +1056,15 @@ impl AppView {
             key: "theme",
             help: "One of the Synaps TUI's themes. Following the Synaps config shows the theme its `theme =` names.",
             control: match pinned(self.theme_source, "--theme", theme::ENV_THEME) {
-                Some(why) => Self::locked(format!("{} · {why}", scheme.choice.theme), p),
+                Some(why) => Self::locked("theme", format!("{} · {why}", scheme.choice.theme), p),
                 None => h_flex()
                     .gap(px(12.))
                     .items_center()
-                    .child(mono(theme_value, 13., p.prose))
+                    .child({
+                        let shown = SharedString::from(theme_value);
+                        let said = shown.clone();
+                        mono(shown, 13., p.prose).debug_selector(move || format!("value theme = {said}"))
+                    })
                     .child(open_picker("app-theme-pick"))
                     .into_any_element(),
             },
@@ -1021,11 +1078,15 @@ impl AppView {
             key: "accent",
             help: "Replaces the theme's “you” and focus colours; never a state.",
             control: match pinned(self.accent_source, "--accent", theme::ENV_ACCENT) {
-                Some(why) => Self::locked(format!("{accent} · {why}"), p),
+                Some(why) => Self::locked("accent", format!("{accent} · {why}"), p),
                 None => h_flex()
                     .gap(px(12.))
                     .items_center()
-                    .child(mono(accent, 13., p.prose))
+                    .child({
+                        let shown = SharedString::from(accent);
+                        let said = shown.clone();
+                        mono(shown, 13., p.prose).debug_selector(move || format!("value accent = {said}"))
+                    })
                     .child(open_picker("app-accent-pick"))
                     .into_any_element(),
             },
@@ -1058,8 +1119,10 @@ impl AppView {
             key: "motion",
             help: "Full, reduced (no movement, short fades) or off (nothing animates). Follows the system until you choose.",
             control: match motion.lock {
-                Some(crate::motion::Lock::Flag) => Self::locked(format!("{} · set by --motion for this run", level.key()), p),
-                Some(crate::motion::Lock::NoBootFx) => Self::locked(format!("off · set by ${}", crate::motion::ENV_NO_BOOT_FX), p),
+                Some(crate::motion::Lock::Flag) => Self::locked("motion", format!("{} · set by --motion for this run", level.key()), p),
+                Some(crate::motion::Lock::NoBootFx) => {
+                    Self::locked("motion", format!("off · set by ${}", crate::motion::ENV_NO_BOOT_FX), p)
+                }
                 None => self.choice(
                     "motion",
                     Pick::Motion,
@@ -1150,6 +1213,7 @@ impl AppView {
                 control = control.child(
                     div()
                         .id(if rail { "rail-reset" } else { "right-reset" })
+                        .debug_selector(move || if rail { "rail-reset" } else { "right-reset" }.into())
                         .cursor_pointer()
                         .child(mono("reset width", 12., p.dim))
                         .hover(|d| d.text_color(p.ink))
@@ -1352,6 +1416,7 @@ impl AppView {
                     .child(
                         div()
                             .id("system-prompt")
+                            .debug_selector(|| "system-prompt".into())
                             .mt(px(8.))
                             .max_h(px(12. * 20.))
                             .overflow_y_scroll()
@@ -1367,7 +1432,10 @@ impl AppView {
                     )
                     .child(self.bars.prompt.bar(crate::scrollbar::Ground::Canvas))
                     .into_any_element(),
-                None => mono("the daemon's default prompt", 13., p.dim).mt(px(4.)).into_any_element(),
+                None => mono("the daemon's default prompt", 13., p.dim)
+                    .mt(px(4.))
+                    .debug_selector(|| "system-prompt-none".into())
+                    .into_any_element(),
             };
             rows.push(Row {
                 id: "session-system".into(),
@@ -1375,6 +1443,7 @@ impl AppView {
                 key: "system_prompt",
                 help: "This session's system prompt (/prompt in the TUI). Applying and reloading from disk wait for the client's Set.",
                 control: Self::locked(
+                    "system_prompt",
                     if self.model.lives[self.panes.cur.live].stats.view.as_ref().is_some_and(|v| v.system_prompt.is_some()) {
                         "custom"
                     } else {
@@ -1472,6 +1541,7 @@ impl AppView {
                 let first = lines.is_empty();
                 lines.push(
                     h_flex()
+                        .debug_selector(|| format!("reference {} = {value}", d.key))
                         .w_full()
                         .min_h(px(32.))
                         .gap(px(12.))
@@ -1547,6 +1617,7 @@ impl AppView {
 
     fn info_row_owned(label: String, value: String, first: bool, p: &Palette) -> AnyElement {
         h_flex()
+            .debug_selector(|| format!("fact {label} = {value}"))
             .w_full()
             .min_h(px(36.))
             .py(px(8.))
