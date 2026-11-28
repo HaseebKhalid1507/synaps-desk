@@ -1,24 +1,60 @@
 //! Settings' find (settings-overhaul PLAN v3.2 §1.7, §3.3, §3.6; PR 3).
 //!
-//! **Compile-only scaffolding** (PLAN §4's rules): the types and signatures
-//! the tests name, with bodies that find nothing, so each test below runs
-//! and fails on its own assertion. The next commit is the find.
-#![allow(dead_code, unused_variables, unused_imports)]
+//! A query is at most 16 words in 256 bytes, held in a fixed buffer
+//! ([`Query`]). A row's own strings are read in place, ASCII
+//! case-insensitively, with the separators (`_ . - /` and space) skipped on
+//! both sides: nothing is copied for search, and every hit is a byte range
+//! of the string it is in.
+//! - **Every word must hit** (AND).
+//! - **Typos.** A word of 4 or more characters may be one edit (a
+//!   substitution, an insertion, a deletion or two neighbours swapped) from
+//!   a word of the label or the key, never of the help. Only a word that no
+//!   row has as typed is read that way: `bash` finds the bash rows, not
+//!   Dash URL ([`Search::begin`]'s scan).
+//! - **Aliases** ([`ALIASES`]): `colour` finds Accent and Theme, and so on.
+//! - **Rank.** Label prefix, label word start, key (or inside a label
+//!   word), alias or value, help; a typo just below its place. A row's rank
+//!   is the sum of its words', lower first; the page keeps its order among
+//!   equals.
+//! - Until PR 8 an `@word` is an ordinary word.
 
 use std::mem::size_of;
 
+/// The query's bytes and words searched (PLAN §1.7).
 pub(crate) const MAX_BYTES: usize = 256;
 pub(crate) const MAX_WORDS: usize = 16;
+/// The largest legitimate inventory (PLAN §3.6): 14 app, 11 session, 89
+/// config and 9 connection rows, 64 providers and 128 plugins.
 pub(crate) const MAX_ROWS: usize = 315;
+/// A row's hits drawn, at most.
 pub(crate) const HITS_PER_ROW: usize = 8;
 pub(crate) const MAX_HITS: usize = MAX_ROWS * HITS_PER_ROW;
+/// A word this long (in characters, separators aside) may be a typo.
+const TYPO_FROM: usize = 4;
 
+/// What the field says when the query was cut.
 pub(crate) const WORDS_NOTE: &str = "only the first 16 words are searched";
 pub(crate) const BYTES_NOTE: &str = "only the first 256 bytes are searched";
 
-/// The aliases' words (scaffolding: none).
-const ALIASES: &[(&str, &[&str])] = &[];
+/// The aliases (PLAN §1.7): a word, and what it finds in a label or a key.
+const ALIASES: &[(&str, &[&str])] = &[
+    ("colour", &["accent", "theme"]),
+    ("color", &["accent", "theme"]),
+    ("font", &["text size"]),
+    ("zoom", &["text size"]),
+    ("size", &["text size"]),
+    ("dark", &["theme"]),
+    ("light", &["theme"]),
+    ("ctx", &["context"]),
+    ("effort", &["thinking"]),
+    ("reasoning", &["thinking"]),
+    ("retry", &["retries"]),
+    ("notify", &["card notifications"]),
+    ("sidebar", &["sessions rail"]),
+    ("prompt", &["system prompt"]),
+];
 
+/// Where a query was cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cut {
     None,
@@ -26,35 +62,105 @@ pub(crate) enum Cut {
     Words,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A query: its first 256 bytes (trimmed) and its first 16 words, as spans
+/// of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Query {
+    text: [u8; MAX_BYTES],
+    len: u16,
+    spans: [(u16, u16); MAX_WORDS],
     n: u8,
+    cut: Cut,
 }
 
-impl Query {
-    pub(crate) const EMPTY: Query = Query { n: 0 };
+// PLAN §3.6's 256 B and 16 spans of 4 B, plus the length, the count and
+// the cut.
+const _: () = assert!(size_of::<Query>() == MAX_BYTES + MAX_WORDS * 4 + 4);
 
+impl Query {
+    pub(crate) const EMPTY: Query = Query { text: [0; MAX_BYTES], len: 0, spans: [(0, 0); MAX_WORDS], n: 0, cut: Cut::None };
+
+    /// `typed`, trimmed, its first 256 bytes (to a character) and their
+    /// first 16 words. A word of separators alone is no word.
     pub(crate) fn parse(typed: &str) -> Query {
-        Query::EMPTY
+        let typed = typed.trim();
+        let mut end = typed.len().min(MAX_BYTES);
+        while !typed.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kept = &typed[..end];
+        let mut q = Query::EMPTY;
+        q.text[..end].copy_from_slice(kept.as_bytes());
+        q.len = end as u16;
+        if end < typed.len() {
+            q.cut = Cut::Bytes;
+        }
+        for word in kept.split_whitespace() {
+            if word.bytes().all(is_sep) {
+                continue;
+            }
+            if usize::from(q.n) == MAX_WORDS {
+                q.cut = Cut::Words;
+                break;
+            }
+            let at = word.as_ptr() as usize - kept.as_ptr() as usize;
+            q.spans[usize::from(q.n)] = (at as u16, (at + word.len()) as u16);
+            q.n += 1;
+        }
+        q
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        true
+        self.n == 0
     }
 
+    /// The text kept, as typed.
     pub(crate) fn text(&self) -> &str {
-        ""
+        std::str::from_utf8(&self.text[..usize::from(self.len)]).unwrap_or_default()
     }
 
     pub(crate) fn words(&self) -> impl Iterator<Item = &str> + '_ {
-        std::iter::empty()
+        (0..self.n).map(|i| std::str::from_utf8(self.word(i)).unwrap_or_default())
     }
 
+    fn word(&self, i: u8) -> &[u8] {
+        let (a, b) = self.spans[usize::from(i)];
+        &self.text[usize::from(a)..usize::from(b)]
+    }
+
+    /// What the field says: the query was cut.
     pub(crate) fn note(&self) -> Option<&'static str> {
-        None
+        match self.cut {
+            Cut::None => None,
+            Cut::Bytes => Some(BYTES_NOTE),
+            Cut::Words => Some(WORDS_NOTE),
+        }
+    }
+
+    /// The words that may be a typo (a bit each): 4 characters or more.
+    fn typo_words(&self) -> u16 {
+        (0..self.n).filter(|&i| chars(self.word(i)) >= TYPO_FROM).fold(0, |m, i| m | 1 << i)
     }
 }
 
+impl Default for Query {
+    fn default() -> Self {
+        Query::EMPTY
+    }
+}
+
+impl std::fmt::Debug for Query {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Query")
+            .field("text", &self.text())
+            .field("words", &self.words().collect::<Vec<_>>())
+            .field("cut", &self.cut)
+            .finish()
+    }
+}
+
+/// A row's strings, read where they are. `value` is a shown value (a
+/// Connection fact's, a provider's); the page's rows have none yet.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Fields<'a> {
     pub label: &'a str,
@@ -68,16 +174,19 @@ impl<'a> Fields<'a> {
         Fields { label, key, help, value: "" }
     }
 
+    /// A fact: its label and its value.
     pub(crate) fn fact(label: &'a str, value: &'a str) -> Self {
         Fields { label, value, ..Fields::default() }
     }
 }
 
+/// A hit's field.
 pub(crate) const LABEL: u8 = 0;
 pub(crate) const KEY: u8 = 1;
 pub(crate) const HELP: u8 = 2;
 pub(crate) const VALUE: u8 = 3;
 
+/// A hit: bytes `start..end` of field `field` of row `row`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Hit {
     pub row: u16,
@@ -86,66 +195,381 @@ pub(crate) struct Hit {
     pub end: u16,
 }
 
+const _: () = assert!(size_of::<Hit>() == 8);
+
+/// Lower ranks first.
 pub(crate) type Rank = u16;
 
+/// A row found: its number in the pass (its hits' key) and its rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Found {
     pub row: u16,
     pub rank: Rank,
 }
 
-pub(crate) fn find(q: &Query, f: &Fields, out: &mut Vec<Hit>) -> Option<Rank> {
+const _: () = assert!(size_of::<Found>() == 4);
+
+// A word's place, best first: tier × 2, and + 1 for a typo.
+const AT_LABEL_PREFIX: u16 = 0;
+const AT_LABEL_WORD: u16 = 2;
+const AT_KEY: u16 = 4;
+const AT_ALIAS: u16 = 6;
+const AT_HELP: u16 = 8;
+
+fn is_sep(b: u8) -> bool {
+    matches!(b, b'_' | b'.' | b'-' | b'/' | b' ')
+}
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b >= 0x80
+}
+
+/// Characters, separators aside.
+fn chars(t: &[u8]) -> usize {
+    t.iter().filter(|&&b| !is_sep(b) && b & 0xC0 != 0x80).count()
+}
+
+/// A field as searched: up to 65,535 bytes (a hit's `u16`).
+fn hay(s: &str) -> &[u8] {
+    &s.as_bytes()[..s.len().min(usize::from(u16::MAX))]
+}
+
+/// `t` read in `h` from `s` on, separators skipped on both sides: where it
+/// ends.
+fn reads_at(h: &[u8], s: usize, t: &[u8]) -> Option<usize> {
+    let (mut i, mut j) = (s, 0);
+    loop {
+        while j < t.len() && is_sep(t[j]) {
+            j += 1;
+        }
+        if j == t.len() {
+            return Some(i);
+        }
+        if i > s {
+            while i < h.len() && is_sep(h[i]) {
+                i += 1;
+            }
+        }
+        if i == h.len() || !h[i].eq_ignore_ascii_case(&t[j]) {
+            return None;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+/// Where `t` first reads in `h` from byte `from` on; `word`: the first at
+/// a word's start, if any is (a label's place is its best).
+fn place(h: &[u8], t: &[u8], word: bool, from: usize) -> Option<(usize, usize)> {
+    let first = *t.iter().find(|&&b| !is_sep(b))?;
+    let mut any = None;
+    for s in from..h.len() {
+        if !h[s].eq_ignore_ascii_case(&first) {
+            continue;
+        }
+        let Some(e) = reads_at(h, s, t) else { continue };
+        if !word || s == 0 || !is_word(h[s - 1]) {
+            return Some((s, e));
+        }
+        any = any.or(Some((s, e)));
+    }
+    any
+}
+
+/// `w` and `t` are at most one edit apart (ASCII case folded).
+fn one_edit(w: &[u8], t: &[u8]) -> bool {
+    let eq = |a: &[u8], b: &[u8]| a.eq_ignore_ascii_case(b);
+    let (n, m) = (w.len(), t.len());
+    if n.abs_diff(m) > 1 {
+        return false;
+    }
+    let mut i = 0;
+    while i < n.min(m) && w[i].eq_ignore_ascii_case(&t[i]) {
+        i += 1;
+    }
+    if i == n.min(m) {
+        return true;
+    }
+    match n.cmp(&m) {
+        std::cmp::Ordering::Equal => {
+            eq(&w[i + 1..], &t[i + 1..])
+                || (i + 1 < n
+                    && w[i].eq_ignore_ascii_case(&t[i + 1])
+                    && w[i + 1].eq_ignore_ascii_case(&t[i])
+                    && eq(&w[i + 2..], &t[i + 2..]))
+        }
+        std::cmp::Ordering::Greater => eq(&w[i + 1..], &t[i..]),
+        std::cmp::Ordering::Less => eq(&w[i..], &t[i + 1..]),
+    }
+}
+
+/// The first word of `h` one edit from `t` (separators already out).
+fn typo_in(h: &[u8], t: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < h.len() {
+        if !is_word(h[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < h.len() && is_word(h[i]) {
+            i += 1;
+        }
+        if one_edit(&h[s..i], t) {
+            return Some((s, i));
+        }
+    }
     None
 }
 
-#[derive(Default)]
+/// The alias `t` is, if it is one.
+fn alias(t: &[u8]) -> Option<&'static [&'static str]> {
+    ALIASES.iter().find(|(a, _)| reads_at(a.as_bytes(), 0, t) == Some(a.len()) && chars(t) == a.len()).map(|(_, to)| *to)
+}
+
+type Spot = Option<(u16, u16)>;
+
+fn spot(r: Option<(usize, usize)>) -> Spot {
+    r.map(|(s, e)| (s as u16, e as u16))
+}
+
+/// Word `t`'s best place in a row (`typo`: it may be one edit off), and
+/// where it is in each field (label, key, help, value).
+fn word_place(t: &[u8], f: &Fields, typo: bool) -> Option<(u16, [Spot; 4])> {
+    let (label, key, help, value) = (hay(f.label), hay(f.key), hay(f.help), hay(f.value));
+    let mut at = [None; 4];
+    let mut best = u16::MAX;
+    if let Some((s, e)) = place(label, t, true, 0) {
+        at[usize::from(LABEL)] = spot(Some((s, e)));
+        best = if s == 0 {
+            AT_LABEL_PREFIX
+        } else if !is_word(label[s - 1]) {
+            AT_LABEL_WORD
+        } else {
+            AT_KEY
+        };
+    }
+    if let Some(r) = place(key, t, false, 0) {
+        at[usize::from(KEY)] = spot(Some(r));
+        best = best.min(AT_KEY);
+    }
+    if let Some(r) = place(value, t, false, 0) {
+        at[usize::from(VALUE)] = spot(Some(r));
+        best = best.min(AT_ALIAS);
+    }
+    if best > AT_ALIAS
+        && let Some(to) = alias(t)
+    {
+        for name in to {
+            let n = name.as_bytes();
+            if let Some(r) = place(label, n, true, 0) {
+                at[usize::from(LABEL)] = spot(Some(r));
+            } else if let Some(r) = place(key, n, false, 0) {
+                at[usize::from(KEY)] = spot(Some(r));
+            } else {
+                continue;
+            }
+            best = best.min(AT_ALIAS);
+            break;
+        }
+    }
+    if let Some(r) = place(help, t, false, 0) {
+        at[usize::from(HELP)] = spot(Some(r));
+        best = best.min(AT_HELP);
+    }
+    if best == u16::MAX && typo {
+        let mut packed = [0u8; MAX_BYTES];
+        let mut n = 0;
+        for &b in t.iter().filter(|&&b| !is_sep(b)) {
+            packed[n] = b;
+            n += 1;
+        }
+        let t = &packed[..n];
+        if let Some((s, e)) = typo_in(label, t) {
+            at[usize::from(LABEL)] = spot(Some((s, e)));
+            best = (if s == 0 { AT_LABEL_PREFIX } else { AT_LABEL_WORD }) + 1;
+        } else if let Some(r) = typo_in(key, t) {
+            at[usize::from(KEY)] = spot(Some(r));
+            best = AT_KEY + 1;
+        }
+    }
+    (best != u16::MAX).then_some((best, at))
+}
+
+/// Row `f` against `q`: found when every word hits (words in `typos` may
+/// be one edit off), its rank; its hits (at most 8, label's first) pushed
+/// to `out` as row `row` when `lit`.
+fn find_row(q: &Query, typos: u16, f: &Fields, row: u16, out: &mut Vec<Hit>, lit: bool) -> Option<Rank> {
+    let mut rank: Rank = 0;
+    let mut at = [[None; 4]; MAX_WORDS];
+    for i in 0..q.n {
+        let (best, spots) = word_place(q.word(i), f, typos & 1 << i != 0)?;
+        rank += best;
+        at[usize::from(i)] = spots;
+    }
+    if lit {
+        // Label first: each word's place, then every other place it reads
+        // as typed in the field.
+        let from = out.len();
+        let hays = [hay(f.label), hay(f.key), hay(f.help), hay(f.value)];
+        'fields: for field in [LABEL, KEY, HELP, VALUE] {
+            let h = hays[usize::from(field)];
+            for (i, spots) in at[..usize::from(q.n)].iter().enumerate() {
+                let mut next = spots[usize::from(field)].map(|(s, e)| (usize::from(s), usize::from(e)));
+                while let Some((start, end)) = next {
+                    if out.len() - from == HITS_PER_ROW {
+                        break 'fields;
+                    }
+                    let hit = Hit { row, field, start: start as u16, end: end as u16 };
+                    if !out[from..].contains(&hit) {
+                        out.push(hit);
+                    }
+                    next = place(h, q.word(i as u8), false, end.max(start + 1));
+                }
+            }
+        }
+    }
+    Some(rank)
+}
+
+/// One row by itself, against `q` (any word of 4 or more characters may
+/// be one edit off): its rank, its hits pushed to `out` as row 0.
+#[cfg(test)]
+pub(crate) fn find(q: &Query, f: &Fields, out: &mut Vec<Hit>) -> Option<Rank> {
+    find_row(q, q.typo_words(), f, 0, out, true)
+}
+
+/// The words a row has as typed (a bit each).
+fn as_typed(q: &Query, f: &Fields) -> u16 {
+    (0..q.n).filter(|&i| word_place(q.word(i), f, false).is_some()).fold(0, |m, i| m | 1 << i)
+}
+
+/// The page's search: its query, the rows found in a pass over the rows
+/// ([`Search::results`]) and their hits. Both lists are reserved once, at
+/// the first query, to their caps (PLAN §3.6) and never grow past them: a
+/// row past [`MAX_ROWS`] is found but neither listed nor lit.
 pub(crate) struct Search {
     query: Query,
+    /// Words that may be one edit off, this pass.
+    typos: u16,
+    /// Words some row has as typed, in this pass's scan.
+    seen: u16,
+    scanning: bool,
+    /// The next row's number.
+    next: u16,
     results: Vec<Found>,
     hits: Vec<Hit>,
 }
 
-impl Default for Query {
+impl Default for Search {
     fn default() -> Self {
-        Query::EMPTY
+        Search { query: Query::EMPTY, typos: 0, seen: 0, scanning: false, next: 0, results: Vec::new(), hits: Vec::new() }
     }
 }
 
 impl Search {
+    /// A new query: whether it changed.
     pub(crate) fn set(&mut self, q: Query) -> bool {
-        false
+        let changed = q != self.query;
+        self.query = q;
+        changed
     }
 
     pub(crate) fn query(&self) -> &Query {
         &self.query
     }
 
+    /// A pass over the rows begins. True: it scans first, each row [`take`]n
+    /// once for what it has as typed (answering None), then [`scanned`],
+    /// then each row again. A word no row has as typed may then be one
+    /// edit off.
+    ///
+    /// [`take`]: Search::take
+    /// [`scanned`]: Search::scanned
     pub(crate) fn begin(&mut self) -> bool {
-        false
+        if !self.query.is_empty() && self.hits.capacity() == 0 {
+            self.results.reserve_exact(MAX_ROWS);
+            self.hits.reserve_exact(MAX_HITS);
+        }
+        self.results.clear();
+        self.hits.clear();
+        (self.next, self.seen, self.typos) = (0, 0, 0);
+        self.scanning = self.query.typo_words() != 0;
+        self.scanning
     }
 
-    pub(crate) fn scanned(&mut self) {}
+    /// The scan is done.
+    pub(crate) fn scanned(&mut self) {
+        self.typos = self.query.typo_words() & !self.seen;
+        (self.scanning, self.next) = (false, 0);
+    }
 
+    /// Row `f`: found (every row is, with no query) or not; its hits kept.
     pub(crate) fn take(&mut self, f: &Fields) -> Option<Found> {
-        None
+        self.take_row(f, true)
     }
 
+    /// [`Search::take`] for a row drawn with other strings than `f`: found
+    /// or not, its hits not kept.
+    pub(crate) fn take_unlit(&mut self, f: &Fields) -> Option<Found> {
+        self.take_row(f, false)
+    }
+
+    fn take_row(&mut self, f: &Fields, lit: bool) -> Option<Found> {
+        if self.query.is_empty() {
+            return Some(Found { row: u16::MAX, rank: 0 });
+        }
+        if self.scanning {
+            self.seen |= as_typed(&self.query, f);
+            return None;
+        }
+        let room = self.results.len() < MAX_ROWS;
+        let row = self.next;
+        let rank = find_row(&self.query, self.typos, f, row, &mut self.hits, lit && room)?;
+        self.next = self.next.saturating_add(1);
+        let found = Found { row, rank };
+        if room {
+            self.results.push(found);
+        }
+        Some(found)
+    }
+
+    /// Every row of `rows`, scan and all: what is found.
+    #[cfg(test)]
     pub(crate) fn run(&mut self, rows: &[Fields]) -> &[Found] {
+        if self.begin() {
+            for f in rows {
+                self.take(f);
+            }
+            self.scanned();
+        }
+        for f in rows {
+            self.take(f);
+        }
         &self.results
     }
 
+    /// The rows found in this pass, in their order.
+    #[cfg(test)]
     pub(crate) fn results(&self) -> &[Found] {
         &self.results
     }
 
+    /// Row `row`'s hits.
     pub(crate) fn hits_of(&self, row: u16) -> &[Hit] {
-        &[]
+        let a = self.hits.partition_point(|h| h.row < row);
+        let b = a + self.hits[a..].partition_point(|h| h.row == row);
+        &self.hits[a..b]
     }
 
+    /// Bytes held (PLAN §3.6: `size_of` and every buffer's capacity).
+    #[cfg(test)]
     pub(crate) fn retained(&self) -> usize {
-        0
+        let Search { query: _, typos: _, seen: _, scanning: _, next: _, results, hits } = self;
+        size_of::<Self>() + results.capacity() * size_of::<Found>() + hits.capacity() * size_of::<Hit>()
     }
 
+    #[cfg(test)]
     pub(crate) fn capacities(&self) -> (usize, usize) {
         (self.results.capacity(), self.hits.capacity())
     }
