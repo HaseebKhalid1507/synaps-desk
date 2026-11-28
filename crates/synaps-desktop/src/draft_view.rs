@@ -172,9 +172,46 @@ pub(crate) struct Field {
     /// characters, 2: past the draft's room), said at the next frame.
     pub refused: Rc<Cell<u8>>,
     /// What the kit's undo history may hold since it was last cleared
-    /// (bytes, [`FIELD_HISTORY_MAX`]).
+    /// (bytes, [`FIELD_HISTORY_MAX`]): a composition's marked text too
+    /// ([`AppView::edit_marked`]).
     pub history: usize,
+    /// Its text as last seen (bytes, and a hash of it and its marked
+    /// range), and whether a composition was under way then.
+    seen: (usize, u64),
+    composing: bool,
     _sub: Subscription,
+    _watch: Subscription,
+}
+
+/// What the field says of a composition refused because its history
+/// would pass [`FIELD_HISTORY_MAX`].
+pub(crate) const COMPOSED_LONG: &str = "this composition is too long to keep · type it in parts";
+
+/// A note's whole text and title, at their characters' most bytes, fit
+/// in a draft's room (§1.8): a text area's characters bound what it is
+/// marked with.
+const _: () = assert!(
+    std::mem::size_of::<Draft>() + 4 * (cards_spec::block::NOTE_TEXT_MAX + cards_spec::block::TITLE_MAX) <= crate::drafts::DRAFT_MAX_BYTES
+);
+
+/// The hash of text `v` and its marked range (`Field::seen`).
+fn seen_hash(v: &str, marked: &Option<std::ops::Range<usize>>) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&(v, marked), &mut h);
+    h.finish()
+}
+
+/// The bytes of text `v`'s UTF-16 range `r` (the kit's marked range).
+fn utf16_bytes(v: &str, r: &std::ops::Range<usize>) -> usize {
+    let mut at = 0;
+    v.chars()
+        .filter(|c| {
+            let inside = at >= r.start && at < r.end;
+            at += c.len_utf16();
+            inside
+        })
+        .map(char::len_utf8)
+        .sum()
 }
 
 /// A pane's editing of one draft.
@@ -255,6 +292,22 @@ fn items(b: &cards_spec::board::Block) -> Vec<ItemId> {
 }
 
 /// What field `of` edits, in block `b` (a draft's view).
+/// Whether transcript `t` has row `row`.
+fn has_row(t: &synaps_client::Transcript, row: u64) -> bool {
+    t.items().iter().any(|i| i.id == row)
+}
+
+/// Transcript `t`'s row of call `call` (a tool row's: the row a block
+/// anchors at, as a reattach numbers it).
+fn row_of_call(t: &synaps_client::Transcript, call: &str) -> Option<u64> {
+    t.items().iter().find(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == call)).map(|i| i.id)
+}
+
+/// The call of transcript `t`'s row `row`, if a tool row.
+fn call_of(t: &synaps_client::Transcript, row: u64) -> Option<std::sync::Arc<str>> {
+    t.items().iter().find(|i| i.id == row).and_then(|i| i.tool.as_ref()).map(|c| std::sync::Arc::from(c.tool_id.as_str()))
+}
+
 fn field_value(b: &cards_spec::board::Block, of: &FieldOf) -> Option<String> {
     match (of, &b.body) {
         (FieldOf::Label(i), Body::Plan(p)) => p.steps.iter().find(|s| &s.id == i).map(|s| s.label.clone()),
@@ -354,9 +407,10 @@ impl AppView {
                     return false;
                 }
                 let Some(generation) = board.generation else { return false };
-                // Where it is drawn now: where it stays while held (§3.4).
-                let shown = self.model.lives[self.panes.cur.live].transcript.drawn().cloned();
-                let place = shown.as_deref().and_then(|d| crate::drafts::Place::of(d, &bound.id));
+                // Where it is drawn now: where it stays while held (§3.4),
+                // its rows named by their calls too.
+                let t = &self.model.lives[self.panes.cur.live].transcript;
+                let place = t.drawn().and_then(|d| crate::drafts::Place::of(d, &bound.id)).map(|p| p.called(|r| call_of(t, r)));
                 match self.block_drafts.take(&session, &bound, generation) {
                     Ok(d) => {
                         if d.place.is_none() {
@@ -720,6 +774,7 @@ impl AppView {
         let Some(value) = field_value(&d.view(), &of) else { return };
         let room = Rc::new(Cell::new(self.field_room(&value)));
         let refused = Rc::new(Cell::new(0u8));
+        let seen = (value.len(), seen_hash(&value, &None));
         let field = if of == FieldOf::Text {
             let e = cx.new(|cx| {
                 let mut s = TextareaState::new(window, cx).auto_grow(2, 6);
@@ -733,7 +788,10 @@ impl AppView {
                 }
             });
             e.update(cx, |s, cx| s.focus(window, cx));
-            Field { of, line: None, long: Some(e), room, refused, history: 0, _sub: sub }
+            let watch = cx.observe_in(&e, window, move |this: &mut Self, _, window, cx| {
+                this.in_pane(pane, |this| this.edit_marked(window, cx));
+            });
+            Field { of, line: None, long: Some(e), room, refused, history: 0, seen, composing: false, _sub: sub, _watch: watch }
         } else {
             // No text past its cap is taken, typed, pasted or marked: the
             // kit refuses it, and the block says why at the next frame.
@@ -768,7 +826,10 @@ impl AppView {
                 _ => {}
             });
             e.update(cx, |s, cx| s.focus(window, cx));
-            Field { of, line: Some(e), long: None, room, refused, history: 0, _sub: sub }
+            let watch = cx.observe_in(&e, window, move |this: &mut Self, _, window, cx| {
+                this.in_pane(pane, |this| this.edit_marked(window, cx));
+            });
+            Field { of, line: Some(e), long: None, room, refused, history: 0, seen, composing: false, _sub: sub, _watch: watch }
         };
         if let Some(ed) = self.panes.cur.edit.at.as_mut() {
             ed.field = Some(field);
@@ -845,6 +906,62 @@ impl AppView {
                 s.set_selected_range(at..at, cx);
             });
         }
+    }
+
+    /// The open field as an IME marks text in it (its notify): the kit
+    /// sends no `Change` for marked text, checks only a one-line field's,
+    /// and keeps each preedit in its undo history (gpui-base 0.9.1,
+    /// `replace_and_mark_text_in_range`), so each is checked here as it
+    /// comes, counted as the kit keeps it: the text it took out and the
+    /// text it marked. Marked text past the field's characters (a text
+    /// area's are within the draft's room, asserted with [`COMPOSED_LONG`];
+    /// a line's past either the kit refuses), or a composition whose
+    /// history would pass [`FIELD_HISTORY_MAX`], is refused: the field
+    /// gets the draft's value back, which ends the composition and clears
+    /// its history, and the block says why. A composition's commit is a
+    /// `Change` ([`AppView::edit_typed`]).
+    fn edit_marked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
+        let Some(f) = e.field.as_ref() else { return };
+        let row = e.row;
+        let (v, marked) = match (f.line.clone(), f.long.clone()) {
+            (Some(l), _) => (l.read(cx).value(), l.update(cx, |s, cx| s.marked_text_range(window, cx))),
+            (None, Some(a)) => (a.read(cx).value(), a.update(cx, |s, cx| s.marked_text_range(window, cx))),
+            (None, None) => return,
+        };
+        let look = seen_hash(&v, &marked);
+        let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) else { return };
+        if f.seen.1 == look {
+            return;
+        }
+        let (was, before) = (f.composing, f.seen.0);
+        f.seen = (v.len(), look);
+        f.composing = marked.is_some();
+        if !was && marked.is_none() {
+            return;
+        }
+        let mark = marked.as_ref().map_or(0, |r| utf16_bytes(&v, r));
+        f.history += (before + mark).saturating_sub(v.len()) + mark;
+        if marked.is_none() {
+            return;
+        }
+        let of = f.of.clone();
+        let why = if v.chars().count() > of.chars() {
+            at_most(of.chars())
+        } else if f.history > FIELD_HISTORY_MAX {
+            COMPOSED_LONG.to_string()
+        } else {
+            return;
+        };
+        let held = self.editing_draft().and_then(|d| field_value(&d.view(), &of)).unwrap_or_default();
+        log::info!(target: "synaps_desktop::drafts", "draft {row}: a composition refused ({} bytes marked): {why}", mark);
+        self.field_set(&held, window, cx);
+        if let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) {
+            f.seen = (held.len(), seen_hash(&held, &None));
+            f.composing = false;
+        }
+        self.edit_says(row, why, cx);
+        self.remeasure_draft(row);
     }
 
     /// The open field closes; `refocus`: the block's keys have the focus
@@ -1002,8 +1119,9 @@ impl AppView {
         }
         let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
         let here = self.edit_session().as_deref() == Some(e.session.as_str()) && self.model.tabs.view().is_none();
-        // An orphan has no row to draw in: its keys are the dock's buttons.
-        let have = self.block_drafts.by_key(e.key).is_some_and(|(s, d)| s == e.session && Fate::in_row(d.ended));
+        // A draft not drawn in its row (an orphan, one another draft of its
+        // block has the row of): its keys are the dock's buttons.
+        let have = self.block_drafts.by_key(e.key).is_some_and(|(s, d)| s == e.session && self.block_drafts.rowed(s, d));
         let (a, l) = self.panes.cur.edit.inputs();
         let in_field = a.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window))
             || l.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window));
@@ -1038,16 +1156,25 @@ impl AppView {
                 None if !l.transcript.has_blocks() => self.block_drafts.gone(&session),
                 _ => false,
             };
-            // A held block whose row its history no longer has (a
-            // reattach): its place is where the board draws it now.
-            if let Some(d) = l.transcript.drawn() {
-                let items = l.shown().items();
-                for (id, p) in self.block_drafts.places(&session) {
-                    if let crate::drafts::Place::Row { item, .. } = p
-                        && !items.iter().any(|i| i.id == item)
-                    {
-                        self.block_drafts.re_place(&session, &id, crate::drafts::Place::of(d, &id));
+            // A held block whose row its history numbered anew (a
+            // reattach): its place there, its row found by its call (§3.4:
+            // the anchor it was taken at, the agent's move of it still
+            // waiting). No row has that call (the anchor itself is gone,
+            // not renumbered): held where the board draws it now.
+            let t = &l.transcript;
+            for (id, p) in self.block_drafts.places(&session) {
+                if p.there(|r| has_row(t, r)) {
+                    continue;
+                }
+                let now = t.drawn().filter(|d| d.epoch == t.blocks_epoch());
+                match p.renumbered(|r| has_row(t, r), |c| row_of_call(t, c)) {
+                    Some(q) => self.block_drafts.re_place(&session, &id, Some(q)),
+                    None if now.is_some() => {
+                        let q = now.and_then(|d| crate::drafts::Place::of(d, &id)).map(|q| q.called(|r| call_of(t, r)));
+                        log::info!(target: "synaps_desktop::drafts", "draft of {id}: its anchor's call is gone; held where it is drawn");
+                        self.block_drafts.re_place(&session, &id, q);
                     }
+                    None => {}
                 }
             }
             // And for a restore asked for (§3.6): its pre-check is the
@@ -1145,15 +1272,23 @@ impl AppView {
     ) -> std::sync::Arc<synaps_client::blocks::Drawn> {
         let l = &self.model.lives[live];
         let Some(session) = l.active.as_ref().map(|a| a.session_id.as_str()) else { return d };
-        // A row its history no longer has (a reattach numbers its rows
-        // anew): drawn where the agent put it, and taken as its place
-        // ([`AppView::sync_drafts`]).
-        let items = l.shown().items();
-        let mut holds = self.block_drafts.places(session);
-        holds.retain(|(_, p)| match p {
-            crate::drafts::Place::Row { item, .. } => items.iter().any(|i| i.id == *item),
-            crate::drafts::Place::Rail { .. } => true,
-        });
+        // A row its history numbered anew (a reattach): found by its call
+        // (the session's transcript's: the board's rows, a watch focused
+        // or not). Its call gone too: drawn where the agent put it, taken
+        // as its place ([`AppView::sync_drafts`]).
+        let t = &l.transcript;
+        let holds: Vec<_> = self
+            .block_drafts
+            .places(session)
+            .into_iter()
+            .filter_map(|(id, p)| {
+                if p.there(|r| has_row(t, r)) {
+                    Some((id, p))
+                } else {
+                    p.renumbered(|r| has_row(t, r), |c| row_of_call(t, c)).map(|q| (id, q))
+                }
+            })
+            .collect();
         if holds.is_empty() {
             return d;
         }
@@ -1650,8 +1785,9 @@ impl AppView {
     }
 
     /// The drafts dock, over the composer (module docs): the session's
-    /// drafts with no row drawn in this pane (gone, compacted), a line
-    /// each, with Copy to composer and Discard; then this desk's
+    /// drafts with no row drawn in this pane (gone, compacted, or another
+    /// draft of the block has its row: [`crate::drafts::Drafts::rowed`]),
+    /// a line each, with Copy to composer and Discard; then this desk's
     /// hand-backs whose block ended while they say something (D8b,
     /// [`AppView::ended_hand_backs`]), with Copy and Discard, no Resend.
     pub(crate) fn drafts_dock(&self, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1659,7 +1795,7 @@ impl AppView {
         let rowless: Vec<&Draft> = self
             .block_drafts
             .of(&session)
-            .filter(|d| self.block_drawn(crate::blocks::row_id(&d.id)).is_none() || !Fate::in_row(d.ended))
+            .filter(|d| self.block_drawn(crate::blocks::row_id(&d.id)).is_none() || !self.block_drafts.rowed(&session, d))
             .collect();
         let ended = self.ended_hand_backs();
         if rowless.is_empty() && ended.is_empty() {

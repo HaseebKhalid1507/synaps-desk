@@ -569,9 +569,14 @@ impl Draft {
     }
 
     /// What it keeps in all: its own, the base block at B2's ceiling, and
-    /// the body it sent (≤ 200 characters and 8 KiB: §3.3's caps).
+    /// its place (at most a board's live blocks before it) and the body it
+    /// sent (≤ 200 characters and 8 KiB: §3.3's caps).
     pub(crate) fn bytes(&self) -> usize {
-        self.own_bytes() + BLOCK_MAX_OWNED + 2 * std::mem::size_of::<usize>() + self.sent.as_ref().map_or(0, String::capacity)
+        self.own_bytes()
+            + BLOCK_MAX_OWNED
+            + 2 * std::mem::size_of::<usize>()
+            + self.place.as_ref().map_or(0, Place::heap)
+            + self.sent.as_ref().map_or(0, String::capacity)
     }
 
     // ── the patch, line 1, the pre-check ──────────────────────────────
@@ -925,34 +930,90 @@ impl Draft {
 
 /// Where a held block is drawn, as it was when taken (§3.4: the agent's
 /// `move` and `collapse` of it wait in drawing until the hold ends): its
-/// list (a transcript row's blocks, or a rail slot's sections), its place
-/// in it, and the block before it there.
+/// list (a transcript row's blocks, or a rail slot's sections), and the
+/// blocks before it there, nearest first (none: it was first). Its
+/// rows' calls name them across a reattach, which numbers rows anew
+/// ([`Place::renumbered`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Place {
-    /// The `at`th block anchored at transcript row `item`.
-    Row { item: u64, at: usize, after: Option<Ref> },
-    /// The `at`th section of rail slot `slot` (its creating call's row
-    /// `row`: a section the user put into the transcript draws there).
-    Rail { slot: usize, at: usize, row: Option<u64>, after: Option<Ref> },
+    /// Among the blocks anchored at transcript row `item`, its call
+    /// `call`'s.
+    Row { item: u64, call: Option<Arc<str>>, after: Vec<Ref> },
+    /// Among rail slot `slot`'s sections, its creating call's row `row`
+    /// and that row's call `call` (a section the user put into the
+    /// transcript draws there).
+    Rail { slot: usize, row: Option<u64>, call: Option<Arc<str>>, after: Vec<Ref> },
 }
 
 impl Place {
-    /// Where top-level block `id` is on board `d`.
+    /// Where top-level block `id` is on board `d` (no calls: [`Place::called`]).
     pub(crate) fn of(d: &Drawn, id: &Ref) -> Option<Place> {
+        // At most a board's live blocks before it ([`cards_spec::block::LIVE_MAX`]).
+        let before = |list: &[synaps_client::blocks::Shown], at: usize| -> Vec<Ref> {
+            list[..at].iter().rev().take(cards_spec::block::LIVE_MAX).map(|s| s.block.id.clone()).collect()
+        };
         for (item, rb) in &d.rows {
             if let Some(at) = rb.blocks.iter().position(|s| &s.block.id == id) {
-                let after = at.checked_sub(1).map(|k| rb.blocks[k].block.id.clone());
-                return Some(Place::Row { item: *item, at, after });
+                return Some(Place::Row { item: *item, call: None, after: before(&rb.blocks, at) });
             }
         }
         for (slot, list) in d.rail.iter().enumerate() {
             if let Some(at) = list.iter().position(|s| &s.block.id == id) {
                 let row = d.rail_rows[slot].get(at).copied().flatten();
-                let after = at.checked_sub(1).map(|k| list[k].block.id.clone());
-                return Some(Place::Rail { slot, at, row, after });
+                return Some(Place::Rail { slot, row, call: None, after: before(list, at) });
             }
         }
         None
+    }
+
+    /// With its row's call, as `call_of` says a transcript row's.
+    pub(crate) fn called(mut self, call_of: impl Fn(u64) -> Option<Arc<str>>) -> Place {
+        match &mut self {
+            Place::Row { item, call, .. } => *call = call_of(*item),
+            Place::Rail { row: Some(r), call, .. } => *call = call_of(*r),
+            Place::Rail { row: None, .. } => {}
+        }
+        self
+    }
+
+    /// Whether its rows are in a transcript that has row `has` (none
+    /// numbered anew since it was taken).
+    pub(crate) fn there(&self, has: impl Fn(u64) -> bool) -> bool {
+        match self {
+            Place::Row { item, .. } => has(*item),
+            Place::Rail { row, .. } => row.is_none_or(has),
+        }
+    }
+
+    /// This place in a transcript that has row `has` and finds a call's
+    /// row (`by_call`): its row's id there, found by its call when a
+    /// reattach numbered its rows anew (§3.4: the anchor it was taken at,
+    /// never where the agent's deferred move put it). `None`: no row
+    /// there has its call (its anchor is gone, not renumbered); a rail
+    /// section's place keeps its slot, no row with it.
+    pub(crate) fn renumbered(&self, has: impl Fn(u64) -> bool, by_call: impl Fn(&str) -> Option<u64>) -> Option<Place> {
+        let find = |row: u64, call: &Option<Arc<str>>| if has(row) { Some(row) } else { call.as_deref().and_then(&by_call) };
+        match self {
+            Place::Row { item, call, after } => Some(Place::Row { item: find(*item, call)?, call: call.clone(), after: after.clone() }),
+            Place::Rail { slot, row, call, after } => {
+                let row = row.and_then(|r| find(r, call));
+                Some(Place::Rail { slot: *slot, row, call: row.and(call.clone()), after: after.clone() })
+            }
+        }
+    }
+
+    fn after(&self) -> &[Ref] {
+        match self {
+            Place::Row { after, .. } | Place::Rail { after, .. } => after,
+        }
+    }
+
+    /// Its heap's bytes: the blocks before it, its call.
+    pub(crate) fn heap(&self) -> usize {
+        let (Place::Row { call, after, .. } | Place::Rail { call, after, .. }) = self;
+        call.as_ref().map_or(0, |c| c.len() + 2 * std::mem::size_of::<usize>())
+            + after.capacity() * std::mem::size_of::<Ref>()
+            + after.iter().map(|r| r.block().map_or(cards_spec::block::BLOCK_ID_MAX, |b| b.as_str().len())).sum::<usize>()
     }
 }
 
@@ -961,57 +1022,83 @@ impl Place {
 /// group, none drawn twice; `None`: each is in its place, or gone (its
 /// draft is in the dock). What the board says of each block is the
 /// board's: only where it draws changes.
+///
+/// Where: in its list, right after the nearest of the blocks before it
+/// then that is there now, or first if none is. Each held block is taken
+/// out first, then put back once the blocks before it that are held are
+/// back (so not in the order the drafts were made); a held block's place
+/// is checked as the others', never taken as kept because it is in its
+/// list.
 pub(crate) fn hold_places(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
-    let mut out: Option<Drawn> = None;
+    let drawn = |id: &Ref| Place::of(d, id).is_some() || member(d, id);
+    if !holds.iter().any(|(id, _)| drawn(id)) {
+        return None;
+    }
+    let mut x = d.clone();
+    // Each held block drawn, taken out (and its rail row, if a rail's).
+    let mut left: Vec<(&Ref, &Place, synaps_client::blocks::Shown, Option<Option<u64>>)> = Vec::new();
     for (id, place) in holds {
-        let cur = out.as_ref().unwrap_or(d);
-        let now = Place::of(cur, id);
-        let after_there = |x: &Drawn, after: &Option<Ref>| match (place, after) {
-            (_, None) => false,
-            (Place::Row { item, .. }, Some(a)) => x.rows.get(item).is_some_and(|r| r.blocks.iter().any(|s| &s.block.id == a)),
-            (Place::Rail { slot, .. }, Some(a)) => x.rail[*slot].iter().any(|s| &s.block.id == a),
-        };
-        let after = match place {
-            Place::Row { after, .. } | Place::Rail { after, .. } => after,
-        };
-        let in_place = match (place, now.as_ref()) {
-            (Place::Row { item, .. }, Some(Place::Row { item: i, after: a, .. })) => item == i && (a == after || !after_there(cur, after)),
-            (Place::Rail { slot, .. }, Some(Place::Rail { slot: s, after: a, .. })) => {
-                slot == s && (a == after || !after_there(cur, after))
-            }
-            _ => false,
-        };
-        // In its place, or gone (its draft is in the dock): as it is.
-        if in_place || (now.is_none() && !member(cur, id)) {
+        if left.iter().any(|l| l.0 == id) {
             continue;
         }
-        let x = out.get_or_insert_with(|| d.clone());
-        let Some(s) = take_out(x, id) else { continue };
-        let there = after_there(x, after);
+        if let Some((s, row)) = take_out(&mut x, id) {
+            left.push((id, place, s, row));
+        }
+    }
+    let in_list = |x: &Drawn, place: &Place, a: &Ref| match place {
+        Place::Row { item, .. } => x.rows.get(item).is_some_and(|r| r.blocks.iter().any(|s| &s.block.id == a)),
+        Place::Rail { slot, .. } => x.rail[*slot].iter().any(|s| &s.block.id == a),
+    };
+    while !left.is_empty() {
+        // The first whose place is known: right after a block there, or
+        // first; one before it held and not back yet, it waits. Each
+        // waiting (places taken on boards that disagree): the first as if
+        // those it waits for were gone.
+        let pick = |wait: bool| {
+            left.iter().enumerate().find_map(|(i, (_, place, ..))| {
+                for a in place.after() {
+                    if in_list(&x, place, a) {
+                        return Some((i, Some(a.clone())));
+                    }
+                    if wait && left.iter().any(|l| l.0 == a) {
+                        return None;
+                    }
+                }
+                Some((i, None))
+            })
+        };
+        let Some((i, after)) = pick(true).or_else(|| pick(false)) else { break };
+        let (_, place, s, rail_row) = left.remove(i);
         match place {
-            Place::Row { item, at, after } => {
-                let rb = std::sync::Arc::make_mut(x.rows.entry(*item).or_default());
-                let k = match after.as_ref().filter(|_| there) {
-                    Some(a) => rb.blocks.iter().position(|s| &s.block.id == a).map_or(0, |k| k + 1),
-                    None if after.is_none() => 0,
-                    None => (*at).min(rb.blocks.len()),
-                };
+            Place::Row { item, .. } => {
+                let rb = Arc::make_mut(x.rows.entry(*item).or_default());
+                let k = after.and_then(|a| rb.blocks.iter().position(|s| s.block.id == a)).map_or(0, |k| k + 1);
                 rb.blocks.insert(k, s);
             }
-            Place::Rail { slot, at, row, after } => {
+            Place::Rail { slot, row, .. } => {
                 let list = &mut x.rail[*slot];
-                let k = match after.as_ref().filter(|_| there) {
-                    Some(a) => list.iter().position(|s| &s.block.id == a).map_or(0, |k| k + 1),
-                    None if after.is_none() => 0,
-                    None => (*at).min(list.len()),
-                };
+                let k = after.and_then(|a| list.iter().position(|s| s.block.id == a)).map_or(0, |k| k + 1);
                 list.insert(k, s);
+                // Its creating call's row: the board's, if it was a rail's.
                 let rows = &mut x.rail_rows[*slot];
-                rows.insert(k.min(rows.len()), *row);
+                rows.insert(k.min(rows.len()), rail_row.unwrap_or(*row));
             }
         }
     }
-    out
+    (!same_places(d, &x)).then_some(x)
+}
+
+/// Whether boards `a` and `b` draw each block in the same place: each
+/// row's and rail slot's blocks, their members, and the rail's rows.
+fn same_places(a: &Drawn, b: &Drawn) -> bool {
+    fn ids(l: &[synaps_client::blocks::Shown]) -> impl Iterator<Item = (&Ref, usize)> + '_ {
+        l.iter().flat_map(|s| std::iter::once((&s.block.id, s.members.len())).chain(s.members.iter().map(|m| (&m.block.id, 0))))
+    }
+    fn row<'a>(d: &'a Drawn, k: &u64) -> &'a [synaps_client::blocks::Shown] {
+        d.rows.get(k).map_or(&[][..], |r| &r.blocks[..])
+    }
+    a.rows.keys().chain(b.rows.keys()).all(|k| ids(row(a, k)).eq(ids(row(b, k))))
+        && (0..2).all(|s| ids(&a.rail[s]).eq(ids(&b.rail[s])) && a.rail_rows[s] == b.rail_rows[s])
 }
 
 /// Whether block `id` is a group's member on board `d`.
@@ -1020,9 +1107,9 @@ fn member(d: &Drawn, id: &Ref) -> bool {
 }
 
 /// Block `id` taken out of board `d`, wherever it draws: a transcript
-/// row's, a rail slot's (its creating call's row with it), or a group's
-/// member.
-fn take_out(d: &mut Drawn, id: &Ref) -> Option<synaps_client::blocks::Shown> {
+/// row's, a rail slot's (its creating call's row with it: `Some`), or a
+/// group's member.
+fn take_out(d: &mut Drawn, id: &Ref) -> Option<(synaps_client::blocks::Shown, Option<Option<u64>>)> {
     let row_of = |rb: &synaps_client::blocks::RowBlocks| {
         rb.blocks.iter().position(|s| &s.block.id == id || s.members.iter().any(|m| &m.block.id == id))
     };
@@ -1030,22 +1117,20 @@ fn take_out(d: &mut Drawn, id: &Ref) -> Option<synaps_client::blocks::Shown> {
         let rb = std::sync::Arc::make_mut(d.rows.get_mut(&item)?);
         let j = row_of(rb)?;
         if &rb.blocks[j].block.id == id {
-            return Some(rb.blocks.remove(j));
+            return Some((rb.blocks.remove(j), None));
         }
         let g = &mut rb.blocks[j];
         let m = g.members.iter().position(|m| &m.block.id == id)?;
-        return Some(g.members.remove(m));
+        return Some((g.members.remove(m), None));
     }
     for slot in 0..d.rail.len() {
         if let Some(j) = d.rail[slot].iter().position(|s| &s.block.id == id) {
-            if j < d.rail_rows[slot].len() {
-                d.rail_rows[slot].remove(j);
-            }
-            return Some(d.rail[slot].remove(j));
+            let row = (j < d.rail_rows[slot].len()).then(|| d.rail_rows[slot].remove(j)).flatten();
+            return Some((d.rail[slot].remove(j), Some(row)));
         }
         for g in &mut d.rail[slot] {
             if let Some(m) = g.members.iter().position(|m| &m.block.id == id) {
-                return Some(g.members.remove(m));
+                return Some((g.members.remove(m), None));
             }
         }
     }
@@ -1100,19 +1185,36 @@ impl Drafts {
         self.all.iter_mut().filter(move |(s, _)| s == session).map(|(_, d)| d)
     }
 
-    /// Session `session`'s draft drawn in block `id`'s row: its latest
-    /// that draws in a row ([`Fate::in_row`]: a stale one stays in its row).
+    /// Session `session`'s draft drawn in block `id`'s row, of those that
+    /// draw in a row ([`Fate::in_row`]: a stale one stays in its row): a
+    /// held one (of the incarnation the board draws) before a stale one,
+    /// then the latest. One draft a row, by its key: every other draft of
+    /// the session is in the dock ([`Drafts::rowed`]), so each can be
+    /// reached, its keys or its buttons.
     pub(crate) fn in_row(&self, session: &str, id: &Ref) -> Option<&Draft> {
-        self.all.iter().rev().find(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)).map(|(_, d)| d)
+        let mut stale = None;
+        for (_, d) in self.all.iter().rev().filter(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)) {
+            if d.ended.is_none() {
+                return Some(d);
+            }
+            stale.get_or_insert(d);
+        }
+        stale
     }
 
-    /// Where session `session`'s drafts drawn in a row keep their blocks
-    /// ([`hold_places`]), one a block.
+    /// Whether session `session`'s draft `d` is the one drawn in its
+    /// block's row ([`Drafts::in_row`]); else it is in the dock.
+    pub(crate) fn rowed(&self, session: &str, d: &Draft) -> bool {
+        self.in_row(session, &d.id).is_some_and(|x| x.key == d.key)
+    }
+
+    /// Where session `session`'s drafts drawn in their rows keep their
+    /// blocks ([`hold_places`]), one a block.
     pub(crate) fn places(&self, session: &str) -> Vec<(Ref, Place)> {
         let mut out: Vec<(Ref, Place)> = Vec::new();
-        for (_, d) in self.all.iter().rev().filter(|(s, d)| s == session && Fate::in_row(d.ended)) {
+        for (_, d) in self.all.iter().filter(|(s, _)| s == session) {
             if let Some(p) = d.place.as_ref()
-                && !out.iter().any(|(id, _)| id == &d.id)
+                && self.rowed(session, d)
             {
                 out.push((d.id.clone(), p.clone()));
             }

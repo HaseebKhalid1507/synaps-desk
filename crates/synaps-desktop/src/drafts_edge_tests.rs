@@ -2,7 +2,12 @@
 //! change that grows a draft (P2-1), a bound `u-` step is `B`'s (P2-3),
 //! a board without the bound board says nothing of a block it doesn't
 //! draw (P2-5), a held block kept where it was taken (P2-6), and a
-//! session's drafts following it to a new id (P2-4).
+//! session's drafts following it to a new id (P2-4). Round 2: a held
+//! block moved within its own list, and held blocks put back whatever
+//! order their drafts were made (R2 P2-1); drafts of two incarnations
+//! meeting in a follow, one in the row, the other in the dock (R2 P2-2);
+//! a place found by its rows' calls once a reattach numbers them anew
+//! (R2 P2-3).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -332,7 +337,7 @@ fn a_held_block_is_drawn_where_it_was_taken() {
     taken.rows.insert(1, Arc::new(RowBlocks { call: None, blocks: vec![sh("a"), sh("p")], run: None }));
     taken.rows.insert(2, Arc::new(RowBlocks { call: None, blocks: vec![sh("q")], run: None }));
     let place = Place::of(&taken, &r("p")).expect("drawn");
-    assert_eq!(place, Place::Row { item: 1, at: 1, after: Some(r("a")) });
+    assert_eq!(place, Place::Row { item: 1, call: None, after: vec![r("a")] });
     let holds = vec![(r("p"), place)];
     assert!(hold_places(&taken, &holds).is_none(), "in its place: as it is");
     // Moved to row 2's anchor.
@@ -371,7 +376,7 @@ fn a_held_block_is_drawn_where_it_was_taken() {
     in_rail.rail[1] = vec![sh("q"), sh("p")];
     in_rail.rail_rows[1] = vec![Some(4), Some(5)];
     let place = Place::of(&in_rail, &r("p")).expect("drawn");
-    assert_eq!(place, Place::Rail { slot: 1, at: 1, row: Some(5), after: Some(r("q")) });
+    assert_eq!(place, Place::Rail { slot: 1, row: Some(5), call: None, after: vec![r("q")] });
     let mut out = Drawn::default();
     out.rail[1] = vec![sh("q")];
     out.rail_rows[1] = vec![Some(4)];
@@ -440,4 +445,173 @@ fn a_follow_takes_every_draft_and_drops_none_with_changes() {
     ds.follow("S", "T");
     assert_eq!(ds.count("T"), 9, "none dropped");
     assert_eq!(ds.take("T", &block(&st2, "x8"), g2).err(), Some(FULL), "past 8: a take refused");
+}
+
+// ── Round 2 (Shady #114 at 8186107) ───────────────────────────────────
+
+/// Notes named `names`, put in that order.
+fn notes(names: &[&str]) -> (State, Generation) {
+    board(&[Value::Array(names.iter().map(|n| json!({"op":"put","id":n,"kind":"note","body":{"text":n}})).collect())])
+}
+
+/// A board of `st`'s blocks: transcript row 1's `row1`, the rail's end
+/// slot's `rail`, in those orders.
+fn listed(st: &State, row1: &[&str], rail: &[&str]) -> Drawn {
+    let sh = |n: &&str| shown(&block(st, n), Some(&block(st, n)));
+    let mut d = Drawn::default();
+    d.rows.insert(1, Arc::new(RowBlocks { call: None, blocks: row1.iter().map(sh).collect(), run: None }));
+    d.rail[1] = rail.iter().map(sh).collect();
+    d.rail_rows[1] = vec![None; rail.len()];
+    d
+}
+
+fn rail_of(d: &Drawn) -> Vec<String> {
+    d.rail[1].iter().map(|s| s.block.id.to_string()).collect()
+}
+
+/// Shady #114 R2 P2-1: a held block the agent moves within its own list
+/// is put back where it was: first, if taken first (no block before it,
+/// not any place in its list); after the block before it; that one gone,
+/// after the nearest of those before it still there, or first. Its place
+/// is checked, never taken as kept for being in its list. Let go: the
+/// board's order.
+#[test]
+fn a_held_block_moved_within_its_list_is_put_back_in_its_place() {
+    let (st, _) = notes(&["a", "p", "b", "q"]);
+    // First, moved last: first again.
+    let taken = listed(&st, &["p", "q"], &[]);
+    let first = Place::of(&taken, &r("p")).expect("drawn");
+    assert_eq!(first, Place::Row { item: 1, call: None, after: vec![] });
+    assert!(hold_places(&taken, &[(r("p"), first.clone())]).is_none(), "in its place: as it is");
+    let moved = listed(&st, &["q", "p"], &[]);
+    let kept = hold_places(&moved, &[(r("p"), first.clone())]).expect("put back");
+    assert_eq!(rows_of(&kept, 1), ["p", "q"], "first, as taken");
+    // In the middle, moved last: after the block before it.
+    let taken = listed(&st, &["a", "p", "b"], &[]);
+    let mid = Place::of(&taken, &r("p")).expect("drawn");
+    assert_eq!(mid, Place::Row { item: 1, call: None, after: vec![r("a")] });
+    let kept = hold_places(&listed(&st, &["a", "b", "p"], &[]), &[(r("p"), mid.clone())]).expect("put back");
+    assert_eq!(rows_of(&kept, 1), ["a", "p", "b"]);
+    // The block before it removed and it moved last: first, before b.
+    let kept = hold_places(&listed(&st, &["b", "p"], &[]), &[(r("p"), mid.clone())]).expect("put back");
+    assert_eq!(rows_of(&kept, 1), ["p", "b"], "a removed: before b, as taken");
+    assert!(hold_places(&listed(&st, &["p", "b"], &[]), &[(r("p"), mid)]).is_none(), "a removed, p first: in its place");
+    // Two before it, the nearest removed: after the other.
+    let taken = listed(&st, &["q", "a", "p", "b"], &[]);
+    let deep = Place::of(&taken, &r("p")).expect("drawn");
+    assert_eq!(deep, Place::Row { item: 1, call: None, after: vec![r("a"), r("q")] });
+    let kept = hold_places(&listed(&st, &["q", "b", "p"], &[]), &[(r("p"), deep)]).expect("put back");
+    assert_eq!(rows_of(&kept, 1), ["q", "p", "b"], "a removed: after q");
+    // A rail section first in its slot, moved last there.
+    let rp = Place::of(&listed(&st, &[], &["p", "q"]), &r("p")).expect("drawn");
+    let kept = hold_places(&listed(&st, &[], &["q", "p"]), &[(r("p"), rp)]).expect("put back");
+    assert_eq!(rail_of(&kept), ["p", "q"]);
+    // Let go: the board's order.
+    assert!(hold_places(&moved, &[]).is_none());
+}
+
+/// Shady #114 R2 P2-1's second counterexample: `a` then `b` taken from
+/// `[a, b, c]`, both moved by the agent (to the rail; last in their
+/// list, the other way round): put back `[a, b, c]`, whatever order the
+/// drafts were made and their places come in. A block whose place is
+/// after a held one is put back once that one is: three in a chain too.
+#[test]
+fn held_blocks_are_put_back_whatever_order_their_drafts_were_made() {
+    let (st, _) = notes(&["a", "b", "c", "d"]);
+    let taken = listed(&st, &["a", "b", "c"], &[]);
+    let pa = (r("a"), Place::of(&taken, &r("a")).expect("drawn"));
+    let pb = (r("b"), Place::of(&taken, &r("b")).expect("drawn"));
+    let railed = listed(&st, &["c"], &["a", "b"]);
+    let swapped = listed(&st, &["c", "b", "a"], &[]);
+    for holds in [vec![pa.clone(), pb.clone()], vec![pb.clone(), pa.clone()]] {
+        let kept = hold_places(&railed, &holds).expect("put back");
+        assert_eq!(rows_of(&kept, 1), ["a", "b", "c"], "from the rail, {:?} first", holds[0].0);
+        assert!(kept.rail[1].is_empty() && kept.rail_rows[1].is_empty(), "not in the rail too");
+        let kept = hold_places(&swapped, &holds).expect("put back");
+        assert_eq!(rows_of(&kept, 1), ["a", "b", "c"], "swapped, {:?} first", holds[0].0);
+    }
+    let taken = listed(&st, &["d", "a", "b", "c"], &[]);
+    let chain: Vec<(Ref, Place)> = ["c", "b", "a"].iter().map(|n| (r(n), Place::of(&taken, &r(n)).expect("drawn"))).collect();
+    let kept = hold_places(&listed(&st, &["d"], &["c", "a", "b"]), &chain).expect("put back");
+    assert_eq!(rows_of(&kept, 1), ["d", "a", "b", "c"], "three, newest first");
+}
+
+/// Shady #114 R2 P2-2: `S`'s changed draft of `plan`'s first incarnation,
+/// stale (the agent replaced it), and `T`'s changed one of the new
+/// incarnation, held, meet in a follow, either made first. Both kept;
+/// one draws in the block's row, the held one, by its key; the other is
+/// not drawn there ([`Drafts::rowed`]: in the dock), so each is reached.
+/// The docked one's discard leaves the row's.
+#[test]
+fn a_follow_with_drafts_of_two_incarnations_rows_one_and_docks_the_other() {
+    let replace = json!([{"op":"replace","id":"plan","kind":"plan","body":{"steps":[{"id":"fix","label":"Again","state":"todo"}]}}]);
+    let (old, _) = board(&[plan3()]);
+    let (new, g) = board(&[plan3(), replace]);
+    assert_ne!(block(&old, "plan").tag, block(&new, "plan").tag, "two incarnations");
+    let d = drawn(g, vec![shown(&block(&new, "plan"), Some(&block(&new, "plan")))], Some(new.clone()));
+    for stale_first in [true, false] {
+        let mut ds = Drafts::default();
+        let s_take = |ds: &mut Drafts| {
+            let x = ds.take("S", &block(&old, "plan"), g).expect("room");
+            x.strike(&id("fix")).expect("todo");
+            x.key
+        };
+        let t_take = |ds: &mut Drafts| {
+            let x = ds.take("T", &block(&new, "plan"), g).expect("room");
+            x.stop(&id("fix")).expect("todo");
+            x.key
+        };
+        let (s, t) = if stale_first {
+            let s = s_take(&mut ds);
+            (s, t_take(&mut ds))
+        } else {
+            let t = t_take(&mut ds);
+            (s_take(&mut ds), t)
+        };
+        let place = |n: u64| Some(Place::Row { item: n, call: None, after: vec![] });
+        ds.by_key_mut(s).expect("S's").place = place(5);
+        ds.by_key_mut(t).expect("T's").place = place(7);
+        ds.judge("S", &d);
+        ds.judge("T", &d);
+        assert!(matches!(ds.by_key(s).map(|x| x.1.ended), Some(Some(Fate::Rewritten(_)))), "S's is stale");
+        assert!(ds.follow("S", "T").is_empty(), "both changed: none goes");
+        assert_eq!(ds.count("T"), 2);
+        let at = format!("stale made first: {stale_first}");
+        assert_eq!(ds.in_row("T", &r("plan")).map(|x| x.key), Some(t), "{at}: the held one draws in the row");
+        let rowed = |ds: &Drafts, k: u64| ds.by_key(k).is_some_and(|(_, x)| ds.rowed("T", x));
+        assert!(rowed(&ds, t) && !rowed(&ds, s), "{at}: the stale one is not drawn there: the dock");
+        assert_eq!(ds.places("T"), vec![(r("plan"), place(7).expect("a place"))], "{at}: one place a block, the row's draft's");
+        assert!(ds.discard_key(s));
+        assert_eq!(ds.in_row("T", &r("plan")).map(|x| x.key), Some(t), "{at}: its discard leaves the row's");
+    }
+}
+
+/// Shady #114 R2 P2-3: a place names its rows by their calls as well:
+/// once a reattach numbers them anew, its row is found there by its call
+/// (the anchor it was taken at). Its row there: as it is. No row with its
+/// call (the anchor gone, not renumbered): none; a rail section's keeps
+/// its slot, no row with it. What it keeps is counted.
+#[test]
+fn a_place_is_found_by_its_rows_call_once_its_rows_are_numbered_anew() {
+    let (st, g) = notes(&["a", "p", "q"]);
+    let mut taken = listed(&st, &["a", "p"], &["q"]);
+    taken.rail_rows[1] = vec![Some(1)];
+    let call = || Some(Arc::<str>::from("toolu_h0"));
+    let calls = |row: u64| if row == 1 { call() } else { None };
+    let p = Place::of(&taken, &r("p")).expect("drawn").called(calls);
+    assert_eq!(p, Place::Row { item: 1, call: call(), after: vec![r("a")] });
+    let (old, new) = (|row: u64| row == 1, |row: u64| row == 40 || row == 41);
+    let by_call = |c: &str| (c == "toolu_h0").then_some(40);
+    assert!(p.there(old) && !p.there(new));
+    assert_eq!(p.renumbered(old, by_call), Some(p.clone()), "its row there: as it is");
+    assert_eq!(p.renumbered(new, by_call), Some(Place::Row { item: 40, call: call(), after: vec![r("a")] }), "found by its call");
+    assert_eq!(p.renumbered(new, |_| None), None, "its call gone too: none");
+    let q = Place::of(&taken, &r("q")).expect("drawn").called(calls);
+    assert_eq!(q, Place::Rail { slot: 1, row: Some(1), call: call(), after: vec![] });
+    assert_eq!(q.renumbered(new, by_call), Some(Place::Rail { slot: 1, row: Some(40), call: call(), after: vec![] }));
+    assert_eq!(q.renumbered(new, |_| None), Some(Place::Rail { slot: 1, row: None, call: None, after: vec![] }), "its slot kept");
+    let mut d = take(&st, g, "p");
+    let bare = d.bytes();
+    d.place = Some(p.clone());
+    assert!(d.bytes() >= bare + p.heap() && p.heap() >= "toolu_h0".len() + "a".len(), "its place counted");
 }
