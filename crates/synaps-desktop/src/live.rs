@@ -282,6 +282,12 @@ impl Live {
         self.in_flight.push(Target::Card(card), text);
     }
 
+    /// A hand-back's `text` went to the daemon (blocks.md §3.7): its echo
+    /// or refusal is its memo's.
+    pub(crate) fn edit_sent(&mut self, text: String) {
+        self.in_flight.push(Target::Edit, text);
+    }
+
     /// A refusal: the oldest unconfirmed text was refused (the daemon
     /// handles input in order, and earlier echoes confirmed the rest).
     /// A composer's goes back to it; a card's is the card's: `true` (its
@@ -292,7 +298,7 @@ impl Live {
                 effects.push(Effect::Restore(pane, body));
                 false
             }
-            Some(Input { to: Target::Card(_), .. }) => true,
+            Some(Input { to: Target::Card(_) | Target::Edit, .. }) => true,
             None => false,
         }
     }
@@ -341,6 +347,9 @@ pub(crate) enum Target {
     /// An agent card of the store's session (synaps-cards §3.5): its
     /// answer is never given to a composer.
     Card(cards_spec::CardId),
+    /// A block edit handed back (blocks.md §3.7, D8b): its memo's, as a
+    /// card's answer is its card's.
+    Edit,
 }
 
 /// One input in flight: what sent it, the user's text (what goes back to

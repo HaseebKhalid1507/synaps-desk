@@ -990,7 +990,10 @@ impl AppView {
         let Some(shown) = self.panes.cur.walk.walk.as_ref().map(|w| w.shown.get()) else { return };
         let key = ks.key.as_str();
         let text = ks.key_char.clone().filter(|c| !c.is_empty() && !c.chars().any(char::is_control));
-        let ours = undo || matches!(key, "j" | "k" | "down" | "up" | "z" | "c" | "x" | "u" | "p" | "m" | "[" | "]" | "e" | "escape");
+        // `R` (Shift+R) restores a past revision (§3.8, D8b).
+        let restore = m.shift && key == "r";
+        let ours =
+            undo || restore || matches!(key, "j" | "k" | "down" | "up" | "z" | "c" | "x" | "u" | "p" | "m" | "[" | "]" | "e" | "escape");
         cx.stop_propagation();
         if !shown {
             // Not painted yet: Esc and a printable key leave, the key
@@ -1004,7 +1007,7 @@ impl AppView {
             }
             return;
         }
-        if !ours || (m.shift && key != "escape") {
+        if !ours || (m.shift && key != "escape" && !restore) {
             // Another printable key: typed into the composer, as a card's.
             if let Some(t) = text {
                 self.walk_leave(true, window, cx);
@@ -1014,7 +1017,7 @@ impl AppView {
             return;
         }
         // Only a new, bare press acts (Ctrl+Z: a new press).
-        let fresh = if undo { self.ask_presses.last } else { self.ask_presses.acts };
+        let fresh = if undo || restore { self.ask_presses.last } else { self.ask_presses.acts };
         if !fresh {
             log::debug!(target: "synaps_desktop::walk", "walk key {key}: not a new, bare press");
             return;
@@ -1045,8 +1048,42 @@ impl AppView {
             "u" => self.walk_wish(Wish::Show, window, cx),
             "p" => self.walk_wish(Wish::Pin, window, cx),
             "m" => self.walk_wish(Wish::Slot, window, cx),
+            "r" if restore => self.walk_restore(cx),
             "e" => self.walk_take(window, cx),
             _ => {}
+        }
+    }
+
+    /// `R` on the walked block (§3.6): its past revision in view restored,
+    /// as an edit; then the latest again. Else the block says why.
+    fn walk_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(at) = self.walk_painted_at() else { return };
+        let At::Block(row) = at else {
+            self.edit_says(at.row(), crate::handback_view::VIEW_ONLY, cx);
+            return;
+        };
+        self.restore_now(row, cx);
+    }
+
+    /// The restore of row `row`'s past revision in view (`R`): sent, the
+    /// walk back on the latest; or why not. Without the bound board kept
+    /// (no draft holds one), it waits for it: the next job keeps it.
+    pub(crate) fn restore_now(&mut self, row: u64, cx: &mut Context<Self>) {
+        if !self.bound_board().is_some_and(|b| b.board.is_some()) {
+            self.restore_wanted = Some((self.panes.cur.id, row));
+            self.sync_drafts(cx);
+            return;
+        }
+        match self.restore(row, cx) {
+            Ok(()) => {
+                if let Some(w) = self.panes.cur.walk.walk.as_mut() {
+                    w.rev = None;
+                }
+                self.walk_scratch_drop();
+                self.remeasure_block(row);
+                cx.notify();
+            }
+            Err(why) => self.edit_says(row, why, cx),
         }
     }
 

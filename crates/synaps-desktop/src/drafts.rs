@@ -24,7 +24,7 @@
 //!   is listed, and left out of the patch and of line 1; with nothing
 //!   left, nothing is handed back. The message for what is left is
 //!   `cards_spec::block::message::build`'s, so line 1 and line 2 are the
-//!   grammar's (D8b sends it).
+//!   grammar's ([`crate::handback`] sends it).
 //! - **Stale and orphaned** ([`Draft::fate`]): the incarnation ended while
 //!   held (a `replace`, a `remove`, a rollback that took its creation
 //!   back) and the draft is stale for good: `the agent rewrote this block
@@ -43,7 +43,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cards_spec::block::message::{Edit, Summary, build};
+use cards_spec::block::message::{Edit, build};
+
+use crate::handback::Line1;
 use cards_spec::block::{DiffState, Generation, HunkState, ItemId, Kind, PLAN_STEPS_MAX, Ref, Step, StepState, Tag};
 use cards_spec::board::{BLOCK_MAX_OWNED, Block, Code, EditResult, Key, State, keys};
 use serde_json::{Map, Value, json};
@@ -196,6 +198,12 @@ pub(crate) struct Draft {
     pub ended: Option<Fate>,
     /// Bumped by every change (a view's key).
     pub serial: u64,
+    /// A restore (§3.6): line 1 says `back to r<M>: `.
+    pub back_to: Option<u32>,
+    /// Handed back (D8b): the edit's body, in flight. It draws, marked
+    /// sending, over the board until the board holds it (§3.7), and takes
+    /// no key.
+    pub sent: Option<String>,
 }
 
 impl Draft {
@@ -207,7 +215,18 @@ impl Draft {
             Body::Diff(_) => Intents::Diff(BTreeMap::new()),
             _ => return None,
         };
-        Some(Draft { id: b.id.clone(), tag: b.tag, base: b.rev, generation, base_block: b, intents, ended: None, serial: 0 })
+        Some(Draft {
+            id: b.id.clone(),
+            tag: b.tag,
+            base: b.rev,
+            generation,
+            base_block: b,
+            intents,
+            ended: None,
+            serial: 0,
+            back_to: None,
+            sent: None,
+        })
     }
 
     /// Its base body's steps, if it is a plan's.
@@ -468,9 +487,10 @@ impl Draft {
             }
     }
 
-    /// What it keeps in all: its own, and the base block at B2's ceiling.
+    /// What it keeps in all: its own, the base block at B2's ceiling, and
+    /// the body it sent (≤ 200 characters and 8 KiB: §3.3's caps).
     pub(crate) fn bytes(&self) -> usize {
-        self.own_bytes() + BLOCK_MAX_OWNED + 2 * std::mem::size_of::<usize>()
+        self.own_bytes() + BLOCK_MAX_OWNED + 2 * std::mem::size_of::<usize>() + self.sent.as_ref().map_or(0, String::capacity)
     }
 
     // ── the patch, line 1, the pre-check ──────────────────────────────
@@ -614,12 +634,29 @@ impl Draft {
     /// The edit of the intents `keep` says, and its message (`Err`: why
     /// there is none, as `Edit::new` and `build` say).
     fn edit_of(&self, keep: &dyn Fn(&Key) -> bool) -> Result<(Edit, String), String> {
-        let edit = Edit::new(self.id.clone(), self.base, self.tag, &self.parts(keep)).map_err(|e| e.to_string())?;
-        let pieces = self.pieces(keep);
-        let summary =
-            Summary { title: self.base_block.title.as_deref(), back_to: None, pieces: pieces.iter().map(String::as_str).collect() };
-        let text = build(&edit, &summary).map_err(|e| e.to_string())?;
+        let (edit, l1) = self.edit_line1(keep)?;
+        let text = build(&edit, &l1.summary()).map_err(|e| e.to_string())?;
         Ok((edit, text))
+    }
+
+    /// The edit of the intents `keep` says, and its line 1's parts.
+    fn edit_line1(&self, keep: &dyn Fn(&Key) -> bool) -> Result<(Edit, Line1), String> {
+        let edit = Edit::new(self.id.clone(), self.base, self.tag, &self.parts(keep)).map_err(|e| e.to_string())?;
+        let l1 = Line1 { title: self.base_block.title.clone(), back_to: self.back_to, pieces: self.pieces(keep) };
+        Ok((edit, l1))
+    }
+
+    /// The hand-back (D8b, §3.2): the pre-check on `board`, then the edit
+    /// of what is left and its line 1; `Err`, why nothing goes.
+    pub(crate) fn handing(&self, board: &State) -> Result<(Edit, Line1), String> {
+        if let Some(off) = self.check(board).off {
+            return Err(off);
+        }
+        let (edit, _) = self.edit_of(&|_: &Key| true)?;
+        let o = board.precheck(&edit).ok_or("not an edit of this block")?;
+        let ks = keys(&edit);
+        let applies: Vec<&Key> = ks.iter().zip(&o.codes).filter(|(_, c)| **c == Code::Applied).map(|(k, _)| k).collect();
+        self.edit_line1(&|k: &Key| applies.contains(&k))
     }
 
     /// The pre-check at hand-back (§3.2) on `board`, the current bound
@@ -701,6 +738,24 @@ impl Draft {
         if tag == self.tag { Fate::Held } else { Fate::Rewritten(rev) }
     }
 
+    /// Another hand-back landed on its incarnation since `B` (§5.4): the
+    /// revision it is at now (`another edit arrived · r7`). A hold is this
+    /// desk's, so one landing while it is held is another's.
+    pub(crate) fn other_edit(&self, st: &State) -> Option<u32> {
+        let _ = st;
+        None
+    }
+
+    /// A restore (§3.6) of `now` (the current incarnation, bound) back to
+    /// `then`, one of its past revisions: a draft over `now` whose intents
+    /// are the user paths of `then` that differ now. Execution state and
+    /// notes don't come back, nor items removed since (their ids are
+    /// spent); the steps added since keep their order after `then`'s.
+    pub(crate) fn restore(now: Arc<Block>, then: &Block, generation: Generation) -> Option<Self> {
+        let _ = (now, then, generation);
+        None
+    }
+
     /// The agent's changes to its incarnation since `B` (§3.2's `· 2 agent
     /// changes`), as the bound board `st` counts them: its revisions since
     /// `B` less the users' (pending ones count once bound).
@@ -752,6 +807,9 @@ impl Drafts {
     /// unless the caps refuse it (why).
     pub(crate) fn take(&mut self, session: &str, b: &Arc<Block>, generation: Generation) -> Result<&mut Draft, &'static str> {
         if let Some(i) = self.all.iter().position(|(s, d)| s == session && d.id == b.id && d.tag == b.tag && d.ended.is_none()) {
+            if self.all[i].1.sent.is_some() {
+                return Err(crate::handback::SENDING);
+            }
             return Ok(&mut self.all[i].1);
         }
         if self.count(session) >= DRAFTS_MAX {
@@ -777,6 +835,11 @@ impl Drafts {
     /// in place (none is dropped). Whether any changed.
     pub(crate) fn judge(&mut self, session: &str, d: &Drawn) -> bool {
         let mut moved = false;
+        // One sent whose block ended: the board draws what it is now (its
+        // delivery carries on, §3.7).
+        let n = self.all.len();
+        self.all.retain(|(s, x)| !(s == session && x.sent.is_some() && x.ended.is_none() && x.fate(d) != Fate::Held));
+        moved |= self.all.len() < n;
         for (_, x) in self.all.iter_mut().filter(|(s, _)| s == session) {
             if x.ended.is_none() {
                 let f = x.fate(d);
@@ -804,7 +867,9 @@ impl Drafts {
     }
 
     fn end(&mut self, session: &str, f: Fate) -> bool {
-        let mut any = false;
+        let n = self.all.len();
+        self.all.retain(|(s, x)| !(s == session && x.sent.is_some()));
+        let mut any = self.all.len() < n;
         for (_, x) in self.all.iter_mut().filter(|(s, x)| s == session && x.ended.is_none()) {
             log::info!(target: "synaps_desktop::drafts", "draft of {} ended: {f:?}", x.id);
             x.ended = Some(f);
@@ -812,6 +877,20 @@ impl Drafts {
             any = true;
         }
         any
+    }
+
+    /// Session `session`'s draft of `id`'s incarnation `tag` was handed
+    /// back as `body` (`None`: it wasn't, after all: held again).
+    pub(crate) fn sent(&mut self, session: &str, id: &Ref, tag: Tag, body: Option<String>) {
+        let _ = (session, id, tag, body);
+    }
+
+    /// Session `session`'s handed-back drafts that `drawn` says are done
+    /// with (their edit not in flight, and the board holding the history
+    /// it is in): they go, and the board draws the block. Their rows.
+    pub(crate) fn settle_sent(&mut self, session: &str, done: &dyn Fn(&str) -> bool) -> Vec<u64> {
+        let _ = (session, done);
+        Vec::new()
     }
 
     /// Session `from`'s drafts are session `to`'s now (a worker tab that

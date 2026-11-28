@@ -34,6 +34,8 @@ mod effect_tests;
 mod entry_tests;
 #[path = "gate_clock_tests.rs"]
 mod gate_clock_tests;
+#[path = "handback_ui_tests.rs"]
+mod handback_ui_tests;
 #[path = "hang_tests.rs"]
 mod hang_tests;
 #[path = "held_tests.rs"]

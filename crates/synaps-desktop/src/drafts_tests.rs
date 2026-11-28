@@ -373,3 +373,72 @@ fn a_drafts_own_bytes_stay_within_its_cap() {
     assert!(refused > 0, "the cap refuses before 20 labels of 400 bytes");
     assert!(d.bytes() >= d.own_bytes() + BLOCK_MAX_OWNED, "the base block charged at B2's ceiling");
 }
+
+// ── D8b ──────────────────────────────────────────────────────────────
+
+/// §3.6: a restore is an edit of the current incarnation back to the user
+/// paths of rN that differ now, line 1 `back to rN:`, its base the current
+/// revision. Execution state doesn't come back (the agent's `done`), nor
+/// an item removed since; a step added since keeps its place after rN's.
+#[test]
+fn a_restore_is_an_edit_of_the_paths_that_differ() {
+    let r1 = plan();
+    let later = json!([{"op":"patch","id":"plan","set":{"steps.fix.label":"Fix it","steps.test.state":"done"},
+        "order":{"steps":["deploy","fix","test","bandaid"]},"append":{"steps":[{"id":"docs","label":"Docs","state":"todo"}]}}]);
+    let (then, _) = board(std::slice::from_ref(&r1));
+    let (now, g) = board(&[r1, later]);
+    let cur = block(&now, "plan");
+    assert_eq!(cur.rev, 2);
+    let d = Draft::restore(cur, &then.block(&Ref::parse("plan").unwrap()).unwrap().clone(), g).expect("a plan");
+    assert!(d.changed());
+    let (edit, l1) = d.handing(&now).expect("something to restore");
+    let text = cards_spec::block::message::build(&edit, &l1.summary()).unwrap();
+    let (line1, line2) = text.split_once('\n').unwrap();
+    assert_eq!(
+        line1,
+        "[block plan edited r2] Close the refresh race → back to r1: order fix, test, bandaid, deploy, docs · rename fix “Fix the race”"
+    );
+    assert!(line2.contains("\"order\":{\"steps\":[\"fix\",\"test\",\"bandaid\",\"deploy\",\"docs\"]}"), "{line2}");
+    assert!(line2.contains("\"steps.fix.label\":\"Fix the race\""), "{line2}");
+    assert!(!line2.contains("steps.test.state"), "execution state doesn't come back: {line2}");
+    // As r1 now: nothing to restore.
+    let (same, g) = board(&[plan()]);
+    let d = Draft::restore(block(&same, "plan"), &then.block(&Ref::parse("plan").unwrap()).unwrap().clone(), g).unwrap();
+    assert!(!d.changed());
+}
+
+/// §5.4: another hand-back on the incarnation since `B` is `another edit
+/// arrived · rN`; the agent's ticks aren't.
+#[test]
+fn another_edit_since_b_is_told_and_ticks_are_not() {
+    let (st, g) = board(&[plan()]);
+    let d = take(&st, g, "plan");
+    let (ticked, _) = board(&[plan(), tick("fix", "doing")]);
+    assert_eq!(d.other_edit(&ticked), None, "the agent's tick");
+    let mut h = history("go", &[plan(), tick("fix", "doing")]);
+    let tag = block(&st, "plan").tag;
+    h.push(json!({"role": "user", "content": format!(
+        "[block plan edited r1] Close the refresh race → skip test\n{{\"of\":\"{tag}\",\"set\":{{\"steps.test.state\":\"skipped\"}}}}")}));
+    let (b, events) = Board::of_history(&h);
+    let other = b.bound(&events);
+    assert_eq!(other.block(&Ref::parse("plan").unwrap()).unwrap().rev, 3);
+    assert_eq!(d.other_edit(&other), Some(3));
+}
+
+/// A draft handed back (D8b) is sent: it takes no new hold until it
+/// settles, and is charged its body.
+#[test]
+fn a_sent_draft_takes_no_new_hold_and_is_charged_its_body() {
+    let (st, g) = board(&[plan()]);
+    let mut all = Drafts::default();
+    let b = block(&st, "plan");
+    all.take("s", &b, g).unwrap().strike(&id("fix")).unwrap();
+    let before = all.bytes();
+    let body = "x".repeat(1000);
+    all.sent("s", &b.id, b.tag, Some(body.clone()));
+    assert!(all.bytes() >= before + 1000);
+    assert_eq!(all.take("s", &b, g).err(), Some(crate::handback::SENDING));
+    assert_eq!(all.settle_sent("s", &|t| t != body), Vec::<u64>::new(), "still out");
+    assert_eq!(all.settle_sent("s", &|t| t == body), vec![crate::blocks::row_id(&b.id)]);
+    assert_eq!(all.count("s"), 0, "it went: the board draws the block");
+}

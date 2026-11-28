@@ -503,6 +503,8 @@ impl AppView {
             )
             .child(head)
             .children(body)
+            // This desk's hand-back of it, while it says something (D8b).
+            .children(self.edit_delivery(s, id, p, m, cx))
             .child(crate::lease::probe(&self.panes.cur.lease, &self.fx, id, tag, id))
             // The walk's ring (D7): its keys act once it is painted.
             .children(self.walk_ring(crate::walk::At::Block(id), tag, None, p))
@@ -841,6 +843,30 @@ impl AppView {
                                 cx,
                             )
                         }),
+                )
+            })
+            .when_some(past.is_none().then(|| self.changed_your_edit(s)).flatten(), |d, path| {
+                // The agent overwrote the user's (§3.4 step 6), until the
+                // user next focuses it; the path on hover.
+                let tip = format!("changed your edit: {}", path.as_str());
+                d.child(
+                    div()
+                        .id(("block-changed", id))
+                        .flex_shrink(4.)
+                        .min_w(px(m.meta * 2.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px(px(4.))
+                        .bg(p.well_d)
+                        .font_family(fonts::MONO)
+                        .text_px(m.meta)
+                        .text_color(p.acc)
+                        .debug_selector({
+                            let t = format!("block-changed {id} {}", path.as_str());
+                            move || t.clone()
+                        })
+                        .child("changed your edit")
+                        .tooltip(move |window, cx| crate::overlay::tip(tip.clone(), window, cx)),
                 )
             })
             .child(div().flex_1().min_w(px(8.)))

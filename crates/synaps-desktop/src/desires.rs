@@ -425,7 +425,6 @@ pub(crate) enum Carry {
     /// Typed text while a turn runs.
     Steer,
     /// A block edit handed back, or restored (D8), or its Resend.
-    #[cfg_attr(not(test), expect(dead_code, reason = "D8's hand-back carries notices"))]
     HandBack,
     /// A card answer: all grammar, never a notice (§3.5).
     Answer,

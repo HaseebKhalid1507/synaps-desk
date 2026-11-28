@@ -34,8 +34,9 @@
 //!   - note: `r` its text, `t` its title, each in a field.
 //!   - diff: `j`/`k` the hunk cursor; `y` keeps it, `n` drops it, while the
 //!     diff is a proposal.
-//!   - Enter hands back: D8b sends it (B4's memo, D2a's send). Here it
-//!     sends nothing, and says so.
+//!   - Enter hands back ([`crate::handback_view`]): the pre-check, then
+//!     the grammar's message through B4's memo and D2a's send; the draft
+//!     draws on, marked sending, until the board holds it.
 //!   - Esc: with no changes, the draft goes and the keys go back to the
 //!     composer; with changes, the first Esc says `Esc again discards ·
 //!     Enter hands back`, the second discards. There is no dialog. Never
@@ -79,9 +80,6 @@ pub(crate) const EDIT_CTX: &str = "BlockEdit";
 /// A draft field's inputs: Tab has no binding there (`NoAction`), and
 /// comes as a key.
 pub(crate) const EDIT_INPUT_CTX: &str = "BlockEdit > Input";
-
-/// Enter on a held block, in D8a: nothing is sent.
-pub(crate) const NOT_SENT: &str = "handing back comes with D8b · nothing was sent";
 
 /// The first Esc with changes (§3.2).
 pub(crate) const ESC_AGAIN: &str = "Esc again discards · Enter hands back";
@@ -283,6 +281,11 @@ impl AppView {
                     self.edit_says(row, NOT_EDITABLE, cx);
                     return false;
                 }
+                // An edit of it out (§3.7): no new hold until it settles.
+                if self.model.memos.edits.in_flight(&session, &bound.id, bound.tag).is_some() {
+                    self.edit_says(row, crate::handback::SENDING, cx);
+                    return false;
+                }
                 let Some(generation) = board.generation else { return false };
                 match self.block_drafts.take(&session, &bound, generation) {
                     Ok(d) => (d.id.clone(), tag, items(&d.view()).into_iter().next(), Some(bound.rev)),
@@ -379,6 +382,21 @@ impl AppView {
         let row = e.row;
         let (session, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
         let Some(d) = self.editing_draft() else { return };
+        if d.sent.is_some() {
+            self.edit_says(row, crate::handback::SENDING, cx);
+            return;
+        }
+        if part == Part::HandBack && d.ended.is_none() {
+            match self.edit_hand_back(cx) {
+                Ok(()) => {
+                    log::info!(target: "synaps_desktop::drafts", "draft {row}: handed back");
+                    self.edit_leave(true, window, cx);
+                    self.remeasure_draft(row);
+                }
+                Err(why) => self.edit_says(row, why, cx),
+            }
+            return;
+        }
         let view = d.view();
         let by_hash = |h: u64| items(&view).into_iter().find(|i| item_hash(i) == h);
         if let Some(f) = d.ended
@@ -427,7 +445,7 @@ impl AppView {
                 self.edit_open_field(FieldOf::Title, window, cx);
                 Ok(())
             }
-            Part::HandBack => Err(NOT_SENT),
+            Part::HandBack => Ok(()),
             Part::Copy => {
                 self.draft_copy(&session, &id, tag, window, cx);
                 return;
@@ -778,6 +796,23 @@ impl AppView {
             self.panes.cur.edit.focus = Some(cx.focus_handle());
         }
         self.sync_drafts(cx);
+        // The block the user focuses (the walk's ring on it, or its
+        // draft's keys): its `changed your edit` seen (§3.4 step 6).
+        let walked = self.panes.cur.walk.walk.as_ref().filter(|w| w.painted.get().is_some()).and_then(|w| match w.at {
+            crate::walk::At::Block(r) => Some(r),
+            crate::walk::At::Rail(_) => None,
+        });
+        if let Some(r) = walked.or(self.panes.cur.edit.at.as_ref().map(|e| e.row)) {
+            self.saw_changed(r);
+        }
+        // A restore that waited for the bound board: it is here.
+        if let Some((pane, row)) = self.restore_wanted
+            && pane == self.panes.cur.id
+            && self.bound_board().is_some_and(|b| b.board.is_some())
+        {
+            self.restore_wanted = None;
+            self.restore_now(row, cx);
+        }
         let Some(e) = self.panes.cur.edit.at.as_ref() else {
             if self.panes.cur.edit.holds(window) {
                 self.edit_leave(true, window, cx);
@@ -804,6 +839,7 @@ impl AppView {
     /// of [`crate::drafts`]), and each store's jobs keeping the bound board
     /// while its session holds a draft (a job asked for when that changes).
     pub(crate) fn sync_drafts(&mut self, cx: &mut Context<Self>) {
+        self.settle_sent_drafts();
         for live in self.model.lives.ids() {
             let l = &self.model.lives[live];
             let Some(session) = l.active.as_ref().map(|a| a.session_id.clone()) else { continue };
@@ -814,7 +850,10 @@ impl AppView {
                 None if !l.transcript.has_blocks() => self.block_drafts.gone(&session),
                 _ => false,
             };
-            let want = self.block_drafts.holds(&session);
+            // And for a restore asked for (§3.6): its pre-check is the
+            // same ([`AppView::restore`]).
+            let restoring = self.restore_wanted.is_some_and(|(pane, _)| self.panes.iter().any(|p| p.id == pane && p.live == live));
+            let want = self.block_drafts.holds(&session) || restoring;
             let l = &mut self.model.lives[live];
             if l.transcript.blocks_keeps_bound() != want {
                 l.transcript.blocks_keep_bound(want);
@@ -885,10 +924,20 @@ impl AppView {
         let st = board.as_deref().and_then(|b| b.board.clone());
         let ended = d.ended;
         let agent = st.as_deref().map_or(0, |st| d.agent_changes(st));
-        let head_words = match ended.and_then(Fate::says) {
-            Some(w) => w,
-            None if agent > 0 => format!("EDITING · r{} · {agent} agent change{}", d.base, if agent == 1 { "" } else { "s" }),
-            None => format!("EDITING · r{}", d.base),
+        let other = st.as_deref().and_then(|st| d.other_edit(st));
+        let head_words = match (ended.and_then(Fate::says), self.sent_head(d)) {
+            (Some(w), _) => w,
+            (None, Some(h)) => h,
+            (None, None) => {
+                let mut h = format!("EDITING · r{}", d.base);
+                if agent > 0 {
+                    h.push_str(&format!(" · {agent} agent change{}", if agent == 1 { "" } else { "s" }));
+                }
+                if let Some(r) = other {
+                    h.push_str(&format!(" · another edit arrived · r{r}"));
+                }
+                h
+            }
         };
         let title = crate::ask::shown(view.title.as_deref().unwrap_or(&d.id.to_string()), cards_spec::Lines::Single);
         let ink = if ended.is_some() { p.dim_t } else { p.focus };
@@ -1121,15 +1170,20 @@ impl AppView {
         }
         // The footer (§3.2): what fails now, why nothing goes, the Esc,
         // the hold's word, the buttons.
+        let sent = self.sent_words(d);
         let checked = match ended {
             Some(_) => None,
+            None if sent.is_some() => None,
             None => st.as_deref().map(|st| d.check(st)),
         };
         let mut lines: Vec<(String, Hsla)> = Vec::new();
         if let Some(f) = checked.as_ref().and_then(crate::drafts::Checked::footer) {
             lines.push((f, p.warn));
         }
-        if ended.is_none() {
+        if let Some(w) = &sent {
+            lines.push((w.clone(), p.dim_t));
+        }
+        if ended.is_none() && sent.is_none() {
             let off = match &checked {
                 None => Some("checking…".to_string()),
                 Some(c) => c.off.clone(),
@@ -1146,6 +1200,15 @@ impl AppView {
             lines.push((n, p.acc));
         }
         let can = checked.as_ref().is_some_and(|c| c.message.is_some());
+        // The button and the send never disagree (§3.7): the memo's own
+        // admission, behind the card path's gate.
+        let may = if can { self.may_hand_back(d) } else { Err(String::new()) };
+        if let Err(w) = &may
+            && can
+            && !lines.iter().any(|(t, _)| t == w)
+        {
+            lines.push((w.clone(), p.warn));
+        }
         let button = |label: &'static str, part: Part, on: bool, ready: bool| {
             clicks(
                 div()
@@ -1173,9 +1236,11 @@ impl AppView {
                 true,
                 false,
             )),
-            // D8b sends it: until then it is off, whatever the pre-check
-            // says (`ready`: the pre-check left something to hand back).
-            None => h_flex().gap(px(g.gap)).child(button("Hand back", Part::HandBack, false, can)).child(button(
+            // Sent: its delivery's words, and no button.
+            None if sent.is_some() => h_flex(),
+            // On when the memo admits it (`ready`: the pre-check left
+            // something to hand back).
+            None => h_flex().gap(px(g.gap)).child(button("Hand back", Part::HandBack, may.is_ok(), can)).child(button(
                 "Discard",
                 Part::Discard,
                 true,

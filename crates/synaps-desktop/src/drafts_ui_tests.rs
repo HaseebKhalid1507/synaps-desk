@@ -18,12 +18,12 @@ use super::blocks_ui_tests::{bounds, click, drawn, open_session, round, turn};
 use super::keys_tests::{composer_text, keys_at, press, prompt, prompt_pending};
 use super::{open_at, settle, wait};
 use crate::app::AppView;
-use crate::draft_view::{ESC_AGAIN, KEEPS_WORKING, NOT_SENT};
+use crate::draft_view::{ESC_AGAIN, KEEPS_WORKING};
 use crate::drafts::{FULL, Fate, NOTHING_LEFT};
 
 type W = (AnyWindowHandle, Entity<AppView>);
 
-fn row(name: &str) -> u64 {
+pub(super) fn row(name: &str) -> u64 {
     crate::blocks::row_id(&Ref::parse(name).expect("an id"))
 }
 
@@ -70,7 +70,7 @@ fn ops(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, tool
 
 /// Ctrl+G, `k` `times`, then `e` on the walked block: its ring painted
 /// first, as a hand would wait for it.
-fn walk_take(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ups: usize) {
+pub(super) fn walk_take(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ups: usize) {
     press(cx, w, "ctrl-g");
     wait(cx, w, view, 300);
     for _ in 0..ups {
@@ -108,7 +108,7 @@ fn order(cx: &mut TestAppContext, view: &Entity<AppView>) -> Vec<String> {
     p.steps.iter().map(|s| s.id.to_string()).collect()
 }
 
-fn footer(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str, text: &str) -> bool {
+pub(super) fn footer(cx: &mut TestAppContext, w: AnyWindowHandle, name: &str, text: &str) -> bool {
     has(cx, w, format!("draft-footer {} {text}", row(name)))
 }
 
@@ -132,7 +132,7 @@ fn kept(cx: &mut TestAppContext, view: &Entity<AppView>) -> bool {
 }
 
 /// The session's compaction, as the daemon says it.
-fn compact(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn compact(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     let sid = attachment(cx, view).1;
     let j = view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].transcript.journal().to_string());
     heard(
@@ -198,8 +198,8 @@ fn e_takes_a_plan_and_its_keys_edit_the_draft(cx: &mut TestAppContext) {
 
 /// The draft draws over `B` (§3.4): an agent tick while held is counted in
 /// the header, never drawn under the user; struck, then run past, the
-/// pre-check lists it and leaves nothing to hand back. Hand back is off in
-/// D8a, and Enter sends nothing.
+/// pre-check lists it and leaves nothing to hand back: Hand back is off,
+/// and Enter sends nothing.
 #[gpui_kit::test]
 fn agent_changes_are_counted_and_the_pre_check_lists_what_fails(cx: &mut TestAppContext) {
     let (w, view) = planned(cx);
@@ -209,7 +209,7 @@ fn agent_changes_are_counted_and_the_pre_check_lists_what_fails(cx: &mut TestApp
     press(cx, w, "j");
     press(cx, w, "x");
     assert_eq!(step(cx, &view, "deploy").0, "skipped");
-    assert!(has(cx, w, format!("draft-button {p} Hand back off ready")), "something to hand back");
+    assert!(has(cx, w, format!("draft-button {p} Hand back on ready")), "something to hand back");
     ops(cx, w, &view, "toolu_t1", json!([{"op":"patch","id":"p","set":{"steps.deploy.state":"doing"}}]));
     assert!(has(cx, w, format!("draft-head {p} EDITING · r1 · 1 agent change")), "counted");
     assert_eq!(step(cx, &view, "deploy").0, "skipped", "drawn over B, not under the user");
@@ -219,8 +219,8 @@ fn agent_changes_are_counted_and_the_pre_check_lists_what_fails(cx: &mut TestApp
     ops(cx, w, &view, "toolu_t2", json!([{"op":"patch","id":"p","set":{"steps.fix.label":"Fix it"}}]));
     assert!(has(cx, w, format!("draft-head {p} EDITING · r1 · 2 agent changes")));
     press(cx, w, "enter");
-    assert_eq!(says(cx, &view).as_deref(), Some(NOT_SENT), "D8b sends it: nothing went");
-    view.read_with(cx, |v, _| assert!(v.sent.is_none(), "nothing sent"));
+    assert_eq!(says(cx, &view).as_deref(), Some(NOTHING_LEFT), "nothing left: nothing goes");
+    view.read_with(cx, |v, _| assert!(v.sent.is_none() && v.edit_sends.is_empty(), "nothing sent"));
 }
 
 /// Cancel (§3.2): with no changes Esc lets the draft go, the keys to the
@@ -477,14 +477,17 @@ fn the_draft_keys_never_resolve_a_prompt(cx: &mut TestAppContext) {
     walk_take(cx, w, &view, 0);
     assert!(editing(cx, w, &view), "taken with a prompt up");
     prompt_pending(cx, &view, "e");
-    for k in ["x", "j", "b", "enter", "y", "n"] {
+    for k in ["x", "j", "b", "y", "n"] {
         press(cx, w, k);
         prompt_pending(cx, &view, k);
     }
     press(cx, w, "escape");
     prompt_pending(cx, &view, "one Esc");
-    press(cx, w, "escape");
-    prompt_pending(cx, &view, "the second Esc, discarding");
+    // Enter hands it back (D8b): a message of its own, never the prompt's
+    // answer.
+    press(cx, w, "enter");
+    prompt_pending(cx, &view, "Enter, handing back");
+    view.read_with(cx, |v, _| assert_eq!(v.edit_sends.len(), 1, "handed back"));
     assert_eq!(keys_at(cx, w, &view), (true, false), "the composer, not the window");
     press(cx, w, "escape");
     prompt_pending(cx, &view, "an Esc after");

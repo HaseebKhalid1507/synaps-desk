@@ -606,7 +606,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn after_card(&mut self, row: u64, cx: &mut Context<Self>) {
+    pub(crate) fn after_card(&mut self, row: u64, cx: &mut Context<Self>) {
         self.memo_seen = self.model.memos.changes();
         self.remeasure_row(row);
         self.arm_card_tick(cx);
@@ -692,7 +692,9 @@ impl AppView {
         self.memo_seen = n;
         for pane in self.panes.iter_mut() {
             for (ix, d) in pane.disp.iter().enumerate() {
-                if d.kind == Kind::Ask {
+                // A card, a block (its hand-back's delivery line, its
+                // draft's), a hand-back's row.
+                if matches!(d.kind, Kind::Ask | Kind::Block { .. } | Kind::HandBack) {
                     pane.list.remeasure_items(ix..ix + 1);
                 }
             }

@@ -62,7 +62,7 @@ fn tail(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
 }
 
 /// Where the walk of the pane acted on is.
-fn at(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<At> {
+pub(super) fn at(cx: &mut TestAppContext, view: &Entity<AppView>) -> Option<At> {
     view.read_with(cx, |v, _| v.panes.cur.walk.walk.as_ref().map(|w| w.at))
 }
 
@@ -120,7 +120,7 @@ fn away(cx: &mut TestAppContext, w: AnyWindowHandle) {
 }
 
 /// Ctrl+G, and the walk's first frames: its ring painted.
-fn enter(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn enter(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     press(cx, w, "ctrl-g");
     wait(cx, w, view, 300);
     assert!(walking(cx, w, view), "the walk has the keys");
@@ -744,7 +744,7 @@ fn sec(cx: &mut TestAppContext, view: &Entity<AppView>, name: &str) -> Option<(S
 
 /// D6b's writes landed (a dismissal draws once it is written), and the
 /// frames after.
-fn landed(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+pub(super) fn landed(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
     super::rail_wishes_ui_tests::written(cx, view);
     wait(cx, w, view, 300);
     super::rail_wishes_ui_tests::written(cx, view);
@@ -1364,7 +1364,7 @@ fn the_palettes_block_commands_act_on_the_walked_block(cx: &mut TestAppContext) 
 
 /// A block call as the history keeps it: the assistant's `cards_block`
 /// call of `ops` (its id `tool`), and its receipt.
-fn call(tool: &str, ops: Value) -> [Value; 2] {
+pub(super) fn call(tool: &str, ops: Value) -> [Value; 2] {
     let input = synaps_client::synthetic::block_input(ops.clone());
     [
         json!({"role": "assistant", "content": [{"type": "tool_use", "id": tool, "name": "cards_block", "input": input}]}),
@@ -1372,11 +1372,11 @@ fn call(tool: &str, ops: Value) -> [Value; 2] {
     ]
 }
 
-fn user(text: &str) -> Value {
+pub(super) fn user(text: &str) -> Value {
     json!({"role": "user", "content": text})
 }
 
-fn said_ok() -> Value {
+pub(super) fn said_ok() -> Value {
     json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
 }
 
@@ -1386,7 +1386,7 @@ fn note_op(id: &str) -> Value {
 
 /// The blocks demo's window, its history `messages` after its first, and
 /// no turn running: every board settled. The list at its end.
-fn settled_with(cx: &mut TestAppContext, messages: Vec<Value>) -> W {
+pub(super) fn settled_with(cx: &mut TestAppContext, messages: Vec<Value>) -> W {
     let (win, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
     open_session(cx, win, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
     super::keys_tests::at_rest(cx, win, &view);
@@ -1401,7 +1401,7 @@ fn settled_with(cx: &mut TestAppContext, messages: Vec<Value>) -> W {
 
 /// What the history after the view's holds lands, settled; the frames
 /// after.
-fn then(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
+pub(super) fn then(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, messages: Vec<Value>) {
     super::answer_tests::land(cx, w, view, messages);
     landed(cx, w, view);
 }
@@ -2307,7 +2307,7 @@ fn started(cx: &mut TestAppContext, view: &Entity<AppView>) -> u64 {
 }
 
 /// `j` until the walk is on `to`, painted.
-fn walk_on(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
+pub(super) fn walk_on(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, to: At) {
     for _ in 0..16 {
         if at(cx, view) == Some(to) {
             break;

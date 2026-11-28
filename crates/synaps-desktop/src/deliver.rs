@@ -280,7 +280,7 @@ pub(crate) fn recovering(t: &Transcript) -> bool {
 /// A view the memo may settle on (§3.5's "settled"): the history is the
 /// latest digest's, and the slot is known. One read on a stale slot sends
 /// twice a steer the engine holds (Shady #81 round 4).
-fn settled(t: &Transcript) -> bool {
+pub(crate) fn settled(t: &Transcript) -> bool {
     t.history_settled() && t.slot_known()
 }
 
@@ -356,6 +356,9 @@ pub(crate) struct Memos {
     /// taken in) since the desk last took them, for its memory of card
     /// choices ([`crate::recall`]); at most [`REACHED_CAP`].
     reached: Vec<Reached>,
+    /// The sessions' block memos (D8b, [`crate::handback`]): fed beside
+    /// the card memos, the same events, views and clock.
+    pub(crate) edits: crate::handback::HandBacks,
 }
 
 /// Answers kept for [`Memos::take_reached`] at most, the oldest dropped.
@@ -375,7 +378,7 @@ impl Memos {
     /// How many times an entry changed: cards drawn from one are measured
     /// again when it moves.
     pub(crate) fn changes(&self) -> u64 {
-        self.changes
+        self.changes + self.edits.changes()
     }
 
     /// `session`'s entry for `card`, while it answers it (the same binding).
@@ -397,6 +400,7 @@ impl Memos {
     pub(crate) fn timed(&self) -> bool {
         self.by.values().flat_map(Memo::entries).any(|e| matches!(e.state, State::Sending | State::Checking))
             || self.gaps.values().any(|g| !g.over)
+            || self.edits.timed()
     }
 
     /// Why a card of `session` waits while its view recovers from dropped
@@ -541,6 +545,18 @@ impl Memos {
                 x.ended = true;
             }
         }
+        // A refusal names no text: it is the memo's whose oldest sending
+        // entry is older (§3.7, "Two memos, one session").
+        if let Heard::Refused { .. } = ev {
+            let card = self.by.get(session).and_then(Memo::oldest_sending);
+            let edit = self.edits.oldest_sending(session);
+            if edit.is_some_and(|e| card.is_none_or(|c| e < c)) {
+                self.edits.on(session, ev, now);
+                return;
+            }
+        } else {
+            self.edits.on(session, ev, now);
+        }
         self.with(session, |m| m.on(ev, now));
         match ev {
             Heard::Delivered { text } => {
@@ -571,6 +587,7 @@ impl Memos {
         let view = Self::view(&fold, t);
         self.with(session, |m| m.observe(&view, now));
         self.retire(session, t);
+        self.edits.observe(session, t, t.drawn().map(|d| &**d), now);
     }
 
     /// Retire each entry of `session` at rest (not confirmed, or not sent)
@@ -745,6 +762,7 @@ impl Memos {
         for s in sessions {
             self.with(&s, |m| m.tick(now));
         }
+        self.edits.tick(now);
         for g in self.gaps.values_mut().filter(|g| !g.over && now.saturating_duration_since(g.since) >= CHECK_WAIT) {
             g.over = true;
             g.waited = true;
@@ -829,7 +847,7 @@ impl Memos {
 impl crate::model::Model {
     /// Whether store `lid` may send an agent card's answer now: its
     /// attachment and session, or why not (the card's line).
-    fn card_gate(&self, lid: crate::live::LiveId) -> Result<(u64, String), String> {
+    pub(crate) fn card_gate(&self, lid: crate::live::LiveId) -> Result<(u64, String), String> {
         let l = &self.lives[lid];
         l.input_gate().map_err(str::to_string)?;
         if l.transcript.compacting() {

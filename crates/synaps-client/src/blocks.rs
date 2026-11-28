@@ -134,7 +134,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
-use cards_spec::board::{Board, Event, Place, State, Visibility};
+use cards_spec::board::{Board, EditOutcome, Event, Place, State, Visibility};
 use cards_spec::fold::{self, NAMES as CARD_NAMES};
 use serde_json::Value;
 
@@ -356,9 +356,11 @@ impl HistoryBlocks {
                 if ends {
                     push(Event::ResultsEnd, None);
                 }
-                // Its text, if the host's rule leaves it one string.
+                // Its text, if the host's rule leaves it one string, on its
+                // row: a hand-back's outcome is drawn there (D8b).
+                let user = rows.iter().find(|i| i.kind == ItemKind::User).map(|i| i.id);
                 for e in fold::events(std::slice::from_ref(m)).into_iter().filter(|e| matches!(e, Event::User { .. })) {
-                    push(e, None);
+                    push(e, user);
                 }
             }
             _ => {
@@ -2208,6 +2210,12 @@ pub struct Drawn {
     pub log: Arc<[(Logged, Mark)]>,
     pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
+    /// What each hand-back still kept did (§3.7's application layer, B2's
+    /// outcomes, ≤ 256), with its user message's row (what its row draws)
+    /// and its body's hash ([`body_hash`]: a steer the engine drained has
+    /// no row until its history lands). D8b's. A copy of the board's,
+    /// counted at B2's count of them.
+    pub outcomes: Arc<[Handed]>,
     /// The bound board itself (§1.7: the committed fold and the open
     /// batch's bound calls, never a pending op), while a desk holds a
     /// draft over it ([`HistoryBlocks::keep_bound`]): what the desk's
@@ -2754,9 +2762,27 @@ impl Worker {
         let log: Arc<[(Logged, Mark)]> = lines.iter().map(|l| ((*l).clone(), mark(l.at.event))).collect();
         let records: Arc<[(Record, Mark)]> = recs.iter().map(|r| ((*r).clone(), mark(r.at.event))).collect();
         let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
-        let [_, tombs, recs, _, _, _, logs] = view.owned_by_owner();
+        let outcomes: Arc<[Handed]> = view
+            .outcomes()
+            .filter(|_| false)
+            .map(|o| {
+                let body = match self.journal.get(o.at.event) {
+                    Some(Event::User { text }) => body_hash(cards_spec::block::message::split(text).0),
+                    _ => 0,
+                };
+                Handed { outcome: o.clone(), row: row(o.at.event), body }
+            })
+            .collect();
+        let [_, tombs, recs, _, _, outs, logs] = view.owned_by_owner();
         let calls = CALL_IDS_MAX - room;
-        let kept = tombs + recs + logs + (log.len() + records.len()) * std::mem::size_of::<Mark>() + calls + 3 * ARC;
+        let kept = tombs
+            + recs
+            + logs
+            + outs
+            + (log.len() + records.len()) * std::mem::size_of::<Mark>()
+            + outcomes.len() * (std::mem::size_of::<Handed>() - std::mem::size_of::<EditOutcome>())
+            + calls
+            + 4 * ARC;
         let bytes = std::mem::size_of::<Drawn>()
             + vis_owned(self.settled_heap)
             + visibility.as_ref().map_or(0, |_| vis_owned(vis_heap(view)))
@@ -2784,10 +2810,30 @@ impl Worker {
             log,
             records,
             tombstones,
+            outcomes,
             board: None,
             bytes,
         }
     }
+}
+
+/// A hand-back's outcome as a board drew it ([`Drawn::outcomes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handed {
+    pub outcome: EditOutcome,
+    /// Its user message's row, once it has one.
+    pub row: Option<u64>,
+    /// Its body's [`body_hash`].
+    pub body: u64,
+}
+
+/// An edit message's body (its text without notice lines), hashed: what
+/// a desk matches its own hand-back to its outcome by.
+pub fn body_hash(body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
 }
 
 /// The bound board's block, if it is the same incarnation as `b`.

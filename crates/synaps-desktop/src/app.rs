@@ -2441,6 +2441,18 @@ pub struct AppView {
     pub(crate) card_tick: Option<Task<()>>,
     /// The memos' change count the cards were last measured at.
     pub(crate) memo_seen: u64,
+    /// Hand-backs waiting for their notices' marks, by ticket (D8b,
+    /// [`crate::handback_view`]; ≤ `desires::QUEUE_MAX`, as every message
+    /// that waits).
+    pub(crate) edit_waits: std::collections::HashMap<u64, crate::handback_view::EditSend>,
+    /// The `changed your edit` chips seen ([`crate::handback_view::SEEN_MAX`]).
+    pub(crate) changed_seen: Vec<(String, cards_spec::block::Ref, cards_spec::block::Tag, cards_spec::block::Path)>,
+    /// A restore waiting for its pane's bound board (`R`, §3.6): the
+    /// pane, the block row.
+    pub(crate) restore_wanted: Option<(crate::pane::PaneId, u64)>,
+    /// What hand-backs would have gone to the daemon (tests).
+    #[cfg(test)]
+    pub(crate) edit_sends: Vec<crate::handback::EditOut>,
     /// Every key's presses: an entered card's keys act on new ones only
     /// ([`crate::ask_keys::Presses`]).
     pub(crate) ask_presses: crate::ask_keys::Presses,
@@ -3077,6 +3089,11 @@ impl AppView {
             recall: crate::recall::Recall::new(true, None),
             card_tick: None,
             memo_seen: 0,
+            edit_waits: std::collections::HashMap::new(),
+            changed_seen: Vec::new(),
+            restore_wanted: None,
+            #[cfg(test)]
+            edit_sends: Vec::new(),
             ask_presses: Default::default(),
             block_drafts: Default::default(),
             #[cfg(test)]

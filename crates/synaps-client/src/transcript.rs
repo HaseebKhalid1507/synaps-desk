@@ -2206,7 +2206,10 @@ impl Transcript {
             // come as `External` and `steering_delivered`, never so.
             // An agent card's answer (its grammar, synaps-cards §3.3): its
             // card says where it is (queued, then answered), never its JSON.
-            SessionEvent::Steered { text, .. } if cards_spec::message::parse(text).is_some() => {}
+            // A card's answer, a block's hand-back: their own rows say.
+            SessionEvent::Steered { text, .. }
+                if cards_spec::message::parse(text).is_some()
+                    || cards_spec::block::message::parse(cards_spec::block::message::split(text).0).is_some() => {}
             SessionEvent::Steered { text, .. } => self.notice(ItemKind::Notice, format!("steered: {text}")),
             SessionEvent::SystemNotice { text } => {
                 // Events were dropped here ([`Transcript::resyncing`]): the

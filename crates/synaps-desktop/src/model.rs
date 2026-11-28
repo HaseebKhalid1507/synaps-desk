@@ -1560,7 +1560,7 @@ impl Model {
         }
         match to {
             crate::live::Target::Pane(pane) => Some(Effect::Unsent { pane, session, text }),
-            crate::live::Target::Card(_) => None,
+            crate::live::Target::Card(_) | crate::live::Target::Edit => None,
         }
     }
 
@@ -1584,7 +1584,7 @@ impl Model {
                     // A card's answer, echoed: its memo hears it (a
                     // driver's echo can't be told here: no state of that
                     // session is kept).
-                    if let Some(crate::live::Input { to: Target::Card(_), body, .. }) = texts.remove(k) {
+                    if let Some(crate::live::Input { to: Target::Card(_) | Target::Edit, body, .. }) = texts.remove(k) {
                         memos.on(session, cards_spec::memo::Event::Echo { text: &body, driver: false }, now);
                     }
                 }
@@ -1595,7 +1595,7 @@ impl Model {
                     Some(crate::live::Input { to: Target::Pane(pane), body: text, .. }) => {
                         effects.push(Effect::Unsent { pane, session: session.clone(), text })
                     }
-                    Some(crate::live::Input { to: Target::Card(_), .. }) => {
+                    Some(crate::live::Input { to: Target::Card(_) | Target::Edit, .. }) => {
                         memos.on(session, cards_spec::memo::Event::Refused { reason: &error.to_string() }, now);
                     }
                     None => {}
