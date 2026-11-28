@@ -70,6 +70,12 @@ pub(crate) struct Work {
     /// A finished board that waits for a pane's pointer lease to end
     /// ([`crate::lease`]).
     pub(crate) waiting: Option<Arc<Drawn>>,
+    /// Boards that landed, drawn or waiting (a draft's footer is judged
+    /// again on each: [`crate::draft_view`]).
+    pub(crate) landed: u64,
+    /// Where its session's drafts keep their blocks, as last asked for (a
+    /// change asks for a job: [`AppView::sync_drafts`]).
+    pub(crate) places: u64,
     /// A step's budget, if not [`STEP`] (tests: none, a slice a step).
     #[cfg(test)]
     pub(crate) budget: Option<Duration>,
@@ -83,6 +89,12 @@ impl Work {
         self.job = None;
         self.asked = None;
         self.waiting = None;
+    }
+
+    /// Its next frame asks for a board again, its input moved or not (D8:
+    /// the bound board kept, or let go, from that job on).
+    pub(crate) fn again(&mut self) {
+        self.asked = None;
     }
 
     /// Its transcript's board, revision `rev`, is the one drawn: nothing to
@@ -314,6 +326,7 @@ impl AppView {
             l.board.waiting = None;
             if l.transcript.drawn().is_some() {
                 l.transcript.set_drawn(None);
+                l.board.landed += 1;
             }
             return;
         };

@@ -130,7 +130,7 @@
 //! (`collapse` with `run`, §1.3).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cards_spec::block::{self, Receipt};
@@ -181,6 +181,9 @@ struct Shared {
     took: AtomicU64,
     /// What its worker keeps, roughly (bytes), as of its last job.
     bytes: AtomicUsize,
+    /// A desk holds a draft over this history's board (D8, §3.2): its
+    /// jobs publish the bound board itself ([`Drawn::board`]).
+    keep_bound: AtomicBool,
 }
 
 /// The history's events, read message by message ([`HistoryBlocks::message`]),
@@ -256,6 +259,18 @@ impl HistoryBlocks {
     /// Its worker ([`Worker`]): the board's work on this history.
     pub fn worker(&self) -> &Arc<Mutex<Worker>> {
         &self.worker
+    }
+
+    /// Whether its boards keep the bound board itself ([`Drawn::board`]):
+    /// while a desk holds a draft over it (D8's pre-check, §3.2). The
+    /// next job's board follows; one finished before doesn't.
+    pub fn keep_bound(&self, on: bool) {
+        self.shared.keep_bound.store(on, Ordering::Relaxed);
+    }
+
+    /// See [`HistoryBlocks::keep_bound`].
+    pub fn keeps_bound(&self) -> bool {
+        self.shared.keep_bound.load(Ordering::Relaxed)
     }
 
     /// What it keeps (bytes, heap included): the staged events and their
@@ -2193,12 +2208,20 @@ pub struct Drawn {
     pub log: Arc<[(Logged, Mark)]>,
     pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
+    /// The bound board itself (§1.7: the committed fold and the open
+    /// batch's bound calls, never a pending op), while a desk holds a
+    /// draft over it ([`HistoryBlocks::keep_bound`]): what the desk's
+    /// pre-check runs B2's guards on (`State::precheck`, §3.2). The job
+    /// builds it for every board and keeps it only then, moved, never
+    /// copied; at most B2's working set (≤ 1 MiB), counted in `bytes` at
+    /// B2's count of it.
+    pub board: Option<Arc<State>>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates, its op log, records and
     /// tombstones, its visibility maps ([`vis_owned`]: `settled`, which its
     /// worker holds too, counted in both; `visibility` once more unless it
-    /// is `settled`'s). A row's
+    /// is `settled`'s), and the bound board when it is kept. A row's
     /// [`Arc`] of it is its.
     pub bytes: usize,
 }
@@ -2648,7 +2671,11 @@ impl Worker {
         // The fates of the live turn's batches and the open one's.
         let mut calls = o.fates.clone();
         fates(events, o.batch.start, events.len(), true, |p, f| calls.push((p, f)));
-        let drawn = self.drawn(input, &view, &bound, &calls);
+        let mut drawn = self.drawn(input, &view, &bound, &calls);
+        if input.shared.keep_bound.load(Ordering::Relaxed) {
+            drawn.bytes += ARC + std::mem::size_of::<State>() + bound.owned_by_owner().iter().sum::<usize>();
+            drawn.board = Some(Arc::new(bound));
+        }
         input.shared.bytes.store(self.bytes(), Ordering::Relaxed);
         Some(drawn)
     }
@@ -2757,6 +2784,7 @@ impl Worker {
             log,
             records,
             tombstones,
+            board: None,
             bytes,
         }
     }

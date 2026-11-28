@@ -224,6 +224,11 @@ pub struct Tabs {
     /// Worker tabs' draft keys that changed with their session (a follow,
     /// a merge): (from, to), for [`Drafts::rekey`].
     rekeys: Vec<(String, String)>,
+    /// Sessions a tab followed to a new id, the same conversation (a
+    /// follow, a merge into the tab holding it): (from, to), session ids,
+    /// for the block drafts ([`Tabs::take_followed`]). At most
+    /// [`CLOSED_MAX`] wait.
+    followed: Vec<(String, String)>,
 }
 
 impl Tabs {
@@ -236,6 +241,23 @@ impl Tabs {
     /// The worker tabs' draft keys changed since the last call ([`Tabs::rekeys`]).
     pub fn take_rekeys(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.rekeys)
+    }
+
+    /// The sessions followed to a new id since the last call, oldest first
+    /// (`crate::drafts::Drafts::follow`).
+    pub fn take_followed(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.followed)
+    }
+
+    /// Session `from` is `to` now, for its block drafts.
+    fn moved(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        if self.followed.len() == CLOSED_MAX {
+            self.followed.remove(0);
+        }
+        self.followed.push((from.to_string(), to.to_string()));
     }
 
     fn set_session(&mut self, ix: usize, to: &str) {
@@ -400,6 +422,7 @@ impl Tabs {
             self.set_session(s, to);
         }
         self.repoint_workers(&from, to);
+        self.moved(&from, to);
         if self.follows.len() == CLOSED_MAX {
             self.follows.remove(0);
         }
@@ -793,6 +816,7 @@ impl Tabs {
                     self.last_session = Some(keep);
                     if let Some(from) = from {
                         self.repoint_workers(&from, session);
+                        self.moved(&from, session);
                     }
                 } else {
                     self.follow(i, session);
@@ -812,6 +836,7 @@ impl Tabs {
                     // Its worker tabs go along (after: they may merge too).
                     if let Some(from) = from {
                         self.repoint_workers(&from, session);
+                        self.moved(&from, session);
                     }
                 } else {
                     self.follow(i, session);

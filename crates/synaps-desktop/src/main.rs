@@ -55,6 +55,8 @@ mod desires;
 mod detail;
 mod diag;
 mod dnd;
+mod draft_view;
+mod drafts;
 mod events;
 mod favourites;
 mod files;
