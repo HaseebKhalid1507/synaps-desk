@@ -72,6 +72,7 @@ pub struct RuntimeInfo {
     pub subagent_timeout: Option<u64>,
     pub max_tool_output: Option<u64>,
     pub bash_timeout: Option<u64>,
+    pub bash_max_timeout: Option<u64>,
     /// The session's own system prompt (`None`: the daemon's default).
     pub system_prompt: Option<std::sync::Arc<str>>,
 }
@@ -91,6 +92,7 @@ impl RuntimeInfo {
             subagent_timeout: n("subagent_timeout"),
             max_tool_output: n("max_tool_output"),
             bash_timeout: n("bash_timeout"),
+            bash_max_timeout: n("bash_max_timeout"),
             system_prompt: o.get("system_prompt").and_then(Value::as_str).map(std::sync::Arc::from),
         };
         (info != RuntimeInfo::default()).then_some(info)
@@ -467,6 +469,16 @@ mod tests {
         // A re-attach of the same session is live again.
         s.on_attached(&a);
         assert!(!s.detached);
+    }
+
+    /// `RuntimeView` has carried `bash_max_timeout` since 2026-09
+    /// (SynapsCLI `session/view.rs:30`); THIS SESSION's row reads it.
+    #[test]
+    fn runtime_view_reads_bash_max_timeout() {
+        let view = |max: u64| RuntimeInfo::from_value(&json!({"model": "m", "bash_timeout": 120, "bash_max_timeout": max}));
+        assert_ne!(view(600), view(300), "two views that differ only in it differ");
+        assert!(RuntimeInfo::from_value(&json!({"bash_max_timeout": 600})).is_some(), "a view of it alone is a view");
+        assert_ne!(view(300), RuntimeInfo::from_value(&json!({"model": "m", "bash_timeout": 120})), "an older view, without it");
     }
 
     #[test]
