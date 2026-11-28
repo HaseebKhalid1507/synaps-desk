@@ -7,15 +7,25 @@
 //! of the string it is in.
 //! - **Every word must hit** (AND).
 //! - **Typos.** A word of 4 or more characters may be one edit (a
-//!   substitution, an insertion, a deletion or two neighbours swapped) from
-//!   a word of the label or the key, never of the help. Only a word that no
-//!   row has as typed is read that way: `bash` finds the bash rows, not
-//!   Dash URL ([`Search::begin`]'s scan).
+//!   substitution, an insertion, a deletion or two neighbours swapped, of
+//!   characters) from a word of the label or the key, never of the help.
+//!   A word is letters and digits; `—` ends one as a space does.
+//! - **Exact first.** When some row has every word as typed (or by its
+//!   alias), only such rows are found: `bash` finds the bash rows, not Dash
+//!   URL. When none does, words may be one edit off, in any row: `content
+//!   window` finds Context window ([`Search::end`]).
 //! - **Aliases** ([`ALIASES`]): `colour` finds Accent and Theme, and so on.
 //! - **Rank.** Label prefix, label word start, key (or inside a label
 //!   word), alias or value, help; a typo just below its place. A row's rank
 //!   is the sum of its words', lower first; the page keeps its order among
 //!   equals.
+//! - **Hits.** Every place a word reads as typed in a field, leftmost
+//!   first and never overlapping, at most 8 a row (the label's first).
+//! - A field is read to its first 65,535 bytes, cut back to a character: a
+//!   hit always slices its field, and a word the cut ends inside is no
+//!   typo.
+//! - **Once a query.** A row is matched when the query changes or its
+//!   strings do, never because the page draws again ([`Search`]).
 //! - Until PR 8 an `@word` is an ordinary word.
 
 use std::mem::size_of;
@@ -187,7 +197,7 @@ pub(crate) const HELP: u8 = 2;
 pub(crate) const VALUE: u8 = 3;
 
 /// A hit: bytes `start..end` of field `field` of row `row`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Hit {
     pub row: u16,
     pub field: u8,
@@ -220,8 +230,19 @@ fn is_sep(b: u8) -> bool {
     matches!(b, b'_' | b'.' | b'-' | b'/' | b' ')
 }
 
-fn is_word(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b >= 0x80
+/// A letter or a digit: what a word is made of.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
+/// A word starts at byte `s` of `h` (a character's start): no letter or
+/// digit before it.
+fn word_start(h: &[u8], s: usize) -> bool {
+    let Some(mut p) = s.checked_sub(1) else { return true };
+    while p > 0 && h[p] & 0xC0 == 0x80 {
+        p -= 1;
+    }
+    !std::str::from_utf8(&h[p..s]).ok().and_then(|c| c.chars().next()).is_some_and(is_word)
 }
 
 /// Characters, separators aside.
@@ -229,9 +250,14 @@ fn chars(t: &[u8]) -> usize {
     t.iter().filter(|&&b| !is_sep(b) && b & 0xC0 != 0x80).count()
 }
 
-/// A field as searched: up to 65,535 bytes (a hit's `u16`).
-fn hay(s: &str) -> &[u8] {
-    &s.as_bytes()[..s.len().min(usize::from(u16::MAX))]
+/// A field as searched: its first 65,535 bytes (a hit's `u16`), cut back
+/// to a character.
+fn hay(s: &str) -> &str {
+    let mut end = s.len().min(usize::from(u16::MAX));
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// `t` read in `h` from `s` on, separators skipped on both sides: where it
@@ -268,7 +294,7 @@ fn place(h: &[u8], t: &[u8], word: bool, from: usize) -> Option<(usize, usize)> 
             continue;
         }
         let Some(e) = reads_at(h, s, t) else { continue };
-        if !word || s == 0 || !is_word(h[s - 1]) {
+        if !word || word_start(h, s) {
             return Some((s, e));
         }
         any = any.or(Some((s, e)));
@@ -276,47 +302,63 @@ fn place(h: &[u8], t: &[u8], word: bool, from: usize) -> Option<(usize, usize)> 
     any
 }
 
-/// `w` and `t` are at most one edit apart (ASCII case folded).
-fn one_edit(w: &[u8], t: &[u8]) -> bool {
-    let eq = |a: &[u8], b: &[u8]| a.eq_ignore_ascii_case(b);
-    let (n, m) = (w.len(), t.len());
+/// `w` and `t` are at most one edit apart, counted in characters (ASCII
+/// case folded): a substitution, an insertion, a deletion or two
+/// neighbours swapped.
+fn one_edit(w: &str, t: &str) -> bool {
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let m = t.chars().count();
+    // `w`'s characters, counted no further than could be one edit.
+    let n = w.chars().take(m + 2).count();
     if n.abs_diff(m) > 1 {
         return false;
     }
-    let mut i = 0;
-    while i < n.min(m) && w[i].eq_ignore_ascii_case(&t[i]) {
-        i += 1;
+    let (mut i, mut j) = (0, 0);
+    let (mut a, mut b) = (w.chars(), t.chars());
+    loop {
+        match (a.next(), b.next()) {
+            (Some(x), Some(y)) if x.eq_ignore_ascii_case(&y) => (i, j) = (i + x.len_utf8(), j + y.len_utf8()),
+            (Some(_), Some(_)) => break,
+            _ => return true,
+        }
     }
-    if i == n.min(m) {
-        return true;
+    let (w, t) = (&w[i..], &t[j..]);
+    fn rest(s: &str) -> &str {
+        s.chars().next().map_or(s, |c| &s[c.len_utf8()..])
     }
     match n.cmp(&m) {
         std::cmp::Ordering::Equal => {
-            eq(&w[i + 1..], &t[i + 1..])
-                || (i + 1 < n
-                    && w[i].eq_ignore_ascii_case(&t[i + 1])
-                    && w[i + 1].eq_ignore_ascii_case(&t[i])
-                    && eq(&w[i + 2..], &t[i + 2..]))
+            eq(rest(w), rest(t)) || {
+                let (mut x, mut y) = (w.chars(), t.chars());
+                match (x.next(), x.next(), y.next(), y.next()) {
+                    (Some(w0), Some(w1), Some(t0), Some(t1)) => {
+                        w0.eq_ignore_ascii_case(&t1) && w1.eq_ignore_ascii_case(&t0) && eq(rest(rest(w)), rest(rest(t)))
+                    }
+                    _ => false,
+                }
+            }
         }
-        std::cmp::Ordering::Greater => eq(&w[i + 1..], &t[i..]),
-        std::cmp::Ordering::Less => eq(&w[i..], &t[i + 1..]),
+        std::cmp::Ordering::Greater => eq(rest(w), t),
+        std::cmp::Ordering::Less => eq(w, rest(t)),
     }
 }
 
-/// The first word of `h` one edit from `t` (separators already out).
-fn typo_in(h: &[u8], t: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i < h.len() {
-        if !is_word(h[i]) {
-            i += 1;
-            continue;
-        }
-        let s = i;
-        while i < h.len() && is_word(h[i]) {
-            i += 1;
-        }
-        if one_edit(&h[s..i], t) {
-            return Some((s, i));
+/// The first word of `field` (as searched, [`hay`]) one edit from `t`
+/// (separators already out). A word the cut ends inside is no word.
+fn typo_in(field: &str, t: &str) -> Option<(usize, usize)> {
+    let h = hay(field);
+    let cut = field[h.len()..].chars().next().is_some_and(is_word);
+    let mut start = None;
+    for (i, c) in h.char_indices().chain([(h.len(), ' ')]) {
+        match (is_word(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                start = None;
+                if (i < h.len() || !cut) && one_edit(&h[s..i], t) {
+                    return Some((s, i));
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -336,14 +378,14 @@ fn spot(r: Option<(usize, usize)>) -> Spot {
 /// Word `t`'s best place in a row (`typo`: it may be one edit off), and
 /// where it is in each field (label, key, help, value).
 fn word_place(t: &[u8], f: &Fields, typo: bool) -> Option<(u16, [Spot; 4])> {
-    let (label, key, help, value) = (hay(f.label), hay(f.key), hay(f.help), hay(f.value));
+    let (label, key, help, value) = (hay(f.label).as_bytes(), hay(f.key).as_bytes(), hay(f.help).as_bytes(), hay(f.value).as_bytes());
     let mut at = [None; 4];
     let mut best = u16::MAX;
     if let Some((s, e)) = place(label, t, true, 0) {
         at[usize::from(LABEL)] = spot(Some((s, e)));
         best = if s == 0 {
             AT_LABEL_PREFIX
-        } else if !is_word(label[s - 1]) {
+        } else if word_start(label, s) {
             AT_LABEL_WORD
         } else {
             AT_KEY
@@ -384,11 +426,12 @@ fn word_place(t: &[u8], f: &Fields, typo: bool) -> Option<(u16, [Spot; 4])> {
             packed[n] = b;
             n += 1;
         }
-        let t = &packed[..n];
-        if let Some((s, e)) = typo_in(label, t) {
+        // A word less its separators (ASCII) is still whole characters.
+        let t = std::str::from_utf8(&packed[..n]).unwrap_or_default();
+        if let Some((s, e)) = typo_in(f.label, t) {
             at[usize::from(LABEL)] = spot(Some((s, e)));
             best = (if s == 0 { AT_LABEL_PREFIX } else { AT_LABEL_WORD }) + 1;
-        } else if let Some(r) = typo_in(key, t) {
+        } else if let Some(r) = typo_in(f.key, t) {
             at[usize::from(KEY)] = spot(Some(r));
             best = AT_KEY + 1;
         }
@@ -397,51 +440,64 @@ fn word_place(t: &[u8], f: &Fields, typo: bool) -> Option<(u16, [Spot; 4])> {
 }
 
 /// Row `f` against `q`: found when every word hits (words in `typos` may
-/// be one edit off), its rank; its hits (at most 8, label's first) pushed
-/// to `out` as row `row` when `lit`.
-fn find_row(q: &Query, typos: u16, f: &Fields, row: u16, out: &mut Vec<Hit>, lit: bool) -> Option<Rank> {
+/// be one edit off): its rank, whether a word was one edit off, and how
+/// many hits it wrote to `out` (as row `row`; none when `out` is empty).
+/// The hits: the label's, then the key's, the help's and the value's; in
+/// each field every place a word reads as typed, from the field's start,
+/// leftmost first and never overlapping (as `str::match_indices`), or a
+/// word's alias or typo, at its place; at most `out.len()`.
+fn find_row(q: &Query, typos: u16, f: &Fields, row: u16, out: &mut [Hit]) -> Option<(Rank, bool, u8)> {
     let mut rank: Rank = 0;
+    let mut typo = false;
     let mut at = [[None; 4]; MAX_WORDS];
     for i in 0..q.n {
         let (best, spots) = word_place(q.word(i), f, typos & 1 << i != 0)?;
         rank += best;
+        typo |= best & 1 == 1;
         at[usize::from(i)] = spots;
     }
-    if lit {
-        // Label first: each word's place, then every other place it reads
-        // as typed in the field.
-        let from = out.len();
-        let hays = [hay(f.label), hay(f.key), hay(f.help), hay(f.value)];
-        'fields: for field in [LABEL, KEY, HELP, VALUE] {
-            let h = hays[usize::from(field)];
-            for (i, spots) in at[..usize::from(q.n)].iter().enumerate() {
-                let mut next = spots[usize::from(field)].map(|(s, e)| (usize::from(s), usize::from(e)));
-                while let Some((start, end)) = next {
-                    if out.len() - from == HITS_PER_ROW {
-                        break 'fields;
-                    }
-                    let hit = Hit { row, field, start: start as u16, end: end as u16 };
-                    if !out[from..].contains(&hit) {
-                        out.push(hit);
-                    }
-                    next = place(h, q.word(i as u8), false, end.max(start + 1));
-                }
+    let words = usize::from(q.n);
+    let mut n = 0;
+    'fields: for field in [LABEL, KEY, HELP, VALUE] {
+        if n == out.len() {
+            break;
+        }
+        let h = hay([f.label, f.key, f.help, f.value][usize::from(field)]).as_bytes();
+        // Each word's next place in the field, and whether it reads there
+        // as typed (else it is its alias's or typo's place, taken once).
+        let mut next = [None; MAX_WORDS];
+        let mut typed = [false; MAX_WORDS];
+        for i in 0..words {
+            next[i] = place(h, q.word(i as u8), false, 0);
+            typed[i] = next[i].is_some();
+            if !typed[i] {
+                next[i] = at[i][usize::from(field)].map(|(s, e)| (usize::from(s), usize::from(e)));
             }
         }
+        while let Some(i) = (0..words).filter(|&i| next[i].is_some()).min_by_key(|&i| next[i]) {
+            let Some((s, e)) = next[i] else { break };
+            let hit = Hit { row, field, start: s as u16, end: e as u16 };
+            if !out[..n].contains(&hit) {
+                if n == out.len() {
+                    break 'fields;
+                }
+                out[n] = hit;
+                n += 1;
+            }
+            next[i] = if typed[i] { place(h, q.word(i as u8), false, e.max(s + 1)) } else { None };
+        }
     }
-    Some(rank)
+    Some((rank, typo, n as u8))
 }
 
 /// One row by itself, against `q` (any word of 4 or more characters may
 /// be one edit off): its rank, its hits pushed to `out` as row 0.
 #[cfg(test)]
 pub(crate) fn find(q: &Query, f: &Fields, out: &mut Vec<Hit>) -> Option<Rank> {
-    find_row(q, q.typo_words(), f, 0, out, true)
-}
-
-/// The words a row has as typed (a bit each).
-fn as_typed(q: &Query, f: &Fields) -> u16 {
-    (0..q.n).filter(|&i| word_place(q.word(i), f, false).is_some()).fold(0, |m, i| m | 1 << i)
+    let mut hits = [Hit::default(); HITS_PER_ROW];
+    let (rank, _, n) = find_row(q, q.typo_words(), f, 0, &mut hits)?;
+    out.extend_from_slice(&hits[..usize::from(n)]);
+    Some(rank)
 }
 
 // The matcher's work and the walks over the rows, on this thread (a test's
@@ -469,37 +525,101 @@ pub(crate) fn walks() -> u64 {
     WALKS.with(|c| c.get())
 }
 
-/// What the search keeps of a row.
-#[cfg(test)]
-pub(crate) type Item = Found;
+/// What a row was matched as: a hash of its strings, where they are
+/// (`'static`, [`Search::take`]) or what they say ([`Search::take_made`]),
+/// and whether it is lit.
+struct Stamp(u64);
 
-/// The page's search: its query, the rows found in a pass over the rows
-/// ([`Search::results`]) and their hits. Both lists are reserved once, at
-/// the first query, to their caps (PLAN §3.6) and never grow past them: a
-/// row past [`MAX_ROWS`] is found but neither listed nor lit.
+impl Stamp {
+    fn word(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        let (words, rest) = b.as_chunks::<8>();
+        for &w in words {
+            self.word(u64::from_le_bytes(w));
+        }
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        self.word(u64::from_le_bytes(tail));
+        self.word(b.len() as u64);
+    }
+
+    /// Strings that never change, by where they are and their length.
+    fn at(f: &Fields<'static>, lit: bool) -> u64 {
+        let mut s = Stamp(1 | u64::from(lit) << 1);
+        for x in [f.label, f.key, f.help, f.value] {
+            s.word(x.as_ptr().addr() as u64);
+            s.word(x.len() as u64);
+        }
+        s.0
+    }
+
+    /// Strings made for this frame, by what they say.
+    fn of(f: &Fields, lit: bool) -> u64 {
+        let mut s = Stamp(4 | u64::from(lit) << 1);
+        for x in [f.label, f.key, f.help, f.value] {
+            s.bytes(x.as_bytes());
+        }
+        s.0
+    }
+}
+
+/// What the search keeps of a row: what it was matched as, its rank
+/// ([`NONE`]: not found), whether a word was one edit off, and its hits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Item {
+    stamp: u64,
+    rank: Rank,
+    typo: bool,
+    hits: u8,
+}
+
+const _: () = assert!(size_of::<Item>() == 16);
+
+/// An item not found.
+const NONE: Rank = Rank::MAX;
+
+/// The page's search: its query, and what each row of the page's walk
+/// over its rows was found as, with its hits. A row is matched when the
+/// query changes or its strings do, never because the page draws again
+/// (a scroll, a help opened, a resize, motion): a walk reads what was
+/// found. Both lists are reserved once, at the first query, to their caps
+/// (PLAN §3.6) and never grow past them: a row past [`MAX_ROWS`] is
+/// matched each walk, found but neither kept nor lit.
+///
+/// **Exact first.** When some row has every word as typed (or by its
+/// alias), only such rows are found; when none does, a word of 4 or more
+/// characters may be one edit off, in any row ([`Search::end`]).
 pub(crate) struct Search {
     query: Query,
-    /// Words that may be one edit off, this pass.
-    typos: u16,
-    /// Words some row has as typed, in this pass's scan.
-    seen: u16,
-    scanning: bool,
-    /// The next row's number.
+    /// Only rows with every word as typed are found (else typos too).
+    exact: bool,
+    /// Rows past the cap this walk: found as typed (1), with a typo (2).
+    past: u8,
+    /// The walk's next row.
     next: u16,
-    results: Vec<Found>,
+    /// The last walk's rows, by their place in it.
+    items: Vec<Item>,
+    /// Their hits: row `r`'s from `r * HITS_PER_ROW`.
     hits: Vec<Hit>,
 }
 
 impl Default for Search {
     fn default() -> Self {
-        Search { query: Query::EMPTY, typos: 0, seen: 0, scanning: false, next: 0, results: Vec::new(), hits: Vec::new() }
+        Search { query: Query::EMPTY, exact: true, past: 0, next: 0, items: Vec::new(), hits: Vec::new() }
     }
 }
 
 impl Search {
-    /// A new query: whether it changed.
+    /// A new query: whether it changed. What was found is forgotten.
     pub(crate) fn set(&mut self, q: Query) -> bool {
         let changed = q != self.query;
+        if changed {
+            self.items.clear();
+            self.exact = true;
+        }
         self.query = q;
         changed
     }
@@ -508,115 +628,143 @@ impl Search {
         &self.query
     }
 
-    /// A pass over the rows begins. True: it scans first, each row [`take`]n
-    /// once for what it has as typed (answering None), then [`scanned`],
-    /// then each row again. A word no row has as typed may then be one
-    /// edit off.
+    /// A walk over the page's rows begins: each row [`take`]n in the
+    /// page's order (the same rows, whatever is found), then [`end`].
     ///
     /// [`take`]: Search::take
-    /// [`scanned`]: Search::scanned
-    pub(crate) fn begin(&mut self) -> bool {
+    /// [`end`]: Search::end
+    pub(crate) fn begin(&mut self) {
         #[cfg(test)]
         count(&WALKS);
-        if !self.query.is_empty() && self.hits.capacity() == 0 {
-            self.results.reserve_exact(MAX_ROWS);
+        if !self.query.is_empty() && self.hits.is_empty() {
+            self.items.reserve_exact(MAX_ROWS);
             self.hits.reserve_exact(MAX_HITS);
+            self.hits.resize(MAX_HITS, Hit::default());
         }
-        self.results.clear();
-        self.hits.clear();
-        (self.next, self.seen, self.typos) = (0, 0, 0);
-        self.scanning = self.query.typo_words() != 0;
-        self.scanning
+        (self.next, self.past) = (0, 0);
     }
 
-    /// The scan is done.
-    pub(crate) fn scanned(&mut self) {
-        self.typos = self.query.typo_words() & !self.seen;
-        (self.scanning, self.next) = (false, 0);
+    /// The walk is over: whether to walk again. A walk answers the last
+    /// walk's way (exact rows only, or typos too); when it finds the other
+    /// way is right now (rows found as typed came or went), the page walks
+    /// again, which matches nothing.
+    pub(crate) fn end(&mut self) -> bool {
+        if self.query.is_empty() {
+            return false;
+        }
+        self.items.truncate(usize::from(self.next));
+        let found = |typo| self.items.iter().any(|i| i.rank != NONE && i.typo == typo);
+        let exact = self.past & 1 != 0 || found(false) || (self.past & 2 == 0 && !found(true));
+        let again = exact != self.exact;
+        self.exact = exact;
+        again
     }
 
-    /// Row `f`: found (every row is, with no query) or not; its hits kept.
-    pub(crate) fn take(&mut self, f: &Fields) -> Option<Found> {
-        self.take_row(f, true)
+    /// Row `f`, its strings `'static` (known by where they are): found
+    /// (every row is, with no query) or not; its hits kept.
+    pub(crate) fn take(&mut self, f: &Fields<'static>) -> Option<Found> {
+        self.take_row(f, || Stamp::at(f, true), true)
     }
 
     /// [`Search::take`] for a row drawn with other strings than `f`: found
     /// or not, its hits not kept.
-    pub(crate) fn take_unlit(&mut self, f: &Fields) -> Option<Found> {
-        self.take_row(f, false)
+    pub(crate) fn take_unlit(&mut self, f: &Fields<'static>) -> Option<Found> {
+        self.take_row(f, || Stamp::at(f, false), false)
     }
 
-    fn take_row(&mut self, f: &Fields, lit: bool) -> Option<Found> {
+    /// [`Search::take`] for a row of strings made for this frame (known by
+    /// what they say).
+    pub(crate) fn take_made(&mut self, f: &Fields) -> Option<Found> {
+        self.take_row(f, || Stamp::of(f, true), true)
+    }
+
+    fn take_row(&mut self, f: &Fields, stamp: impl FnOnce() -> u64, lit: bool) -> Option<Found> {
         if self.query.is_empty() {
             return Some(Found { row: u16::MAX, rank: 0 });
         }
+        let row = self.next;
+        self.next = self.next.saturating_add(1);
+        let at = usize::from(row);
+        let item = if at < MAX_ROWS {
+            let stamp = stamp();
+            match self.items.get(at) {
+                Some(i) if i.stamp == stamp => *i,
+                _ => {
+                    let room = if lit { HITS_PER_ROW } else { 0 };
+                    let item = Self::matched(&self.query, f, row, &mut self.hits[at * HITS_PER_ROW..][..room], stamp);
+                    if at < self.items.len() {
+                        self.items[at] = item;
+                    } else {
+                        self.items.push(item);
+                    }
+                    item
+                }
+            }
+        } else {
+            let item = Self::matched(&self.query, f, row, &mut [], 0);
+            if item.rank != NONE {
+                self.past |= if item.typo { 2 } else { 1 };
+            }
+            item
+        };
+        (item.rank != NONE && !(self.exact && item.typo)).then_some(Found { row, rank: item.rank })
+    }
+
+    fn matched(q: &Query, f: &Fields, row: u16, out: &mut [Hit], stamp: u64) -> Item {
         #[cfg(test)]
         count(&MATCHED);
-        if self.scanning {
-            self.seen |= as_typed(&self.query, f);
-            return None;
+        match find_row(q, q.typo_words(), f, row, out) {
+            Some((rank, typo, hits)) => Item { stamp, rank, typo, hits },
+            None => Item { stamp, rank: NONE, typo: false, hits: 0 },
         }
-        let room = self.results.len() < MAX_ROWS;
-        let row = self.next;
-        let rank = find_row(&self.query, self.typos, f, row, &mut self.hits, lit && room)?;
-        self.next = self.next.saturating_add(1);
-        let found = Found { row, rank };
-        if room {
-            self.results.push(found);
-        }
-        Some(found)
     }
 
-    /// Every row of `rows`, scan and all: what is found.
-    #[cfg(test)]
-    pub(crate) fn run(&mut self, rows: &[Fields]) -> &[Found] {
-        if self.begin() {
-            for f in rows {
-                self.take(f);
-            }
-            self.scanned();
-        }
-        for f in rows {
-            self.take(f);
-        }
-        &self.results
-    }
-
-    /// Each row of `rows` found, as the page takes them: its index and rank.
+    /// Each row of `rows` found, as the page takes them (walked again when
+    /// [`Search::end`] says so): its index and rank.
     #[cfg(test)]
     pub(crate) fn found_in(&mut self, rows: &[Fields]) -> Vec<(usize, Rank)> {
-        if self.begin() {
-            for f in rows {
-                self.take(f);
-            }
-            self.scanned();
-        }
-        rows.iter().enumerate().filter_map(|(i, f)| self.take(f).map(|x| (i, x.rank))).collect()
+        let walk = |s: &mut Search| {
+            s.begin();
+            let found = rows.iter().enumerate().filter_map(|(i, f)| s.take_made(f).map(|x| (i, x.rank))).collect();
+            (found, s.end())
+        };
+        let (found, again) = walk(self);
+        if again { walk(self).0 } else { found }
     }
 
-    /// The rows found in this pass, in their order.
+    /// Every row of `rows`: what is found.
     #[cfg(test)]
-    pub(crate) fn results(&self) -> &[Found] {
-        &self.results
+    pub(crate) fn run(&mut self, rows: &[Fields]) -> Vec<Found> {
+        self.found_in(rows);
+        self.results()
+    }
+
+    /// The rows found in the last walk (to the cap), in their order.
+    #[cfg(test)]
+    pub(crate) fn results(&self) -> Vec<Found> {
+        let found = |i: &&Item| i.rank != NONE && !(self.exact && i.typo);
+        self.items.iter().enumerate().filter(|(_, i)| found(i)).map(|(r, i)| Found { row: r as u16, rank: i.rank }).collect()
     }
 
     /// Row `row`'s hits.
     pub(crate) fn hits_of(&self, row: u16) -> &[Hit] {
-        let a = self.hits.partition_point(|h| h.row < row);
-        let b = a + self.hits[a..].partition_point(|h| h.row == row);
-        &self.hits[a..b]
+        let at = usize::from(row);
+        match self.items.get(at) {
+            Some(i) if i.rank != NONE => &self.hits[at * HITS_PER_ROW..][..usize::from(i.hits)],
+            _ => &[],
+        }
     }
 
     /// Bytes held (PLAN §3.6: `size_of` and every buffer's capacity).
     #[cfg(test)]
     pub(crate) fn retained(&self) -> usize {
-        let Search { query: _, typos: _, seen: _, scanning: _, next: _, results, hits } = self;
-        size_of::<Self>() + results.capacity() * size_of::<Found>() + hits.capacity() * size_of::<Hit>()
+        let Search { query: _, exact: _, past: _, next: _, items, hits } = self;
+        size_of::<Self>() + items.capacity() * size_of::<Item>() + hits.capacity() * size_of::<Hit>()
     }
 
     #[cfg(test)]
     pub(crate) fn capacities(&self) -> (usize, usize) {
-        (self.results.capacity(), self.hits.capacity())
+        (self.items.capacity(), self.hits.capacity())
     }
 }
 

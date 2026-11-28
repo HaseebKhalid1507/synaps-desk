@@ -147,8 +147,9 @@ type Saved = (u64, bool, Option<Instant>, Option<u64>);
 
 #[derive(Default)]
 pub(crate) struct SettingsUi {
-    /// The find: its query, and the rows the last pass found, with their
-    /// hits (settings_find.rs). A pass runs as the page is drawn.
+    /// The find: its query, and what each row of the page was found as,
+    /// with its hits (settings_find.rs). A row is matched when the query or
+    /// its strings change; a draw reads what was found.
     pub search: RefCell<find::Search>,
     /// Each value shown (by its control): what it was, whether it was being
     /// sent, and when its save's afterglow begins (motion.md §6.8).
@@ -475,10 +476,16 @@ impl AppView {
         }
     }
 
-    /// A row, to the find: in its scan, nothing yet (None); then found or
-    /// not, with its rank and hits. With no query, every row.
-    fn take(&self, f: &Fields) -> Option<Found> {
+    /// A row of the page's own strings, to the find: found or not, with
+    /// its rank and hits. With no query, every row.
+    fn take(&self, f: &Fields<'static>) -> Option<Found> {
         self.settings.search.borrow_mut().take(f)
+    }
+
+    /// [`Self::take`] for a row of strings made for this draw (a fact, a
+    /// provider, a plugin).
+    fn take_made(&self, f: &Fields) -> Option<Found> {
+        self.settings.search.borrow_mut().take_made(f)
     }
 
     /// THIS APP's row `id`, its control and what is under it built only
@@ -1008,7 +1015,7 @@ impl AppView {
                 .into_any_element(),
         ));
         let gate = self.config_gate();
-        let groups = || {
+        let walk = || {
             [
                 self.group_connection(p),
                 self.group_app(p, cx),
@@ -1019,13 +1026,17 @@ impl AppView {
                 self.group_plugins(p),
             ]
         };
-        // A word that may be a typo: first a scan of every row for what it
-        // has as typed (nothing is built), then the rows (settings_find.rs).
-        if self.settings.search.borrow_mut().begin() {
-            groups();
-            self.settings.search.borrow_mut().scanned();
+        // The find's walk over the rows (settings_find.rs): a row is matched
+        // only when the query or its strings changed. When the walk finds
+        // the other way right (rows as typed came or went), the page walks
+        // again, from what was found.
+        self.settings.search.borrow_mut().begin();
+        let mut groups = walk();
+        if self.settings.search.borrow_mut().end() {
+            self.settings.search.borrow_mut().begin();
+            groups = walk();
+            self.settings.search.borrow_mut().end();
         }
-        let groups = groups();
         let mut shown_groups = Vec::new();
         for (ix, (line, rows)) in groups.into_iter().enumerate() {
             if on && rows.is_empty() {
@@ -1162,7 +1173,7 @@ impl AppView {
             ("Telemetry sources", sources),
         ];
         let mut rows: Vec<(Found, &'static str, String)> =
-            rows.into_iter().filter_map(|(l, v)| self.take(&Fields::fact(l, &v)).map(|f| (f, l, v))).collect();
+            rows.into_iter().filter_map(|(l, v)| self.take_made(&Fields::fact(l, &v)).map(|f| (f, l, v))).collect();
         rows.sort_by_key(|(f, ..)| f.rank);
         let search = self.settings.search.borrow();
         let rows = rows.into_iter().enumerate().map(|(i, (f, l, v))| Self::info_row(l, v, i == 0, search.hits_of(f.row), p)).collect();
@@ -1596,9 +1607,11 @@ impl AppView {
             });
         }
         // Found by its own words, else (unlit) by the config key's it shows.
-        let keepwarm = self.take(&Fields::new("Cache keep-warm", "keepwarm", KEEPWARM_HELP)).or_else(|| {
-            settings::def("cache_keepwarm").and_then(|d| self.settings.search.borrow_mut().take_unlit(&Fields::new(d.label, d.key, d.help)))
-        });
+        // Both are taken, whatever is found: a walk takes the same rows.
+        let own = self.take(&Fields::new("Cache keep-warm", "keepwarm", KEEPWARM_HELP));
+        let by_key = settings::def("cache_keepwarm")
+            .and_then(|d| self.settings.search.borrow_mut().take_unlit(&Fields::new(d.label, d.key, d.help)));
+        let keepwarm = own.or(by_key);
         if let Some(found) = keepwarm {
             rows.push(Row {
                 id: "session-keepwarm".into(),
@@ -1740,7 +1753,7 @@ impl AppView {
                         if let Some(n) = &v.note {
                             s.push_str(&format!(" · {n}"));
                         }
-                        self.take(&Fields::fact(&v.name, &s)).map(|f| (f, v.name.clone(), s))
+                        self.take_made(&Fields::fact(&v.name, &s)).map(|f| (f, v.name.clone(), s))
                     })
                     .collect();
                 found.sort_by_key(|(f, ..)| f.rank);
@@ -1774,7 +1787,7 @@ impl AppView {
                             v.scope
                         );
                         let f = Fields { help: &v.description, ..Fields::fact(&v.name, &s) };
-                        self.take(&f).map(|f| (f, v.name.clone(), s))
+                        self.take_made(&f).map(|f| (f, v.name.clone(), s))
                     })
                     .collect();
                 found.sort_by_key(|(f, ..)| f.rank);
