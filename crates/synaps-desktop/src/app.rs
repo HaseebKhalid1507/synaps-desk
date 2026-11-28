@@ -2133,22 +2133,23 @@ impl SaveJob {
                 hold = job.hold.take();
             }
         }
-        // STAND-IN (tests-first): recorded once the write has returned, its
-        // locks let go, as 75ac5ce did.
-        let out = write(&|| slot_of(slot).closed, &|| {});
-        #[cfg(test)]
-        if let (Some((at, go)), Ok(true)) = (&hold, &out) {
-            let _ = at.send(());
-            let _ = go.recv();
-        }
+        let done = || {
+            #[cfg(test)]
+            if let Some((at, go)) = &hold {
+                let _ = at.send(());
+                let _ = go.recv();
+            }
+            let mut job = slot_of(slot);
+            job.writes += 1;
+            job.done[kind as usize] = Some(generation);
+        };
+        let out = write(&|| slot_of(slot).closed, &done);
         let mut job = slot_of(slot);
         job.busy -= 1;
         if !out? {
             job.fenced += 1;
             return Ok(false);
         }
-        job.writes += 1;
-        job.done[kind as usize] = Some(generation);
         Ok(true)
     }
 
@@ -2456,6 +2457,9 @@ pub struct AppView {
     pub(crate) settings_input_subs: [Subscription; 3],
     pub(crate) settings_find_guard: crate::settings_editor::EditGuard,
     pub(crate) settings_input_guard: crate::settings_editor::EditGuard,
+    /// Each field's text when no composition was under way, as last seen:
+    /// what a composition refused goes back to (value, find).
+    pub(crate) settings_accepted: [String; 2],
     pub(crate) gear_menu: bool,
     /// Overlays as they leave (fluid.md §3.10): what was open last frame,
     /// and what closed and when, drawn without a hitbox until gone; the
@@ -3178,6 +3182,7 @@ impl AppView {
             settings_input_subs: i.settings_input_subs,
             settings_find_guard: crate::settings_editor::EditGuard::find(),
             settings_input_guard: crate::settings_editor::EditGuard::value(),
+            settings_accepted: [String::new(), String::new()],
             gear_menu: false,
             menu_was: None,
             menu_leaving: None,

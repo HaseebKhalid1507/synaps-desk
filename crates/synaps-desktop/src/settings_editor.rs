@@ -5,8 +5,11 @@
 //! budget the input is rebuilt from its text, its history dropped with the
 //! old entity. The kit offers no other bound but a depth of 1,000 steps.
 //! An IME's composition is charged as it is marked, preedit by preedit,
-//! as the kit keeps it ([`AppView::field_marked`]); a rebuild carries a
-//! composition under way over to the new input.
+//! as the kit keeps it ([`AppView::field_marked`]). One that would pass
+//! the budget is refused on the same input ([`AppView::refuse_composition`]):
+//! no input is ever replaced while a composition is under way, since the
+//! platform's input handler keeps the input it was given until the window's
+//! next frame (Shady #116 R2-B1).
 
 use gpui_kit::component::input::{Input, InputEditsEvent, InputEvent, InputState};
 use gpui_kit::{
@@ -25,9 +28,6 @@ pub(crate) const FIND_BUDGET: u32 = 16_384;
 pub(crate) const CLEARED: &str = "Undo history cleared to keep memory in bounds.";
 
 /// Under an input whose composition was refused at its budget.
-// STAND-IN (tests-first): no composition is refused (a rebuild carries it
-// over, as 75ac5ce did), so this never shows.
-#[allow(dead_code)]
 pub(crate) const COMPOSED: &str = "Composition too long to keep: taken out, and the undo history cleared. Type it in parts.";
 
 /// An edit that replaced something, or one of several in its batch, may
@@ -44,6 +44,9 @@ pub(crate) struct EditGuard {
     pub(crate) cleared: bool,
     /// A paste would have passed the cap and was refused: the note shows.
     pub(crate) refused: bool,
+    /// A composition would have passed the budget and was refused: the
+    /// note shows ([`AppView::refuse_composition`]).
+    pub(crate) composed: bool,
     /// The text's length as last seen (bytes), and, in a composition, a
     /// hash of the text and its marked range then ([`Self::marked`]).
     seen_len: u32,
@@ -68,7 +71,17 @@ pub(crate) enum Pasted {
 
 impl EditGuard {
     pub(crate) const fn new(cap: usize, budget: u32) -> EditGuard {
-        EditGuard { cap: cap as u32, budget, charge: 0, cleared: false, refused: false, seen_len: 0, seen_hash: 0, composing: false }
+        EditGuard {
+            cap: cap as u32,
+            budget,
+            charge: 0,
+            cleared: false,
+            refused: false,
+            composed: false,
+            seen_len: 0,
+            seen_hash: 0,
+            composing: false,
+        }
     }
 
     pub(crate) fn value() -> EditGuard {
@@ -121,7 +134,10 @@ impl EditGuard {
     /// `push_history`, 3359–3404, into `UndoManager::record_transaction`,
     /// undo_manager.rs:100–118; one with nothing changed is not kept). Each
     /// is charged so, twice and a step for its records, as an edit is; a
-    /// cancel too (an empty preedit, with no event either). Whether the
+    /// cancel too (an empty preedit, with no event either). Its first also
+    /// keeps the whole text the composition began on, until a commit or a
+    /// set value lets it go, not a cancel (`ime_original_text`, state.rs:
+    /// 4961–4962, let go at 1685 and 1292): charged twice too. Whether the
     /// budget is passed.
     pub(crate) fn marked(&mut self, len: usize, marked: Option<(usize, u64)>) -> bool {
         let before = self.seen_len as usize;
@@ -132,9 +148,10 @@ impl EditGuard {
             Some((_, look)) if self.composing && look == self.seen_hash => return false,
             Some(m) => m,
         };
+        let began = if self.composing { 0 } else { 2 * before as u32 };
         (self.seen_hash, self.composing) = (look, marked.is_some());
         let took = (before + mark).saturating_sub(len);
-        self.charge = self.charge.saturating_add(Self::charge_of(took, mark, true));
+        self.charge = self.charge.saturating_add(Self::charge_of(took, mark, true)).saturating_add(began);
         self.charge > self.budget
     }
 
@@ -151,19 +168,18 @@ impl EditGuard {
     }
 
     /// The input was rebuilt from its text: nothing charged, and no
-    /// composition on it (unless one is [`Self::carried`] over).
+    /// composition on it.
     pub(crate) fn rebuilt(&mut self) {
         self.charge = 0;
         self.cleared = true;
         self.composing = false;
     }
 
-    /// A composition carried over to the rebuilt input, its `mark` bytes
-    /// marked again on it ([`Self::marked`]'s `look`): the one preedit
-    /// the new input keeps.
-    pub(crate) fn carried(&mut self, len: usize, mark: usize, look: u64) {
-        self.charge = Self::charge_of(0, mark, true);
-        (self.seen_len, self.seen_hash, self.composing) = (len as u32, look, true);
+    /// A composition refused, the input set back to its text before it,
+    /// `len` bytes, its history cleared: nothing charged, nothing marked.
+    pub(crate) fn composition_refused(&mut self, len: usize) {
+        self.rebuilt();
+        (self.composed, self.seen_len) = (true, len as u32);
     }
 
     /// A fresh input (opened, or retired empty).
@@ -247,7 +263,8 @@ impl AppView {
     /// A new entity for field `f` holding `text` (capped by the kit's
     /// validator), and its subscriptions; the old one goes, with its
     /// history and its buffers. What `keep` says of the old one carries
-    /// over (a rebuild).
+    /// over (a rebuild). Never while a composition is under way on it
+    /// ([`Self::rebuild`]).
     pub(crate) fn new_field(&mut self, f: Field, text: &str, keep: Keep, window: &mut Window, cx: &mut Context<Self>) {
         let cap = self.field_guard(f).cap();
         let old = self.field_input(f).clone();
@@ -282,6 +299,7 @@ impl AppView {
             });
         }
         let subs = Self::field_subs(f, &input, window, cx);
+        self.settings_accepted[f as usize] = text.to_string();
         match f {
             Field::Value => (self.settings_input, self.settings_input_subs) = (input.clone(), subs),
             Field::Find => (self.settings_find, self.settings_find_subs) = (input.clone(), subs),
@@ -336,6 +354,9 @@ impl AppView {
                 cx.defer_in(window, move |this, window, cx| this.rebuild_field(f, window, cx));
             }
         });
+        // Deferred, it still runs before the update that notified returns
+        // (gpui-pre 0.3.12 `App::flush_effects` runs each `Effect::Defer` as
+        // it comes, app.rs:2162–2164), so before the platform's next call.
         let marked = cx.observe_in(input, window, move |this: &mut Self, input, window, cx| {
             if this.field_marked(f, &input, window, cx) {
                 cx.defer_in(window, move |this, window, cx| this.rebuild_field(f, window, cx));
@@ -346,7 +367,8 @@ impl AppView {
 
     /// Field `f`'s input notified: a composition's preedit charged as the
     /// kit keeps it ([`EditGuard::marked`]); whether the budget is passed.
-    /// Out of a composition only the text's length is read.
+    /// Out of a composition, its text is what a composition refused goes
+    /// back to ([`Self::refuse_composition`]), kept when it changed.
     fn field_marked(&mut self, f: Field, input: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // A field replaced since: its old input is not this field's.
         if self.field_input(f) != input {
@@ -355,6 +377,9 @@ impl AppView {
         let marked = input.update(cx, |s, cx| s.marked_text_range(window, cx));
         let s = input.read(cx);
         let len = s.text().len();
+        if marked.is_none() && s.text() != &self.settings_accepted[f as usize] {
+            self.settings_accepted[f as usize] = s.value().to_string();
+        }
         let composition = marked.map(|m| {
             let v = s.value();
             let bytes = utf16_byte(&v, m.end) - utf16_byte(&v, m.start);
@@ -363,11 +388,8 @@ impl AppView {
         self.field_guard(f).marked(len, composition)
     }
 
-    /// Field `f` rebuilt from its own text, at its budget. A composition
-    /// under way carries over: the new input holds the text around it and
-    /// marks its text again, its caret where it was, so the composition
-    /// goes on (its next preedit replaces that, its commit or cancel ends
-    /// it) and the new input's history is that one preedit.
+    /// Field `f` rebuilt from its own text, at its budget; mid composition,
+    /// the composition refused instead ([`Self::refuse_composition`]).
     pub(crate) fn rebuild_field(&mut self, f: Field, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(f, true, window, cx);
     }
@@ -375,38 +397,47 @@ impl AppView {
     /// [`Self::rebuild_field`]; without `scroll`, the scroll is not kept.
     fn rebuild(&mut self, f: Field, scroll: bool, window: &mut Window, cx: &mut Context<Self>) {
         let old = self.field_input(f).clone();
-        let marked = old.update(cx, |s, cx| s.marked_text_range(window, cx));
-        let (text, sel) = {
-            let s = old.read(cx);
-            (s.value().to_string(), s.selected_range())
-        };
-        let Some(m16) = marked else {
-            self.new_field(f, &text, Keep::Caret { scroll }, window, cx);
-            let g = self.field_guard(f);
-            g.rebuilt();
-            g.seen_len = text.len() as u32;
-            self.views_changed(cx);
+        if let Some(m16) = old.update(cx, |s, cx| s.marked_text_range(window, cx)) {
+            self.refuse_composition(f, m16, window, cx);
             return;
-        };
-        let m = utf16_byte(&text, m16.start)..utf16_byte(&text, m16.end);
-        let around = format!("{}{}", &text[..m.start], &text[m.end..]);
-        // The caret within the marked text, in UTF-16 (as the kit takes it).
-        let within = |b: usize| text[m.start..b.clamp(m.start, m.end)].encode_utf16().count();
-        let caret = within(sel.start)..within(sel.end);
-        self.new_field(f, &around, Keep::Caret { scroll }, window, cx);
-        let input = self.field_input(f).clone();
-        let preedit = &text[m.clone()];
-        let (len, again) = input.update(cx, |s, cx| {
-            s.set_selected_range(m.start..m.start, cx);
-            s.replace_and_mark_text_in_range(None, preedit, Some(caret), window, cx);
-            (s.text().len(), s.marked_text_range(window, cx))
-        });
+        }
+        let text = old.read(cx).value().to_string();
+        self.new_field(f, &text, Keep::Caret { scroll }, window, cx);
         let g = self.field_guard(f);
         g.rebuilt();
-        g.seen_len = len as u32;
-        if let Some(r) = again {
-            g.carried(len, preedit.len(), look(&text, &r));
+        g.seen_len = text.len() as u32;
+        self.views_changed(cx);
+    }
+
+    /// The composition under way on field `f` (marked over `m16`, UTF-16)
+    /// refused at the budget, on the same input: the platform's input
+    /// handler keeps the input it was given until the window's next frame,
+    /// so an input put in its place would miss the next preedit or the
+    /// commit (Shady #116 R2-B1; gpui-pre 0.3.12 window.rs:5633–5655). The
+    /// input goes back to its text before the composition, which ends it and
+    /// clears the kit's history, its pending composition too (gpui-base
+    /// 0.9.1 `set_value`, state.rs; `UndoManager::clear`, undo_manager.rs:
+    /// 332–336), and its note says why. Its caret goes where the composition
+    /// began, and is in view: the kit's `set_value` puts the start in view
+    /// over any caret follow at the next frame, and the caret's move after
+    /// it puts the caret in view in its place, measured on the input's last
+    /// layout, right at that offset since the text before it is the same
+    /// (`move_to`, movement.rs:62–95, through `scroll_to_with_padding`).
+    /// The platform's next preedit starts a composition there, its history
+    /// empty.
+    fn refuse_composition(&mut self, f: Field, m16: std::ops::Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.field_input(f).clone();
+        let back = self.settings_accepted[f as usize].clone();
+        let mut at = utf16_byte(&input.read(cx).value(), m16.start);
+        at = at.min(back.len());
+        while !back.is_char_boundary(at) {
+            at -= 1;
         }
+        input.update(cx, |s, cx| {
+            s.set_value(back.clone(), window, cx);
+            s.set_selected_range(at..at, cx);
+        });
+        self.field_guard(f).composition_refused(back.len());
         self.views_changed(cx);
     }
 
@@ -489,6 +520,8 @@ impl AppView {
         };
         if g.refused {
             Some(format!("Not pasted: this field takes at most {} bytes.", crate::usage::thousands(g.cap() as u64)))
+        } else if g.composed {
+            Some(COMPOSED.to_string())
         } else {
             g.cleared.then(|| CLEARED.to_string())
         }
