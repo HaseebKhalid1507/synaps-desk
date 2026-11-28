@@ -58,6 +58,9 @@ pub(crate) struct UsageUi {
     /// Tests: the loads asked for.
     #[cfg(test)]
     pub loads: usize,
+    /// Tests: a synthetic view's loads go to the dash, not the demo's.
+    #[cfg(test)]
+    pub live: bool,
     /// The board last drawn, what it shows (its range and host), and when
     /// its charts' reveal began (motion.md §6.8).
     revealed: std::cell::Cell<Option<(usize, u64, Option<Instant>)>>,
@@ -66,6 +69,14 @@ pub(crate) struct UsageUi {
 }
 
 impl UsageUi {
+    /// A synthetic view's loads go to the dash (tests: [`Self::live`]).
+    pub fn loads_live(&self) -> bool {
+        #[cfg(test)]
+        return self.live;
+        #[cfg(not(test))]
+        false
+    }
+
     pub fn new(host: Option<String>, range: Range) -> Self {
         UsageUi {
             host,
@@ -82,6 +93,8 @@ impl UsageUi {
             queued: false,
             #[cfg(test)]
             loads: 0,
+            #[cfg(test)]
+            live: false,
             revealed: Default::default(),
             spots: Default::default(),
             paths: Default::default(),

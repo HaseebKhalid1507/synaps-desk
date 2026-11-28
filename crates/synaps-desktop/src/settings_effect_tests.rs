@@ -865,6 +865,374 @@ fn closing_a_pane_lets_go_of_its_view_whatever_the_focused_tabs(cx: &mut TestApp
     });
 }
 
+/// This machine's Synaps folder for a test, its `config` holding `text`:
+/// [`crate::views::DashUi::base`].
+struct Base(std::path::PathBuf);
+
+impl Base {
+    fn new(name: &str, text: &str) -> Base {
+        let dir = std::env::temp_dir().join(format!("synaps-desk-base-{name}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the folder");
+        std::fs::write(dir.join("config"), text).expect("its config");
+        Base(dir)
+    }
+}
+
+impl Drop for Base {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The channel found for this daemon, nothing under way (a synthetic view
+/// never finds without [`Base`]).
+fn found(cx: &mut TestAppContext, pg: &Page) {
+    pg.view.update(cx, |v, _| {
+        let g = v.model.daemon_gen;
+        v.dash.found_now(g);
+        v.dash.under_way(false, false);
+    });
+}
+
+/// The gate up: replies are held as they land.
+fn gate(cx: &mut TestAppContext, pg: &Page) {
+    pg.view.update(cx, |v, _| v.dash.gate = Some(Vec::new()));
+}
+
+/// How many replies the gate holds.
+fn held(cx: &mut TestAppContext, pg: &Page) -> usize {
+    pg.view.read_with(cx, |v, _| v.dash.gate.as_ref().map_or(0, Vec::len))
+}
+
+/// The first reply the gate holds lands, alone.
+fn let_one(cx: &mut TestAppContext, pg: &Page) {
+    pg.view.update(cx, |v, cx| {
+        let apply = v.dash.gate.as_mut().expect("the gate up").remove(0);
+        apply(v, cx);
+    });
+    settle(cx, pg.w, 8);
+}
+
+/// What the gate holds lands, then what those ask for, until it holds
+/// nothing (the gate stays up): how many landed.
+fn drain(cx: &mut TestAppContext, pg: &Page) -> usize {
+    let mut n = 0;
+    for _ in 0..8 {
+        let k = held(cx, pg);
+        if k == 0 {
+            break;
+        }
+        n += k;
+        pg.view.update(cx, |v, cx| v.let_through(cx));
+        settle(cx, pg.w, 8);
+    }
+    n
+}
+
+/// Settings let go as a fold put it out of sight, then shown again as the
+/// window widens, its pane not focused: MORE DAEMON CONFIG's REFERENCE
+/// values are read again with its config, and drawn; nothing is found
+/// again (Shady #113 round 3, 1).
+#[gpui_kit::test]
+fn settings_shown_again_by_an_unfold_reads_its_reference(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "unfold-reference", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("unfold-reference", "process_scopes = off\n");
+    // As its opening's find read them.
+    changed(cx, &pg, |v| {
+        v.dash.base = Some(base.0.clone());
+        v.settings.reference = Some(crate::settings::read_reference(&base.0, None));
+    });
+    find(cx, &pg, "process_scopes");
+    let (row, none) = ("reference process_scopes = off", "reference process_scopes = —");
+    assert!(drawn(cx, pg.w, row), "its REFERENCE value");
+    let (_left, right) = split_beside(cx, &pg, Kind::Settings);
+    assert!(drawn(cx, pg.w, row), "split: drawn in the pane not focused");
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight: all Settings held goes");
+    found(cx, &pg);
+    let (reads, finds) = (dash.reads(), pg.view.read_with(cx, |v, _| v.dash.finds));
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session's pane, still focused");
+    let value = pg.view.read_with(cx, |v, _| {
+        v.settings.reference.as_ref().and_then(|r| r.values.as_ref().ok()).and_then(|m| m.get("process_scopes").cloned())
+    });
+    assert_eq!(value, Some("off".to_string()), "shown again: its REFERENCE values read again");
+    assert!(drawn(cx, pg.w, row) && !drawn(cx, pg.w, none), "and drawn, in the pane not focused");
+    assert_eq!(dash.reads(), reads + 1, "its config read, once");
+    assert_eq!(pg.view.read_with(cx, |v, _| v.dash.finds), finds, "found: no find");
+}
+
+/// Replies Settings asked for while on screen, held at the gate as a fold
+/// puts it out of sight, land after it let go: a config read's; the reads
+/// an unfold asks for, folded away again before they land; a find's (its
+/// REFERENCE values, the config read after it). Nothing Settings let go of
+/// comes back (Shady #113 round 3, 2). On screen all along, Settings takes
+/// its reply, whatever else let go meanwhile (Usage's hold is its own).
+#[gpui_kit::test]
+fn settings_replies_landing_after_a_fold_bring_nothing_back(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "late-fold", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("late-fold", "process_scopes = off\n");
+    pg.view.update(cx, |v, _| v.dash.base = Some(base.0.clone()));
+    let _ = split_beside(cx, &pg, Kind::Settings);
+    let all = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| settings_held(v));
+    let activate = |cx: &mut TestAppContext| {
+        pg.view.update(cx, |v, cx| {
+            v.window_activated(false, cx);
+            v.window_activated(true, cx);
+        });
+        settle(cx, pg.w, 8);
+    };
+    found(cx, &pg);
+    gate(cx, &pg);
+    // On screen all along: a read (900), held as Usage opens beside it and
+    // closes (Usage let go).
+    dash.set(IDLE, json!("900"));
+    activate(cx);
+    assert_eq!(held(cx, &pg), 1, "a read, its reply held");
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    pg.view.update(cx, |v, cx| {
+        let ix = v.model.tabs.iter().position(|t| t.kind == Kind::Usage).expect("Usage, beside Settings");
+        v.close_tab(ix);
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    assert!(!pg.view.read_with(cx, |v, _| v.model.tabs.iter().any(|t| t.kind == Kind::Usage)), "Usage closed");
+    assert_eq!(drain(cx, &pg), 1, "the read's reply lands");
+    let idle = pg.view.read_with(cx, |v, _| v.dash.config.as_ref().and_then(|c| c.value(IDLE)).map(String::from));
+    assert_eq!(idle.as_deref(), Some("900"), "on screen all along: its reply taken");
+    // A config read (the window back in front), held.
+    let reads = dash.reads();
+    activate(cx);
+    assert_eq!((dash.reads(), held(cx, &pg)), (reads + 1, 1), "read; its reply held");
+    pg.view.update(cx, |v, _| hold_settings(v));
+    assert_eq!(all(cx), [true; 4]);
+    resize_frame(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(all(cx), [false; 4], "folded out of sight: all Settings held goes");
+    assert_eq!(drain(cx, &pg), 1, "the read's reply lands");
+    assert_eq!(all(cx), [false; 4], "a read's reply after the fold brings nothing back");
+    // Unfolded: its config and REFERENCE values read, both held; folded
+    // again before they land.
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!((dash.reads(), held(cx, &pg)), (reads + 2, 2), "its config read, and its REFERENCE values; both held");
+    resize(cx, &pg, FOLDS);
+    assert_eq!(drain(cx, &pg), 2);
+    assert_eq!(all(cx), [false; 4], "an unfold's reads, landing after the fold again, bring nothing back");
+    // Shown again, the gate down: all of it back.
+    pg.view.update(cx, |v, _| v.dash.gate = None);
+    resize(cx, &pg, 1440.);
+    assert_eq!(all(cx)[..3], [true; 3], "shown again: its config, what the dash serves, its REFERENCE values");
+    // A find (the dash URL setting changed), held; the fold; it lands, and
+    // the config read it asks for after it.
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| v.dash_refind(cx));
+    settle(cx, pg.w, 8);
+    assert_eq!(held(cx, &pg), 1, "a find, held");
+    resize_frame(cx, &pg, FOLDS);
+    assert_eq!(all(cx), [false; 4], "folded out of sight: all Settings held goes");
+    assert_eq!(drain(cx, &pg), 2, "the find lands, then the read it asked for");
+    assert_eq!(all(cx), [false; 4], "a find landing after the fold brings nothing back");
+}
+
+/// Replies Settings asked for, held at the gate as a fold puts it out of
+/// sight, Settings shown again by an unfold before they land: a config
+/// read's, a find's, a REFERENCE read's. Asked for before Settings let go,
+/// each drops, though Settings is on screen as it lands (its hold moved
+/// on: what is on screen then is not asked); what the unfold asked for
+/// brings the config and the values as they are now (Shady #113 round 3,
+/// 2).
+#[gpui_kit::test]
+fn replies_asked_before_a_fold_drop_though_settings_is_back(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "late-back", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let base = Base::new("late-back", "process_scopes = off\n");
+    let _ = split_beside(cx, &pg, Kind::Settings);
+    let idle = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.dash.config.as_ref().and_then(|c| c.value(IDLE)).map(String::from));
+    let scopes = |cx: &mut TestAppContext| {
+        pg.view.read_with(cx, |v, _| {
+            v.settings.reference.as_ref().and_then(|r| r.values.as_ref().ok()).and_then(|m| m.get("process_scopes").cloned())
+        })
+    };
+    let refold = |cx: &mut TestAppContext| {
+        resize_frame(cx, &pg, FOLDS);
+        assert!(folded(cx, &pg), "folded");
+        assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight: all Settings held goes");
+        resize(cx, &pg, 1440.);
+        assert!(!folded(cx, &pg), "unfolded");
+    };
+    found(cx, &pg);
+    gate(cx, &pg);
+    // A config read (600).
+    pg.view.update(cx, |v, cx| {
+        v.window_activated(false, cx);
+        v.window_activated(true, cx);
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(held(cx, &pg), 1, "a read (600), its reply held");
+    dash.set(IDLE, json!("900"));
+    refold(cx);
+    assert_eq!(held(cx, &pg), 1, "the unfold's read waits for the one under way");
+    let_one(cx, &pg);
+    assert_eq!(idle(cx), None, "the read asked for before the fold drops, Settings on screen as it lands");
+    assert_eq!(drain(cx, &pg), 1, "the unfold's read lands");
+    assert_eq!(idle(cx).as_deref(), Some("900"), "the config as it is now");
+    // A find (`on`); the unfold's REFERENCE read (`off`).
+    std::fs::write(base.0.join("config"), "process_scopes = on\n").expect("its config");
+    pg.view.update(cx, |v, cx| {
+        v.dash.base = Some(base.0.clone());
+        v.dash_refind(cx);
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(held(cx, &pg), 1, "a find, held");
+    std::fs::write(base.0.join("config"), "process_scopes = off\n").expect("its config");
+    refold(cx);
+    assert_eq!(held(cx, &pg), 2, "the find, and the unfold's REFERENCE read");
+    let_one(cx, &pg);
+    assert_eq!(scopes(cx), None, "the find asked for before the fold: its values drop, Settings on screen as they land");
+    drain(cx, &pg);
+    assert_eq!(scopes(cx).as_deref(), Some("off"), "the unfold's: the values as they are now");
+    // A REFERENCE read (`on`) under way, the next unfold's (`off`).
+    std::fs::write(base.0.join("config"), "process_scopes = on\n").expect("its config");
+    refold(cx);
+    assert_eq!(held(cx, &pg), 2, "the unfold's config and REFERENCE reads");
+    std::fs::write(base.0.join("config"), "process_scopes = off\n").expect("its config");
+    refold(cx);
+    assert_eq!(held(cx, &pg), 3, "the first unfold's two, the second's REFERENCE read (its config read waits)");
+    let_one(cx, &pg);
+    let_one(cx, &pg);
+    assert_eq!((idle(cx), scopes(cx)), (None, None), "the reads asked for before the fold drop, Settings on screen as they land");
+    drain(cx, &pg);
+    assert_eq!((idle(cx).as_deref(), scopes(cx).as_deref()), (Some("900"), Some("off")), "the second unfold's: as they are now");
+}
+
+/// A write Settings sent while on screen (`refused`: the dash refuses
+/// it), its reply held at the gate as Close pane closes Settings' pane,
+/// lands after Settings let go: nothing it let go of comes back (its
+/// config, its row's refusal), and the write's own course ends (Shady
+/// #113 round 3, 2).
+fn write_landing_after_its_pane_closed(cx: &mut TestAppContext, refused: bool) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, &format!("late-close-{refused}"), json!({IDLE: "600"}), "0.13.0", json!(600));
+    if refused {
+        dash.refuse("no");
+    }
+    let (left, right) = split_beside(cx, &pg, Kind::Settings);
+    focus(cx, &pg, left);
+    found(cx, &pg);
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| v.config_write(IDLE, Some("900".into()), cx));
+    settle(cx, pg.w, 8);
+    assert_eq!((dash.posts().len(), held(cx, &pg)), (1, 1), "posted; its reply held");
+    pg.view.update(cx, |v, _| hold_settings(v));
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [true; 4]);
+    pg.view.update(cx, |v, cx| {
+        v.close_pane_tabs();
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused)), (1, right), "the session's pane alone");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "Settings closed: all it held goes");
+    assert!(drain(cx, &pg) >= 1, "the write's reply lands");
+    pg.view.read_with(cx, |v, _| {
+        assert_eq!(settings_held(v), [false; 4], "a write's reply after the close brings nothing back");
+        assert!(!v.dash.order.writing(), "the write ended");
+    });
+    assert_eq!(dash.holds(IDLE), json!(if refused { "600" } else { "900" }), "the dash holds what it took");
+}
+
+#[gpui_kit::test]
+fn a_write_landing_after_its_pane_closed_brings_nothing_back(cx: &mut TestAppContext) {
+    write_landing_after_its_pane_closed(cx, false);
+}
+
+#[gpui_kit::test]
+fn a_refusal_landing_after_its_pane_closed_brings_nothing_back(cx: &mut TestAppContext) {
+    write_landing_after_its_pane_closed(cx, true);
+}
+
+/// Loads Usage asked for while on screen, their replies held at the gate:
+/// one as a fold puts it out of sight; one as a fold does and an unfold
+/// shows it again; one as Close pane closes its pane. Each lands after
+/// Usage let go: nothing it let go of comes back, and nothing is loaded
+/// for it (Shady #113 round 3, 2).
+#[gpui_kit::test]
+fn usage_loads_landing_after_a_fold_or_a_close_bring_nothing_back(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, _dash) = effect_page(cx, "late-usage", json!({IDLE: "600"}), "0.13.0", json!(600));
+    pg.view.update(cx, |v, _| v.usage.live = true);
+    found(cx, &pg);
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    assert!(pg.view.read_with(cx, |v, _| v.usage.board.is_some()), "Usage's board, loaded from the dash");
+    let (left, right) = split_beside(cx, &pg, Kind::Usage);
+    let all = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| usage_held(v));
+    let loads = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.usage.loads);
+    let hold = |v: &mut crate::app::AppView| {
+        v.usage.fetched = Some(std::time::Instant::now());
+        v.usage.error = Some("held".into());
+        v.usage.hover = Some((crate::usage_view::Chart::Spend, 0));
+    };
+    // A load under way, its reply held; the fold.
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| v.usage_load(cx));
+    settle(cx, pg.w, 8);
+    assert_eq!(held(cx, &pg), 1, "loading; its reply held");
+    pg.view.update(cx, |v, _| hold(v));
+    assert_eq!(all(cx), [true; 4]);
+    resize_frame(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(all(cx), [false; 4], "folded out of sight: all Usage held goes");
+    let n = loads(cx);
+    assert_eq!(drain(cx, &pg), 1, "the load's reply lands");
+    assert_eq!(all(cx), [false; 4], "a load's reply after the fold brings nothing back");
+    assert_eq!(loads(cx), n, "and nothing is loaded for it");
+    assert!(!pg.view.read_with(cx, |v, _| v.usage.loading), "the load ended");
+    // A load under way, its reply held; folded, and shown again before it
+    // lands: asked for before Usage let go, it drops, though Usage is on
+    // screen as it lands; the load the unfold asked for brings the board.
+    pg.view.update(cx, |v, cx| v.usage_load(cx));
+    settle(cx, pg.w, 8);
+    resize_frame(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!((held(cx, &pg), pg.view.read_with(cx, |v, _| v.usage.queued)), (1, true), "the unfold's load waits for the one under way");
+    let_one(cx, &pg);
+    assert_eq!(all(cx), [false; 4], "the load asked for before the fold drops, Usage on screen as it lands");
+    assert_eq!(drain(cx, &pg), 1, "the unfold's load lands");
+    assert!(pg.view.read_with(cx, |v, _| v.usage.board.is_some()), "its board");
+    pg.view.update(cx, |v, _| v.dash.gate = None);
+    // Its pane focused, a load under way, a selection made meanwhile; the
+    // pane closed (the palette's Close pane) before the reply lands.
+    focus(cx, &pg, left);
+    gate(cx, &pg);
+    pg.view.update(cx, |v, cx| {
+        v.usage_load(cx);
+        v.usage_load(cx);
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!((held(cx, &pg), pg.view.read_with(cx, |v, _| v.usage.queued)), (1, true), "loading, another queued; the reply held");
+    pg.view.update(cx, |v, cx| {
+        hold(v);
+        v.close_pane_tabs();
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.len(), v.panes.focused)), (1, right), "the session's pane alone");
+    assert_eq!(all(cx), [false; 4], "Usage closed: all it held goes");
+    let n = loads(cx);
+    assert_eq!(drain(cx, &pg), 1, "the load's reply lands");
+    assert_eq!(all(cx), [false; 4], "a load's reply after the close brings nothing back");
+    assert_eq!(loads(cx), n, "and what was queued is not loaded");
+}
+
 /// `daemon_version` is read as semver 2.0.0, whole: anything else is
 /// unreadable (`None`), and a new-session key says `daemon reload` with the
 /// 0.13.0 note (Shady #112 P3).

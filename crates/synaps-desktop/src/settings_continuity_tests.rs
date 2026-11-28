@@ -246,7 +246,7 @@ impl Dash {
     }
 
     /// What its config holds for `key` now (`Null`: unset).
-    fn holds(&self, key: &str) -> Value {
+    pub(super) fn holds(&self, key: &str) -> Value {
         self.state.lock().unwrap().values.get(key).cloned().unwrap_or(Value::Null)
     }
 
@@ -332,6 +332,8 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<DashState>) -> Option<()> {
             }
         } else if line.starts_with("GET /api/info") {
             ("200 OK", json!({"pid": 7, "profile": null}))
+        } else if line.starts_with("GET /api/telemetry") {
+            ("200 OK", telemetry(&line))
         } else {
             s.reads += 1;
             ("200 OK", config_json(&s))
@@ -341,6 +343,25 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<DashState>) -> Option<()> {
     let mut conn = conn;
     write!(conn, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).ok()?;
     Some(())
+}
+
+/// `GET /api/telemetry/…` answered from the demo's store
+/// (`fixtures/usage/all.json`): the section the path asks for.
+fn telemetry(line: &str) -> Value {
+    let all: Value = serde_json::from_str(include_str!("../fixtures/usage/all.json")).expect("the demo's store");
+    let path = line.split_whitespace().nth(1).unwrap_or_default();
+    let sections = [
+        ("group=host", "spend_host"),
+        ("group=model", "spend_model"),
+        ("group=role", "spend_role"),
+        ("/agents", "agents"),
+        ("/cache", "cache"),
+        ("/latency", "latency"),
+        ("/sessions", "sessions_by_cost"),
+        ("/heatmap", "heatmap"),
+        ("/health", "health"),
+    ];
+    all[sections.into_iter().find(|(m, _)| path.contains(m)).map_or("summary", |(_, k)| k)].clone()
 }
 
 /// The daemon connected, local, and `dash` its own: every link of the
