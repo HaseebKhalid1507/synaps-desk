@@ -952,6 +952,10 @@ impl AppView {
     fn send_write(&mut self, (seq, key, value): Send, cx: &mut Context<Self>) {
         let Some(t) = self.dash.target() else { return self.dash.order.abandon() };
         let body = dash::config_body(key, value.as_deref());
+        // The daemon this is sent to, as its receipt's owner (with the
+        // reply's own writePath): not whichever the window shows when the
+        // reply lands (Shady #116 A6).
+        let to = (self.dash.socket.clone(), self.model.daemon.as_ref().and_then(|d| d.profile.clone()));
         #[cfg(test)]
         let gate = crate::settings_saved::gate::post_taken();
         cx.spawn(async move |this, cx| {
@@ -970,20 +974,23 @@ impl AppView {
             }
             let _ = this.update(cx, |v, cx| {
                 let (newer, next) = v.dash.order.written();
+                // A save only if the reply holds what was sent: the dash
+                // reads the file again for it, after its lock, and another
+                // writer's value can be there. Its receipt is due: written
+                // by the next app write, or by its own, whatever the
+                // display's order says of the reply (PLAN §2.2).
+                if let Ok(c) = &got
+                    && c.exposes(key)
+                    && c.value(key) == sent.as_deref()
+                {
+                    let d = crate::settings_saved::daemon_id(to.0.as_deref(), to.1.as_deref(), Some(c.write_path.as_str()));
+                    v.settings.wrote.put(crate::settings_saved::Receipt::daemon(d, key, sent.as_deref(), at_ms));
+                    v.arm_receipts_save(cx);
+                }
                 if v.dash.order.fresh(seq) {
                     match got {
                         Ok(c) => {
                             v.dash_said(Ok(()), cx);
-                            // A save only if the reply holds what was sent: the
-                            // dash reads the file again for it, after its lock,
-                            // and another writer's value can be there.
-                            // Its receipt is due: written by the next app
-                            // write, or by its own (PLAN §2.2).
-                            if c.exposes(key) && c.value(key) == sent.as_deref() {
-                                let r = crate::settings_saved::Receipt::daemon(v.config_owner(&c), key, sent.as_deref(), at_ms);
-                                v.settings.wrote.put(r);
-                                v.arm_receipts_save(cx);
-                            }
                             v.dash.config = Some(c);
                             if !newer {
                                 v.settings.writes.remove(key);

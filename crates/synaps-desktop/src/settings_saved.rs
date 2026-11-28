@@ -337,15 +337,20 @@ impl Default for Receipts {
 impl Receipts {
     pub(crate) const CAP: usize = 256;
 
-    /// `r`, in place of the same save's.
+    /// `r`, in place of the same save's. At the cap the smallest `(at_ms,
+    /// id)` of the 257 goes, as in the file ([`write_into`]): `r` itself
+    /// when it is the oldest (Shady #116 A3).
     pub(crate) fn put(&mut self, r: Receipt) {
         if let Some(had) = self.0.iter_mut().find(|e| e.same(&r)) {
             *had = r;
             return;
         }
         if self.0.len() == Self::CAP
-            && let Some(i) = self.0.iter().enumerate().min_by_key(|(_, e)| e.order()).map(|(i, _)| i)
+            && let Some((i, min)) = self.0.iter().enumerate().min_by_key(|(_, e)| e.order())
         {
+            if r.order() < min.order() {
+                return;
+            }
             self.0.swap_remove(i);
         }
         self.0.push(r);
@@ -374,18 +379,26 @@ impl Receipts {
         self.0.iter().any(Receipt::due)
     }
 
-    /// `rs` are in the file now (each unless a newer save replaced it).
+    /// `rs` are in the file now, as the file kept them ([`write_batch`]):
+    /// this window's receipt that was written is no longer due; one older
+    /// than the file's newer save of its place (another window's, Shady
+    /// #116 A5) is that save now. One newer than both, still due, stays.
     fn written(&mut self, rs: &[Receipt]) {
         for e in self.0.iter_mut() {
-            if rs.iter().any(|r| r.same(e) && r.at_ms == e.at_ms && r.digest == e.digest) {
+            let Some(r) = rs.iter().find(|r| r.same(e)) else { continue };
+            if (r.at_ms, r.digest) == (e.at_ms, e.digest) {
                 e.flags = 0;
+            } else if r.at_ms > e.at_ms {
+                *e = Receipt { flags: 0, ..*r };
             }
         }
     }
 
-    /// The write carrying `rs` failed: each still due, and failed.
+    /// The write carrying `rs` failed: each that is still the receipt it
+    /// carried (its time and value), still due, is failed. A newer save of
+    /// its place since was never in that write (Shady #116 A7).
     fn not_written(&mut self, rs: &[Receipt]) {
-        for e in self.0.iter_mut().filter(|e| e.due() && rs.iter().any(|r| r.same(e))) {
+        for e in self.0.iter_mut().filter(|e| e.due() && rs.iter().any(|r| r.same(e) && (r.at_ms, r.digest) == (e.at_ms, e.digest))) {
             e.flags |= FAILED;
         }
     }
@@ -425,6 +438,12 @@ pub(crate) fn write_into(v: &mut Value, rs: &[Receipt]) {
     }
     let Some(e) = v[STORE]["e"].as_object_mut() else { return };
     for r in rs {
+        // A daemon value's receipt is written after its save (with the next
+        // write): one older than the file's of its place (another window's
+        // newer save) is not. An app value's is its write's own.
+        if r.scope == Scope::Daemon && e.get(&r.id()).and_then(|x| x.get(0)?.as_i64()).is_some_and(|at| at > r.at_ms) {
+            continue;
+        }
         e.insert(r.id(), serde_json::json!([r.at_ms, format!("{:016x}", r.digest)]));
     }
     if e.len() > Receipts::CAP {
@@ -501,6 +520,13 @@ pub(crate) fn write_batch(path: &Path, batch: &AppBatch, due: &[Receipt], stale:
         }
         written.extend(due.iter().map(|r| Receipt { flags: 0, ..*r }));
         write_into(v, &written);
+        // What the file kept for each daemon receipt: ours, or the newer
+        // one it had (Shady #116 A5).
+        for r in written.iter_mut().filter(|r| r.scope == Scope::Daemon) {
+            if let Some(kept) = read_entry(v, r) {
+                *r = kept;
+            }
+        }
         Ok(true)
     })?;
     Ok(written)

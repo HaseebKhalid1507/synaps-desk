@@ -38,6 +38,9 @@ const INDEX_FROM: f32 = 1000.;
 /// A row's control.
 const CONTROL: f32 = 240.;
 
+/// The Usage row's keys: its range's and its host's.
+const USAGE_KEYS: [&str; 2] = ["usage_range", "usage_host"];
+
 /// A config write on its way, or refused (the dash's message).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Write {
@@ -826,11 +829,16 @@ impl AppView {
         out
     }
 
-    /// Under a THIS APP row: its key's failed save (the app values' write,
-    /// or the panels'), `not saved: … · Retry`.
-    fn not_saved(&self, key: &'static str, p: &Palette, cx: &ViewCx) -> Option<AnyElement> {
+    /// A THIS APP key's failed save: the app values' write's note, or the
+    /// panels', if it names the key.
+    fn note_of(&self, key: &'static str) -> Option<&crate::settings_saved::Note> {
         let bit = crate::settings_saved::AppKeySet::default().with(AppKey::of(key)?).0;
-        let n = [&self.settings.app_note, &self.settings.panels_note].into_iter().flatten().find(|n| n.keys & bit != 0)?;
+        [&self.settings.app_note, &self.settings.panels_note].into_iter().flatten().find(|n| n.keys & bit != 0)
+    }
+
+    /// Under a THIS APP row: its key's failed save `n` ([`Self::note_of`]),
+    /// `not saved: … · Retry`.
+    fn not_saved(&self, key: &'static str, n: &crate::settings_saved::Note, p: &Palette, cx: &ViewCx) -> AnyElement {
         let why = n.why.clone();
         let retry = div()
             .id(SharedString::from(format!("retry-{key}")))
@@ -838,14 +846,17 @@ impl AppView {
             .cursor_pointer()
             .child(mono("Retry", 12., p.you))
             .on_click(cx.listener(|this, _, _, cx| this.retry_saves(cx)));
+        // The words wrap beside Retry: a long one (a path) never pushes it
+        // past the row.
         let line = h_flex()
+            .w_full()
             .gap(px(6.))
             .items_start()
             .debug_selector(move || format!("not-saved {key} = {why}"))
-            .child(mono(n.why.to_string(), 12., p.err).whitespace_normal())
-            .child(mono("·", 12., p.dim))
-            .child(retry);
-        Some(line.into_any_element())
+            .child(mono(n.why.to_string(), 12., p.err).whitespace_normal().flex_1().min_w_0())
+            .child(mono("·", 12., p.dim).flex_none())
+            .child(retry.flex_none());
+        line.into_any_element()
     }
 
     /// `control` with `saved 13:58` before it (at `saved-at <key> = …`),
@@ -1468,16 +1479,26 @@ impl AppView {
             let control = v_flex()
                 .gap(px(8.))
                 .items_end()
-                .child(self.choice(
-                    "usage-range",
-                    Pick::Range,
-                    Range::ALL.iter().map(|r| SharedString::from(r.label())).collect(),
-                    Some(self.app_settings.usage_range.label()),
-                    None,
+                .child(Self::saved_beside(
+                    self.choice(
+                        "usage-range",
+                        Pick::Range,
+                        Range::ALL.iter().map(|r| SharedString::from(r.label())).collect(),
+                        Some(self.app_settings.usage_range.label()),
+                        None,
+                        p,
+                        cx,
+                    ),
+                    "usage_range",
+                    self.app_saved_at(AppKey::UsageRange, cx),
                     p,
-                    cx,
                 ))
-                .child(self.choice("usage-host", Pick::Host, hosts, Some(&host), None, p, cx))
+                .child(Self::saved_beside(
+                    self.choice("usage-host", Pick::Host, hosts, Some(&host), None, p, cx),
+                    "usage_host",
+                    self.app_saved_at(AppKey::UsageHost, cx),
+                    p,
+                ))
                 .into_any_element();
             (control, Vec::new())
         });
@@ -1486,12 +1507,20 @@ impl AppView {
             .into_iter()
             .enumerate()
             .map(|(i, mut r)| {
-                if let Some(n) = self.not_saved(r.key, p, cx) {
-                    r.under.push(n);
+                // The Usage row's two controls each save their own key: each
+                // shows its own failure and time (Shady #116 A4).
+                let key = r.key;
+                let keys: &[&'static str] = if key == "usage_range" { &USAGE_KEYS } else { std::slice::from_ref(&key) };
+                let mut said: Vec<*const crate::settings_saved::Note> = Vec::new();
+                for &k in keys {
+                    if let Some(n) = self.note_of(k).filter(|n| !said.contains(&std::ptr::from_ref(*n))) {
+                        said.push(std::ptr::from_ref(n));
+                        r.under.push(self.not_saved(k, n, p, cx));
+                    }
                 }
-                if let Some(k) = AppKey::of(r.key) {
+                if let Some(k) = AppKey::of(key).filter(|_| keys.len() == 1) {
                     let at = self.app_saved_at(k, cx);
-                    r.control = Self::saved_beside(r.control, r.key, at, p);
+                    r.control = Self::saved_beside(r.control, key, at, p);
                 }
                 self.render_row(r, i == 0, p, cx)
             })

@@ -1931,6 +1931,17 @@ pub fn load_panels(path: &Path) -> Panels {
 /// (text size, the two folds) get their receipts in the same write
 /// ([`crate::settings_saved`]): the receipts written.
 pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<Vec<crate::settings_saved::Receipt>> {
+    save_panels_if(path, p, keys, &|| false).map(Option::unwrap_or_default)
+}
+
+/// [`save_panels`] unless `stale()`, asked under the settings file's lock
+/// (a close took its place: Shady #116 A2). `None`: stale, nothing written.
+pub fn save_panels_if(
+    path: &Path,
+    p: Panels,
+    keys: PanelKeys,
+    stale: &dyn Fn() -> bool,
+) -> std::io::Result<Option<Vec<crate::settings_saved::Receipt>>> {
     use crate::settings_saved::{AppKey, AppValue, Receipt};
     let mut kv = Vec::with_capacity(2);
     if keys.rail {
@@ -1956,21 +1967,26 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<V
         kv.push((Panels::TEXT_SIZE, p.text_size.into()));
     }
     if kv.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let rows = [
         (keys.text_size, AppKey::TextSize, AppValue::Num(p.text_size.into())),
         (keys.rail, AppKey::Rail, AppValue::Bool(p.rail_collapsed)),
         (keys.right, AppKey::Right, AppValue::Bool(p.right_collapsed)),
     ];
-    let mut written = Vec::new();
-    update_settings(path, |v| {
+    let mut written = None;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
         for (k, val) in kv {
             v[k] = val;
         }
         let at = crate::settings_saved::now_ms();
-        written = rows.iter().filter(|r| r.0).map(|(_, k, val)| Receipt::app(*k, val, at)).collect();
-        crate::settings_saved::write_into(v, &written);
+        let w: Vec<Receipt> = rows.iter().filter(|r| r.0).map(|(_, k, val)| Receipt::app(*k, val, at)).collect();
+        crate::settings_saved::write_into(v, &w);
+        written = Some(w);
+        Ok(true)
     })?;
     Ok(written)
 }
@@ -2002,12 +2018,25 @@ pub fn load_tabs(path: &Path, key: &str) -> Option<crate::tabs::Saved> {
 /// Save the open tabs under `key`, keeping every other daemon's (see
 /// [`save_settings`]).
 pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io::Result<()> {
-    update_settings(path, |v| {
+    save_tabs_if(path, key, saved, &|| false).map(drop)
+}
+
+/// [`save_tabs`] unless `stale()`, asked under the settings file's lock (a
+/// window's close took its place: Shady #116 A1): whether it wrote.
+pub(crate) fn save_tabs_if(path: &Path, key: &str, saved: &crate::tabs::Saved, stale: &dyn Fn() -> bool) -> std::io::Result<bool> {
+    let mut wrote = false;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
         if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
             v["tabs"] = serde_json::json!({});
         }
         v["tabs"][key] = saved_json(saved);
-    })
+        wrote = true;
+        Ok(true)
+    })?;
+    Ok(wrote)
 }
 
 /// A split layout as the settings file keeps it (split/architecture.md
@@ -2205,7 +2234,16 @@ fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
 /// ([`Layout::union`]: what an older build reads), in one write under the
 /// settings lock, every other key and daemon kept ([`save_settings`]).
 pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<()> {
-    update_settings(path, |v| {
+    save_layout_if(path, key, layout, &|| false).map(drop)
+}
+
+/// [`save_layout`] unless `stale()`, as [`save_tabs_if`].
+pub(crate) fn save_layout_if(path: &Path, key: &str, layout: &Layout, stale: &dyn Fn() -> bool) -> std::io::Result<bool> {
+    let mut wrote = false;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
         for k in ["layout", "tabs"] {
             if !v.get(k).is_some_and(serde_json::Value::is_object) {
                 v[k] = serde_json::json!({});
@@ -2213,7 +2251,10 @@ pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<(
         }
         v["layout"][key] = layout.to_json();
         v["tabs"][key] = saved_json(&layout.union());
-    })
+        wrote = true;
+        Ok(true)
+    })?;
+    Ok(wrote)
 }
 
 /// What a launch restores under `key`, from one read of the file (Shady
@@ -2254,8 +2295,23 @@ pub fn save_favourites(
     base: &[crate::favourites::Favourite],
     ours: &[crate::favourites::Favourite],
 ) -> std::io::Result<Vec<crate::favourites::Favourite>> {
-    let mut written = Vec::new();
-    try_update_settings(path, |v| {
+    save_favourites_if(path, key, base, ours, &|| false).map(Option::unwrap_or_default)
+}
+
+/// [`save_favourites`] unless `stale()`, as [`save_tabs_if`]: `None`,
+/// stale, nothing written.
+pub(crate) fn save_favourites_if(
+    path: &Path,
+    key: &str,
+    base: &[crate::favourites::Favourite],
+    ours: &[crate::favourites::Favourite],
+    stale: &dyn Fn() -> bool,
+) -> std::io::Result<Option<Vec<crate::favourites::Favourite>>> {
+    let mut written = None;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
         let refuse = |what: String| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what}: not overwritten")));
         match v.get("favourites") {
             None => v["favourites"] = serde_json::json!({}),
@@ -2266,12 +2322,13 @@ pub fn save_favourites(
                 }
             }
         }
-        written = match v["favourites"].get(key) {
+        let list = match v["favourites"].get(key) {
             Some(theirs) => crate::favourites::merge(&crate::favourites::from_json(theirs), base, ours),
             None => ours.to_vec(),
         };
-        v["favourites"][key] = crate::favourites::to_json(&written);
-        Ok(())
+        v["favourites"][key] = crate::favourites::to_json(&list);
+        written = Some(list);
+        Ok(true)
     })?;
     Ok(written)
 }
@@ -2326,23 +2383,32 @@ pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<st
 /// The settings file's lock for a write: [`LOCK_TRIES`] tries off the UI
 /// thread, or until the close's deadline while one runs. There is no
 /// unlocked write: `Err` names the lock, and nothing is written.
-fn take_settings_lock(path: &Path) -> std::io::Result<std::fs::File> {
+fn take_settings_lock(path: &Path, writer: &Writer) -> std::io::Result<std::fs::File> {
     let lock = path.with_extension("json.lock");
     let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
     let busy = || std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{name} is locked by another process"));
     let cannot = |why: String| std::io::Error::other(format!("{name} can't be locked: {why}"));
     if let Some(by) = CLOSING.get() {
-        return lock_settings(&lock, by.saturating_duration_since(std::time::Instant::now())).map_err(|e| match e {
-            LockFail::Busy => busy(),
-            LockFail::Cannot(why) => cannot(why),
-        });
+        // No write is begun once the close's time is spent (Shady #116 A1).
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(spent());
+        }
+        return match lock_settings(&lock, left) {
+            Ok(f) => Ok(writer.took(f)),
+            Err(LockFail::Busy) => Err(blocked(busy())),
+            Err(LockFail::Cannot(why)) => Err(writer.cannot(cannot(why))),
+        };
     }
+    // Waiting for another process from here until a write takes the lock:
+    // this process's close that waits for this write says so ([`own_write`]).
+    writer.waits.store(true, std::sync::atomic::Ordering::Relaxed);
     for i in 1..=LOCK_TRIES {
         match lock_settings(&lock, LOCK_WAIT) {
-            Ok(f) => return Ok(f),
+            Ok(f) => return Ok(writer.took(f)),
             Err(LockFail::Busy) if i < LOCK_TRIES => std::thread::sleep(LOCK_GAP),
             Err(LockFail::Busy) => return Err(busy()),
-            Err(LockFail::Cannot(why)) => return Err(cannot(why)),
+            Err(LockFail::Cannot(why)) => return Err(writer.cannot(cannot(why))),
         }
     }
     Err(busy())
@@ -2351,12 +2417,64 @@ fn take_settings_lock(path: &Path) -> std::io::Result<std::fs::File> {
 thread_local! {
     /// The close's deadline, while its flushes run ([`closing`]).
     static CLOSING: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// What the close last waited on in vain: why its time is spent.
+    static BLOCKED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     /// What the close couldn't write, and why: said once, at its end.
     static LOST: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `e`, what a close's wait found in its way: its time is spent on it.
+fn blocked(e: std::io::Error) -> std::io::Error {
+    BLOCKED.with(|b| *b.borrow_mut() = Some(e.to_string()));
+    e
+}
+
+/// A write the close's spent time refuses: why it ran out.
+fn spent() -> std::io::Error {
+    let why = BLOCKED.with(|b| b.borrow().clone()).unwrap_or_else(|| "the close's time ran out".into());
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, why)
+}
+
+/// What a close is told when this process's own write of `path` holds it
+/// up: the other process that one waits for, if it does.
+fn own_write(path: &Path, writer: &Writer) -> std::io::Error {
+    let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
+    let why = match writer.waits.load(std::sync::atomic::Ordering::Relaxed) {
+        true => format!("{name} is locked by another process"),
+        false => format!("{name} is locked by this app's own write"),
+    };
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, why)
+}
+
+/// Waits until `ready()` (asked every 2 ms): a job of this window's own,
+/// in its write of `path`. Within the close's deadline while one runs
+/// ([`closing`]), else as long as it takes. Whether it came; if not, the
+/// close's time is spent (Shady #116 A1) and [`closing_lost`] says why.
+pub(crate) fn wait_for_own(path: &Path, ready: impl Fn() -> bool) -> bool {
+    let writer = writer_of(path);
+    loop {
+        if ready() {
+            return true;
+        }
+        if let Some(by) = CLOSING.get() {
+            blocked(own_write(path, &writer));
+            if std::time::Instant::now() >= by {
+                return false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Why a close's write of `keys` didn't happen, its time spent: said with
+/// what it couldn't write ([`not_saved_at_close`]).
+pub(crate) fn closing_lost(keys: &[&str]) {
+    not_saved_at_close(keys, &spent());
+}
+
 /// The window's close: `flush` (its writes) within one [`CLOSE_DEADLINE`],
 /// waiting for this process's own writer and for the file's lock alike.
+/// Once it has passed, no write is begun (Shady #116 A1).
 /// What it couldn't write is named on stderr, the one failure no window
 /// can show: `synaps-desktop: not saved at close, settings.json is locked:
 /// theme, text_size`.
@@ -2364,10 +2482,12 @@ pub(crate) fn closing<R>(flush: impl FnOnce() -> R) -> R {
     let outer = CLOSING.get().is_none();
     if outer {
         CLOSING.set(Some(std::time::Instant::now() + CLOSE_DEADLINE));
+        BLOCKED.with(|b| b.borrow_mut().take());
     }
     let out = flush();
     if outer {
         CLOSING.set(None);
+        BLOCKED.with(|b| b.borrow_mut().take());
         let lost = LOST.take();
         let mut why: Vec<&str> = lost.iter().map(|(_, w)| w.as_str()).collect();
         why.dedup();
@@ -2425,6 +2545,7 @@ pub fn carry_favourites(path: &Path, key: &str, list: &[crate::favourites::Favou
 
 /// Change the settings file with `edit` (on its JSON object), as
 /// [`save_settings`] says.
+#[cfg(test)]
 fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
     try_update_settings(path, |v| {
         edit(v);
@@ -2434,17 +2555,40 @@ fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> st
 
 /// This process's writer of the settings file at `path` (the app has one;
 /// each test its own).
-fn writer_of(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-    type Writers = Vec<(std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>)>;
+fn writer_of(path: &Path) -> std::sync::Arc<Writer> {
+    type Writers = Vec<(std::path::PathBuf, std::sync::Arc<Writer>)>;
     static WRITERS: std::sync::Mutex<Writers> = std::sync::Mutex::new(Vec::new());
     let mut all = WRITERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match all.iter().find(|(p, _)| p == path) {
         Some((_, w)) => w.clone(),
         None => {
-            let w = std::sync::Arc::new(std::sync::Mutex::new(()));
+            let w = std::sync::Arc::new(Writer::default());
             all.push((path.to_path_buf(), w.clone()));
             w
         }
+    }
+}
+
+/// A settings file's writer in this process: one write at a time, and
+/// whether its writes wait for another process's lock (from a wait's start
+/// until a write takes it).
+#[derive(Default)]
+struct Writer {
+    one: std::sync::Mutex<()>,
+    waits: std::sync::atomic::AtomicBool,
+}
+
+impl Writer {
+    /// The lock `f`, taken: no one holds it now.
+    fn took(&self, f: std::fs::File) -> std::fs::File {
+        self.waits.store(false, std::sync::atomic::Ordering::Relaxed);
+        f
+    }
+
+    /// A lock that can't be taken at all: no one holds it.
+    fn cannot(&self, e: std::io::Error) -> std::io::Error {
+        self.waits.store(false, std::sync::atomic::Ordering::Relaxed);
+        e
     }
 }
 
@@ -2452,7 +2596,7 @@ fn writer_of(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
 /// writer held).
 #[cfg(test)]
 pub(crate) fn writing(path: &Path) -> bool {
-    writer_of(path).try_lock().is_err()
+    writer_of(path).one.try_lock().is_err()
 }
 
 /// [`update_settings`] with an `edit` that may refuse: the file is then
@@ -2460,6 +2604,7 @@ pub(crate) fn writing(path: &Path) -> bool {
 /// was too (an error says so): only a missing one starts empty. Under the
 /// settings lock, always ([`take_settings_lock`]): a write that can't take
 /// it doesn't run, and the file isn't touched.
+#[cfg(test)]
 pub(crate) fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>) -> std::io::Result<()> {
     update_settings_if(path, |v| edit(v).map(|()| true))
 }
@@ -2474,17 +2619,18 @@ pub(crate) fn update_settings_if(path: &Path, edit: impl FnOnce(&mut serde_json:
     // deadline.
     let writer = writer_of(path);
     let _one = match CLOSING.get() {
-        None => writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        None => writer.one.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        // No write is begun once the close's time is spent (Shady #116 A1).
         Some(by) => loop {
-            match writer.try_lock() {
+            if std::time::Instant::now() >= by {
+                return Err(spent());
+            }
+            match writer.one.try_lock() {
                 Ok(g) => break g,
                 Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < by => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
-                    return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{name} is locked by this app's own write")));
+                    blocked(own_write(path, &writer));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
         },
@@ -2495,7 +2641,7 @@ pub(crate) fn update_settings_if(path: &Path, edit: impl FnOnce(&mut serde_json:
     // And one at a time across processes (two windows, two builds): the
     // read, the merge and the rename under an advisory lock of a file of
     // its own, so no window writes over what another wrote after its read.
-    let _lock = take_settings_lock(path)?;
+    let _lock = take_settings_lock(path, &writer)?;
     // Lossy: a stray invalid byte is a file that does not parse (set aside
     // below), never one read as missing (which would wipe every key).
     let text = match std::fs::read(path) {
