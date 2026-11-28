@@ -1004,6 +1004,10 @@ impl AppView {
                             )))
                             .child(
                                 div()
+                                    .debug_selector({
+                                        let s = st.id.to_string();
+                                        move || format!("block-label {id} {s}")
+                                    })
                                     .min_w_0()
                                     .flex_shrink(1.)
                                     .overflow_hidden()

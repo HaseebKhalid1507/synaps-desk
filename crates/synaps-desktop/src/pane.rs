@@ -163,6 +163,8 @@ pub struct Pane {
     /// The block walk here, the focus that holds its keys, and the local
     /// undo ([`crate::walk`], D7).
     pub(crate) walk: crate::walk::WalkMode,
+    /// Its draft keys (D8): the draft being edited, its focus, its note.
+    pub(crate) edit: crate::draft_view::EditMode,
     /// A body the user opened or closed (S1) ([`BodyHold`]).
     pub(crate) body_hold: Cell<Option<BodyHold>>,
     /// The user's scroll while an answered card folds: the room it leaves
@@ -529,6 +531,7 @@ impl Pane {
             ask_shown: Default::default(),
             ask: Default::default(),
             walk: Default::default(),
+            edit: Default::default(),
             body_hold: Cell::new(None),
             touch_kept: Cell::new(false),
             metrics_gen: 0,

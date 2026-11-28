@@ -258,6 +258,15 @@ impl HistoryBlocks {
         &self.worker
     }
 
+    /// Whether its boards keep the bound board itself (D8; the
+    /// tests-first commit's stand-in: never yet).
+    pub fn keep_bound(&self, _on: bool) {}
+
+    /// See [`HistoryBlocks::keep_bound`].
+    pub fn keeps_bound(&self) -> bool {
+        false
+    }
+
     /// What it keeps (bytes, heap included): the staged events and their
     /// rows, the last message's call ids, and its worker's fold as of its
     /// last job ([`Worker::bytes`]).
@@ -2193,6 +2202,9 @@ pub struct Drawn {
     pub log: Arc<[(Logged, Mark)]>,
     pub records: Arc<[(Record, Mark)]>,
     pub tombstones: Arc<[Tombstone]>,
+    /// The bound board itself, while a desk holds a draft over it (D8;
+    /// the tests-first commit's stand-in: never yet).
+    pub board: Option<Arc<State>>,
     /// What it keeps, heap included (bytes): its rows and their blocks
     /// (copies of the boards' blocks, counted at B2's count of those: an
     /// upper bound), its committed fates, its op log, records and
@@ -2757,6 +2769,7 @@ impl Worker {
             log,
             records,
             tombstones,
+            board: None,
             bytes,
         }
     }

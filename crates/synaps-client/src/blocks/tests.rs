@@ -626,3 +626,27 @@ fn a_boards_marks_share_their_calls_ids_within_a_budget() {
     assert!(d.records[without].1.row.is_some(), "its row kept");
     assert!(d.records.iter().rev().take(256).all(|(_, m)| m.call.is_some()), "the newest records keep theirs");
 }
+
+/// D8's pre-check (§3.2): while a desk holds a draft over the history's
+/// board ([`HistoryBlocks::keep_bound`]), its jobs publish the bound board
+/// itself, charged in the board's bytes at B2's count of it; off, none, and
+/// nothing charged. The bound board holds no pending op.
+#[test]
+fn the_bound_board_is_kept_only_while_a_draft_holds_it_and_charged() {
+    let h = blocks_history();
+    let hb = read(&h);
+    let run = |hb: &HistoryBlocks| Worker::default().run(&Input::of(hb, &LiveLog::default()).unwrap(), &mut || true).expect("done");
+    let off = run(&hb);
+    assert!(off.board.is_none(), "no draft: no bound board kept");
+    hb.keep_bound(true);
+    assert!(hb.keeps_bound());
+    let on = run(&hb);
+    let b = on.board.as_deref().expect("kept");
+    let owned: usize = b.owned_by_owner().iter().sum();
+    assert!(owned > 0);
+    assert!(on.bytes >= off.bytes + owned, "charged: {} vs {} + {owned}", on.bytes, off.bytes);
+    assert!(b.live() > 0, "the board's blocks");
+    assert!(b.blocks().all(|blk| !blk.pending), "bound: no pending op");
+    hb.keep_bound(false);
+    assert!(run(&hb).board.is_none(), "let go: the next job keeps none");
+}

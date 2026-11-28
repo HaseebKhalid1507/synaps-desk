@@ -2444,6 +2444,9 @@ pub struct AppView {
     /// Every key's presses: an entered card's keys act on new ones only
     /// ([`crate::ask_keys::Presses`]).
     pub(crate) ask_presses: crate::ask_keys::Presses,
+    /// The blocks taken and held on this desk, by session (D8,
+    /// [`crate::drafts`]): shared by the panes showing a session.
+    pub(crate) block_drafts: crate::drafts::Drafts,
     /// Tests: a stand-in for D6b's side of the walk's shared and stored
     /// keys ([`crate::walk::BlockDesires`]; else D6b's stores, `wishes`).
     #[cfg(test)]
@@ -3075,6 +3078,7 @@ impl AppView {
             card_tick: None,
             memo_seen: 0,
             ask_presses: Default::default(),
+            block_drafts: Default::default(),
             #[cfg(test)]
             desires: None,
             oplog: None,
