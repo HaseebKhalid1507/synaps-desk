@@ -2018,24 +2018,36 @@ pub fn load_tabs(path: &Path, key: &str) -> Option<crate::tabs::Saved> {
 /// Save the open tabs under `key`, keeping every other daemon's (see
 /// [`save_settings`]).
 pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io::Result<()> {
-    save_tabs_if(path, key, saved, &|| false).map(drop)
+    save_tabs_if(path, key, saved, &|| false, &|| {}).map(drop)
 }
 
 /// [`save_tabs`] unless `stale()`, asked under the settings file's lock (a
-/// window's close took its place: Shady #116 A1): whether it wrote.
-pub(crate) fn save_tabs_if(path: &Path, key: &str, saved: &crate::tabs::Saved, stale: &dyn Fn() -> bool) -> std::io::Result<bool> {
+/// window's close took its place: Shady #116 A1): whether it wrote. `done`
+/// runs once the file is in place, still under its lock, so what it records
+/// is in the order the writes were made ([`update_settings_then`]).
+pub(crate) fn save_tabs_if(
+    path: &Path,
+    key: &str,
+    saved: &crate::tabs::Saved,
+    stale: &dyn Fn() -> bool,
+    done: &dyn Fn(),
+) -> std::io::Result<bool> {
     let mut wrote = false;
-    update_settings_if(path, |v| {
-        if stale() {
-            return Ok(false);
-        }
-        if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
-            v["tabs"] = serde_json::json!({});
-        }
-        v["tabs"][key] = saved_json(saved);
-        wrote = true;
-        Ok(true)
-    })?;
+    update_settings_then(
+        path,
+        |v| {
+            if stale() {
+                return Ok(false);
+            }
+            if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
+                v["tabs"] = serde_json::json!({});
+            }
+            v["tabs"][key] = saved_json(saved);
+            wrote = true;
+            Ok(true)
+        },
+        done,
+    )?;
     Ok(wrote)
 }
 
@@ -2234,26 +2246,31 @@ fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
 /// ([`Layout::union`]: what an older build reads), in one write under the
 /// settings lock, every other key and daemon kept ([`save_settings`]).
 pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<()> {
-    save_layout_if(path, key, layout, &|| false).map(drop)
+    save_layout_if(path, key, layout, &|| false, &|| {}).map(drop)
 }
 
-/// [`save_layout`] unless `stale()`, as [`save_tabs_if`].
-pub(crate) fn save_layout_if(path: &Path, key: &str, layout: &Layout, stale: &dyn Fn() -> bool) -> std::io::Result<bool> {
+/// [`save_layout`] unless `stale()`, `done` once it is in place, as
+/// [`save_tabs_if`].
+pub(crate) fn save_layout_if(path: &Path, key: &str, layout: &Layout, stale: &dyn Fn() -> bool, done: &dyn Fn()) -> std::io::Result<bool> {
     let mut wrote = false;
-    update_settings_if(path, |v| {
-        if stale() {
-            return Ok(false);
-        }
-        for k in ["layout", "tabs"] {
-            if !v.get(k).is_some_and(serde_json::Value::is_object) {
-                v[k] = serde_json::json!({});
+    update_settings_then(
+        path,
+        |v| {
+            if stale() {
+                return Ok(false);
             }
-        }
-        v["layout"][key] = layout.to_json();
-        v["tabs"][key] = saved_json(&layout.union());
-        wrote = true;
-        Ok(true)
-    })?;
+            for k in ["layout", "tabs"] {
+                if !v.get(k).is_some_and(serde_json::Value::is_object) {
+                    v[k] = serde_json::json!({});
+                }
+            }
+            v["layout"][key] = layout.to_json();
+            v["tabs"][key] = saved_json(&layout.union());
+            wrote = true;
+            Ok(true)
+        },
+        done,
+    )?;
     Ok(wrote)
 }
 
@@ -2576,6 +2593,9 @@ fn writer_of(path: &Path) -> std::sync::Arc<Writer> {
 struct Writer {
     one: std::sync::Mutex<()>,
     waits: std::sync::atomic::AtomicBool,
+    /// Tests: this process's writes waiting for `one` now.
+    #[cfg(test)]
+    behind: std::sync::atomic::AtomicU32,
 }
 
 impl Writer {
@@ -2599,6 +2619,13 @@ pub(crate) fn writing(path: &Path) -> bool {
     writer_of(path).one.try_lock().is_err()
 }
 
+/// Tests: whether a write of `path` in this process waits for another one
+/// of this process to finish.
+#[cfg(test)]
+pub(crate) fn behind_another(path: &Path) -> bool {
+    writer_of(path).behind.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// [`update_settings`] with an `edit` that may refuse: the file is then
 /// left as it was. A file that is there but cannot be read is left as it
 /// was too (an error says so): only a missing one starts empty. Under the
@@ -2613,13 +2640,37 @@ pub(crate) fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json
 /// (`Ok(false)`: a batch a later write holds): the file is then not
 /// written at all.
 pub(crate) fn update_settings_if(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<bool>) -> std::io::Result<()> {
+    update_settings_then(path, edit, || {})
+}
+
+/// [`update_settings_if`], and `then` once the file is in place (renamed
+/// over the old one), before its locks go: what `then` records of the write
+/// is in the order the writes were made, in this process and across them
+/// (Shady #116 R2-A8: two jobs' records made after their locks went could
+/// come in the opposite order to their writes).
+pub(crate) fn update_settings_then(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<bool>,
+    then: impl FnOnce(),
+) -> std::io::Result<()> {
     use std::io::Write;
     // One writer at a time in this process, per file: each re-reads and
     // merges, so no write is lost. A close waits for it no longer than its
     // deadline.
     let writer = writer_of(path);
     let _one = match CLOSING.get() {
-        None => writer.one.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        None => match writer.one.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                writer.behind.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let g = writer.one.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(test)]
+                writer.behind.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            }
+        },
         // No write is begun once the close's time is spent (Shady #116 A1).
         Some(by) => loop {
             if std::time::Instant::now() >= by {
@@ -2688,6 +2739,9 @@ pub(crate) fn update_settings_if(path: &Path, edit: impl FnOnce(&mut serde_json:
     {
         // Best effort: the file itself is already complete.
         let _ = std::fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }).and_then(|d| d.sync_all());
+    }
+    if written.is_ok() {
+        then();
     }
     written
 }

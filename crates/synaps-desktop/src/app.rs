@@ -2038,6 +2038,12 @@ pub(crate) struct SaveJob {
     /// `tabs_written` / `layout_written` (Shady #59 r2 L1: a write that
     /// finished while the flush waited for the lock, its continuation not
     /// yet run, left those stale, and a change undone since read as saved).
+    /// Recorded while the job still holds the file's lock, so the last
+    /// recorded is the last written (Shady #116 R2-A8: two jobs recording
+    /// after their writes could record in the opposite order, the older
+    /// write's generation over the newer one's, and a layout changed back
+    /// to it read as saved; a layout's generation is its content's hash, so
+    /// no order can be read from it).
     done: [Option<u64>; 2],
     /// Tests: the generation the last job read (its write is next).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2046,6 +2052,34 @@ pub(crate) struct SaveJob {
     /// not inferred from the file's contents).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) writes: u32,
+    /// Tests: the next job waits here once its write is in place, before
+    /// it records it ([`SaveJob::hold_next`]).
+    #[cfg(test)]
+    hold: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+}
+
+/// Tests: a job held once its write is in place ([`SaveJob::hold_next`]).
+#[cfg(test)]
+pub(crate) struct Held {
+    at: std::sync::mpsc::Receiver<()>,
+    go: std::sync::mpsc::Sender<()>,
+    seen: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl Held {
+    /// Whether the job is held now (or has been).
+    pub(crate) fn reached(&self) -> bool {
+        if !self.seen.get() && self.at.try_recv().is_ok() {
+            self.seen.set(true);
+        }
+        self.seen.get()
+    }
+
+    /// The job goes on.
+    pub(crate) fn release(self) {
+        let _ = self.go.send(());
+    }
 }
 
 /// What a [`SaveJob`] writes: `tabs.<key>` alone (split panes off), or the
@@ -2067,28 +2101,46 @@ impl SaveJob {
         generation: u64,
         write: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<bool> {
-        Self::write_if(slot, kind, generation, |_| write().map(|()| true))
+        Self::write_if(slot, kind, generation, |_, done| {
+            write()?;
+            done();
+            Ok(true)
+        })
     }
 
     /// The delayed write of generation `generation` of `kind`: `write`,
     /// given `stale` to ask under the file's lock (the window's last flush
-    /// has run), unless that flush came first; whether it wrote. What it
-    /// wrote is recorded as it ends ([`SaveJob::take_done`]), before the
-    /// flush that waits for it goes on.
+    /// has run) and `done` to call once the file is in place, still under
+    /// its lock, unless that flush came first; whether it wrote. `done`
+    /// records what it wrote ([`SaveJob::take_done`]), in the order of the
+    /// writes, before the flush that waits for it goes on.
     pub(crate) fn write_if(
         slot: &std::sync::Mutex<SaveJob>,
         kind: SaveKind,
         generation: u64,
-        write: impl FnOnce(&dyn Fn() -> bool) -> std::io::Result<bool>,
+        write: impl FnOnce(&dyn Fn() -> bool, &dyn Fn()) -> std::io::Result<bool>,
     ) -> std::io::Result<bool> {
+        #[cfg(test)]
+        let hold;
         {
             let mut job = slot_of(slot);
             if job.closed {
                 return Ok(false);
             }
             job.busy += 1;
+            #[cfg(test)]
+            {
+                hold = job.hold.take();
+            }
         }
-        let out = write(&|| slot_of(slot).closed);
+        // STAND-IN (tests-first): recorded once the write has returned, its
+        // locks let go, as 75ac5ce did.
+        let out = write(&|| slot_of(slot).closed, &|| {});
+        #[cfg(test)]
+        if let (Some((at, go)), Ok(true)) = (&hold, &out) {
+            let _ = at.send(());
+            let _ = go.recv();
+        }
         let mut job = slot_of(slot);
         job.busy -= 1;
         if !out? {
@@ -2098,6 +2150,28 @@ impl SaveJob {
         job.writes += 1;
         job.done[kind as usize] = Some(generation);
         Ok(true)
+    }
+
+    /// The layout's delayed write, generation `generation`, as its job makes
+    /// it off the UI thread ([`SaveJob::write_if`]).
+    pub(crate) fn write_layout(
+        slot: &std::sync::Mutex<SaveJob>,
+        path: &std::path::Path,
+        key: &str,
+        layout: &theme::Layout,
+        generation: u64,
+    ) -> std::io::Result<bool> {
+        Self::write_if(slot, SaveKind::Layout, generation, |stale, done| theme::save_layout_if(path, key, layout, stale, done))
+    }
+
+    /// Tests: the next job to begin waits once its write is in place,
+    /// before it records it, until released.
+    #[cfg(test)]
+    pub(crate) fn hold_next(slot: &std::sync::Mutex<SaveJob>) -> Held {
+        let (at_tx, at) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        slot_of(slot).hold = Some((at_tx, go_rx));
+        Held { at, go, seen: std::cell::Cell::new(false) }
     }
 
     /// Tests: whether a job is in its write.
@@ -4715,7 +4789,7 @@ impl AppView {
                 .ok();
             let Some((Some(path), Some(key), saved, generation, slot)) = job else { return };
             let done = off_ui(cx.background_executor().clone(), move || {
-                SaveJob::write_if(&slot, SaveKind::Tabs, generation, |stale| theme::save_tabs_if(&path, &key, &saved, stale))
+                SaveJob::write_if(&slot, SaveKind::Tabs, generation, |stale, done| theme::save_tabs_if(&path, &key, &saved, stale, done))
             })
             .await;
             let _ = this.update(cx, |v, cx| match done {
@@ -4887,10 +4961,8 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), layout, generation, slot)) = job else { return };
-            let done = off_ui(cx.background_executor().clone(), move || {
-                SaveJob::write_if(&slot, SaveKind::Layout, generation, |stale| theme::save_layout_if(&path, &key, &layout, stale))
-            })
-            .await;
+            let done =
+                off_ui(cx.background_executor().clone(), move || SaveJob::write_layout(&slot, &path, &key, &layout, generation)).await;
             let _ = this.update(cx, |v, cx| match done {
                 Ok(_) => {
                     // What it wrote, unless the flush took it first.

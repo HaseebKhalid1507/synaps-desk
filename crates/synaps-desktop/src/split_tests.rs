@@ -6436,6 +6436,84 @@ fn a_delayed_layout_write_that_finished_as_the_quit_came_is_written_over(cx: &mu
     }
 }
 
+/// Until `ok()`, in real time (a job on a thread of its own): 10 s at most.
+fn in_real_time(what: &str, ok: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !ok() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{what}: never");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Shady #116 R2-A8: what a delayed layout write records of itself is in
+/// the order of the writes, so the window's flush never reads an older
+/// write as the file's. Two worker threads, each making a layout job's
+/// write ([`crate::app::SaveJob::write_layout`], as `schedule_layout_save`'s
+/// job does off the UI thread). A writes G1 (the first pane focused) and is
+/// held once its write is in place, before it records it. B writes G2 (a
+/// tab opened there): it writes and records, or waits behind A. A goes on;
+/// both finish. The layout goes back to G1 (the tab closed: the same
+/// content, so the same generation) and the flush runs before the save's
+/// delay: the file must end on G1 and its tabs' union. Before, A recorded
+/// G1 after B had recorded G2, though the file held G2, and the flush,
+/// reading G1 as written, wrote nothing.
+#[gpui_kit::test]
+fn a_layout_job_recorded_after_a_newer_ones_write_never_fools_the_close(cx: &mut TestAppContext) {
+    use crate::app::SaveJob;
+    let (window, view, client, mut a, _attaches, _events) = on_a(cx, "a8-order", None);
+    let k = format!("test:a8-order-{}", std::process::id());
+    let path = crate::theme::settings_path().expect("the tests' settings file");
+    view.update(cx, |v, _| v.tabs_key = Some(k.clone()));
+    frame(cx, window);
+    key(cx, window, "ctrl-\\");
+    wait_saved(cx, window);
+    let (order, slot) = view.read_with(cx, |v, _| (v.reading_order(), v.save_job.clone()));
+    let writes = || slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writes;
+    let job = |g: u64, l: crate::theme::Layout| {
+        let (slot, path, k) = (slot.clone(), path.clone(), k.clone());
+        std::thread::spawn(move || SaveJob::write_layout(&slot, &path, &k, &l, g))
+    };
+    // G1, A: held once its write is in place.
+    view.update(cx, |v, cx| v.focus_pane(order[0], crate::pane::KeysTo::Pane, cx));
+    frame(cx, window);
+    let (g1, l1) = view.read_with(cx, |v, _| (v.layout_gen(), v.layout_now()));
+    let held = SaveJob::hold_next(&slot);
+    let a_job = job(g1, l1.clone());
+    in_real_time("A held, its write in place", || held.reached());
+    assert_eq!(crate::theme::load_layout(&path, &k).as_ref(), Some(&l1), "G1 in the file");
+    // G2, B: written and recorded, or waiting behind A.
+    view.update(cx, |v, cx| {
+        v.model.tabs.open("s-a8", "a8", crate::tabs::Place::New);
+        cx.notify();
+    });
+    frame(cx, window);
+    let (g2, l2) = view.read_with(cx, |v, _| (v.layout_gen(), v.layout_now()));
+    assert_ne!(l2.union(), l1.union(), "G2's tabs are not G1's");
+    let before = writes();
+    let b_job = job(g2, l2);
+    in_real_time("B written and recorded, or waiting behind A", || writes() > before || crate::theme::behind_another(&path));
+    held.release();
+    assert!(a_job.join().expect("A").expect("G1 written") && b_job.join().expect("B").expect("G2 written"), "both wrote");
+    // Back to G1, and the flush before the save's delay.
+    view.update(cx, |v, cx| {
+        let i = v.model.tabs.find("s-a8").expect("the tab");
+        v.model.tabs.close(i);
+        cx.notify();
+    });
+    frame(cx, window);
+    assert_eq!(view.read_with(cx, |v, _| v.layout_gen()), g1, "G1 again: its content, so its generation");
+    view.update(cx, |v, _| v.flush_tabs());
+    assert_eq!(
+        crate::theme::load_restore(&path, &k, Some(true)),
+        (Some(l1.clone()), Some(l1.union())),
+        "G1 and its tabs' union in the file"
+    );
+    cx.run_until_parked();
+    let _ = names(&mut a);
+    view.update(cx, |v, _| v.client = None);
+    let _ = client.shutdown();
+}
+
 /// Shady #59 L5.1 (#55 n1): what a pane draws keeps its element state
 /// through split → one pane. A press held on pane A's Allow while the other
 /// pane closes (Off: in its frame, the layout one pane now), let go on it

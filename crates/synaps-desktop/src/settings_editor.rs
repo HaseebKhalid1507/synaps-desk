@@ -24,6 +24,12 @@ pub(crate) const FIND_BUDGET: u32 = 16_384;
 /// Under an input whose history was rebuilt away, once.
 pub(crate) const CLEARED: &str = "Undo history cleared to keep memory in bounds.";
 
+/// Under an input whose composition was refused at its budget.
+// STAND-IN (tests-first): no composition is refused (a rebuild carries it
+// over, as 75ac5ce did), so this never shows.
+#[allow(dead_code)]
+pub(crate) const COMPOSED: &str = "Composition too long to keep: taken out, and the undo history cleared. Type it in parts.";
+
 /// An edit that replaced something, or one of several in its batch, may
 /// add a `Change` and its cursor records to a step.
 const STEP: u32 = 512;
