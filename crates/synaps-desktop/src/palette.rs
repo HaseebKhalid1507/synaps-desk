@@ -1092,11 +1092,19 @@ impl AppView {
     fn block_entries(&self) -> Vec<AppEntry> {
         use crate::walk::Wish;
         let walked = self.palette_walked.filter(|(pane, ..)| self.panes.iter().any(|p| p.id == *pane));
+        // What the walked block takes, as its keys and hover offer it (the
+        // pane acted on is the one walked while the palette is open).
+        let found = walked.filter(|(pane, ..)| *pane == self.panes.cur.id).and_then(|(_, at, painted)| self.target_at(at, painted));
         let off = |wish: Wish| -> Option<&'static str> {
-            match walked {
-                None => Some("walk to a block first · Ctrl+G"),
-                Some((.., painted)) if painted.tomb.is_some() && wish == Wish::Pin => Some("a tombstone: x or u"),
-                Some(_) => None,
+            match (walked, &found) {
+                (None, _) => Some("walk to a block first · Ctrl+G"),
+                (Some((.., painted)), _) if painted.tomb.is_some() && wish == Wish::Pin => Some("a tombstone: x or u"),
+                (_, Some((_, f)))
+                    if !self.block_desires().offers(wish, &f.s.block, matches!(f.place, cards_spec::board::Place::Rail(_))) =>
+                {
+                    Some("not on this block")
+                }
+                _ => None,
             }
         };
         let k = |key: &'static str| -> Option<SharedString> { Some(key.into()) };

@@ -1238,6 +1238,36 @@ fn p_puts_an_agents_rail_section_into_the_transcript_and_back(cx: &mut TestAppCo
     assert_eq!(sec(cx, &view, "r1"), Some((Slot::Upper, false, false)), "back by the hover");
 }
 
+/// A card's block is no desire's (D6b keys desires by block id): `x` on
+/// it does nothing, and neither the hover nor the palette offers `x` or
+/// `u`; its pin is offered.
+#[gpui_kit::test]
+fn a_cards_block_isnt_offered_a_dismissal(cx: &mut TestAppContext) {
+    use crate::palette::Mode;
+    let (w, view) = walked(cx);
+    let name = format!("card:{}", synaps_client::synthetic::BLOCKS_CARD);
+    let k = row(&name);
+    enter(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(k));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 0, "nothing asked");
+    assert!(has(cx, w, format!("block-head {k}")), "still drawn");
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.open_palette(Mode::Commands, window, cx))).expect("the window");
+    wait(cx, w, &view, 300);
+    let off = |cx: &mut TestAppContext, title: &str| {
+        view.read_with(cx, |v, cx| v.palette_entries(cx).1.iter().find(|e| e.title.as_ref() == title).map(|e| e.off.clone()))
+    };
+    assert_eq!(off(cx, "Dismiss the walked block"), Some(Some("not on this block".into())));
+    assert_eq!(off(cx, "Show the walked block again"), Some(Some("not on this block".into())));
+    assert_eq!(off(cx, "Pin the walked block"), Some(None), "its pin is");
+    cx.update_window(w, |_, window, cx| view.update(cx, |v, cx| v.close_palette(window, cx))).expect("the window");
+    let at_ = head(cx, w, &name);
+    mouse(cx, w, at_, "move");
+    wait(cx, w, &view, 300);
+    assert!(has(cx, w, format!("hover-act {k} rail")) && !has(cx, w, format!("hover-act {k} ×")), "the hover: its pin, no ×");
+}
+
 /// A section put into the transcript is one of its rows to the lease
 /// (§6.2): hovered, the agent replacing it waits under the pointer, and
 /// the release draws it.

@@ -493,11 +493,12 @@ impl BlockDesires for Stores {
         true
     }
 
-    fn offers(&self, wish: Wish, _b: &Block, rail: bool) -> bool {
+    fn offers(&self, wish: Wish, b: &Block, rail: bool) -> bool {
         match wish {
             // The rail hides a dismissal (its footer counts it), the
-            // transcript draws its tombstone.
-            Wish::Dismiss | Wish::Show => true,
+            // transcript draws its tombstone; a block's (a card is no
+            // desire's).
+            Wish::Dismiss | Wish::Show => matches!(b.id, Ref::Block(_)),
             // A transcript block into the rail (its stub stays), an
             // agent's section into the transcript, and back.
             Wish::Pin => true,

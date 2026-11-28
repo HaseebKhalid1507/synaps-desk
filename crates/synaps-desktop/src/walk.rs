@@ -656,7 +656,7 @@ impl AppView {
     }
 
     /// Target `at` as `painted`, if the bound board still holds it so.
-    fn target_at(&self, at: At, painted: Painted) -> Option<(std::sync::Arc<Drawn>, Found)> {
+    pub(crate) fn target_at(&self, at: At, painted: Painted) -> Option<(std::sync::Arc<Drawn>, Found)> {
         let board = self.bound_board()?;
         let f = self.find_on(&board, at)?;
         (f.s.bound.as_ref().is_some_and(|b| b.tag == painted.tag) && f.tomb == painted.tomb).then_some((board, f))
