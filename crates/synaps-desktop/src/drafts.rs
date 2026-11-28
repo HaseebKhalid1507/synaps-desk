@@ -97,8 +97,9 @@ pub(crate) const DOUBLED: &str = "another draft of this block is held · copy or
 /// `s` cut at `n` characters (a character's boundary), kept at its length
 /// (what [`Draft::own_bytes`] counts is what it holds).
 pub(crate) fn cut(s: &str, n: usize) -> String {
-    // Fail-first (Shady #114 P2-1): this fix is off until the next commit.
-    s.chars().take(n).collect()
+    let mut out: String = s.chars().take(n).collect();
+    out.shrink_to_fit();
+    out
 }
 
 /// The kinds a user edits (§3.2): status, metric and file aren't.
@@ -163,8 +164,7 @@ pub(crate) struct PlanIntents {
 impl PlanIntents {
     /// Whether step `id` is one this draft added.
     pub(crate) fn adds(&self, id: &ItemId) -> bool {
-        // Fail-first (Shady #114 P2-3): this fix is off until the next commit.
-        id.is_user()
+        self.added.iter().any(|(i, _)| i == id)
     }
 }
 
@@ -382,10 +382,7 @@ impl Draft {
             }
             Some(_) => return Err(RAN),
         }
-        // Fail-first (Shady #114 P2-1): this fix is off until the next commit.
-        drop(before);
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// Toggle a stop before step `id` (§3.2): only a `todo` or `skipped`
@@ -403,10 +400,7 @@ impl Draft {
         } else {
             p.stop.insert(id.clone(), now);
         }
-        // Fail-first (Shady #114 P2-1): this fix is off until the next commit.
-        drop(before);
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// Move step `id` one place up (`-1`) or down (`1`): text and order
@@ -494,10 +488,7 @@ impl Draft {
         } else {
             h.insert(id.clone(), want);
         }
-        // Fail-first (Shady #114 P2-1): this fix is off until the next commit.
-        drop(before);
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// The change just made stands if the draft is within its cap; else it
@@ -768,10 +759,7 @@ impl Draft {
                 None => return Fate::Gone,
             },
             None => {
-                let Some((s, _)) = crate::lease::find_any(d, crate::blocks::row_id(&self.id)) else {
-                    // Fail-first (Shady #114 P2-5): this fix is off until the next commit.
-                    return Fate::Gone;
-                };
+                let Some((s, _)) = crate::lease::find_any(d, crate::blocks::row_id(&self.id)) else { return Fate::Held };
                 match s.bound.as_ref() {
                     Some(b) => (b.tag, b.rev),
                     // Pending only: the bound board can't say yet.
@@ -831,10 +819,6 @@ impl Place {
 /// draft is in the dock). What the board says of each block is the
 /// board's: only where it draws changes.
 pub(crate) fn hold_places(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
-    // Fail-first (Shady #114 P2-6): this fix is off until the next commit.
-    if !holds.is_empty() {
-        return None;
-    }
     let mut out: Option<Drawn> = None;
     for (id, place) in holds {
         let cur = out.as_ref().unwrap_or(d);
@@ -1089,8 +1073,7 @@ impl Drafts {
     /// let go of (drafts with no change).
     pub(crate) fn follow(&mut self, from: &str, to: &str) -> Vec<u64> {
         let mut gone = Vec::new();
-        // Fail-first (Shady #114 P2-4): this fix is off until the next commit.
-        if from == to || !from.is_empty() {
+        if from == to {
             return gone;
         }
         let came: Vec<usize> = (0..self.all.len()).filter(|&i| self.all[i].0 == from).collect();

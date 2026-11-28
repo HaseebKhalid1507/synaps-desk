@@ -695,8 +695,7 @@ impl AppView {
             .filter(|p| p.id != pane && p.edit.at.as_ref().is_some_and(|e| e.key == key && e.field.is_some()))
             .map(|p| p.id)
             .collect();
-        // Fail-first (Shady #114 P2-2): this fix is off until the next commit.
-        for o in others.into_iter().filter(|_| false) {
+        for o in others {
             self.in_pane(o, |this| this.edit_close_field(false, window, cx));
         }
         let Some(d) = self.editing_draft() else { return };
@@ -735,9 +734,7 @@ impl AppView {
                         // Said at the view's next frame.
                         cx.notify(view);
                     }
-                    // Fail-first (Shady #114 P2-2): this fix is off until the next commit.
-                    let _ = w;
-                    true
+                    w == 0
                 });
                 s.set_value(value, window, cx);
                 s
@@ -796,9 +793,7 @@ impl AppView {
             Some(f) => {
                 f.room.set(room);
                 f.history += before.len() + v.len();
-                // Fail-first (Shady #114 P2-2): this fix is off until the next commit.
-                let _ = FIELD_HISTORY_MAX;
-                false
+                now != v || f.history > FIELD_HISTORY_MAX
             }
             None => false,
         };
@@ -1050,8 +1045,9 @@ impl AppView {
                 }
             }
             let look = h.finish();
-            // Fail-first (Shady #114 P2-7): this fix is off until the next commit.
-            let _ = crate::blocks::row_id(&d.id);
+            if d.foot.is_some_and(|f| f.1 != look) {
+                rows.push(crate::blocks::row_id(&d.id));
+            }
             d.foot = Some((memo, look));
         }
         rows
