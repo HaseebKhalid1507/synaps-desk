@@ -461,7 +461,7 @@ fn reopening_keeps_due_and_failed_receipts_over_the_file(cx: &mut TestAppContext
     std::fs::create_dir_all(path(&pg).parent().expect("its folder")).expect("the folder");
     std::fs::write(path(&pg), v.to_string()).expect("written");
     let reopen = |cx: &mut TestAppContext| {
-        pg.view.update(cx, |v, cx| v.view_shown(cx));
+        pg.view.update(cx, |v, cx| v.view_shown(true, cx));
         cx.run_until_parked();
         local(cx, &pg, &dash);
     };

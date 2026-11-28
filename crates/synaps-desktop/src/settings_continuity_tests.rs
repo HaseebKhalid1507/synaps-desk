@@ -50,7 +50,7 @@ pub(super) const NARROW: (f32, f32) = (1440., 900.);
 /// in the frame (`app.rs`' `pane_wants`); with the tests' motion clock
 /// pinned that spring never lands, and a test window's draw never ends.
 /// Motion's own case starts from Off.
-fn window(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
+pub(super) fn window(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
     let home = own(&format!("continuity-{name}"));
     let (w, view, events) = open_at(cx, size, crate::theme::Panels::default().text_size);
     cx.update_window(w, |_, window, _| window.activate_window()).expect("the window");
@@ -246,12 +246,17 @@ impl Dash {
     }
 
     /// What its config holds for `key` now (`Null`: unset).
-    fn holds(&self, key: &str) -> Value {
+    pub(super) fn holds(&self, key: &str) -> Value {
         self.state.lock().unwrap().values.get(key).cloned().unwrap_or(Value::Null)
     }
 
     pub(super) fn refuse(&self, why: &str) {
         self.state.lock().unwrap().refuse = Some(why.into());
+    }
+
+    /// Its next `POST`s taken again ([`Dash::refuse`] over).
+    pub(super) fn accept(&self) {
+        self.state.lock().unwrap().refuse = None;
     }
 
     /// Its file's `key` changed by something else (`Null`: removed).
@@ -332,6 +337,8 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<DashState>) -> Option<()> {
             }
         } else if line.starts_with("GET /api/info") {
             ("200 OK", json!({"pid": 7, "profile": null}))
+        } else if line.starts_with("GET /api/telemetry") {
+            ("200 OK", telemetry(&line))
         } else {
             s.reads += 1;
             ("200 OK", config_json(&s))
@@ -341,6 +348,25 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<DashState>) -> Option<()> {
     let mut conn = conn;
     write!(conn, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).ok()?;
     Some(())
+}
+
+/// `GET /api/telemetry/…` answered from the demo's store
+/// (`fixtures/usage/all.json`): the section the path asks for.
+fn telemetry(line: &str) -> Value {
+    let all: Value = serde_json::from_str(include_str!("../fixtures/usage/all.json")).expect("the demo's store");
+    let path = line.split_whitespace().nth(1).unwrap_or_default();
+    let sections = [
+        ("group=host", "spend_host"),
+        ("group=model", "spend_model"),
+        ("group=role", "spend_role"),
+        ("/agents", "agents"),
+        ("/cache", "cache"),
+        ("/latency", "latency"),
+        ("/sessions", "sessions_by_cost"),
+        ("/heatmap", "heatmap"),
+        ("/health", "health"),
+    ];
+    all[sections.into_iter().find(|(m, _)| path.contains(m)).map_or("summary", |(_, k)| k)].clone()
 }
 
 /// The daemon connected, local, and `dash` its own: every link of the

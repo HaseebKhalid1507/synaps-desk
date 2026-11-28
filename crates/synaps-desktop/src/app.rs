@@ -2396,8 +2396,7 @@ pub struct AppView {
     pub(crate) gear_leaving: Option<Instant>,
     gear_was: bool,
     pub(crate) gear_dismissed: Option<Point<Pixels>>,
-    shown_view: Option<crate::tabs::Kind>,
-    shown_views: usize,
+    shown: crate::views::Shown,
     /// The panes Settings and Usage draw in (cached: [`crate::views::ViewPane`]),
     /// their width, what they read of the rest of the app at the last frame
     /// ([`AppView::view_inputs`] and the theme), and whether the window is
@@ -3116,8 +3115,7 @@ impl AppView {
             gear_leaving: None,
             gear_was: false,
             gear_dismissed: None,
-            shown_view: None,
-            shown_views: 0,
+            shown: Default::default(),
             settings_pane: i.settings_pane,
             usage_pane: i.usage_pane,
             view_width: 0.,
@@ -10358,17 +10356,7 @@ impl Render for AppView {
         let p = theme::palette(cx);
         let m = theme::metrics(cx);
         self.fx.set_ink(p.ink);
-        // Settings or Usage came on screen (or one closed): after this
-        // frame, never inside it, what it shows is asked for if stale.
         let view = self.model.tabs.view();
-        let open_views = self.model.tabs.iter().filter(|t| t.kind != crate::tabs::Kind::Session).count();
-        if (view, open_views) != (self.shown_view, self.shown_views) {
-            (self.shown_view, self.shown_views) = (view, open_views);
-            cx.defer_in(window, move |v, window, cx| {
-                v.view_shown(cx);
-                v.settings_tab_closed(window, cx);
-            });
-        }
         // What the view on screen reads of the rest of the app changed (the
         // daemon, the session, the panels, the theme): its cached pane draws
         // again, next frame.
@@ -10421,6 +10409,21 @@ impl Render for AppView {
         let (rail, right) = sides(self.width, self.panels, crate::chrome::MARK);
         let yielded = self.pane_yield;
         let (rail, right) = self.pane_sides(rail, right);
+        // Settings or Usage came on screen or went (a focus, a tab or pane
+        // closed, a fold or an unfold: this frame's layout, its fold just
+        // decided): after this frame, never inside it, what it shows is
+        // asked for if stale, and what no pane on screen has open goes.
+        // A Settings tab closed: its fields' text and history go too, when
+        // no Settings tab is left.
+        let shown = self.shown();
+        if shown != self.shown {
+            let opened = shown.focused != self.shown.focused;
+            self.shown = shown;
+            cx.defer_in(window, move |v, window, cx| {
+                v.view_shown(opened, cx);
+                v.settings_tab_closed(window, cx);
+            });
+        }
         let with_panes = self.yield_on_flight(yielded, resized);
         if let Side::Open(w) = rail {
             self.rail_width = w;

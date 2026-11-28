@@ -258,9 +258,10 @@ impl AppView {
 
     /// The Settings tab is gone: both fields replaced by empty ones (their
     /// text, history and buffers go with the old entities), unless they
-    /// are fresh already.
+    /// are fresh already. A Settings tab in any pane keeps them (a split's
+    /// other pane may show it while this one has the focus).
     pub(crate) fn settings_tab_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.tabs.iter().any(|t| t.kind == crate::tabs::Kind::Settings) {
+        if self.open_in_a_pane(crate::tabs::Kind::Settings) {
             return;
         }
         for f in [Field::Value, Field::Find] {
