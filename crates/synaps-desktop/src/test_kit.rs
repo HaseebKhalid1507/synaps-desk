@@ -26,6 +26,8 @@ mod card_sync_tab_tests;
 mod cards_d_tests;
 #[path = "change_tests.rs"]
 mod change_tests;
+#[path = "settings_effect_tests.rs"]
+mod effect_tests;
 #[path = "entry_tests.rs"]
 mod entry_tests;
 #[path = "gate_clock_tests.rs"]

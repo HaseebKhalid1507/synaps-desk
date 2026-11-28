@@ -178,6 +178,10 @@ pub(crate) struct SettingsUi {
     /// it finished): a value's afterglow starts there, never on a guess.
     app_gen: u64,
     pub(crate) app_wrote: Option<(u64, Instant)>,
+    /// The daemon values this app wrote in this run, by whose config
+    /// ([`AppView::config_owner`]) and key: what the file held after the
+    /// dash's 200. A row says it was saved while the file still holds it.
+    pub(crate) wrote: HashMap<(u64, &'static str), Option<String>>,
 }
 
 type AppBatch = BTreeMap<&'static str, Option<String>>;
@@ -725,7 +729,8 @@ impl AppView {
 
     /// Lines under a CONFIG row: what its editor takes when the row's help
     /// names more ([`settings::editor_note`], at `config-note-<key>`), the
-    /// refusal, or that it waits for a reload.
+    /// refusal, and when its change takes effect ([`crate::settings_effect::lines`], at
+    /// `effect <key> = <lines>`; a wait in warn, at `warn <key>`).
     fn config_under(&self, key: &'static str, writable: bool, p: &Palette) -> Vec<AnyElement> {
         let mut out = Vec::new();
         let editor = writable && self.shown_config().is_some_and(|c| c.exposes(key));
@@ -736,14 +741,33 @@ impl AppView {
         if let Some(Write::Refused(m)) = self.settings.writes.get(key) {
             out.push(mono(m.clone(), 12., p.err).whitespace_normal().debug_selector(|| format!("refused {key} = {m}")).into_any_element());
         }
-        if let Some(c) = self.shown_config().filter(|c| c.pending.iter().any(|k| k == key)) {
-            out.push(mono(format!("saved · applies after: {}", c.reload_cmd), 12., p.warn).whitespace_normal().into_any_element());
+        if let Some(c) = self.shown_config().filter(|c| c.exposes(key)) {
+            let wrote = self.settings.wrote.get(&(self.config_owner(c), key)).is_some_and(|v| v.as_deref() == c.value(key));
+            let seen = crate::settings_effect::Observed { idle_exit_running: c.idle_exit_running };
+            let lines =
+                crate::settings_effect::lines(key, self.daemon_version(), c.value(key), &seen, wrote, self.settings.open_help == Some(key));
+            if !lines.is_empty() {
+                let said = lines.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" | ");
+                let lines = lines.into_iter().map(|(text, warn)| {
+                    let line = mono(text, 12., if warn { p.warn } else { p.dim }).whitespace_normal();
+                    if warn { line.debug_selector(move || format!("warn {key}")) } else { line }
+                });
+                out.push(v_flex().gap(px(2.)).debug_selector(move || format!("effect {key} = {said}")).children(lines).into_any_element());
+            }
         }
         out
     }
 
+    /// A daemon row's tag: when its change takes effect, once the dash's
+    /// config is read.
     fn applies(&self, key: &str) -> Option<&'static str> {
-        self.shown_config().and_then(|c| c.applies.get(key)).and_then(|a| settings::applies_tag(a))
+        self.shown_config().filter(|c| c.exposes(key))?;
+        crate::settings_effect::effect_of(key, self.daemon_version()).map(crate::settings_effect::Effect::word)
+    }
+
+    /// The connected daemon's `Welcome.daemon_version` (empty: none).
+    fn daemon_version(&self) -> &str {
+        self.model.daemon.as_ref().map_or("", |d| d.version.as_str())
     }
 
     // ── layout ─────────────────────────────────────────────────────────
@@ -781,10 +805,11 @@ impl AppView {
                         let said = help.clone();
                         d.child(sans(help, 13., 20., p.dim).whitespace_normal().debug_selector(move || format!("help-text {key} = {said}")))
                     })
-                    .when_some(r.tag, |d, t| d.child(mono(t, 12., p.dim).mt(px(2.)))),
+                    .when_some(r.tag, |d, t| d.child(mono(t, 12., p.dim).mt(px(2.)).debug_selector(move || format!("tag {key} = {t}")))),
             )
             .child(div().flex_none().flex().justify_end().child(r.control));
-        // Under it, full width: a session row's default, a refusal, a reload.
+        // Under it, full width: a session row's default, a refusal, when it
+        // takes effect.
         v_flex()
             .debug_selector(|| format!("row {}", r.id))
             .id(r.id)
@@ -1393,7 +1418,7 @@ impl AppView {
                         .into_any_element(),
                 );
                 if let Some(t) = self.applies(key) {
-                    under.push(mono(t, 12., p.dim).into_any_element());
+                    under.push(mono(t, 12., p.dim).debug_selector(move || format!("tag {key} = {t}")).into_any_element());
                 }
                 under.extend(self.config_under(key, writable, p));
             }

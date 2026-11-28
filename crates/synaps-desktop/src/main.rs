@@ -87,6 +87,7 @@ mod revisions;
 mod scroll;
 mod scrollbar;
 mod settings;
+mod settings_effect;
 mod settings_view;
 mod shell;
 mod split;

@@ -248,6 +248,13 @@ pub(crate) struct DashUi {
 }
 
 impl DashUi {
+    /// Tests: the channel as found for daemon `generation` (a synthetic
+    /// view never probes).
+    #[cfg(test)]
+    pub fn found_now(&mut self, generation: u64) {
+        self.found_gen = Some(generation);
+    }
+
     pub fn target(&self) -> Option<Target> {
         match &self.found {
             Some(Ok((t, _))) => Some(t.clone()),
@@ -676,6 +683,16 @@ impl AppView {
         self.dash.config_of(self.daemon_id())
     }
 
+    /// Whose config `c` is, for the record of this run's writes: the
+    /// daemon (its socket and profile) and the file (PLAN §2.2's receipt
+    /// identity). Not its pid: a cold start is the same daemon's.
+    pub(crate) fn config_owner(&self, c: &ConfigSnapshot) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&self.dash.socket, self.model.daemon.as_ref().map(|d| &d.profile), &c.write_path).hash(&mut h);
+        h.finish()
+    }
+
     /// Whose config the dash has, when not this daemon's.
     pub(crate) fn config_foreign(&self) -> Option<String> {
         self.dash.config_foreign(self.daemon_id())
@@ -902,6 +919,7 @@ impl AppView {
                     match got {
                         Ok(c) => {
                             v.dash_said(Ok(()), cx);
+                            v.settings.wrote.insert((v.config_owner(&c), key), c.value(key).map(String::from));
                             v.dash.config = Some(c);
                             if !newer {
                                 v.settings.writes.remove(key);
@@ -1092,6 +1110,11 @@ impl AppView {
         }
         if active && std::mem::take(&mut self.dash.missed_tick) {
             self.dash_tick(cx);
+        }
+        // Idle exit's comparison is the dash's to read again (one GET; a
+        // find under way reads it as it ends).
+        if active && self.model.tabs.view() == Some(Kind::Settings) && !self.dash.finding {
+            self.ask_config(cx);
         }
     }
 

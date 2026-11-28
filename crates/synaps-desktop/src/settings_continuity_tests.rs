@@ -33,9 +33,9 @@ use crate::theme::test_home::{Own, own};
 // ── the page ──────────────────────────────────────────────────────────
 
 /// Settings open, saving to a folder of its own.
-struct Page {
-    w: AnyWindowHandle,
-    view: Entity<AppView>,
+pub(super) struct Page {
+    pub(super) w: AnyWindowHandle,
+    pub(super) view: Entity<AppView>,
     home: Own,
     _events: async_channel::Receiver<synaps_client::Event>,
 }
@@ -73,7 +73,7 @@ fn page(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
     pg
 }
 
-fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: &str) -> bool {
+pub(super) fn drawn(cx: &mut TestAppContext, w: AnyWindowHandle, sel: &str) -> bool {
     VisualTestContext::from_window(w, cx).debug_bounds(String::leak(sel.to_string())).is_some()
 }
 
@@ -109,7 +109,7 @@ fn up(cx: &mut TestAppContext, w: AnyWindowHandle, at: gpui_kit::Point<Pixels>) 
 }
 
 /// A click on what `sel` names, and what it does drawn.
-fn click(cx: &mut TestAppContext, w: AnyWindowHandle, sel: &str) {
+pub(super) fn click(cx: &mut TestAppContext, w: AnyWindowHandle, sel: &str) {
     let at = bounds(cx, w, sel).center();
     mouse(cx, w, at, false);
     down(cx, w, at);
@@ -134,7 +134,7 @@ fn find(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
 }
 
 /// A field (`field-<name>`) edited: clicked, `text` typed over it, Enter.
-fn edit(cx: &mut TestAppContext, w: AnyWindowHandle, field: &str, text: &str) {
+pub(super) fn edit(cx: &mut TestAppContext, w: AnyWindowHandle, field: &str, text: &str) {
     click(cx, w, field);
     type_over(cx, w, text);
     press(cx, w, "enter");
@@ -145,7 +145,7 @@ fn saved(cx: &mut TestAppContext, pg: &Page) {
     wait(cx, pg.w, &pg.view, crate::app::SAVE_DELAY.as_millis() as u64 + 100);
 }
 
-fn changed(cx: &mut TestAppContext, pg: &Page, f: impl FnOnce(&mut AppView)) {
+pub(super) fn changed(cx: &mut TestAppContext, pg: &Page, f: impl FnOnce(&mut AppView)) {
     pg.view.update(cx, |v, cx| {
         f(v);
         v.views_changed(cx);
@@ -188,7 +188,8 @@ fn file_keys(pg: &Page) -> Vec<String> {
 /// request: `POST /api/config` sets the key in its config (its file) and
 /// answers with the config, or, refusing, a 400 in its words; a `GET`
 /// answers the config or `/api/info`. It keeps what each `POST` carried.
-struct Dash {
+/// Its answer's other fields (`idleExitRunning`, `pending`) are the test's.
+pub(super) struct Dash {
     port: u16,
     state: Arc<Mutex<DashState>>,
 }
@@ -197,6 +198,7 @@ struct DashState {
     values: serde_json::Map<String, Value>,
     refuse: Option<String>,
     posts: Vec<Value>,
+    extra: serde_json::Map<String, Value>,
     stop: bool,
 }
 
@@ -205,7 +207,7 @@ impl Dash {
         let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let port = l.local_addr().expect("its address").port();
         let values = values.as_object().cloned().unwrap_or_default();
-        let state = Arc::new(Mutex::new(DashState { values, refuse: None, posts: Vec::new(), stop: false }));
+        let state = Arc::new(Mutex::new(DashState { values, refuse: None, posts: Vec::new(), extra: serde_json::Map::new(), stop: false }));
         let s = state.clone();
         std::thread::spawn(move || {
             for conn in l.incoming() {
@@ -222,11 +224,11 @@ impl Dash {
         format!("http://127.0.0.1:{}/?token=c0ffee", self.port)
     }
 
-    fn snapshot(&self) -> crate::dash::ConfigSnapshot {
+    pub(super) fn snapshot(&self) -> crate::dash::ConfigSnapshot {
         serde_json::from_value(config_json(&self.state.lock().unwrap())).expect("a snapshot")
     }
 
-    fn posts(&self) -> Vec<Value> {
+    pub(super) fn posts(&self) -> Vec<Value> {
         self.state.lock().unwrap().posts.clone()
     }
 
@@ -237,6 +239,16 @@ impl Dash {
 
     fn refuse(&self, why: &str) {
         self.state.lock().unwrap().refuse = Some(why.into());
+    }
+
+    /// Its file's `key` changed by something else (`Null`: removed).
+    pub(super) fn set(&self, key: &str, value: Value) {
+        self.state.lock().unwrap().values.insert(key.into(), value);
+    }
+
+    /// Its answer's field `field` from now on.
+    pub(super) fn answer(&self, field: &str, value: Value) {
+        self.state.lock().unwrap().extra.insert(field.into(), value);
     }
 }
 
@@ -251,7 +263,9 @@ impl Drop for Dash {
 const PATH: &str = "~/.synaps-cli/config";
 
 fn config_json(s: &DashState) -> Value {
-    json!({"ok": true, "writable": true, "path": PATH, "values": s.values, "pending": [], "reloadCmd": "synaps daemon reload"})
+    let mut v = json!({"ok": true, "writable": true, "path": PATH, "values": s.values, "pending": [], "reloadCmd": "synaps daemon reload"});
+    v.as_object_mut().expect("an object").extend(s.extra.clone());
+    v
 }
 
 /// One request answered; `None`: the dash is dropped.
@@ -319,7 +333,7 @@ fn local(cx: &mut TestAppContext, pg: &Page, dash: &Dash) {
 }
 
 /// Settings over a local daemon whose dash holds `values`.
-fn daemon_page(cx: &mut TestAppContext, name: &str, values: Value) -> (Page, Dash) {
+pub(super) fn daemon_page(cx: &mut TestAppContext, name: &str, values: Value) -> (Page, Dash) {
     let pg = page(cx, name, NARROW);
     let dash = Dash::new(values);
     local(cx, &pg, &dash);
