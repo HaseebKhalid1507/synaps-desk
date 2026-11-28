@@ -239,6 +239,9 @@ pub(crate) struct DashUi {
     config_asking: bool,
     today_asking: bool,
     pub order: ConfigOrder,
+    /// Finds started (the tests': an `--offline` view never probes).
+    #[cfg(test)]
+    pub finds: u32,
     /// A poll fell while the window was in the background: done on return.
     missed_tick: bool,
     pub poll: Option<Task<()>>,
@@ -689,6 +692,10 @@ impl AppView {
     /// when Settings opens, or when the dash did not answer. What waited on
     /// it runs after ([`AppView::dash_found`]). Never for `--offline`.
     pub(crate) fn dash_find(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.dash.finds += 1;
+        }
         if self.synthetic {
             return;
         }
