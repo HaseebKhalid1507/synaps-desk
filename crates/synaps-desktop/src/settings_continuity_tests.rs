@@ -36,13 +36,13 @@ use crate::theme::test_home::{Own, own};
 pub(super) struct Page {
     pub(super) w: AnyWindowHandle,
     pub(super) view: Entity<AppView>,
-    home: Own,
-    _events: async_channel::Receiver<synaps_client::Event>,
+    pub(super) home: Own,
+    pub(super) _events: async_channel::Receiver<synaps_client::Event>,
 }
 
 /// From this pane width Settings has its index.
 const WIDE: (f32, f32) = (1920., 1080.);
-const NARROW: (f32, f32) = (1440., 900.);
+pub(super) const NARROW: (f32, f32) = (1440., 900.);
 
 /// The demo window, `size`, in use (active: a field left blurs), its
 /// session shown. At Reduced: under Full a segment's bar (or the picker's
@@ -60,14 +60,14 @@ pub(super) fn window(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> P
 }
 
 /// Settings opened by its key (Ctrl+, / Cmd+,).
-fn open_settings(cx: &mut TestAppContext, pg: &Page) {
+pub(super) fn open_settings(cx: &mut TestAppContext, pg: &Page) {
     press(cx, pg.w, crate::views::view_keys(cfg!(target_os = "macos"), cfg!(target_os = "linux")).0);
     assert_eq!(pg.view.read_with(cx, |v, _| v.model.tabs.view()), Some(crate::tabs::Kind::Settings), "its key opens Settings");
     assert!(drawn(cx, pg.w, "settings-find"), "Settings, drawn");
 }
 
 /// [`window`], Settings open.
-fn page(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
+pub(super) fn page(cx: &mut TestAppContext, name: &str, size: (f32, f32)) -> Page {
     let pg = window(cx, name, size);
     open_settings(cx, &pg);
     pg
@@ -118,7 +118,7 @@ pub(super) fn click(cx: &mut TestAppContext, w: AnyWindowHandle, sel: &str) {
 }
 
 /// Text typed into what has focus, after rubbing out what it held.
-fn type_over(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
+pub(super) fn type_over(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
     let mut vcx = VisualTestContext::from_window(w, cx);
     vcx.simulate_keystrokes(&["backspace"; 64].join(" "));
     if !text.is_empty() {
@@ -128,7 +128,7 @@ fn type_over(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
 }
 
 /// The find box: `text` in it.
-fn find(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
+pub(super) fn find(cx: &mut TestAppContext, w: AnyWindowHandle, text: &str) {
     click(cx, w, "settings-find");
     type_over(cx, w, text);
 }
@@ -141,7 +141,7 @@ pub(super) fn edit(cx: &mut TestAppContext, w: AnyWindowHandle, field: &str, tex
 }
 
 /// Past the app's save delay: what waited is written.
-fn saved(cx: &mut TestAppContext, pg: &Page) {
+pub(super) fn saved(cx: &mut TestAppContext, pg: &Page) {
     wait(cx, pg.w, &pg.view, crate::app::SAVE_DELAY.as_millis() as u64 + 100);
 }
 
@@ -371,7 +371,7 @@ fn telemetry(line: &str) -> Value {
 
 /// The daemon connected, local, and `dash` its own: every link of the
 /// config gate proven (as `views.rs`' `proven`), so its rows write.
-fn local(cx: &mut TestAppContext, pg: &Page, dash: &Dash) {
+pub(super) fn local(cx: &mut TestAppContext, pg: &Page, dash: &Dash) {
     let (url, snap) = (dash.url(), dash.snapshot());
     changed(cx, pg, |v| {
         v.model.daemon = Some(crate::model::Daemon { version: "0.13.0".into(), profile: None, pid: 7 });
@@ -751,14 +751,16 @@ fn theme_pick_and_follow_save(cx: &mut TestAppContext) {
     assert_eq!(scheme(cx).0, "nord", "picked");
     assert!(!pg.view.read_with(cx, |v, _| v.theme_follows_config));
     assert!(drawn(cx, w, "value theme = nord"), "the row says so");
+    saved(cx, &pg);
     assert_eq!(relaunch(&pg).theme.as_deref(), Some("nord"), "read back");
     click(cx, w, "picker-follow");
     let config = pg.view.read_with(cx, |v, _| v.config_choice().0);
     assert_eq!(scheme(cx).0, config, "the config's theme");
     assert!(pg.view.read_with(cx, |v, _| v.theme_follows_config));
     assert!(drawn(cx, w, &format!("value theme = {config} · follows the Synaps config")), "the row says so");
+    saved(cx, &pg);
     assert_eq!(relaunch(&pg).theme, None, "read back: no theme, so it follows");
-    assert!(file_keys(&pg).contains(&"theme".to_string()), "written, as null");
+    assert!(!file_keys(&pg).contains(&"theme".to_string()), "removed");
 }
 
 /// 17. Accent's door, its hex field, `#35f2ff`, Enter: the app's accent,
@@ -776,11 +778,13 @@ fn accent_hex_through_the_door_applies_and_persists(cx: &mut TestAppContext) {
     press(cx, w, "enter");
     assert_eq!(scheme(cx).1, Some(0x35f2ff), "applied");
     assert!(drawn(cx, w, "value accent = #35f2ff"), "the row says so");
+    saved(cx, &pg);
     assert_eq!(relaunch(&pg).accent.as_deref(), Some("#35f2ff"), "read back");
     let (name, hex) = crate::theme::PRESETS[1];
     click(cx, w, &format!("picker-preset {name}"));
     assert_eq!(scheme(cx).1, Some(hex), "a preset");
     assert!(drawn(cx, w, &format!("value accent = {}", crate::theme::to_hex(hex))));
+    saved(cx, &pg);
     assert_eq!(relaunch(&pg).accent, Some(crate::theme::to_hex(hex)), "read back");
 }
 

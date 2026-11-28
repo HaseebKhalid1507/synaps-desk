@@ -1735,7 +1735,9 @@ pub fn load_accent(path: &Path) -> Option<String> {
 }
 
 /// Save the accent override, or `null` for the theme's own colours (see
-/// [`save_settings`]).
+/// [`save_settings`]). The app saves it through its batch now
+/// ([`crate::settings_saved`]).
+#[cfg(test)]
 pub fn save_accent(path: &Path, hex: Option<u32>) -> std::io::Result<()> {
     save_settings(path, &[("accent", hex.map(to_hex).into())])
 }
@@ -1768,7 +1770,9 @@ pub fn load_theme(path: &Path) -> Option<String> {
     load_settings(path)?.get("theme")?.as_str().map(str::to_string)
 }
 
-/// Save the picked theme, or `null` to follow the Synaps config again.
+/// Save the picked theme, or `null` to follow the Synaps config again (as
+/// [`save_accent`]).
+#[cfg(test)]
 pub fn save_theme(path: &Path, name: Option<&str>) -> std::io::Result<()> {
     save_settings(path, &[("theme", name.into())])
 }
@@ -1814,13 +1818,13 @@ impl Default for Panels {
 }
 
 impl Panels {
-    const RAIL: &str = "rail_collapsed";
-    const RIGHT: &str = "right_collapsed";
-    const RAIL_WIDTH: &str = "rail_width";
-    const RIGHT_WIDTH: &str = "right_width";
-    const HISTORY: &str = "history_open";
-    const FAVS: &str = "favourites_closed";
-    const TEXT_SIZE: &str = "text_size";
+    pub(crate) const RAIL: &str = "rail_collapsed";
+    pub(crate) const RIGHT: &str = "right_collapsed";
+    pub(crate) const RAIL_WIDTH: &str = "rail_width";
+    pub(crate) const RIGHT_WIDTH: &str = "right_width";
+    pub(crate) const HISTORY: &str = "history_open";
+    pub(crate) const FAVS: &str = "favourites_closed";
+    pub(crate) const TEXT_SIZE: &str = "text_size";
 }
 
 /// Which of the panel keys a window changed (and so writes).
@@ -1851,6 +1855,35 @@ impl PanelKeys {
 
     pub fn is_empty(self) -> bool {
         self == Self::default()
+    }
+
+    /// The Settings rows among them, as their keys' bits
+    /// ([`crate::settings_saved::AppKeySet`]).
+    pub fn rows(self) -> u16 {
+        use crate::settings_saved::{AppKey, AppKeySet};
+        let mut s = AppKeySet::default();
+        for (on, k) in [(self.text_size, AppKey::TextSize), (self.rail, AppKey::Rail), (self.right, AppKey::Right)] {
+            if on {
+                s = s.with(k);
+            }
+        }
+        s.0
+    }
+
+    /// Their keys in the settings file.
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (self.rail, Panels::RAIL),
+            (self.right, Panels::RIGHT),
+            (self.rail_width, Panels::RAIL_WIDTH),
+            (self.right_width, Panels::RIGHT_WIDTH),
+            (self.history, Panels::HISTORY),
+            (self.favs, Panels::FAVS),
+            (self.text_size, Panels::TEXT_SIZE),
+        ]
+        .into_iter()
+        .filter_map(|(on, k)| on.then_some(k))
+        .collect()
     }
 
     pub fn or(self, o: Self) -> Self {
@@ -1894,8 +1927,22 @@ pub fn load_panels(path: &Path) -> Panels {
 }
 
 /// Save the panel states in `keys` only (see [`save_settings`]): another
-/// window's fold of the other panel is left as it wrote it.
-pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<()> {
+/// window's fold of the other panel is left as it wrote it. The rows' keys
+/// (text size, the two folds) get their receipts in the same write
+/// ([`crate::settings_saved`]): the receipts written.
+pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<Vec<crate::settings_saved::Receipt>> {
+    save_panels_if(path, p, keys, &|| false).map(Option::unwrap_or_default)
+}
+
+/// [`save_panels`] unless `stale()`, asked under the settings file's lock
+/// (a close took its place: Shady #116 A2). `None`: stale, nothing written.
+pub fn save_panels_if(
+    path: &Path,
+    p: Panels,
+    keys: PanelKeys,
+    stale: &dyn Fn() -> bool,
+) -> std::io::Result<Option<Vec<crate::settings_saved::Receipt>>> {
+    use crate::settings_saved::{AppKey, AppValue, Receipt};
     let mut kv = Vec::with_capacity(2);
     if keys.rail {
         kv.push((Panels::RAIL, p.rail_collapsed.into()));
@@ -1920,9 +1967,28 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
         kv.push((Panels::TEXT_SIZE, p.text_size.into()));
     }
     if kv.is_empty() {
-        return Ok(());
+        return Ok(Some(Vec::new()));
     }
-    save_settings(path, &kv)
+    let rows = [
+        (keys.text_size, AppKey::TextSize, AppValue::Num(p.text_size.into())),
+        (keys.rail, AppKey::Rail, AppValue::Bool(p.rail_collapsed)),
+        (keys.right, AppKey::Right, AppValue::Bool(p.right_collapsed)),
+    ];
+    let mut written = None;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
+        for (k, val) in kv {
+            v[k] = val;
+        }
+        let at = crate::settings_saved::now_ms();
+        let w: Vec<Receipt> = rows.iter().filter(|r| r.0).map(|(_, k, val)| Receipt::app(*k, val, at)).collect();
+        crate::settings_saved::write_into(v, &w);
+        written = Some(w);
+        Ok(true)
+    })?;
+    Ok(written)
 }
 
 /// Set `keys` in the settings file, keeping its other keys. A file that is
@@ -1930,18 +1996,11 @@ pub fn save_panels(path: &Path, p: Panels, keys: PanelKeys) -> std::io::Result<(
 /// lost), then replaced. Written to a temporary file of this process (two
 /// windows never share one), flushed to disk, then renamed over the old
 /// one (and, on Unix, the directory synced so the rename survives a
-/// crash); the temporary file never outlives a failure.
+/// crash); the temporary file never outlives a failure. The app's own
+/// values go through its batch ([`crate::settings_saved::write_batch`]).
+#[cfg(test)]
 pub fn save_settings(path: &Path, keys: &[(&str, serde_json::Value)]) -> std::io::Result<()> {
-    save_settings_unless(path, keys, || false)
-}
-
-/// [`save_settings`], unless `stale()` (asked under the writer's lock)
-/// says a later write already holds these keys: then nothing changes.
-pub fn save_settings_unless(path: &Path, keys: &[(&str, serde_json::Value)], stale: impl FnOnce() -> bool) -> std::io::Result<()> {
     update_settings(path, |v| {
-        if stale() {
-            return;
-        }
         for (k, val) in keys {
             v[*k] = val.clone();
         }
@@ -1959,12 +2018,37 @@ pub fn load_tabs(path: &Path, key: &str) -> Option<crate::tabs::Saved> {
 /// Save the open tabs under `key`, keeping every other daemon's (see
 /// [`save_settings`]).
 pub fn save_tabs(path: &Path, key: &str, saved: &crate::tabs::Saved) -> std::io::Result<()> {
-    update_settings(path, |v| {
-        if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
-            v["tabs"] = serde_json::json!({});
-        }
-        v["tabs"][key] = saved_json(saved);
-    })
+    save_tabs_if(path, key, saved, &|| false, &|| {}).map(drop)
+}
+
+/// [`save_tabs`] unless `stale()`, asked under the settings file's lock (a
+/// window's close took its place: Shady #116 A1): whether it wrote. `done`
+/// runs once the file is in place, still under its lock, so what it records
+/// is in the order the writes were made ([`update_settings_then`]).
+pub(crate) fn save_tabs_if(
+    path: &Path,
+    key: &str,
+    saved: &crate::tabs::Saved,
+    stale: &dyn Fn() -> bool,
+    done: &dyn Fn(),
+) -> std::io::Result<bool> {
+    let mut wrote = false;
+    update_settings_then(
+        path,
+        |v| {
+            if stale() {
+                return Ok(false);
+            }
+            if !v.get("tabs").is_some_and(serde_json::Value::is_object) {
+                v["tabs"] = serde_json::json!({});
+            }
+            v["tabs"][key] = saved_json(saved);
+            wrote = true;
+            Ok(true)
+        },
+        done,
+    )?;
+    Ok(wrote)
 }
 
 /// A split layout as the settings file keeps it (split/architecture.md
@@ -2162,15 +2246,32 @@ fn layout_of(v: &serde_json::Value, key: &str) -> Option<Layout> {
 /// ([`Layout::union`]: what an older build reads), in one write under the
 /// settings lock, every other key and daemon kept ([`save_settings`]).
 pub fn save_layout(path: &Path, key: &str, layout: &Layout) -> std::io::Result<()> {
-    update_settings(path, |v| {
-        for k in ["layout", "tabs"] {
-            if !v.get(k).is_some_and(serde_json::Value::is_object) {
-                v[k] = serde_json::json!({});
+    save_layout_if(path, key, layout, &|| false, &|| {}).map(drop)
+}
+
+/// [`save_layout`] unless `stale()`, `done` once it is in place, as
+/// [`save_tabs_if`].
+pub(crate) fn save_layout_if(path: &Path, key: &str, layout: &Layout, stale: &dyn Fn() -> bool, done: &dyn Fn()) -> std::io::Result<bool> {
+    let mut wrote = false;
+    update_settings_then(
+        path,
+        |v| {
+            if stale() {
+                return Ok(false);
             }
-        }
-        v["layout"][key] = layout.to_json();
-        v["tabs"][key] = saved_json(&layout.union());
-    })
+            for k in ["layout", "tabs"] {
+                if !v.get(k).is_some_and(serde_json::Value::is_object) {
+                    v[k] = serde_json::json!({});
+                }
+            }
+            v["layout"][key] = layout.to_json();
+            v["tabs"][key] = saved_json(&layout.union());
+            wrote = true;
+            Ok(true)
+        },
+        done,
+    )?;
+    Ok(wrote)
 }
 
 /// What a launch restores under `key`, from one read of the file (Shady
@@ -2211,8 +2312,23 @@ pub fn save_favourites(
     base: &[crate::favourites::Favourite],
     ours: &[crate::favourites::Favourite],
 ) -> std::io::Result<Vec<crate::favourites::Favourite>> {
-    let mut written = Vec::new();
-    try_update_settings(path, |v| {
+    save_favourites_if(path, key, base, ours, &|| false).map(Option::unwrap_or_default)
+}
+
+/// [`save_favourites`] unless `stale()`, as [`save_tabs_if`]: `None`,
+/// stale, nothing written.
+pub(crate) fn save_favourites_if(
+    path: &Path,
+    key: &str,
+    base: &[crate::favourites::Favourite],
+    ours: &[crate::favourites::Favourite],
+    stale: &dyn Fn() -> bool,
+) -> std::io::Result<Option<Vec<crate::favourites::Favourite>>> {
+    let mut written = None;
+    update_settings_if(path, |v| {
+        if stale() {
+            return Ok(false);
+        }
         let refuse = |what: String| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{what}: not overwritten")));
         match v.get("favourites") {
             None => v["favourites"] = serde_json::json!({}),
@@ -2223,34 +2339,51 @@ pub fn save_favourites(
                 }
             }
         }
-        written = match v["favourites"].get(key) {
+        let list = match v["favourites"].get(key) {
             Some(theirs) => crate::favourites::merge(&crate::favourites::from_json(theirs), base, ours),
             None => ours.to_vec(),
         };
-        v["favourites"][key] = crate::favourites::to_json(&written);
-        Ok(())
+        v["favourites"][key] = crate::favourites::to_json(&list);
+        written = Some(list);
+        Ok(true)
     })?;
     Ok(written)
 }
 
-/// How long a write waits for another process's lock on the settings file
-/// (its read, merge and rename take milliseconds) before it writes
-/// unlocked: a holder stopped mid-write (a suspended or hung process) never
-/// freezes this one, on the UI thread or off it.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long one try waits for another process's lock on the settings file
+/// (its read, merge and rename take milliseconds): a holder stopped
+/// mid-write (a suspended or hung process) never freezes this one.
+pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A write off the UI thread tries the lock this many times, [`LOCK_GAP`]
+/// apart (about 1.25 s in all), then fails, and says why (PLAN §2.2).
+pub(crate) const LOCK_TRIES: u32 = 3;
+pub(crate) const LOCK_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The window's close writes what waits within this, all its flushes
+/// together ([`closing`]), or writes nothing and names what it lost.
+pub(crate) const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Why the settings lock isn't held.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LockFail {
+    /// Another process holds it still, after the wait.
+    Busy,
+    /// The lock file can't be opened or locked at all.
+    Cannot(String),
+}
 
 /// The advisory lock on `lock` (the settings' own lock file), tried until
 /// `wait` has passed while another holds it (std's `WouldBlock`: `EWOULDBLOCK`,
-/// Windows' `ERROR_LOCK_VIOLATION` only). `Err`: why it isn't held, at once
-/// for a lock file that can't be opened or locked at all (the caller writes
-/// unlocked and says so on stderr). Never a blocking lock.
-pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+/// Windows' `ERROR_LOCK_VIOLATION` only); at once [`LockFail::Cannot`] for
+/// a lock file that can't be opened or locked at all. Never a blocking lock.
+pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<std::fs::File, LockFail> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(lock)
-        .map_err(|e| format!("{} not opened ({e})", lock.display()))?;
+        .map_err(|e| LockFail::Cannot(format!("{} not opened ({e})", lock.display())))?;
     let deadline = std::time::Instant::now() + wait;
     loop {
         match f.try_lock() {
@@ -2258,9 +2391,157 @@ pub(crate) fn lock_settings(lock: &Path, wait: std::time::Duration) -> Result<st
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            Err(e) => return Err(format!("{} not locked ({e})", lock.display())),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(LockFail::Busy),
+            Err(e) => return Err(LockFail::Cannot(format!("{} not locked ({e})", lock.display()))),
         }
     }
+}
+
+/// The settings file's lock for a write: [`LOCK_TRIES`] tries off the UI
+/// thread, or until the close's deadline while one runs. There is no
+/// unlocked write: `Err` names the lock, and nothing is written.
+fn take_settings_lock(path: &Path, writer: &Writer) -> std::io::Result<std::fs::File> {
+    let lock = path.with_extension("json.lock");
+    let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
+    let busy = || std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{name} is locked by another process"));
+    let cannot = |why: String| std::io::Error::other(format!("{name} can't be locked: {why}"));
+    if let Some(by) = CLOSING.get() {
+        // No write is begun once the close's time is spent (Shady #116 A1).
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(spent());
+        }
+        return match lock_settings(&lock, left) {
+            Ok(f) => Ok(writer.took(f)),
+            Err(LockFail::Busy) => Err(blocked(busy())),
+            Err(LockFail::Cannot(why)) => Err(writer.cannot(cannot(why))),
+        };
+    }
+    // Waiting for another process from here until a write takes the lock:
+    // this process's close that waits for this write says so ([`own_write`]).
+    writer.waits.store(true, std::sync::atomic::Ordering::Relaxed);
+    for i in 1..=LOCK_TRIES {
+        match lock_settings(&lock, LOCK_WAIT) {
+            Ok(f) => return Ok(writer.took(f)),
+            Err(LockFail::Busy) if i < LOCK_TRIES => std::thread::sleep(LOCK_GAP),
+            Err(LockFail::Busy) => return Err(busy()),
+            Err(LockFail::Cannot(why)) => return Err(writer.cannot(cannot(why))),
+        }
+    }
+    Err(busy())
+}
+
+thread_local! {
+    /// The close's deadline, while its flushes run ([`closing`]).
+    static CLOSING: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// What the close last waited on in vain: why its time is spent.
+    static BLOCKED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// What the close couldn't write, and why: said once, at its end.
+    static LOST: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `e`, what a close's wait found in its way: its time is spent on it.
+fn blocked(e: std::io::Error) -> std::io::Error {
+    BLOCKED.with(|b| *b.borrow_mut() = Some(e.to_string()));
+    e
+}
+
+/// A write the close's spent time refuses: why it ran out.
+fn spent() -> std::io::Error {
+    let why = BLOCKED.with(|b| b.borrow().clone()).unwrap_or_else(|| "the close's time ran out".into());
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, why)
+}
+
+/// What a close is told when this process's own write of `path` holds it
+/// up: the other process that one waits for, if it does.
+fn own_write(path: &Path, writer: &Writer) -> std::io::Error {
+    let name = path.file_name().map_or_else(|| "settings.json".into(), |n| n.to_string_lossy());
+    let why = match writer.waits.load(std::sync::atomic::Ordering::Relaxed) {
+        true => format!("{name} is locked by another process"),
+        false => format!("{name} is locked by this app's own write"),
+    };
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, why)
+}
+
+/// Waits until `ready()` (asked every 2 ms): a job of this window's own,
+/// in its write of `path`. Within the close's deadline while one runs
+/// ([`closing`]), else as long as it takes. Whether it came; if not, the
+/// close's time is spent (Shady #116 A1) and [`closing_lost`] says why.
+pub(crate) fn wait_for_own(path: &Path, ready: impl Fn() -> bool) -> bool {
+    let writer = writer_of(path);
+    loop {
+        if ready() {
+            return true;
+        }
+        if let Some(by) = CLOSING.get() {
+            blocked(own_write(path, &writer));
+            if std::time::Instant::now() >= by {
+                return false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Why a close's write of `keys` didn't happen, its time spent: said with
+/// what it couldn't write ([`not_saved_at_close`]).
+pub(crate) fn closing_lost(keys: &[&str]) {
+    not_saved_at_close(keys, &spent());
+}
+
+/// The window's close: `flush` (its writes) within one [`CLOSE_DEADLINE`],
+/// waiting for this process's own writer and for the file's lock alike.
+/// Once it has passed, no write is begun (Shady #116 A1).
+/// What it couldn't write is named on stderr, the one failure no window
+/// can show: `synaps-desktop: not saved at close, settings.json is locked:
+/// theme, text_size`.
+pub(crate) fn closing<R>(flush: impl FnOnce() -> R) -> R {
+    let outer = CLOSING.get().is_none();
+    if outer {
+        CLOSING.set(Some(std::time::Instant::now() + CLOSE_DEADLINE));
+        BLOCKED.with(|b| b.borrow_mut().take());
+    }
+    let out = flush();
+    if outer {
+        CLOSING.set(None);
+        BLOCKED.with(|b| b.borrow_mut().take());
+        let lost = LOST.take();
+        let mut why: Vec<&str> = lost.iter().map(|(_, w)| w.as_str()).collect();
+        why.dedup();
+        if !lost.is_empty() {
+            let keys = lost.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+            let line = match why.as_slice() {
+                [w] if w.ends_with("is locked by another process") => {
+                    format!("synaps-desktop: not saved at close, {}: {keys}", w.trim_end_matches(" by another process"))
+                }
+                _ => format!("synaps-desktop: not saved at close ({}): {keys}", why.join("; ")),
+            };
+            eprintln!("{line}");
+            #[cfg(test)]
+            SAID.with(|s| s.borrow_mut().push(line));
+        }
+    }
+    out
+}
+
+/// A close's write of `keys` failed with `e` ([`closing`] says so).
+pub(crate) fn not_saved_at_close(keys: &[&str], e: &std::io::Error) {
+    if CLOSING.get().is_none() {
+        eprintln!("synaps-desktop: not saved ({e}): {}", keys.join(", "));
+        return;
+    }
+    LOST.with(|l| l.borrow_mut().extend(keys.iter().map(|k| (k.to_string(), e.to_string()))));
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Tests: the close lines this thread printed, taken.
+#[cfg(test)]
+pub(crate) fn said_at_close() -> Vec<String> {
+    SAID.take()
 }
 
 /// The favourites this process holds, per settings file and daemon key, as
@@ -2281,6 +2562,7 @@ pub fn carry_favourites(path: &Path, key: &str, list: &[crate::favourites::Favou
 
 /// Change the settings file with `edit` (on its JSON object), as
 /// [`save_settings`] says.
+#[cfg(test)]
 fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
     try_update_settings(path, |v| {
         edit(v);
@@ -2288,24 +2570,129 @@ fn update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> st
     })
 }
 
+/// This process's writer of the settings file at `path` (the app has one;
+/// each test its own).
+fn writer_of(path: &Path) -> std::sync::Arc<Writer> {
+    type Writers = Vec<(std::path::PathBuf, std::sync::Arc<Writer>)>;
+    static WRITERS: std::sync::Mutex<Writers> = std::sync::Mutex::new(Vec::new());
+    let mut all = WRITERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match all.iter().find(|(p, _)| p == path) {
+        Some((_, w)) => w.clone(),
+        None => {
+            let w = std::sync::Arc::new(Writer::default());
+            all.push((path.to_path_buf(), w.clone()));
+            w
+        }
+    }
+}
+
+/// A settings file's writer in this process: one write at a time, and
+/// whether its writes wait for another process's lock (from a wait's start
+/// until a write takes it).
+#[derive(Default)]
+struct Writer {
+    one: std::sync::Mutex<()>,
+    waits: std::sync::atomic::AtomicBool,
+    /// Tests: this process's writes waiting for `one` now.
+    #[cfg(test)]
+    behind: std::sync::atomic::AtomicU32,
+}
+
+impl Writer {
+    /// The lock `f`, taken: no one holds it now.
+    fn took(&self, f: std::fs::File) -> std::fs::File {
+        self.waits.store(false, std::sync::atomic::Ordering::Relaxed);
+        f
+    }
+
+    /// A lock that can't be taken at all: no one holds it.
+    fn cannot(&self, e: std::io::Error) -> std::io::Error {
+        self.waits.store(false, std::sync::atomic::Ordering::Relaxed);
+        e
+    }
+}
+
+/// Tests: whether a write of `path` is under way in this process (its
+/// writer held).
+#[cfg(test)]
+pub(crate) fn writing(path: &Path) -> bool {
+    writer_of(path).one.try_lock().is_err()
+}
+
+/// Tests: whether a write of `path` in this process waits for another one
+/// of this process to finish.
+#[cfg(test)]
+pub(crate) fn behind_another(path: &Path) -> bool {
+    writer_of(path).behind.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// [`update_settings`] with an `edit` that may refuse: the file is then
 /// left as it was. A file that is there but cannot be read is left as it
-/// was too (an error says so): only a missing one starts empty.
-fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>) -> std::io::Result<()> {
+/// was too (an error says so): only a missing one starts empty. Under the
+/// settings lock, always ([`take_settings_lock`]): a write that can't take
+/// it doesn't run, and the file isn't touched.
+#[cfg(test)]
+pub(crate) fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<()>) -> std::io::Result<()> {
+    update_settings_if(path, |v| edit(v).map(|()| true))
+}
+
+/// [`try_update_settings`] with an `edit` that may find nothing to do
+/// (`Ok(false)`: a batch a later write holds): the file is then not
+/// written at all.
+pub(crate) fn update_settings_if(path: &Path, edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<bool>) -> std::io::Result<()> {
+    update_settings_then(path, edit, || {})
+}
+
+/// [`update_settings_if`], and `then` once the file is in place (renamed
+/// over the old one), before its locks go: what `then` records of the write
+/// is in the order the writes were made, in this process and across them
+/// (Shady #116 R2-A8: two jobs' records made after their locks went could
+/// come in the opposite order to their writes).
+pub(crate) fn update_settings_then(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Value) -> std::io::Result<bool>,
+    then: impl FnOnce(),
+) -> std::io::Result<()> {
     use std::io::Write;
-    // One writer at a time in this process: the theme (UI thread) and the
-    // panels (background) each re-read and merge, so neither write is lost.
-    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = WRITER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // One writer at a time in this process, per file: each re-reads and
+    // merges, so no write is lost. A close waits for it no longer than its
+    // deadline.
+    let writer = writer_of(path);
+    let _one = match CLOSING.get() {
+        None => match writer.one.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                writer.behind.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let g = writer.one.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(test)]
+                writer.behind.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            }
+        },
+        // No write is begun once the close's time is spent (Shady #116 A1).
+        Some(by) => loop {
+            if std::time::Instant::now() >= by {
+                return Err(spent());
+            }
+            match writer.one.try_lock() {
+                Ok(g) => break g,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    blocked(own_write(path, &writer));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        },
+    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     // And one at a time across processes (two windows, two builds): the
     // read, the merge and the rename under an advisory lock of a file of
     // its own, so no window writes over what another wrote after its read.
-    let _lock = lock_settings(&path.with_extension("json.lock"), LOCK_WAIT)
-        .inspect_err(|why| eprintln!("synaps-desktop: {why}: settings written unlocked"))
-        .ok();
+    let _lock = take_settings_lock(path, &writer)?;
     // Lossy: a stray invalid byte is a file that does not parse (set aside
     // below), never one read as missing (which would wipe every key).
     let text = match std::fs::read(path) {
@@ -2319,7 +2706,9 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
         std::fs::copy(path, path.with_extension("json.bad"))?;
     }
     let mut v = parsed.unwrap_or_else(|| serde_json::json!({}));
-    edit(&mut v)?;
+    if !edit(&mut v)? {
+        return Ok(());
+    }
     // Set aside, the file had the favourites (they are in `.bad` now): a
     // write of other keys (the tabs, the theme) carries this process's in
     // memory, unless the edit wrote them itself.
@@ -2350,6 +2739,9 @@ fn try_update_settings(path: &Path, edit: impl FnOnce(&mut serde_json::Value) ->
     {
         // Best effort: the file itself is already complete.
         let _ = std::fs::File::open(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }).and_then(|d| d.sync_all());
+    }
+    if written.is_ok() {
+        then();
     }
     written
 }
@@ -3391,7 +3783,8 @@ mod tests {
     /// its own: two opens conflict as two processes do). N4: never for
     /// longer than its wait: a holder that never lets go (stopped mid-write)
     /// does not freeze it, and a lock file that can't be opened isn't waited
-    /// for at all; either way it writes, unlocked. No bound here depends on
+    /// for at all. Either way it writes nothing, and says why (PLAN §2.2's
+    /// strict lock: there is no unlocked write). No bound here depends on
     /// how fast the machine is: a wait that was waited out took at least its
     /// length, one not waited for took less than a minute of it.
     #[test]
@@ -3413,28 +3806,34 @@ mod tests {
         assert!(!waiter.is_finished(), "held: still waiting");
         other.unlock().unwrap();
         assert!(waiter.join().unwrap().is_ok(), "taken once let go");
-        // Held for good: not taken, after the whole wait; the write goes
-        // ahead, unlocked.
+        // Held for good: not taken, after the whole wait; the write, after
+        // its three tries, writes nothing and says the lock is held.
         other.lock().unwrap();
         let t0 = Instant::now();
         let why = lock_settings(&lock, LOCK_WAIT).unwrap_err();
         assert!(t0.elapsed() >= LOCK_WAIT, "{:?}", t0.elapsed());
-        assert!(why.contains("not locked"), "{why}");
-        save_settings(&path, &[("accent", "#35f2ff".into())]).unwrap();
-        assert_eq!(load_accent(&path).as_deref(), Some("#35f2ff"));
-        assert_eq!(load_theme(&path).as_deref(), Some("nord"), "merged");
+        assert_eq!(why, LockFail::Busy);
+        let before = std::fs::read(&path).unwrap();
+        let t0 = Instant::now();
+        let e = save_settings(&path, &[("accent", "#35f2ff".into())]).unwrap_err();
+        assert!(t0.elapsed() >= LOCK_WAIT * LOCK_TRIES + LOCK_GAP * (LOCK_TRIES - 1), "three tries: {:?}", t0.elapsed());
+        assert_eq!(e.to_string(), "settings.json is locked by another process");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "not written unlocked");
         // A lock file that can't be opened (a directory there: EISDIR,
         // Windows' ERROR_ACCESS_DENIED): not waited for, whatever the wait;
-        // the write goes ahead, unlocked.
+        // the write is refused at once, and writes nothing.
         drop(other);
         std::fs::remove_file(&lock).unwrap();
         std::fs::create_dir(&lock).unwrap();
         let t0 = Instant::now();
         let why = lock_settings(&lock, Duration::from_secs(60)).unwrap_err();
         assert!(t0.elapsed() < Duration::from_secs(60), "not waited for: {:?}", t0.elapsed());
-        assert!(why.contains("not opened"), "{why}");
-        save_settings(&path, &[("accent", "#ff2d7b".into())]).unwrap();
-        assert_eq!(load_accent(&path).as_deref(), Some("#ff2d7b"));
+        assert!(matches!(&why, LockFail::Cannot(w) if w.contains("not opened")), "{why:?}");
+        let t0 = Instant::now();
+        let e = save_settings(&path, &[("accent", "#ff2d7b".into())]).unwrap_err();
+        assert!(t0.elapsed() < LOCK_WAIT, "refused at once: {:?}", t0.elapsed());
+        assert!(e.to_string().starts_with("settings.json can't be locked: "), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "not written unlocked");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3780,7 +4179,7 @@ mod tests {
         let p = Panels { text_size: 20, ..p0 };
         save_panels(&path, p, PanelKeys::changed(p0, p)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({"text_size": 20}));
+        assert_eq!(without_receipts(v), serde_json::json!({"text_size": 20}));
         assert_eq!(load_panels(&path), p);
         for bad in [r#"{"text_size": 19}"#, r#"{"text_size": "big"}"#, r#"{"text_size": -1}"#, r#"{"text_size": 1e9}"#] {
             std::fs::write(&path, bad).unwrap();
@@ -3821,6 +4220,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The file's values: its receipts (`settings.saved`, which a panels
+    /// write carries since Settings PR 5) set aside.
+    fn without_receipts(mut v: serde_json::Value) -> serde_json::Value {
+        v.as_object_mut().map(|o| o.remove(crate::settings_saved::STORE));
+        v
+    }
+
     /// Nit 5: a THIS APP batch a quit's flush wrote again changes nothing
     /// when its own write lands late.
     #[test]
@@ -3828,11 +4234,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("synaps-desktop-stale-{}", std::process::id()));
         let path = dir.join("settings.json");
         let _ = std::fs::remove_dir_all(&dir);
+        use crate::settings_saved::{AppBatch, write_batch};
         save_settings(&path, &[("text_size", 15.into()), ("dash_url", "new".into())]).unwrap();
-        save_settings_unless(&path, &[("dash_url", "old".into())], || true).unwrap();
+        let batch = |v: &str| {
+            let mut b = AppBatch::default();
+            b.insert("dash_url", Some(v.into()));
+            b
+        };
+        write_batch(&path, &batch("old"), &[], || true).unwrap();
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((v["dash_url"].as_str(), v["text_size"].as_u64()), (Some("new"), Some(15)));
-        save_settings_unless(&path, &[("dash_url", "later".into())], || false).unwrap();
+        write_batch(&path, &batch("later"), &[], || false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["dash_url"], "later");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3866,7 +4278,7 @@ mod tests {
             "the accent's save keeps them"
         );
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({"accent": "#2d7bff", "rail_collapsed": true, "right_collapsed": true}));
+        assert_eq!(without_receipts(v), serde_json::json!({"accent": "#2d7bff", "rail_collapsed": true, "right_collapsed": true}));
         // Hand edits: not a boolean, or not JSON, means open.
         std::fs::write(&path, r#"{"rail_collapsed": "yes", "right_collapsed": 1}"#).unwrap();
         assert_eq!(load_panels(&path), Panels::default());

@@ -7,13 +7,11 @@
 //! It draws in a cached pane ([`crate::views::ViewPane`]).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, Paste};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -25,7 +23,9 @@ use crate::fonts::TextPx as _;
 use crate::model::ConnState;
 use crate::rail::State;
 use crate::settings::{self, Cat};
+use crate::settings_editor::Field;
 use crate::settings_find::{self as find, Fields, Found, Hit};
+use crate::settings_saved::{AppKey, AppValue, SettingsWriter};
 use crate::theme::{self, Palette};
 use crate::usage::Range;
 use crate::views::{Answer, ViewCx};
@@ -37,6 +37,9 @@ const INDEX: f32 = 176.;
 const INDEX_FROM: f32 = 1000.;
 /// A row's control.
 const CONTROL: f32 = 240.;
+
+/// The Usage row's keys: its range's and its host's.
+const USAGE_KEYS: [&str; 2] = ["usage_range", "usage_host"];
 
 /// A config write on its way, or refused (the dash's message).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +124,10 @@ pub(crate) enum Pick {
     Host,
 }
 
+/// A usage host longer than this isn't offered (the writer's bound, PLAN
+/// §3.6 Part 2).
+pub(crate) const HOST_MAX: usize = 256;
+
 /// The groups, in order (the index's entries; each is one child of the
 /// scrolling column, after the title).
 const GROUPS: [&str; 7] = [
@@ -166,77 +173,22 @@ pub(crate) struct SettingsUi {
     /// off the UI thread when Settings opens (`Err`: it could not be read;
     /// its rows show `—`).
     pub reference: Option<settings::Reference>,
-    /// The outcome of a THIS APP change, under its rows (every key of the
-    /// batch that failed).
-    pub app_note: Option<(Vec<&'static str>, String)>,
-    /// THIS APP keys waiting for their save ([`crate::app::SAVE_DELAY`]
-    /// after the last change, all in one write, in order), and that save.
-    pub(crate) app_dirty: BTreeMap<&'static str, Option<String>>,
-    app_save: Option<Task<()>>,
-    /// The batch being written off the UI thread, and its stop: a quit's
-    /// flush writes it again with what came after, and the late write
-    /// then changes nothing (checked under the settings file's lock).
-    app_writing: Option<(AppBatch, Arc<AtomicBool>)>,
-    /// THIS APP changes so far, and the last that a write saved (with when
-    /// it finished): a value's afterglow starts there, never on a guess.
-    app_gen: u64,
-    pub(crate) app_wrote: Option<(u64, Instant)>,
-    /// The daemon values this app saved in this run ([`Saves`]). A row
-    /// says it was saved while the file still holds it.
-    pub(crate) wrote: Saves,
+    /// The window's writer: what waits to be saved, what failed, and the
+    /// receipts ([`crate::settings_saved`]). Its fields read as this one's.
+    pub(crate) writer: SettingsWriter,
 }
 
-type AppBatch = BTreeMap<&'static str, Option<String>>;
-
-/// The daemon values this app saved in this run: a `POST` whose reply held
-/// the value it sent. By whose config ([`AppView::config_owner`]) and key,
-/// the last [`Saves::CAP`] of them, each value's digest (none of its text
-/// kept). A save that leaves only takes its row's `saved ·` with it; what
-/// the dash read of the running daemon is never this.
-#[derive(Default)]
-pub(crate) struct Saves(std::collections::VecDeque<(u64, &'static str, [u8; 32])>);
-
-impl Saves {
-    /// As PR 5's receipts (PLAN §2.2).
-    pub(crate) const CAP: usize = 256;
-
-    fn digest(value: Option<&str>) -> [u8; 32] {
-        use sha2::Digest as _;
-        let mut h = sha2::Sha256::new();
-        match value {
-            None => h.update([0]),
-            Some(v) => {
-                h.update([1]);
-                h.update(v.as_bytes());
-            }
-        }
-        h.finalize().into()
-    }
-
-    /// `value` saved as `key` in `owner`'s config: its pair's last save,
-    /// the oldest pair's going past [`Saves::CAP`].
-    pub(crate) fn insert(&mut self, owner: u64, key: &'static str, value: Option<&str>) {
-        self.0.retain(|&(o, k, _)| (o, k) != (owner, key));
-        if self.0.len() == Self::CAP {
-            self.0.pop_front();
-        }
-        self.0.push_back((owner, key, Self::digest(value)));
-    }
-
-    /// This run's last save of `key` in `owner`'s config was `value`.
-    pub(crate) fn holds(&self, owner: u64, key: &str, value: Option<&str>) -> bool {
-        self.0.iter().find(|&&(o, k, _)| (o, k) == (owner, key)).is_some_and(|e| e.2 == Self::digest(value))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
+impl std::ops::Deref for SettingsUi {
+    type Target = SettingsWriter;
+    fn deref(&self) -> &SettingsWriter {
+        &self.writer
     }
 }
 
-/// A batch as the settings file takes it.
-fn app_pairs(keys: &AppBatch) -> Vec<(&'static str, serde_json::Value)> {
-    keys.iter().map(|(k, v)| (*k, v.clone().into())).collect()
+impl std::ops::DerefMut for SettingsUi {
+    fn deref_mut(&mut self) -> &mut SettingsWriter {
+        &mut self.writer
+    }
 }
 
 /// THIS SESSION's Cache keep-warm row: its mode, read-only until the
@@ -363,7 +315,7 @@ impl AppView {
                     st.level = Some(l);
                     cx.set_global(st);
                     crate::motion::Level::apply(cx);
-                    self.save_app("motion", Some(l.key().to_string()), cx);
+                    self.save_app(AppKey::Motion, AppValue::Str(l.key().into()), cx);
                     cx.notify();
                 }
             }
@@ -376,94 +328,25 @@ impl AppView {
             }
             Pick::Notify => {
                 self.app_settings.quiet = value == "off";
-                self.save_app(NOTIFY, Some(value.to_string()), cx);
+                self.save_app(AppKey::Notify, AppValue::Str(value.into()), cx);
             }
             Pick::Remember => {
                 self.set_recall(value == "on", cx);
-                self.save_app(crate::recall::SETTING, Some(value.to_string()), cx);
+                self.save_app(AppKey::Remember, AppValue::Str(value.into()), cx);
             }
             Pick::Range => {
                 if let Some(r) = Range::parse(value) {
                     self.app_settings.usage_range = r;
-                    self.save_app("usage_range", Some(r.key().to_string()), cx);
+                    self.save_app(AppKey::UsageRange, AppValue::Str(r.key().into()), cx);
                 }
             }
             Pick::Host => {
                 let h = (value != "all").then(|| value.to_string());
                 self.app_settings.usage_host = h.clone();
-                self.save_app("usage_host", h, cx);
+                self.save_app(AppKey::UsageHost, AppValue::of(h), cx);
             }
         }
         self.views_changed(cx);
-    }
-
-    /// A THIS APP key, saved [`crate::app::SAVE_DELAY`] after the last
-    /// change with the others waiting, in one write off the UI thread (two
-    /// quick changes of a key cannot land out of order).
-    fn save_app(&mut self, key: &'static str, value: Option<String>, cx: &mut Context<Self>) {
-        if theme::settings_path().is_none() {
-            self.settings.app_note = Some((vec![key], "not saved: no config folder".into()));
-            return;
-        }
-        self.settings.app_note = None;
-        self.settings.app_gen += 1;
-        self.settings.app_dirty.insert(key, value);
-        self.arm_app_save(cx);
-    }
-
-    fn arm_app_save(&mut self, cx: &mut Context<Self>) {
-        self.settings.app_save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(crate::app::SAVE_DELAY).await;
-            let _ = this.update(cx, |v, cx| v.write_app(cx));
-        }));
-    }
-
-    fn write_app(&mut self, cx: &mut Context<Self>) {
-        if self.settings.app_writing.is_some() {
-            // The last write is still out: this one goes after it.
-            return self.arm_app_save(cx);
-        }
-        let keys = std::mem::take(&mut self.settings.app_dirty);
-        let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
-        let stop = Arc::new(AtomicBool::new(false));
-        let generation = self.settings.app_gen;
-        self.settings.app_writing = Some((keys.clone(), stop.clone()));
-        cx.spawn(async move |this, cx| {
-            let saved = cx
-                .background_spawn(async move {
-                    let pairs = app_pairs(&keys);
-                    theme::save_settings_unless(&path, &pairs, || stop.load(Ordering::SeqCst))
-                        .map_err(|e| (keys.keys().copied().collect::<Vec<_>>(), e.to_string()))
-                })
-                .await;
-            let _ = this.update(cx, |v, cx| {
-                v.settings.app_writing = None;
-                match saved {
-                    Err((keys, e)) => v.settings.app_note = Some((keys, format!("not saved: {e}"))),
-                    Ok(()) => v.settings.app_wrote = Some((generation, v.fx.now())),
-                }
-                v.views_changed(cx);
-            });
-        })
-        .detach();
-    }
-
-    /// A save still waiting, written now: the window is closing. A batch
-    /// still being written goes again under what came after it (nit 5:
-    /// the older one never lands last).
-    pub(crate) fn flush_app(&mut self) {
-        self.settings.app_save = None;
-        let mut keys = AppBatch::new();
-        if let Some((out, stop)) = self.settings.app_writing.take() {
-            stop.store(true, Ordering::SeqCst);
-            keys = out;
-        }
-        keys.append(&mut self.settings.app_dirty);
-        if let Some(path) = theme::settings_path().filter(|_| !keys.is_empty())
-            && let Err(e) = theme::save_settings(&path, &app_pairs(&keys))
-        {
-            eprintln!("synaps-desktop: settings not saved: {e}");
-        }
     }
 
     /// Start editing a field: the shared input takes its value and focus.
@@ -473,11 +356,15 @@ impl AppView {
             Edit::DaemonLabel => self.app_settings.daemon_label.clone().unwrap_or_default(),
             Edit::DashUrl => self.app_settings.dash_url.as_deref().map(crate::dash::strip_token).unwrap_or_default(),
         };
+        // Fresh on each open (its history starts empty); a value past the
+        // field's cap never opens it (its row says so).
+        if value.len() > crate::settings_editor::VALUE_CAP {
+            return;
+        }
         self.settings.editing = Some(e);
-        self.settings_input.update(cx, |s, cx| {
-            s.set_value(value, window, cx);
-            s.focus(window, cx);
-        });
+        self.new_field(crate::settings_editor::Field::Value, &value, crate::settings_editor::Keep::Nothing, window, cx);
+        self.settings_input_guard.fresh();
+        self.settings_input.update(cx, |s, cx| s.focus(window, cx));
         self.views_changed(cx);
     }
 
@@ -495,12 +382,12 @@ impl AppView {
             Edit::DaemonLabel => {
                 let v = (!typed.is_empty()).then_some(typed);
                 self.app_settings.daemon_label = v.clone();
-                self.save_app("daemon_label", v, cx);
+                self.save_app(AppKey::DaemonLabel, AppValue::of(v), cx);
             }
             Edit::DashUrl => {
                 let saved = (!typed.is_empty()).then(|| crate::dash::strip_token(&typed));
                 self.app_settings.dash_url = (!typed.is_empty()).then_some(typed);
-                self.save_app("dash_url", saved, cx);
+                self.save_app(AppKey::DashUrl, AppValue::of(saved), cx);
                 self.dash_refind(cx);
             }
         }
@@ -736,7 +623,7 @@ impl AppView {
     fn app_pending(&self, id: &SharedString) -> bool {
         let key = id.strip_prefix("field-").unwrap_or(id).replace('-', "_");
         let key = key.as_str();
-        self.settings.app_dirty.contains_key(key) || self.settings.app_writing.as_ref().is_some_and(|(keys, _)| keys.contains_key(key))
+        self.settings.app_dirty.contains_key(key) || self.settings.app_writing.as_ref().is_some_and(|(batch, _)| batch.contains_key(key))
     }
 
     pub(crate) fn saved_glow(&self, id: &SharedString, value: &str, sending: bool) -> f32 {
@@ -787,12 +674,20 @@ impl AppView {
             Edit::DaemonLabel => "field-daemon-label".into(),
             Edit::DashUrl => "field-dash-url".into(),
         };
+        // Longer than the field takes: its length, and where to edit it.
+        let long = !editing && value.len() > crate::settings_editor::VALUE_CAP;
+        let value: SharedString = match long {
+            true => format!("{} bytes: longer than this app edits; use /settings in the TUI", crate::usage::thousands(value.len() as u64))
+                .into(),
+            false => value,
+        };
         let body = if editing {
             div()
                 .flex_1()
                 .min_w_0()
                 .font_family(crate::fonts::MONO)
                 .text_px(13.)
+                .capture_action(cx.listener(|this, _: &Paste, window, cx| this.field_paste(Field::Value, window, cx)))
                 .child(Input::new(&self.settings_input).appearance(false))
                 .into_any_element()
         } else {
@@ -807,7 +702,7 @@ impl AppView {
                 .debug_selector(move || format!("{} = {}", said.0, said.1))
                 .into_any_element()
         };
-        h_flex()
+        let boxed = h_flex()
             .debug_selector(|| id.to_string())
             .id(id)
             .w(px(CONTROL))
@@ -817,15 +712,24 @@ impl AppView {
             .items_center()
             .border_1()
             .border_color(if editing { p.focus } else { p.edge })
-            .when(!editing, |d| d.cursor_text())
+            .when(!editing && !long, |d| d.cursor_text())
             .child(body)
             .when(!unit.is_empty(), |d| d.child(mono(unit, 12., p.dim)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if this.settings.editing != Some(e) {
                     this.settings_edit(e, window, cx);
                 }
-            }))
-            .into_any_element()
+            }));
+        // Under the open field: a paste refused, or its history cleared.
+        match self.field_note(Field::Value).filter(|_| editing) {
+            Some(n) => v_flex()
+                .items_end()
+                .gap(px(4.))
+                .child(h_flex().child(boxed))
+                .child(mono(n.clone(), 12., p.dim).debug_selector(move || format!("field-note {n}")))
+                .into_any_element(),
+            None => boxed.into_any_element(),
+        }
     }
 
     /// A read-only value: dim text, no border, then the rail's LOCKED glyph
@@ -869,14 +773,17 @@ impl AppView {
             return Self::locked(key, shown, p);
         }
         let id: &'static str = settings::def(key).map_or("config", |d| d.key);
-        match settings::config_choices(key) {
+        let control = match settings::config_choices(key) {
             Some(opts) => {
                 self.choice(id, Pick::Config(key), opts.iter().map(|o| SharedString::from(*o)).collect(), Some(&shown), sending, p, cx)
             }
             None => {
                 self.field(Edit::Config(key), sending.unwrap_or(&shown).to_string().into(), settings::unit(key), sending.is_some(), p, cx)
             }
-        }
+        };
+        let at = sending.is_none().then(|| self.daemon_saved_at(key, raw)).flatten();
+        let at = at.map(|r| format!("saved {}", crate::settings_saved::when(r.at_ms, crate::settings_saved::now_ms())));
+        Self::saved_beside(control, key, at, p)
     }
 
     /// Lines under a CONFIG row: what its editor takes when the row's help
@@ -894,7 +801,7 @@ impl AppView {
             out.push(mono(m.clone(), 12., p.err).whitespace_normal().debug_selector(|| format!("refused {key} = {m}")).into_any_element());
         }
         if let Some(c) = self.shown_config().filter(|c| c.exposes(key)) {
-            let wrote = self.settings.wrote.holds(self.config_owner(c), key, c.value(key));
+            let wrote = self.daemon_saved_at(key, c.value(key)).is_some();
             let seen = crate::settings_effect::Observed { idle_exit_running: c.idle_exit_running };
             let lines =
                 crate::settings_effect::lines(key, self.daemon_version(), c.value(key), &seen, wrote, self.settings.open_help == Some(key));
@@ -906,8 +813,63 @@ impl AppView {
                 });
                 out.push(v_flex().gap(px(2.)).debug_selector(move || format!("effect {key} = {said}")).children(lines).into_any_element());
             }
+            // Its save's time is this run's only: its write failed.
+            if let Some(n) =
+                self.settings.receipts_note.as_ref().filter(|_| self.daemon_saved_at(key, c.value(key)).is_some_and(|r| r.failed()))
+            {
+                let why = n.why.clone();
+                out.push(
+                    mono(n.why.to_string(), 12., p.err)
+                        .whitespace_normal()
+                        .debug_selector(move || format!("not-kept {key} = {why}"))
+                        .into_any_element(),
+                );
+            }
         }
         out
+    }
+
+    /// A THIS APP key's failed save: the app values' write's note, or the
+    /// panels', if it names the key.
+    fn note_of(&self, key: &'static str) -> Option<&crate::settings_saved::Note> {
+        let bit = crate::settings_saved::AppKeySet::default().with(AppKey::of(key)?).0;
+        [&self.settings.app_note, &self.settings.panels_note].into_iter().flatten().find(|n| n.keys & bit != 0)
+    }
+
+    /// Under a THIS APP row: its key's failed save `n` ([`Self::note_of`]),
+    /// `not saved: … · Retry`.
+    fn not_saved(&self, key: &'static str, n: &crate::settings_saved::Note, p: &Palette, cx: &ViewCx) -> AnyElement {
+        let why = n.why.clone();
+        let retry = div()
+            .id(SharedString::from(format!("retry-{key}")))
+            .debug_selector(move || format!("retry {key}"))
+            .cursor_pointer()
+            .child(mono("Retry", 12., p.you))
+            .on_click(cx.listener(|this, _, _, cx| this.retry_saves(cx)));
+        // The words wrap beside Retry: a long one (a path) never pushes it
+        // past the row.
+        let line = h_flex()
+            .w_full()
+            .gap(px(6.))
+            .items_start()
+            .debug_selector(move || format!("not-saved {key} = {why}"))
+            .child(mono(n.why.to_string(), 12., p.err).whitespace_normal().flex_1().min_w_0())
+            .child(mono("·", 12., p.dim).flex_none())
+            .child(retry.flex_none());
+        line.into_any_element()
+    }
+
+    /// `control` with `saved 13:58` before it (at `saved-at <key> = …`),
+    /// while the value it shows is the one this app saved.
+    fn saved_beside(control: AnyElement, key: &'static str, at: Option<String>, p: &Palette) -> AnyElement {
+        let Some(at) = at else { return control };
+        let said = at.clone();
+        h_flex()
+            .gap(px(10.))
+            .items_center()
+            .child(mono(at, 12., p.dim).debug_selector(move || format!("saved-at {key} = {said}")))
+            .child(control)
+            .into_any_element()
     }
 
     /// A daemon row's tag: when its change takes effect, once the dash's
@@ -1067,14 +1029,18 @@ impl AppView {
                                         .flex_1()
                                         .font_family(crate::fonts::MONO)
                                         .text_px(13.)
+                                        .capture_action(
+                                            cx.listener(|this, _: &Paste, window, cx| this.field_paste(Field::Find, window, cx)),
+                                        )
                                         .child(Input::new(&self.settings_find).appearance(false)),
                                 ),
                         )
                         // A query cut to its first 16 words or 256 bytes says
-                        // so, under the field (taking no room from the page).
-                        .when_some(note, |d, n| {
+                        // so, under the field (taking no room from the page);
+                        // so does a paste refused, or its history cleared.
+                        .when_some(self.field_note(Field::Find).map(SharedString::from).or(note.map(SharedString::from)), |d, n| {
                             d.child(
-                                mono(n, 12., p.dim)
+                                mono(n.clone(), 12., p.dim)
                                     .absolute()
                                     .top(px(32.))
                                     .right(px(0.))
@@ -1506,22 +1472,33 @@ impl AppView {
             (control, Vec::new())
         });
         let mut hosts: Vec<SharedString> = vec!["all".into()];
-        hosts.extend(self.usage.chips.iter().map(|h| SharedString::from(h.clone())));
+        // A host is offered only up to the writer's bound for it.
+        hosts.extend(self.usage.chips.iter().filter(|h| h.len() <= HOST_MAX).map(|h| SharedString::from(h.clone())));
         let host = self.app_settings.usage_host.clone().unwrap_or_else(|| "all".into());
         self.app_row(&mut rows, "app-usage", "Usage opens on", "usage_range", "The range and host Usage shows when it opens.", || {
             let control = v_flex()
                 .gap(px(8.))
                 .items_end()
-                .child(self.choice(
-                    "usage-range",
-                    Pick::Range,
-                    Range::ALL.iter().map(|r| SharedString::from(r.label())).collect(),
-                    Some(self.app_settings.usage_range.label()),
-                    None,
+                .child(Self::saved_beside(
+                    self.choice(
+                        "usage-range",
+                        Pick::Range,
+                        Range::ALL.iter().map(|r| SharedString::from(r.label())).collect(),
+                        Some(self.app_settings.usage_range.label()),
+                        None,
+                        p,
+                        cx,
+                    ),
+                    "usage_range",
+                    self.app_saved_at(AppKey::UsageRange, cx),
                     p,
-                    cx,
                 ))
-                .child(self.choice("usage-host", Pick::Host, hosts, Some(&host), None, p, cx))
+                .child(Self::saved_beside(
+                    self.choice("usage-host", Pick::Host, hosts, Some(&host), None, p, cx),
+                    "usage_host",
+                    self.app_saved_at(AppKey::UsageHost, cx),
+                    p,
+                ))
                 .into_any_element();
             (control, Vec::new())
         });
@@ -1530,8 +1507,20 @@ impl AppView {
             .into_iter()
             .enumerate()
             .map(|(i, mut r)| {
-                if let Some((_, n)) = self.settings.app_note.as_ref().filter(|(k, _)| k.contains(&r.key)) {
-                    r.under.push(mono(n.clone(), 12., p.err).into_any_element());
+                // The Usage row's two controls each save their own key: each
+                // shows its own failure and time (Shady #116 A4).
+                let key = r.key;
+                let keys: &[&'static str] = if key == "usage_range" { &USAGE_KEYS } else { std::slice::from_ref(&key) };
+                let mut said: Vec<*const crate::settings_saved::Note> = Vec::new();
+                for &k in keys {
+                    if let Some(n) = self.note_of(k).filter(|n| !said.contains(&std::ptr::from_ref(*n))) {
+                        said.push(std::ptr::from_ref(n));
+                        r.under.push(self.not_saved(k, n, p, cx));
+                    }
+                }
+                if let Some(k) = AppKey::of(key).filter(|_| keys.len() == 1) {
+                    let at = self.app_saved_at(k, cx);
+                    r.control = Self::saved_beside(r.control, key, at, p);
                 }
                 self.render_row(r, i == 0, p, cx)
             })

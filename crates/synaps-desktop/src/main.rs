@@ -31,6 +31,9 @@
 // every test module builds, stays the authority on dead code.
 #![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
+// The test binary's global allocator: synaps-client's counting one
+// (#102's, one copy of it), whose accounts the kit-input gates read
+// (settings-overhaul PLAN §3.4, `settings_editor_tests.rs`).
 mod agent_rail;
 mod agent_rail_view;
 mod agent_surface;
@@ -61,6 +64,9 @@ mod files;
 mod fit;
 mod fonts;
 mod glyph;
+#[cfg(test)]
+#[path = "../../synaps-client/tests/heap/mod.rs"]
+mod heap;
 mod lattice;
 mod lease;
 mod live;
@@ -87,8 +93,10 @@ mod revisions;
 mod scroll;
 mod scrollbar;
 mod settings;
+mod settings_editor;
 mod settings_effect;
 mod settings_find;
+mod settings_saved;
 mod settings_view;
 mod shell;
 mod split;

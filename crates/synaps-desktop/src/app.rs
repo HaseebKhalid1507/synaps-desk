@@ -1911,7 +1911,7 @@ pub(crate) fn lines_below(below: f32, line: f32) -> usize {
 }
 
 /// What the picker says after a save.
-fn saved_note(saved: Option<(std::io::Result<()>, std::path::PathBuf)>, overridden: &str) -> SharedString {
+pub(crate) fn saved_note(saved: Option<(std::io::Result<()>, std::path::PathBuf)>, overridden: &str) -> SharedString {
     match saved {
         Some((Ok(()), path)) => format!("saved to {}{overridden}", path.display()).into(),
         Some((Err(e), _)) => format!("not saved: {e}").into(),
@@ -1925,21 +1925,63 @@ pub(crate) fn well_body(prompt: &str) -> SharedString {
     SharedString::from(prompt)
 }
 
+/// A job's slot, locked only to read or note its state, never across a
+/// write (Shady #116 A1).
+fn slot_of<T>(slot: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `f` off the UI thread, on the background executor; in tests on a
+/// thread of its own once [`jobs_on_threads`] is set, so a test can close
+/// the window while a job waits in its write (Shady #116 A1).
+pub(crate) async fn off_ui<R: Send + 'static>(ex: gpui_kit::BackgroundExecutor, f: impl FnOnce() -> R + Send + 'static) -> R {
+    #[cfg(test)]
+    if JOBS_ON_THREADS.get() {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(f());
+        });
+        return rx.recv().await.expect("the job's thread");
+    }
+    ex.spawn(async move { f() }).await
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOBS_ON_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: the tabs', layout's and favourites' jobs on threads of their
+/// own from now on ([`off_ui`]).
+#[cfg(test)]
+pub(crate) fn jobs_on_threads(on: bool) {
+    JOBS_ON_THREADS.set(on);
+}
+
 /// A favourites write shared by the window and its background job: the job
-/// writes holding the lock and leaves what it wrote here, so the window
-/// takes it ([`crate::favourites::Favourites::written`]) whether or not the
-/// task that started it is still there.
+/// leaves what it wrote here, so the window takes it
+/// ([`crate::favourites::Favourites::written`]) whether or not the task
+/// that started it is still there. Its lock is never held across the write
+/// (Shady #116 A1): the window's close waits for a job in its write only
+/// within its deadline, and the job, once the close has come, finds it
+/// under the file's lock and writes nothing.
 #[derive(Default)]
-struct FavsJob {
-    /// The window closed: a job not begun yet writes nothing.
+pub(crate) struct FavsJob {
+    /// The window closed: a job writes nothing from now on.
     closed: bool,
     /// The generation written, the list sent, the file's list after.
     done: Option<(u64, Vec<crate::favourites::Favourite>, Vec<crate::favourites::Favourite>)>,
+    /// Jobs in their write now.
+    busy: u32,
+    /// Tests: jobs that found the window closed under the file's lock.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fenced: u32,
 }
 
 impl FavsJob {
     /// `sent` merged into the file over `base` ([`theme::save_favourites`]),
-    /// unless the window closed first.
+    /// unless the window closed first: before the write, or as it took the
+    /// file's lock.
     fn write(
         slot: &std::sync::Mutex<FavsJob>,
         path: &std::path::Path,
@@ -1948,33 +1990,60 @@ impl FavsJob {
         sent: Vec<crate::favourites::Favourite>,
         generation: u64,
     ) -> std::io::Result<()> {
-        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if job.closed {
-            return Ok(());
+        {
+            let mut job = slot_of(slot);
+            if job.closed {
+                return Ok(());
+            }
+            job.busy += 1;
         }
-        let file = theme::save_favourites(path, key, base, &sent)?;
-        job.done = Some((generation, sent, file));
+        let out = theme::save_favourites_if(path, key, base, &sent, &|| slot_of(slot).closed);
+        let mut job = slot_of(slot);
+        job.busy -= 1;
+        match out? {
+            Some(file) => job.done = Some((generation, sent, file)),
+            None => job.fenced += 1,
+        }
         Ok(())
+    }
+
+    /// Tests: whether a job is in its write.
+    #[cfg(test)]
+    pub(crate) fn in_write(slot: &std::sync::Mutex<FavsJob>) -> bool {
+        slot_of(slot).busy > 0
     }
 }
 
 /// The tabs' (or the layout's) delayed write, shared by the window and its
-/// background job (Shady #59 L1): the job writes holding the lock, and
-/// not at all once the window's last flush has closed it; that flush takes
-/// the lock (waiting out a write under way) and writes the latest, last.
-/// Without it a delayed write already under way at quit could land its
-/// older tabs after the flush's (#55 n6), whatever order the quit and
-/// release callbacks ran in.
+/// background job (Shady #59 L1): the job writes nothing once the window's
+/// last flush has closed it, asked as it begins and again under the file's
+/// lock; that flush waits out a write under way, then writes the latest,
+/// last. Without it a delayed write already under way at quit could land
+/// its older tabs after the flush's (#55 n6), whatever order the quit and
+/// release callbacks ran in. Its lock is never held across a write (Shady
+/// #116 A1): neither the window nor its close waits on it, and the close
+/// waits for a write under way only within its deadline.
 #[derive(Default)]
 pub(crate) struct SaveJob {
-    /// The window's last flush has run: a job not begun writes nothing.
+    /// The window's last flush has run: a job writes nothing from now on.
     closed: bool,
+    /// Jobs in their write now.
+    busy: u32,
+    /// Tests: jobs that found the slot closed under the file's lock.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fenced: u32,
     /// What the last delayed write of each kind wrote (its generation),
     /// recorded under this lock as it finishes, until the view takes it:
     /// the job's continuation, or the flush before it trusts
     /// `tabs_written` / `layout_written` (Shady #59 r2 L1: a write that
     /// finished while the flush waited for the lock, its continuation not
     /// yet run, left those stale, and a change undone since read as saved).
+    /// Recorded while the job still holds the file's lock, so the last
+    /// recorded is the last written (Shady #116 R2-A8: two jobs recording
+    /// after their writes could record in the opposite order, the older
+    /// write's generation over the newer one's, and a layout changed back
+    /// to it read as saved; a layout's generation is its content's hash, so
+    /// no order can be read from it).
     done: [Option<u64>; 2],
     /// Tests: the generation the last job read (its write is next).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1983,6 +2052,34 @@ pub(crate) struct SaveJob {
     /// not inferred from the file's contents).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) writes: u32,
+    /// Tests: the next job waits here once its write is in place, before
+    /// it records it ([`SaveJob::hold_next`]).
+    #[cfg(test)]
+    hold: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+}
+
+/// Tests: a job held once its write is in place ([`SaveJob::hold_next`]).
+#[cfg(test)]
+pub(crate) struct Held {
+    at: std::sync::mpsc::Receiver<()>,
+    go: std::sync::mpsc::Sender<()>,
+    seen: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl Held {
+    /// Whether the job is held now (or has been).
+    pub(crate) fn reached(&self) -> bool {
+        if !self.seen.get() && self.at.try_recv().is_ok() {
+            self.seen.set(true);
+        }
+        self.seen.get()
+    }
+
+    /// The job goes on.
+    pub(crate) fn release(self) {
+        let _ = self.go.send(());
+    }
 }
 
 /// What a [`SaveJob`] writes: `tabs.<key>` alone (split panes off), or the
@@ -1995,22 +2092,93 @@ pub(crate) enum SaveKind {
 
 impl SaveJob {
     /// `write` (generation `generation` of `kind`) unless the window's last
-    /// flush came first; whether it wrote. What it wrote is recorded before
-    /// the lock is let go ([`SaveJob::take_done`]).
+    /// flush came first; whether it wrote ([`SaveJob::write_if`], `write`
+    /// asked nothing under the file's lock).
+    #[cfg(test)]
     pub(crate) fn write(
         slot: &std::sync::Mutex<SaveJob>,
         kind: SaveKind,
         generation: u64,
         write: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<bool> {
-        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if job.closed {
+        Self::write_if(slot, kind, generation, |_, done| {
+            write()?;
+            done();
+            Ok(true)
+        })
+    }
+
+    /// The delayed write of generation `generation` of `kind`: `write`,
+    /// given `stale` to ask under the file's lock (the window's last flush
+    /// has run) and `done` to call once the file is in place, still under
+    /// its lock, unless that flush came first; whether it wrote. `done`
+    /// records what it wrote ([`SaveJob::take_done`]), in the order of the
+    /// writes, before the flush that waits for it goes on.
+    pub(crate) fn write_if(
+        slot: &std::sync::Mutex<SaveJob>,
+        kind: SaveKind,
+        generation: u64,
+        write: impl FnOnce(&dyn Fn() -> bool, &dyn Fn()) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        #[cfg(test)]
+        let hold;
+        {
+            let mut job = slot_of(slot);
+            if job.closed {
+                return Ok(false);
+            }
+            job.busy += 1;
+            #[cfg(test)]
+            {
+                hold = job.hold.take();
+            }
+        }
+        let done = || {
+            #[cfg(test)]
+            if let Some((at, go)) = &hold {
+                let _ = at.send(());
+                let _ = go.recv();
+            }
+            let mut job = slot_of(slot);
+            job.writes += 1;
+            job.done[kind as usize] = Some(generation);
+        };
+        let out = write(&|| slot_of(slot).closed, &done);
+        let mut job = slot_of(slot);
+        job.busy -= 1;
+        if !out? {
+            job.fenced += 1;
             return Ok(false);
         }
-        write()?;
-        job.writes += 1;
-        job.done[kind as usize] = Some(generation);
         Ok(true)
+    }
+
+    /// The layout's delayed write, generation `generation`, as its job makes
+    /// it off the UI thread ([`SaveJob::write_if`]).
+    pub(crate) fn write_layout(
+        slot: &std::sync::Mutex<SaveJob>,
+        path: &std::path::Path,
+        key: &str,
+        layout: &theme::Layout,
+        generation: u64,
+    ) -> std::io::Result<bool> {
+        Self::write_if(slot, SaveKind::Layout, generation, |stale, done| theme::save_layout_if(path, key, layout, stale, done))
+    }
+
+    /// Tests: the next job to begin waits once its write is in place,
+    /// before it records it, until released.
+    #[cfg(test)]
+    pub(crate) fn hold_next(slot: &std::sync::Mutex<SaveJob>) -> Held {
+        let (at_tx, at) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        slot_of(slot).hold = Some((at_tx, go_rx));
+        Held { at, go, seen: std::cell::Cell::new(false) }
+    }
+
+    /// Tests: whether a job is in its write.
+    #[cfg(test)]
+    pub(crate) fn in_write(slot: &std::sync::Mutex<SaveJob>) -> bool {
+        slot_of(slot).busy > 0
     }
 
     /// The generation a finished write of `kind` wrote, once.
@@ -2102,10 +2270,14 @@ pub struct AppView {
     /// The side panels folded to strips and the open HISTORY buckets
     /// (saved with the accent).
     pub panels: theme::Panels,
-    /// Panel keys changed since the last save began, and keys handed to a
-    /// save that has not finished: both written at once on a clean quit.
+    /// Panel keys changed since the last save began; the save out, one at
+    /// a time (its keys, and its stop: a close writes them again, and the
+    /// late write then changes nothing, checked under the file's lock);
+    /// whether a save was asked for while it was out (it goes as that one
+    /// ends). Shady #116 A2.
     panels_dirty: theme::PanelKeys,
-    panels_writing: theme::PanelKeys,
+    panels_out: Option<(theme::PanelKeys, Arc<std::sync::atomic::AtomicBool>)>,
+    panels_again: bool,
     /// The delayed save ([`SAVE_DELAY`]); a newer fold replaces it.
     pub(crate) panels_save: Option<Task<()>>,
     /// A drag of a panel's edge, from the mouse-down on its handle.
@@ -2127,6 +2299,8 @@ pub struct AppView {
     pub(crate) height: f32,
     pub picker_open: bool,
     pub(crate) picker_note: Option<SharedString>,
+    /// The picker's last save was the theme's (else the accent's).
+    pub(crate) picker_theme: bool,
     /// Where the mouse-down that closed the picker from outside was: the
     /// click it starts must not reopen it on its trigger, however long it
     /// is held.
@@ -2210,7 +2384,7 @@ pub struct AppView {
     favs_written: u64,
     favs_save: Option<Task<()>>,
     /// The favourites write on its way, shared with its background job.
-    favs_job: Arc<std::sync::Mutex<FavsJob>>,
+    pub(crate) favs_job: Arc<std::sync::Mutex<FavsJob>>,
     /// A favourites job is between taking the list and its result being
     /// taken (the window's own: never a wait on the job's lock).
     favs_writing: bool,
@@ -2274,6 +2448,18 @@ pub struct AppView {
     pub(crate) keys_rearm: bool,
     pub(crate) settings_find: Entity<InputState>,
     pub(crate) settings_input: Entity<InputState>,
+    /// The fields' inputs just replaced, drawn once more, hidden, so the
+    /// kit lets them go ([`crate::settings_editor::render_retired`]).
+    pub(crate) settings_retired: [Option<Entity<InputState>>; 2],
+    /// Their subscriptions, replaced with them, and their edit guards
+    /// (`settings_editor.rs`).
+    pub(crate) settings_find_subs: [Subscription; 3],
+    pub(crate) settings_input_subs: [Subscription; 3],
+    pub(crate) settings_find_guard: crate::settings_editor::EditGuard,
+    pub(crate) settings_input_guard: crate::settings_editor::EditGuard,
+    /// Each field's text when no composition was under way, as last seen:
+    /// what a composition refused goes back to (value, find).
+    pub(crate) settings_accepted: [String; 2],
     pub(crate) gear_menu: bool,
     /// Overlays as they leave (fluid.md §3.10): what was open last frame,
     /// and what closed and when, drawn without a hitbox until gone; the
@@ -2655,8 +2841,16 @@ impl AppView {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::palette::PLACEHOLDER));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("name: a-z, 0-9, '-'"));
         let hex_input = cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB"));
-        let settings_find = cx.new(|cx| InputState::new(window, cx).placeholder("find a setting"));
-        let settings_input = cx.new(|cx| InputState::new(window, cx));
+        // Settings' two short fields, each capped by the kit's validator,
+        // their subscriptions beside them: the edit guard replaces both
+        // (`settings_editor.rs`).
+        let find_cap = crate::settings_editor::FIND_CAP;
+        let value_cap = crate::settings_editor::VALUE_CAP;
+        let settings_find =
+            cx.new(|cx| InputState::new(window, cx).placeholder("find a setting").validate(move |t, _| t.len() <= find_cap));
+        let settings_input = cx.new(|cx| InputState::new(window, cx).validate(move |t, _| t.len() <= value_cap));
+        let settings_find_subs = Self::field_subs(crate::settings_editor::Field::Find, &settings_find, window, cx);
+        let settings_input_subs = Self::field_subs(crate::settings_editor::Field::Value, &settings_input, window, cx);
         let mut subs = vec![
             // The palette filters as it is typed.
             cx.subscribe_in(&palette_input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
@@ -2716,26 +2910,6 @@ impl AppView {
                     this.apply_custom_accent(cx);
                 }
             }),
-            cx.subscribe_in(&settings_find, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
-                if let InputEvent::Change = ev {
-                    let text = input.read(cx).value().to_string();
-                    this.settings_find(text, cx);
-                }
-            }),
-            cx.subscribe_in(&settings_input, window, |this: &mut Self, _input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } if !this.enter_is_the_picks() => {
-                    this.settings_commit(cx);
-                    window.focus(&this.focus, cx);
-                }
-                // Clicked away: the edit is left as it was.
-                InputEvent::Blur => {
-                    let was = this.settings.editing.take();
-                    if was.is_some() {
-                        this.views_changed(cx);
-                    }
-                }
-                _ => {}
-            }),
         ];
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -2790,19 +2964,23 @@ impl AppView {
         // process's writer, which the app's quit waits for, this window
         // open or not (`rail_wishes::Home::on_quit`).
         subs.push(cx.on_release(|this, cx| {
-            this.flush_panels();
-            this.flush_tabs();
-            this.flush_favs();
-            this.flush_app();
+            theme::closing(|| {
+                this.flush_panels();
+                this.flush_tabs();
+                this.flush_favs();
+                this.flush_app();
+            });
             this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             crate::notify::closing(gone, cx);
         }));
         subs.push(cx.on_app_quit(|this, cx| {
-            this.flush_panels();
-            this.flush_tabs();
-            this.flush_favs();
-            this.flush_app();
+            theme::closing(|| {
+                this.flush_panels();
+                this.flush_tabs();
+                this.flush_favs();
+                this.flush_app();
+            });
             this.flush_wishes();
             let gone = crate::presence::window_gone(this, cx);
             async move { gone.wait().await }
@@ -2833,6 +3011,8 @@ impl AppView {
             secret_input,
             settings_find,
             settings_input,
+            settings_find_subs,
+            settings_input_subs,
             settings_pane,
             usage_pane,
             focus,
@@ -2916,7 +3096,8 @@ impl AppView {
             rects_drawn: Default::default(),
             panels: theme::Panels::default(),
             panels_dirty: Default::default(),
-            panels_writing: Default::default(),
+            panels_out: None,
+            panels_again: false,
             panels_save: None,
             drag: None,
             springback: false,
@@ -2927,6 +3108,7 @@ impl AppView {
             height: 0.,
             picker_open: false,
             picker_note: None,
+            picker_theme: false,
             picker_dismissed: None,
             accent_source: theme::Source::Default,
             theme_source: theme::Source::Default,
@@ -2995,6 +3177,12 @@ impl AppView {
             keys_rearm: false,
             settings_find: i.settings_find,
             settings_input: i.settings_input,
+            settings_retired: [None, None],
+            settings_find_subs: i.settings_find_subs,
+            settings_input_subs: i.settings_input_subs,
+            settings_find_guard: crate::settings_editor::EditGuard::find(),
+            settings_input_guard: crate::settings_editor::EditGuard::value(),
+            settings_accepted: [String::new(), String::new()],
             gear_menu: false,
             menu_was: None,
             menu_leaving: None,
@@ -4605,11 +4793,10 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), saved, generation, slot)) = job else { return };
-            let done = cx
-                .background_spawn(
-                    async move { SaveJob::write(&slot, SaveKind::Tabs, generation, || theme::save_tabs(&path, &key, &saved)) },
-                )
-                .await;
+            let done = off_ui(cx.background_executor().clone(), move || {
+                SaveJob::write_if(&slot, SaveKind::Tabs, generation, |stale, done| theme::save_tabs_if(&path, &key, &saved, stale, done))
+            })
+            .await;
             let _ = this.update(cx, |v, cx| match done {
                 Ok(_) => {
                     // What it wrote, unless the flush took it first.
@@ -4657,7 +4844,8 @@ impl AppView {
                     })
                     .ok();
                 let Some((Some(path), Some(key), base, sent, generation, slot)) = job else { return };
-                let done = cx.background_spawn(async move { FavsJob::write(&slot, &path, &key, &base, sent, generation) }).await;
+                let done =
+                    off_ui(cx.background_executor().clone(), move || FavsJob::write(&slot, &path, &key, &base, sent, generation)).await;
                 let again = this.update(cx, |v, cx| {
                     let taken = v.take_favs_written();
                     if let Err(e) = done {
@@ -4704,24 +4892,34 @@ impl AppView {
     /// Favourites changed since the last write (an update time too),
     /// written now, merged as [`AppView::schedule_favs_save`] does.
     ///
-    /// A background write still running is waited for and taken first (it
-    /// holds [`FavsJob`]'s lock while it writes, never longer than the
-    /// settings lock's bounded wait and the write); one not begun never
-    /// will.
+    /// A background write in its write is waited for (within the close's
+    /// deadline: Shady #116 A1) and taken first; one not begun never will
+    /// write, nor one the deadline gave up on (it finds the window closed
+    /// under the file's lock).
     fn flush_favs(&mut self) {
         self.favs_save = None;
         let slot = self.favs_job.clone();
-        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        job.closed = true;
-        if let Some((generation, sent, file)) = job.done.take() {
+        slot_of(&slot).closed = true;
+        let unsaved = |v: &Self| {
+            let f = &v.model.favs;
+            v.tabs_key.is_some() && v.bench.is_none() && (f.generation != v.favs_written || f.quiet)
+        };
+        let Some(path) = theme::settings_path() else { return };
+        if !theme::wait_for_own(&path, || slot_of(&slot).busy == 0) {
+            if unsaved(self) {
+                theme::closing_lost(&["favourites"]);
+            }
+            return;
+        }
+        if let Some((generation, sent, file)) = slot_of(&slot).done.take() {
             self.model.favs.written(&sent, file);
             self.favs_written = self.favs_written.max(generation);
         }
-        let f = &self.model.favs;
-        if self.tabs_key.is_none() || self.bench.is_some() || (f.generation == self.favs_written && !f.quiet) {
+        if !unsaved(self) {
             return;
         }
-        if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
+        let f = &self.model.favs;
+        if let Some(key) = self.tabs_key.as_deref() {
             let sent = f.list.clone();
             match theme::save_favourites(&path, key, &f.base, &sent) {
                 Ok(file) => {
@@ -4729,7 +4927,7 @@ impl AppView {
                     self.model.favs.quiet = false;
                     self.model.favs.written(&sent, file);
                 }
-                Err(e) => eprintln!("synaps-desktop: favourites not saved: {e}"),
+                Err(e) => theme::not_saved_at_close(&["favourites"], &e),
             }
         }
     }
@@ -4768,11 +4966,8 @@ impl AppView {
                 })
                 .ok();
             let Some((Some(path), Some(key), layout, generation, slot)) = job else { return };
-            let done = cx
-                .background_spawn(async move {
-                    SaveJob::write(&slot, SaveKind::Layout, generation, || theme::save_layout(&path, &key, &layout))
-                })
-                .await;
+            let done =
+                off_ui(cx.background_executor().clone(), move || SaveJob::write_layout(&slot, &path, &key, &layout, generation)).await;
             let _ = this.update(cx, |v, cx| match done {
                 Ok(_) => {
                     // What it wrote, unless the flush took it first.
@@ -4792,18 +4987,36 @@ impl AppView {
     /// the app quits), whether or not a frame scheduled the save; with
     /// split panes, the layout and its union.
     pub(crate) fn flush_tabs(&mut self) {
-        // The delayed write's slot closed, waiting out a write under way:
-        // none lands after this one ([`SaveJob`]; Shady #59 L1, #55 n6).
-        // Held while this writes.
+        // The delayed write's slot closed, a write under way waited out
+        // (within the close's deadline: Shady #116 A1): none lands after
+        // this one ([`SaveJob`]; Shady #59 L1, #55 n6).
         let slot = self.save_job.clone();
-        let mut job = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        job.closed = true;
+        slot_of(&slot).closed = true;
+        if let Some(path) = theme::settings_path()
+            && !theme::wait_for_own(&path, || slot_of(&slot).busy == 0)
+        {
+            // Given up on: it writes nothing now, and neither does this.
+            self.tabs_save = None;
+            let pending = self.restore_tabs.is_some() || self.restore_layout.is_some() || !self.restore_panes.is_empty();
+            if self.tabs_key.is_some() && self.bench.is_none() {
+                match self.split_on() {
+                    true if !pending && self.layout_gen() != self.layout_written => theme::closing_lost(&["layout"]),
+                    false if self.saved_tabs().generation != self.tabs_written => theme::closing_lost(&["tabs"]),
+                    _ => {}
+                }
+            }
+            return;
+        }
         // A delayed write that finished while this waited (its continuation
         // not yet run): what the file holds now, before trusting `written`.
-        if let Some(g) = job.take_done(SaveKind::Layout) {
+        let (layout, tabs) = {
+            let mut job = slot_of(&slot);
+            (job.take_done(SaveKind::Layout), job.take_done(SaveKind::Tabs))
+        };
+        if let Some(g) = layout {
             self.layout_written = g;
         }
-        if let Some(g) = job.take_done(SaveKind::Tabs) {
+        if let Some(g) = tabs {
             self.tabs_written = self.tabs_written.max(g);
         }
         if self.split_on() {
@@ -4813,10 +5026,10 @@ impl AppView {
                 return;
             }
             if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
-                job.writes += 1;
+                slot_of(&slot).writes += 1;
                 match theme::save_layout(&path, key, &self.layout_now()) {
                     Ok(()) => self.layout_written = self.layout_gen(),
-                    Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+                    Err(e) => theme::not_saved_at_close(&["layout"], &e),
                 }
             }
             return;
@@ -4826,10 +5039,10 @@ impl AppView {
             return;
         }
         if let (Some(path), Some(key)) = (theme::settings_path(), self.tabs_key.as_deref()) {
-            job.writes += 1;
+            slot_of(&slot).writes += 1;
             match theme::save_tabs(&path, key, &self.saved_tabs().saved()) {
                 Ok(()) => self.tabs_written = self.saved_tabs().generation,
-                Err(e) => eprintln!("synaps-desktop: tabs not saved: {e}"),
+                Err(e) => theme::not_saved_at_close(&["tabs"], &e),
             }
         }
     }
@@ -6546,16 +6759,28 @@ impl AppView {
     }
 
     /// The accent override (`None`: the theme's own `prompt_fg` and
-    /// `border_active`), repainted at once and saved.
+    /// `border_active`), repainted at once and saved with the app's batch
+    /// (off the UI thread; the picker's note says how it went).
     pub(crate) fn set_accent(&mut self, hex: Option<u32>, cx: &mut Context<Self>) {
         theme::update(cx, |c| c.accent = hex);
-        let overridden = match self.accent_source {
-            theme::Source::Flag => " (the next launch's --accent wins over it)".to_string(),
-            theme::Source::Env => format!(" (${} wins over it at the next launch)", theme::ENV_ACCENT),
-            _ => String::new(),
-        };
-        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_accent(&path, hex), path)), &overridden));
+        self.picker_note = None;
+        self.picker_theme = false;
+        self.save_app(crate::settings_saved::AppKey::Accent, crate::settings_saved::AppValue::of(hex.map(theme::to_hex)), cx);
         cx.notify();
+    }
+
+    /// What the picker's note adds to `saved to …`: the pin that wins at
+    /// the next launch over the theme (or the accent) saved.
+    pub(crate) fn picker_overridden(&self) -> String {
+        let (flag, env, src) = match self.picker_theme {
+            true => ("--theme", theme::ENV_THEME, self.theme_source),
+            false => ("--accent", theme::ENV_ACCENT, self.accent_source),
+        };
+        match src {
+            theme::Source::Flag => format!(" (the next launch's {flag} wins over it)"),
+            theme::Source::Env if !(self.picker_theme && self.theme_follows_config) => format!(" (${env} wins over it at the next launch)"),
+            _ => String::new(),
+        }
     }
 
     /// A built-in theme (or the `<base>/themes/<name>` file over it),
@@ -6591,12 +6816,9 @@ impl AppView {
             c.raw = raw;
         });
         self.theme_follows_config = saved.is_none();
-        let overridden = match self.theme_source {
-            theme::Source::Flag => " (the next launch's --theme wins over it)".to_string(),
-            theme::Source::Env if saved.is_some() => format!(" (${} wins over it at the next launch)", theme::ENV_THEME),
-            _ => String::new(),
-        };
-        self.picker_note = Some(saved_note(theme::settings_path().map(|path| (theme::save_theme(&path, saved), path)), &overridden));
+        self.picker_note = None;
+        self.picker_theme = true;
+        self.save_app(crate::settings_saved::AppKey::Theme, crate::settings_saved::AppValue::of(saved.map(String::from)), cx);
         cx.notify();
     }
 
@@ -6762,41 +6984,115 @@ impl AppView {
     }
 
     /// Write the changed panel keys on the background executor (a read, a
-    /// write, two fsyncs: never on the UI thread).
+    /// write, two fsyncs: never on the UI thread), the rows' receipts with
+    /// them. A failure stays to write with the next change, the window's
+    /// return, or Retry, and says so under its rows.
     fn save_panels(&mut self, cx: &mut Context<Self>) {
         // Never a width in the middle of a drag: its end saves again.
         if self.drag.as_ref().is_some_and(|g| g.moved) {
             return;
         }
+        // One at a time: this one goes as the one out ends.
+        if self.panels_out.is_some() {
+            self.panels_again = true;
+            return;
+        }
+        self.panels_again = false;
         let keys = std::mem::take(&mut self.panels_dirty);
         let Some(path) = theme::settings_path().filter(|_| !keys.is_empty()) else { return };
-        self.panels_writing = self.panels_writing.or(keys);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.panels_out = Some((keys, stop.clone()));
         let p = self.panels;
+        #[cfg(test)]
+        let gate = crate::settings_saved::gate::panels_taken();
         cx.spawn(async move |this, cx| {
-            let saved = cx.background_spawn(async move { theme::save_panels(&path, p, keys) }).await;
-            let _ = this.update(cx, |v, cx| {
-                v.panels_writing = theme::PanelKeys::default();
-                if let Err(e) = saved {
-                    v.panels_dirty = v.panels_dirty.or(keys);
-                    v.model.lives[v.panes.cur.live].last_error = Some(format!("panel layout not saved: {e}"));
-                    cx.notify();
+            let job = {
+                let stop = stop.clone();
+                async move {
+                    #[cfg(test)]
+                    if let Some(g) = gate {
+                        let _ = g.recv().await;
+                    }
+                    theme::save_panels_if(&path, p, keys, &|| stop.load(std::sync::atomic::Ordering::SeqCst))
                 }
-            });
+            };
+            let saved = cx.background_spawn(job).await;
+            let _ = this.update(cx, |v, cx| v.panels_written(keys, &stop, saved, cx));
         })
         .detach();
     }
 
+    /// The panels' save of `keys` ended: what it wrote is saved (its rows'
+    /// note goes); what failed waits in `panels_dirty` under what came
+    /// since, and says so. Then a save asked for meanwhile goes.
+    fn panels_written(
+        &mut self,
+        keys: theme::PanelKeys,
+        stop: &std::sync::atomic::AtomicBool,
+        saved: std::io::Result<Option<Vec<crate::settings_saved::Receipt>>>,
+        cx: &mut Context<Self>,
+    ) {
+        // A close took it (and wrote it again): nothing of it is this one's.
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.panels_out = None;
+        match saved {
+            Ok(written) => {
+                for r in written.into_iter().flatten() {
+                    self.settings.wrote.put(r);
+                }
+                if let Some(n) = self.settings.panels_note.as_mut() {
+                    n.keys &= !keys.rows();
+                    if n.keys == 0 {
+                        self.settings.panels_note = None;
+                    }
+                }
+            }
+            Err(e) => {
+                self.panels_dirty = self.panels_dirty.or(keys);
+                let rows = self.panels_dirty.rows() | self.settings.panels_note.as_ref().map_or(0, |n| n.keys);
+                self.settings.panels_note = Some(crate::settings_saved::Note::new(rows, &format!("not saved: {e}")));
+                self.model.lives[self.panes.cur.live].last_error = Some(format!("panel layout not saved: {e}"));
+            }
+        }
+        if std::mem::take(&mut self.panels_again) {
+            self.save_panels(cx);
+        }
+        self.views_changed(cx);
+    }
+
+    /// Tests: the panel keys still to be written, waiting or out.
+    #[cfg(test)]
+    pub(crate) fn panels_pending(&self) -> theme::PanelKeys {
+        self.panels_dirty.or(self.panels_out.as_ref().map_or_else(Default::default, |o| o.0))
+    }
+
+    /// The panels' failed write, tried again now (Retry, the window's
+    /// return).
+    pub(crate) fn save_panels_now(&mut self, cx: &mut Context<Self>) {
+        self.panels_save = None;
+        self.save_panels(cx);
+    }
+
     /// A save still waiting (or still being written), written now, here:
     /// the window is closing or the app quitting.
+    /// The save out is stopped: these are the latest values, and the last
+    /// write of them (Shady #116 A2).
     fn flush_panels(&mut self) {
         self.panels_save = None;
-        let keys = std::mem::take(&mut self.panels_dirty).or(std::mem::take(&mut self.panels_writing));
+        self.panels_again = false;
+        let mut keys = std::mem::take(&mut self.panels_dirty);
+        if let Some((out, stop)) = self.panels_out.take() {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            keys = keys.or(out);
+        }
         if self.bench.is_none()
             && !keys.is_empty()
             && let Some(path) = theme::settings_path()
             && let Err(e) = theme::save_panels(&path, self.panels, keys)
         {
-            eprintln!("synaps-desktop: panel layout not saved: {e}");
+            theme::not_saved_at_close(&keys.names(), &e);
         }
     }
 
@@ -8856,6 +9152,8 @@ struct Inputs {
     pub(crate) secret_input: Entity<InputState>,
     settings_find: Entity<InputState>,
     settings_input: Entity<InputState>,
+    settings_find_subs: [Subscription; 3],
+    settings_input_subs: [Subscription; 3],
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,
@@ -10192,13 +10490,15 @@ impl Render for AppView {
         // closed, a fold or an unfold: this frame's layout, its fold just
         // decided): after this frame, never inside it, what it shows is
         // asked for if stale, and what no pane on screen has open goes.
+        // A Settings tab closed: its fields' text and history go too, when
+        // no Settings tab is left.
         let shown = self.shown();
         if shown != self.shown {
             let opened = shown.focused != self.shown.focused;
             self.shown = shown;
-            let me = cx.weak_entity();
-            cx.defer(move |cx| {
-                let _ = me.update(cx, |v, cx| v.view_shown(opened, cx));
+            cx.defer_in(window, move |v, window, cx| {
+                v.view_shown(opened, cx);
+                v.settings_tab_closed(window, cx);
             });
         }
         let with_panes = self.yield_on_flight(yielded, resized);
@@ -10440,6 +10740,7 @@ impl Render for AppView {
         self.arm_warm_tick(matches!(right, Side::Open(_)) && (view.is_none() || self.panes.split()), cx);
         let card_tab = self.panes.cur.card_keys.get() == Some(false) && self.allow_all_offered();
         let drop_layer = self.render_drop_layer(&p, cx);
+        let retired = crate::settings_editor::render_retired(&mut self.settings_retired);
         let root = h_flex()
             .id("root")
             .track_focus(&self.focus)
@@ -10843,6 +11144,7 @@ impl Render for AppView {
             .children((view.is_none() || self.panes.split()).then(|| self.render_edge(false, right, right_w, &p, cx)).flatten())
             // Drag and drop's targets and preview (split panes step 4).
             .children(drop_layer)
+            .children(retired)
             .when(self.picker_open, |d| {
                 d.child(deferred(self.render_picker(&p, if view.is_some() { Side::Open(0.) } else { right }, cx)).with_priority(1))
                     .child(deferred(self.bars.picker.bar(crate::scrollbar::Ground::Chrome)).with_priority(1))

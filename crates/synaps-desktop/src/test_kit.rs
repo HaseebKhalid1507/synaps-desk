@@ -52,8 +52,12 @@ mod reveal_tests;
 mod send_tests;
 #[path = "settings_continuity_tests.rs"]
 mod settings_continuity_tests;
+#[path = "settings_editor_tests.rs"]
+mod settings_editor_tests;
 #[path = "settings_find_tests.rs"]
 mod settings_find_tests;
+#[path = "settings_saved_tests.rs"]
+mod settings_saved_tests;
 #[path = "settings_tests.rs"]
 mod settings_tests;
 #[path = "walk_tests.rs"]
