@@ -4,7 +4,15 @@
 //! drafts (P2-4); a pending remove before the bound board ends no draft
 //! (P2-5); a held block stays where it was taken while the agent moves it
 //! (P2-6); the pre-check's footer remeasures the row in every pane
-//! (P2-7). Each fails on `044dc05`.
+//! (P2-7). Each fails on `044dc05`. Round 2 (Shady #114 at `8186107`):
+//! held blocks stay in their places within their own anchor (R2 P2-1);
+//! drafts of two incarnations meeting in a follow, one in the row, the
+//! other in the dock, each its own Copy and Discard (R2 P2-2); a follow
+//! keeps a held block at the anchor it was taken at, and one whose
+//! anchor's call is gone where it is drawn, and while the pane watches a
+//! worker (R2 P2-3); marked
+//! text past a note's cap, and a composition's preedits in a field's
+//! history, refused as they come (R2 P2-4).
 
 use std::sync::Arc;
 
@@ -808,4 +816,422 @@ fn walk_take_at(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppVi
     }
     press(cx, w, "e");
     wait(cx, w, view, 300);
+}
+
+// ── Round 2 (Shady #114 at 8186107) ───────────────────────────────────
+
+/// Pane `q`'s block rows, in order, by name (of `names`).
+fn order_in(cx: &mut TestAppContext, view: &Entity<AppView>, q: crate::pane::PaneId, names: &[&str]) -> Vec<String> {
+    view.update(cx, |v, _| {
+        v.in_pane(q, |v| {
+            v.panes
+                .cur
+                .disp
+                .iter()
+                .filter(|d| matches!(d.kind, crate::turns::Kind::Block { .. }))
+                .filter_map(|d| names.iter().find(|n| row(n) == d.id).map(|n| n.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+    })
+}
+
+/// The pointer gone, its lease long over.
+fn lease_over(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    mouse(cx, w, point(px(2.), px(2.)), "move");
+    wait(cx, w, view, 3000);
+}
+
+/// Shady #114 R2 P2-1: `n`, first in its anchor, and `d` after it are
+/// held, each changed; the agent moves `n` last in the same anchor, then
+/// `d` after it. The pointer's lease long over, both panes draw them where
+/// they were taken, `n` first. Let go of both: each where the agent put
+/// it, in its order.
+#[gpui_kit::test]
+fn held_blocks_stay_in_their_places_within_their_own_anchor(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    split(cx, w, &view);
+    tail(cx, w, &view);
+    let panes = view.read_with(cx, |v, _| v.panes.ids());
+    view.update(cx, |v, cx| v.focus_pane(panes[0], crate::pane::KeysTo::Pane, cx));
+    tail(cx, w, &view);
+    let names = ["n", "d", "p"];
+    assert_eq!(order(cx, &view, &names), names);
+    walk_take_at(cx, w, &view, "d");
+    press(cx, w, "n");
+    walk_take_at(cx, w, &view, "n");
+    press(cx, w, "t");
+    let f = line(cx, &view).expect("n's title");
+    put_in(cx, w, &f, " (mine)");
+    press(cx, w, "enter");
+    let s = session(cx, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.of(&s).filter(|d| d.changed()).count()), 2, "both held, changed");
+    ops(cx, w, &view, "toolu_m1", json!([{"op":"move","id":"n","at":{"after":"p"}}]));
+    ops(cx, w, &view, "toolu_m2", json!([{"op":"move","id":"d","at":{"after":"n"}}]));
+    lease_over(cx, w, &view);
+    for &q in &panes {
+        assert_eq!(order_in(cx, &view, q, &names), names, "held where they were taken, n first: pane {q:?}");
+    }
+    // Let go of n (the pane's), then of d: the agent's order.
+    press(cx, w, "escape");
+    press(cx, w, "escape");
+    walk_take_at(cx, w, &view, "d");
+    press(cx, w, "escape");
+    press(cx, w, "escape");
+    board(cx, w, &view);
+    lease_over(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.len()), 0, "both let go");
+    for &q in &panes {
+        assert_eq!(order_in(cx, &view, q, &names), ["p", "n", "d"], "let go: where the agent put them, pane {q:?}");
+    }
+}
+
+/// Block `name` as the board on screen draws it, and the board's
+/// generation.
+fn drawn_block(
+    cx: &mut TestAppContext,
+    view: &Entity<AppView>,
+    name: &str,
+) -> (Arc<cards_spec::board::Block>, cards_spec::block::Generation) {
+    let id = Ref::parse(name).expect("an id");
+    view.read_with(cx, |v, _| {
+        let d = v.model.lives[v.panes.cur.live].transcript.drawn().cloned().expect("a board");
+        let s = d.rows.values().flat_map(|r| r.blocks.iter()).find(|s| s.block.id == id).expect("drawn").block.clone();
+        (s, d.generation.expect("a generation"))
+    })
+}
+
+fn composer_text(cx: &mut TestAppContext, view: &Entity<AppView>) -> String {
+    view.read_with(cx, |v, cx| v.panes.cur.composer.read(cx).value().to_string())
+}
+
+const T: &str = "20261126-093000-bk01-t";
+
+/// `S` holds a changed draft of `p` that went stale (the agent replaced
+/// `p`), and `T` a changed one of `p`'s new incarnation, made first if
+/// `stale_first`; then `S` follows to `T`. The two drafts' keys.
+fn converge(cx: &mut TestAppContext, stale_first: bool) -> (W, u64, u64) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    let s = session(cx, &view);
+    attach(cx, w, &view, &s, &conv());
+    tail(cx, w, &view);
+    let rp = json!([{"op":"replace","id":"p","kind":"plan","body":{"steps":[{"id":"fix","label":"Again","state":"todo"}]}}]);
+    let (old, g) = drawn_block(cx, &view, "p");
+    let fix = || cards_spec::block::ItemId::parse("fix").expect("an id");
+    let take = |cx: &mut TestAppContext, sid: &str, b: &Arc<cards_spec::board::Block>, strike: bool| {
+        view.update(cx, |v, _| {
+            let d = v.block_drafts.take(sid, b, g).expect("room");
+            if strike { d.strike(&fix()) } else { d.stop(&fix()) }.expect("todo");
+            d.key
+        })
+    };
+    // Made first: taken in the window, its keys the pane's.
+    let ks = stale_first.then(|| {
+        walk_take_at(cx, w, &view, "p");
+        press(cx, w, "x");
+        view.read_with(cx, |v, _| v.panes.cur.edit.at.as_ref().map(|e| e.key)).expect("taken")
+    });
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_rp", rp.clone());
+    let (new, _) = drawn_block(cx, &view, "p");
+    assert_ne!(new.tag, old.tag, "a new incarnation");
+    let kt = take(cx, T, &new, false);
+    let ks = ks.unwrap_or_else(|| take(cx, &s, &old, true));
+    board(cx, w, &view);
+    wait(cx, w, &view, 300);
+    let fate = view.read_with(cx, |v, _| v.block_drafts.by_key(ks).map(|(_, d)| d.ended));
+    assert!(matches!(fate, Some(Some(Fate::Rewritten(_)))), "S's went stale: {fate:?}");
+    let mut h = conv();
+    h.push(json!({"role": "user", "content": "go on"}));
+    h.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_rp", "name": "cards_block", "input": block_input(rp.clone())}]}));
+    h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_rp", "content": block_receipt(&rp)}]}));
+    attach(cx, w, &view, T, &h);
+    assert_eq!(session(cx, &view), T, "followed");
+    tail(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.count(T)), 2, "both kept");
+    ((w, view), ks, kt)
+}
+
+/// After [`converge`]: the held draft draws in `p`'s row; the stale one is
+/// in the dock, with its own Copy and Discard, no pane's keys on it;
+/// neither is hidden.
+fn one_in_the_row_one_in_the_dock(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>, ks: u64, kt: u64) {
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.panes.iter().filter_map(|p| p.edit.at.as_ref().map(|e| e.key)).collect());
+    assert!(!keys.contains(&ks), "no pane's keys on the docked one: {keys:?}");
+    let rowed = view.update(cx, |v, _| v.block_shown(row("p")).and_then(|(_, s)| v.row_draft(&s).map(|d| d.key)));
+    assert_eq!(rowed, Some(kt), "the held one draws in p's row");
+    let says = view.read_with(cx, |v, _| v.block_drafts.by_key(ks).and_then(|(_, d)| d.ended).and_then(Fate::says)).expect("stale");
+    assert!(has(cx, w, format!("dock-draft Close the race · {says}")), "the stale one in the dock");
+    assert!(has(cx, w, "dock-button Copy to composer Close the race".into()) && has(cx, w, "dock-button Discard Close the race".into()));
+}
+
+/// Shady #114 R2 P2-2: the stale draft made first: one draft in the row,
+/// the other in the dock; the dock's Copy takes the stale one's words and
+/// lets it go, the row's held; that one's own keys let it go after.
+#[gpui_kit::test]
+fn drafts_of_two_incarnations_meeting_in_a_follow_are_each_reached_stale_first(cx: &mut TestAppContext) {
+    let ((w, view), ks, kt) = converge(cx, true);
+    one_in_the_row_one_in_the_dock(cx, w, &view, ks, kt);
+    let at = drawn(cx, w, "dock-button Copy to composer Close the race".into()).center();
+    click(cx, w, at);
+    assert_eq!(composer_text(cx, &view), "Close the race → skip fix", "the stale one's words");
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.block_drafts.of(T).map(|d| d.key).collect());
+    assert_eq!(keys, vec![kt], "the held one kept");
+    walk_take_at(cx, w, &view, "p");
+    assert_eq!(view.read_with(cx, |v, _| v.panes.cur.edit.at.as_ref().map(|e| e.key)), Some(kt), "its keys: the row's");
+    press(cx, w, "escape");
+    press(cx, w, "escape");
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.count(T)), 0);
+}
+
+/// The held draft made first: the same; the dock's Discard lets the
+/// stale one go, the held one in its row.
+#[gpui_kit::test]
+fn drafts_of_two_incarnations_meeting_in_a_follow_are_each_reached_held_first(cx: &mut TestAppContext) {
+    let ((w, view), ks, kt) = converge(cx, false);
+    one_in_the_row_one_in_the_dock(cx, w, &view, ks, kt);
+    let at = drawn(cx, w, "dock-button Discard Close the race".into()).center();
+    click(cx, w, at);
+    let keys: Vec<u64> = view.read_with(cx, |v, _| v.block_drafts.of(T).map(|d| d.key).collect());
+    assert_eq!(keys, vec![kt], "discarded from the dock, the held one kept");
+    assert_eq!(composer_text(cx, &view), "", "nothing copied");
+    let rowed = view.update(cx, |v, _| v.block_shown(row("p")).and_then(|(_, s)| v.row_draft(&s).map(|d| d.key)));
+    assert_eq!(rowed, Some(kt), "still in its row");
+}
+
+/// A call `id` of `ops` in a history, and its receipt.
+fn called(h: &mut Vec<Value>, id: &str, ops: &Value) {
+    h.push(
+        json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "cards_block", "input": block_input(ops.clone())}]}),
+    );
+    h.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": block_receipt(ops)}]}));
+}
+
+/// Shady #114 R2 P2-3: `p` taken under `S` at its anchor (the history's
+/// first call), held; the agent puts `x` after it, then moves `p` to the
+/// end, the move waiting. `S` follows to `T`, its rows numbered anew, the
+/// move in its history; under `T` the agent moves `p` to the rail; `T`
+/// follows to `U`. Through each, `p` stays at the anchor it was taken
+/// at, in both panes, never in the rail too. Let go: in the rail, where
+/// the agent put it.
+#[gpui_kit::test]
+fn a_follow_keeps_a_held_block_at_the_anchor_it_was_taken_at(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    let s = session(cx, &view);
+    attach(cx, w, &view, &s, &conv());
+    split(cx, w, &view);
+    tail(cx, w, &view);
+    let panes = view.read_with(cx, |v, _| v.panes.ids());
+    view.update(cx, |v, cx| v.focus_pane(panes[0], crate::pane::KeysTo::Pane, cx));
+    tail(cx, w, &view);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "x");
+    let (px_, pm, pr) = (
+        json!([{"op":"put","id":"x","kind":"note","body":{"text":"after"}}]),
+        json!([{"op":"move","id":"p"}]),
+        json!([{"op":"move","id":"p","target":"rail"}]),
+    );
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_x", px_.clone());
+    ops(cx, w, &view, "toolu_m", pm.clone());
+    lease_over(cx, w, &view);
+    let names = ["n", "g", "p", "x"];
+    assert_eq!(order(cx, &view, &names), names, "moved by the agent: held where it was taken");
+    let held = |cx: &mut TestAppContext, view: &Entity<AppView>, at: &str| {
+        for &q in &panes {
+            assert_eq!(order_in(cx, view, q, &names), names, "{at}: at its anchor, pane {q:?}");
+        }
+        assert!(!in_rail(cx, view, "p"), "{at}: not in the rail too");
+    };
+    let mut h = conv();
+    h.push(json!({"role": "user", "content": "go on"}));
+    called(&mut h, "toolu_x", &px_);
+    called(&mut h, "toolu_m", &pm);
+    attach(cx, w, &view, T, &h);
+    assert_eq!(session(cx, &view), T, "followed");
+    lease_over(cx, w, &view);
+    held(cx, &view, "followed to T");
+    turn(cx, w, &view);
+    ops(cx, w, &view, "toolu_r", pr.clone());
+    lease_over(cx, w, &view);
+    held(cx, &view, "to the rail under T");
+    h.push(json!({"role": "user", "content": "go on"}));
+    called(&mut h, "toolu_r", &pr);
+    let u = "20261126-094500-bk01-u";
+    attach(cx, w, &view, u, &h);
+    assert_eq!(session(cx, &view), u, "followed again");
+    lease_over(cx, w, &view);
+    held(cx, &view, "followed to U");
+    assert_eq!(drafts_of(cx, &view, u, "p").pop().map(|d| d.1), Some(None), "held all along");
+    // Let go: where the agent put it.
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "escape");
+    press(cx, w, "escape");
+    board(cx, w, &view);
+    lease_over(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.block_drafts.len()), 0);
+    assert!(in_rail(cx, &view, "p"), "let go: in the rail");
+    assert_eq!(order(cx, &view, &names), ["n", "g", "x"], "not in the transcript too");
+}
+
+/// Shady #114 R2 P2-3's other case, apart from a renumbering: the anchor
+/// itself gone (the history followed to, of the same generation, has no
+/// row of the call `p` was taken at: another call put it). `p` is held
+/// where the board draws it, that its place now, named by its row's call
+/// there; drawn once, in its row. A guard: the rule as it was.
+#[gpui_kit::test]
+fn a_follow_without_the_anchors_call_holds_the_block_where_it_is_drawn(cx: &mut TestAppContext) {
+    let (w, view, _events) = open_at(cx, (1500., 1000.), crate::theme::Panels::default().text_size);
+    open_session(cx, w, &view, crate::demo::BLOCKS, crate::tabs::Place::Current);
+    let s = session(cx, &view);
+    attach(cx, w, &view, &s, &conv());
+    tail(cx, w, &view);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "x");
+    let h: Vec<Value> = serde_json::from_str(&serde_json::to_string(&conv()).expect("json").replace("toolu_h0", "toolu_h9")).expect("json");
+    attach(cx, w, &view, T, &h);
+    assert_eq!(session(cx, &view), T, "followed");
+    lease_over(cx, w, &view);
+    let p = Ref::parse("p").expect("an id");
+    let (place, at) = view.read_with(cx, |v, _| {
+        let d = v.block_drafts.in_row(T, &p).map(|d| d.place.clone());
+        let at = v.model.lives[v.panes.cur.live]
+            .transcript
+            .items()
+            .iter()
+            .find(|i| i.tool.as_ref().is_some_and(|c| c.tool_id == "toolu_h9"))
+            .map(|i| i.id);
+        (d, at)
+    });
+    let Some(Some(crate::drafts::Place::Row { item, call, .. })) = place else { panic!("held in a row: {place:?}") };
+    assert_eq!((Some(item), call.as_deref()), (at, Some("toolu_h9")), "its place where the board draws it, named by that row's call");
+    assert_eq!(order(cx, &view, &["n", "g", "p"]), ["n", "g", "p"], "drawn once, in its row");
+}
+
+/// Found in round 2, in R2 P2-3's path: the pane watching a worker (its
+/// transcript on screen, not the session's), boards that land keep a
+/// held block where it was taken: its rows are the session's, the
+/// board's. Back on the thread: there still, and never moved.
+#[gpui_kit::test]
+fn a_held_block_stays_in_its_place_while_the_pane_watches_a_worker(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "x");
+    ops(cx, w, &view, "toolu_x", json!([{"op":"put","id":"x","kind":"note","body":{"text":"after"}}]));
+    ops(cx, w, &view, "toolu_m", json!([{"op":"move","id":"p"}]));
+    lease_over(cx, w, &view);
+    let names = ["n", "d", "p", "x", "y"];
+    assert_eq!(order(cx, &view, &names), ["n", "d", "p", "x"], "held where it was taken");
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.open(&crate::watch::Candidate::of(2, "sleeper"), None, std::time::Instant::now());
+        cx.notify();
+    });
+    wait(cx, w, &view, 300);
+    assert_eq!(view.read_with(cx, |v, _| v.model.lives[v.panes.cur.live].watch.focus().map(str::to_string)), Some("sa_2".into()));
+    ops(cx, w, &view, "toolu_y", json!([{"op":"put","id":"y","kind":"note","body":{"text":"while watched"}}]));
+    board(cx, w, &view);
+    lease_over(cx, w, &view);
+    view.update(cx, |v, cx| {
+        let live = v.panes.cur.live;
+        v.model.lives[live].watch.focus_main();
+        cx.notify();
+    });
+    board(cx, w, &view);
+    lease_over(cx, w, &view);
+    assert_eq!(order(cx, &view, &names), ["n", "d", "p", "x", "y"], "back on the thread: where it was taken");
+}
+
+/// The field's composition, as the platform's IME would make it: `text`
+/// marked in place of what is marked (or selected).
+fn mark_in<E: gpui_kit::EntityInputHandler>(cx: &mut TestAppContext, w: AnyWindowHandle, f: &Entity<E>, text: &str) {
+    cx.update_window(w, |_, window, cx| f.update(cx, |s, cx| s.replace_and_mark_text_in_range(None, text, None, window, cx)))
+        .expect("the window");
+    settle(cx, w, 8);
+}
+
+fn marked<E: gpui_kit::EntityInputHandler>(cx: &mut TestAppContext, w: AnyWindowHandle, f: &Entity<E>) -> bool {
+    cx.update_window(w, |_, window, cx| f.update(cx, |s, cx| s.marked_text_range(window, cx))).expect("the window").is_some()
+}
+
+/// What the open field counts its history at (bytes).
+fn history(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
+    view.read_with(cx, |v, _| v.panes.cur.edit.at.as_ref().and_then(|e| e.field.as_ref()).map_or(0, |f| f.history))
+}
+
+/// Shady #114 R2 P2-4: an IME marks a note's text past its 1,500
+/// characters, and again and again: each refused as it is marked (no
+/// `Change` comes), the text area the draft's, no composition left under
+/// way, and said. A composition within the cap is the area's as it is
+/// marked, and the draft's once committed, its characters whole. Closed
+/// and opened again: the draft's.
+#[gpui_kit::test]
+fn marked_text_past_a_notes_cap_is_refused_as_it_is_marked(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    walk_take_at(cx, w, &view, "n");
+    press(cx, w, "r");
+    let a = area(cx, &view).expect("n's text area");
+    let held = note_of(cx, &view).0;
+    let cap = cards_spec::block::NOTE_TEXT_MAX;
+    for (k, big) in ["a".repeat(cap + 1), "é".repeat(cap), "かな".repeat(cap)].iter().enumerate() {
+        mark_in(cx, w, &a, big);
+        wait(cx, w, &view, 100);
+        assert_eq!(area_value(cx, &a), held, "marked past the cap ({k}): refused as marked");
+        assert!(!marked(cx, w, &a), "({k}) no composition left under way");
+        assert_eq!(says(cx, &view).as_deref(), Some("at most 1500 characters"), "({k}) said");
+        assert_eq!(note_of(cx, &view).0, held, "({k}) the draft as it was");
+    }
+    mark_in(cx, w, &a, "かな");
+    assert!(marked(cx, w, &a) && area_value(cx, &a).contains("かな"), "within the cap: the area's as marked");
+    put_in_area(cx, w, &a, "かな");
+    assert!(note_of(cx, &view).0.contains("かな"), "committed: the draft's, {:?}", note_of(cx, &view).0);
+    assert_eq!(area_value(cx, &a), note_of(cx, &view).0);
+    press(cx, w, "escape");
+    press(cx, w, "r");
+    let a = area(cx, &view).expect("opened again");
+    assert_eq!(area_value(cx, &a), note_of(cx, &view).0, "opened again: the draft's");
+}
+
+/// Shady #114 R2 P2-4's history case: a label selected whole, then marked
+/// over and over with 100-byte candidates, each one the field takes (no
+/// `Change` comes); the kit keeps each preedit in its undo history, the
+/// text it took out and the text it marked. The field counts them as they
+/// come, and ends the composition (the field the draft's, said, its
+/// history cleared) before what it keeps passes its budget. Another
+/// composition, committed, is the draft's.
+#[gpui_kit::test]
+fn a_compositions_preedits_count_in_its_fields_history(cx: &mut TestAppContext) {
+    let (w, view) = planned(cx);
+    walk_take_at(cx, w, &view, "p");
+    press(cx, w, "r");
+    let f = line(cx, &view).expect("the label's field");
+    let label = label_of(cx, &view, "fix");
+    let n = label.len();
+    cx.update_window(w, |_, _, cx| f.update(cx, |s, cx| s.set_selected_range(0..n, cx))).expect("the window");
+    settle(cx, w, 4);
+    let mut kept = n;
+    let mut ended = None;
+    for k in 0..200 {
+        mark_in(cx, w, &f, &(if k % 2 == 0 { "a" } else { "b" }).repeat(100));
+        if !marked(cx, w, &f) {
+            ended = Some(k);
+            break;
+        }
+        kept += if k == 0 { 100 } else { 200 };
+        let h = history(cx, &view);
+        assert!(h >= kept, "preedit {k}: counted {h} of the {kept} bytes the kit keeps");
+        assert!(h <= crate::draft_view::FIELD_HISTORY_MAX, "preedit {k}: under way past the budget ({h})");
+    }
+    let k = ended.expect("the composition ended before its history passed the budget");
+    assert!(kept + 200 > crate::draft_view::FIELD_HISTORY_MAX, "not before it would: {k} preedits, {kept} bytes");
+    assert_eq!(label_of(cx, &view, "fix"), label, "the draft as it was");
+    assert_eq!(line_value(cx, &f), label, "the field the draft's");
+    assert_eq!(says(cx, &view).as_deref(), Some(crate::draft_view::COMPOSED_LONG), "said");
+    assert_eq!(history(cx, &view), 0, "its history cleared");
+    mark_in(cx, w, &f, "かな");
+    put_in(cx, w, &f, "かな");
+    assert!(label_of(cx, &view, "fix").contains("かな"), "committed: the draft's");
+    assert_eq!(line_value(cx, &f), label_of(cx, &view, "fix"));
 }
