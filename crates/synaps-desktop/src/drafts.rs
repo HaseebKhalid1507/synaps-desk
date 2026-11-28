@@ -40,10 +40,6 @@
 //!   ([`cards_spec::board::BLOCK_MAX_OWNED`]). Across sessions, at most
 //!   [`DESK_DRAFTS_MAX`].
 
-// The tests-first commit's shape of the module: its types and words, its
-// logic not yet written (every function a stand-in).
-#![allow(dead_code, unused_imports, unused_variables)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -203,128 +199,640 @@ pub(crate) struct Draft {
 }
 
 impl Draft {
+    /// A draft of `b` (bound, at revision `b.rev`) of generation `generation`.
     pub(crate) fn of(b: Arc<Block>, generation: Generation) -> Option<Self> {
-        None
+        let intents = match &b.body {
+            Body::Plan(p) => Intents::Plan(PlanIntents { order: p.steps.iter().map(|s| s.id.clone()).collect(), ..Default::default() }),
+            Body::Note(_) => Intents::Note { text: None, title: None },
+            Body::Diff(_) => Intents::Diff(BTreeMap::new()),
+            _ => return None,
+        };
+        Some(Draft { id: b.id.clone(), tag: b.tag, base: b.rev, generation, base_block: b, intents, ended: None, serial: 0 })
     }
 
+    /// Its base body's steps, if it is a plan's.
+    fn base_steps(&self) -> &[Step] {
+        match &self.base_block.body {
+            Body::Plan(p) => &p.steps,
+            _ => &[],
+        }
+    }
+
+    fn base_step(&self, id: &ItemId) -> Option<&Step> {
+        self.base_steps().iter().find(|s| &s.id == id)
+    }
+
+    /// Whether it holds any change.
     pub(crate) fn changed(&self) -> bool {
-        false
+        match &self.intents {
+            Intents::Plan(p) => !(p.skip.is_empty() && p.stop.is_empty() && p.label.is_empty() && p.added.is_empty()) || self.reordered(),
+            Intents::Note { text, title } => text.is_some() || title.is_some(),
+            Intents::Diff(h) => !h.is_empty(),
+        }
     }
 
+    /// Whether the user moved one of `B`'s steps (an added step placed
+    /// anywhere but last is an order too: [`Draft::placed`]).
+    fn reordered(&self) -> bool {
+        let Intents::Plan(p) = &self.intents else { return false };
+        p.order.iter().filter(|i| !i.is_user()).ne(self.base_steps().iter().map(|s| &s.id))
+    }
+
+    /// Whether line 2 carries an order: the drawn order isn't `B`'s with
+    /// the added steps after it, as an append alone puts them.
+    fn placed(&self) -> bool {
+        let Intents::Plan(p) = &self.intents else { return false };
+        let natural = self.base_steps().iter().map(|s| &s.id).chain(p.added.iter().map(|(i, _)| i));
+        p.order.iter().ne(natural)
+    }
+
+    /// The block as drawn while held: `B` with the intents on it.
     pub(crate) fn view(&self) -> Block {
-        (*self.base_block).clone()
+        let mut b = (*self.base_block).clone();
+        match (&mut b.body, &self.intents) {
+            (Body::Plan(pl), Intents::Plan(p)) => {
+                let mut steps = Vec::with_capacity(p.order.len());
+                for id in &p.order {
+                    let mut s = match self.base_step(id) {
+                        Some(s) => s.clone(),
+                        None => match p.added.iter().find(|(i, _)| i == id) {
+                            Some((i, l)) => Step { id: i.clone(), label: l.clone(), state: StepState::Todo, note: None, stop: false },
+                            None => continue,
+                        },
+                    };
+                    if let Some(&k) = p.skip.get(id) {
+                        s.state = if k { StepState::Skipped } else { StepState::Todo };
+                    }
+                    if let Some(&k) = p.stop.get(id) {
+                        s.stop = k;
+                    }
+                    if let Some(l) = p.label.get(id) {
+                        s.label = l.clone();
+                    }
+                    steps.push(s);
+                }
+                pl.steps = steps;
+            }
+            (Body::Note(n), Intents::Note { text, title }) => {
+                if let Some(t) = text {
+                    n.text = t.clone();
+                }
+                if let Some(t) = title {
+                    b.title = Some(t.clone());
+                }
+            }
+            (Body::Diff(d), Intents::Diff(h)) => {
+                for x in &mut d.hunks {
+                    if let Some(&s) = h.get(&x.id) {
+                        x.state = s;
+                    }
+                }
+            }
+            _ => {}
+        }
+        b
     }
 
+    // ── the editors (§3.2) ─────────────────────────────────────────────
+
+    /// Strike or unstrike step `id`: `Err` says why it can't (a step that
+    /// ran). An added step struck is taken out of the draft.
     pub(crate) fn strike(&mut self, id: &ItemId) -> Result<(), &'static str> {
-        Err("not yet")
+        let base = self.base_step(id).map(|s| s.state);
+        let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
+        match base {
+            None if p.added.iter().any(|(i, _)| i == id) => {
+                p.added.retain(|(i, _)| i != id);
+                p.order.retain(|i| i != id);
+            }
+            None => return Err("not a step"),
+            Some(StepState::Todo | StepState::Skipped) => {
+                let was = base == Some(StepState::Skipped);
+                let now = !p.skip.get(id).copied().unwrap_or(was);
+                if now == was {
+                    p.skip.remove(id);
+                } else {
+                    p.skip.insert(id.clone(), now);
+                }
+            }
+            Some(_) => return Err(RAN),
+        }
+        self.serial += 1;
+        Ok(())
     }
 
+    /// Toggle a stop before step `id` (§3.2): only a `todo` or `skipped`
+    /// step of `B` takes one; an added step never does.
     pub(crate) fn stop(&mut self, id: &ItemId) -> Result<(), &'static str> {
-        Err("not yet")
+        let Some(base) = self.base_step(id).map(|s| (s.state, s.stop)) else { return Err("an added step takes no stop") };
+        let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
+        if !matches!(base.0, StepState::Todo | StepState::Skipped) {
+            return Err(RAN);
+        }
+        let now = !p.stop.get(id).copied().unwrap_or(base.1);
+        if now == base.1 {
+            p.stop.remove(id);
+        } else {
+            p.stop.insert(id.clone(), now);
+        }
+        self.serial += 1;
+        Ok(())
     }
 
+    /// Move step `id` one place up (`-1`) or down (`1`): text and order
+    /// are the user's, a step that ran included (§3.4).
     pub(crate) fn shift(&mut self, id: &ItemId, by: isize) -> bool {
-        false
+        let Intents::Plan(p) = &mut self.intents else { return false };
+        let Some(i) = p.order.iter().position(|x| x == id) else { return false };
+        let Some(j) = i.checked_add_signed(by).filter(|j| *j < p.order.len()) else { return false };
+        p.order.swap(i, j);
+        self.serial += 1;
+        true
     }
 
+    /// Step `id`'s label as the user typed it (cut at B1's cap): a label
+    /// back to `B`'s is no intent. `Err`: the draft would pass its cap.
     pub(crate) fn rename(&mut self, id: &ItemId, label: &str) -> Result<(), &'static str> {
-        Err("not yet")
+        let label: String = label.chars().take(cards_spec::block::STEP_LABEL_MAX).collect();
+        let was = self.base_step(id).map(|s| s.label.clone());
+        let before = self.intents.clone();
+        let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
+        if let Some((_, l)) = p.added.iter_mut().find(|(i, _)| i == id) {
+            *l = label;
+        } else if was.as_deref() == Some(label.as_str()) {
+            p.label.remove(id);
+        } else if was.is_some() {
+            p.label.insert(id.clone(), label);
+        } else {
+            return Err("not a step");
+        }
+        self.within(before)
     }
 
+    /// A step added after `after` (first, if none), labelled `label`, its
+    /// id `id` (`u-`, minted by the caller from the OS's randomness). `Err`
+    /// with why: the plan would pass 20 steps, or the draft its cap.
     pub(crate) fn add(&mut self, after: Option<&ItemId>, id: ItemId, label: &str) -> Result<(), &'static str> {
-        Err("not yet")
+        let before = self.intents.clone();
+        let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
+        if p.order.len() >= PLAN_STEPS_MAX {
+            return Err("the plan is full");
+        }
+        let at = after.and_then(|a| p.order.iter().position(|x| x == a)).map_or(0, |i| i + 1);
+        p.order.insert(at, id.clone());
+        p.added.push((id, label.chars().take(cards_spec::block::STEP_LABEL_MAX).collect()));
+        self.within(before)
     }
 
+    /// A note's text or title as typed: back to `B`'s is no intent.
     pub(crate) fn note(&mut self, title: bool, s: &str) -> Result<(), &'static str> {
-        Err("not yet")
+        let (bt, bx) = (self.base_block.title.clone().unwrap_or_default(), self.base_text());
+        let before = self.intents.clone();
+        let Intents::Note { text, title: t } = &mut self.intents else { return Err("not a note") };
+        if title {
+            let s: String = s.chars().take(cards_spec::block::TITLE_MAX).collect();
+            *t = (s != bt).then_some(s);
+        } else {
+            let s: String = s.chars().take(cards_spec::block::NOTE_TEXT_MAX).collect();
+            *text = (s != bx).then_some(s);
+        }
+        self.within(before)
     }
 
+    /// Its base note's text.
+    fn base_text(&self) -> String {
+        match &self.base_block.body {
+            Body::Note(n) => n.text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Keep (`true`) or drop hunk `id`: only while the diff is a proposal.
+    /// The same again takes it back.
     pub(crate) fn hunk(&mut self, id: &ItemId, keep: bool) -> Result<(), &'static str> {
-        Err("not yet")
+        let Body::Diff(d) = &self.base_block.body else { return Err("not a diff") };
+        if d.state != DiffState::Proposed {
+            return Err(NOT_PROPOSAL);
+        }
+        let Some(base) = d.hunks.iter().find(|h| &h.id == id).map(|h| h.state) else { return Err("not a hunk") };
+        let Intents::Diff(h) = &mut self.intents else { return Err("not a diff") };
+        let want = if keep { HunkState::Kept } else { HunkState::Dropped };
+        let now = h.get(id).copied().unwrap_or(base);
+        if now == want || want == base {
+            h.remove(id);
+        } else {
+            h.insert(id.clone(), want);
+        }
+        self.serial += 1;
+        Ok(())
     }
 
+    /// The change just made stands if the draft is within its cap; else it
+    /// is taken back (`before`).
+    fn within(&mut self, before: Intents) -> Result<(), &'static str> {
+        if self.own_bytes() > DRAFT_MAX_BYTES {
+            self.intents = before;
+            return Err(DRAFT_FULL);
+        }
+        self.serial += 1;
+        Ok(())
+    }
+
+    /// Its own bytes (§1.8's model: inline sizes, strings and vectors by
+    /// capacity, a map entry at twice its key and value plus a node's
+    /// share): its intents and field text, not the base block.
     pub(crate) fn own_bytes(&self) -> usize {
-        0
+        fn id(i: &ItemId) -> usize {
+            i.as_str().len()
+        }
+        let entry = |k: usize, v: usize| 2 * (k + v) + 16;
+        let inline = std::mem::size_of::<Draft>();
+        inline
+            + match &self.intents {
+                Intents::Plan(p) => {
+                    p.order.capacity() * std::mem::size_of::<ItemId>()
+                        + p.order.iter().map(id).sum::<usize>()
+                        + p.skip.keys().map(|k| entry(std::mem::size_of::<ItemId>(), 1) + id(k)).sum::<usize>()
+                        + p.stop.keys().map(|k| entry(std::mem::size_of::<ItemId>(), 1) + id(k)).sum::<usize>()
+                        + p.label
+                            .iter()
+                            .map(|(k, v)| entry(std::mem::size_of::<ItemId>(), std::mem::size_of::<String>()) + id(k) + v.capacity())
+                            .sum::<usize>()
+                        + p.added.capacity() * std::mem::size_of::<(ItemId, String)>()
+                        + p.added.iter().map(|(k, v)| id(k) + v.capacity()).sum::<usize>()
+                }
+                Intents::Note { text, title } => text.as_ref().map_or(0, String::capacity) + title.as_ref().map_or(0, String::capacity),
+                Intents::Diff(h) => {
+                    h.keys().map(|k| entry(std::mem::size_of::<ItemId>(), std::mem::size_of::<HunkState>()) + id(k)).sum::<usize>()
+                }
+            }
     }
 
+    /// What it keeps in all: its own, and the base block at B2's ceiling.
     pub(crate) fn bytes(&self) -> usize {
-        0
+        self.own_bytes() + BLOCK_MAX_OWNED + 2 * std::mem::size_of::<usize>()
     }
 
+    // ── the patch, line 1, the pre-check ──────────────────────────────
+
+    /// The patch (§3.3's line 2 parts: `append`, `order`, `set`), of every
+    /// intent, or of those `keep` says.
+    pub(crate) fn parts(&self, keep: &dyn Fn(&Key) -> bool) -> Value {
+        let mut set = Map::new();
+        let mut append = Vec::new();
+        let mut order = None;
+        let path = |s: &str| cards_spec::block::Path::parse(s).expect("a user path");
+        match &self.intents {
+            Intents::Plan(p) => {
+                for (i, l) in &p.added {
+                    if keep(&Key::Item(path(&format!("steps.{}", i.as_str())))) {
+                        append.push(json!({"id": i.as_str(), "label": l, "state": "todo"}));
+                    }
+                }
+                for (i, l) in &p.label {
+                    let k = format!("steps.{}.label", i.as_str());
+                    if keep(&Key::Set(path(&k))) {
+                        set.insert(k, json!(l));
+                    }
+                }
+                for (i, &s) in &p.skip {
+                    let k = format!("steps.{}.state", i.as_str());
+                    if keep(&Key::Set(path(&k))) {
+                        set.insert(k, json!(if s { "skipped" } else { "todo" }));
+                    }
+                }
+                for (i, &s) in &p.stop {
+                    let k = format!("steps.{}.stop", i.as_str());
+                    if keep(&Key::Set(path(&k))) {
+                        set.insert(k, json!(s));
+                    }
+                }
+                if self.placed() && keep(&Key::Order(path("steps"))) {
+                    // An added step left out isn't named.
+                    let named: Vec<&str> = p
+                        .order
+                        .iter()
+                        .filter(|i| !i.is_user() || keep(&Key::Item(path(&format!("steps.{}", i.as_str())))))
+                        .map(ItemId::as_str)
+                        .collect();
+                    order = Some(json!({"steps": named}));
+                }
+            }
+            Intents::Note { text, title } => {
+                if let Some(t) = text.as_ref().filter(|_| keep(&Key::Set(path("text")))) {
+                    set.insert("text".into(), json!(t));
+                }
+                if let Some(t) = title.as_ref().filter(|_| keep(&Key::Set(path("title")))) {
+                    set.insert("title".into(), json!(t));
+                }
+            }
+            Intents::Diff(h) => {
+                for (i, s) in h {
+                    let k = format!("hunks.{}.state", i.as_str());
+                    if keep(&Key::Set(path(&k))) {
+                        set.insert(k, json!(s.as_str()));
+                    }
+                }
+            }
+        }
+        let mut o = Map::new();
+        if !append.is_empty() {
+            o.insert("append".into(), json!({"steps": append}));
+        }
+        if let Some(v) = order {
+            o.insert("order".into(), v);
+        }
+        if !set.is_empty() {
+            o.insert("set".into(), Value::Object(set));
+        }
+        Value::Object(o)
+    }
+
+    /// Line 1's pieces (§3.3) for the intents `keep` says, in the order
+    /// the examples write them: the order, skips, unskips, stops, renames,
+    /// added steps; a hunk's keeps then drops; a note's text and title.
+    pub(crate) fn pieces(&self, keep: &dyn Fn(&Key) -> bool) -> Vec<String> {
+        let path = |s: &str| cards_spec::block::Path::parse(s).expect("a user path");
+        let set = |k: String| keep(&Key::Set(path(&k)));
+        let list = |ids: Vec<&ItemId>| ids.iter().map(|i| i.as_str()).collect::<Vec<_>>().join(", ");
+        let mut out = Vec::new();
+        match &self.intents {
+            Intents::Plan(p) => {
+                if self.reordered() && keep(&Key::Order(path("steps"))) {
+                    out.push(format!("order {}", list(p.order.iter().filter(|i| !i.is_user()).collect())));
+                }
+                let pick = |m: &BTreeMap<ItemId, bool>, on: bool, field: &str| -> Vec<&ItemId> {
+                    p.order.iter().filter(|i| m.get(*i) == Some(&on) && set(format!("steps.{}.{field}", i.as_str()))).collect()
+                };
+                for (ids, word) in [
+                    (pick(&p.skip, true, "state"), "skip"),
+                    (pick(&p.skip, false, "state"), "unskip"),
+                    (pick(&p.stop, true, "stop"), "stop before"),
+                    (pick(&p.stop, false, "stop"), "no stop before"),
+                ] {
+                    if !ids.is_empty() {
+                        out.push(format!("{word} {}", list(ids)));
+                    }
+                }
+                for i in p.order.iter().filter(|i| p.label.contains_key(*i)) {
+                    if set(format!("steps.{}.label", i.as_str())) {
+                        out.push(format!("rename {} “{}”", i.as_str(), p.label[i]));
+                    }
+                }
+                for (i, l) in &p.added {
+                    if keep(&Key::Item(path(&format!("steps.{}", i.as_str())))) {
+                        let at = p.order.iter().position(|x| x == i).unwrap_or(0);
+                        let after = p.order[..at].iter().rev().find(|x| !x.is_user()).or(at.checked_sub(1).map(|k| &p.order[k]));
+                        out.push(match after {
+                            Some(a) => format!("add “{l}” after {}", a.as_str()),
+                            None => format!("add “{l}” first"),
+                        });
+                    }
+                }
+            }
+            Intents::Note { text, title } => {
+                if let Some(t) = text.as_ref().filter(|_| set("text".into())) {
+                    out.push(format!("text “{t}”"));
+                }
+                if let Some(t) = title.as_ref().filter(|_| set("title".into())) {
+                    out.push(format!("title “{t}”"));
+                }
+            }
+            Intents::Diff(h) => {
+                for (st, word) in [(HunkState::Kept, "keep"), (HunkState::Dropped, "drop")] {
+                    let ids: Vec<&ItemId> =
+                        h.iter().filter(|(i, s)| **s == st && set(format!("hunks.{}.state", i.as_str()))).map(|(i, _)| i).collect();
+                    if !ids.is_empty() {
+                        out.push(format!("{word} {}", list(ids)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The edit of the intents `keep` says, and its message (`Err`: why
+    /// there is none, as `Edit::new` and `build` say).
+    fn edit_of(&self, keep: &dyn Fn(&Key) -> bool) -> Result<(Edit, String), String> {
+        let edit = Edit::new(self.id.clone(), self.base, self.tag, &self.parts(keep)).map_err(|e| e.to_string())?;
+        let pieces = self.pieces(keep);
+        let summary =
+            Summary { title: self.base_block.title.as_deref(), back_to: None, pieces: pieces.iter().map(String::as_str).collect() };
+        let text = build(&edit, &summary).map_err(|e| e.to_string())?;
+        Ok((edit, text))
+    }
+
+    /// The pre-check at hand-back (§3.2) on `board`, the current bound
+    /// board: B2's guards on every intent; what fails is listed and left
+    /// out; the message for what is left.
     pub(crate) fn check(&self, board: &State) -> Checked {
-        Checked { fails: Vec::new(), message: None, off: None }
+        let off = |s: &str| Checked { fails: Vec::new(), message: None, off: Some(s.to_string()) };
+        if let Some(f) = self.ended {
+            return off(&f.says().unwrap_or_default());
+        }
+        if !self.changed() {
+            return off("no changes yet");
+        }
+        let all = |_: &Key| true;
+        let (edit, _) = match self.edit_of(&all) {
+            Ok(e) => e,
+            Err(e) => return off(&e),
+        };
+        let Some(o) = board.precheck(&edit) else { return off("not an edit of this block") };
+        match o.result {
+            EditResult::Applied => {}
+            EditResult::Rewritten => return off("the block was rewritten"),
+            EditResult::Gone => return off("this block is gone"),
+            EditResult::Revisions => return off("replace the block or use a new id"),
+        }
+        let ks = keys(&edit);
+        let fails: Vec<(Key, Code)> =
+            ks.iter().zip(&o.codes).filter(|(_, c)| !matches!(c, Code::Applied | Code::Unchanged)).map(|(k, c)| (k.clone(), *c)).collect();
+        let applies: Vec<&Key> = ks.iter().zip(&o.codes).filter(|(_, c)| **c == Code::Applied).map(|(k, _)| k).collect();
+        if applies.is_empty() {
+            return Checked { fails, message: None, off: Some(NOTHING_LEFT.into()) };
+        }
+        let keep = |k: &Key| applies.contains(&k);
+        match self.edit_of(&keep) {
+            Ok((_, text)) => Checked { fails, message: Some(text), off: None },
+            Err(e) => Checked { fails, message: None, off: Some(e) },
+        }
     }
 
+    /// Copy to composer's words (§3.2): line 1's, without its `[block …]`
+    /// prefix, of every intent. A stale patch is never sent; its words are
+    /// the user's to send as typed text.
     pub(crate) fn words(&self) -> String {
-        String::new()
+        let all = |_: &Key| true;
+        if let Ok((_, text)) = self.edit_of(&all) {
+            let line1 = text.split('\n').next().unwrap_or_default();
+            if let Some((_, rest)) = line1.split_once("] ") {
+                return rest.to_string();
+            }
+        }
+        let name = self.base_block.title.clone().unwrap_or_else(|| self.id.to_string());
+        format!("{name} → {}", self.pieces(&all).join(" · "))
     }
 
+    /// What became of its block on `d` (module docs): a draft that ended
+    /// stays ended. Judged on the bound board, the board itself when `d`
+    /// keeps it (never a pending op); else the block's bound copy.
     pub(crate) fn fate(&self, d: &Drawn) -> Fate {
-        Fate::Held
+        if let Some(f) = self.ended {
+            return f;
+        }
+        if d.generation.is_some_and(|g| g != self.generation) {
+            return Fate::Orphan;
+        }
+        let (tag, rev) = match &d.board {
+            Some(st) => match st.block(&self.id) {
+                Some(b) => (b.tag, b.rev),
+                None => return Fate::Gone,
+            },
+            None => {
+                let Some((s, _)) = crate::lease::find_any(d, crate::blocks::row_id(&self.id)) else { return Fate::Gone };
+                match s.bound.as_ref() {
+                    Some(b) => (b.tag, b.rev),
+                    // Pending only: the bound board can't say yet.
+                    None => return Fate::Held,
+                }
+            }
+        };
+        if tag == self.tag { Fate::Held } else { Fate::Rewritten(rev) }
     }
 
+    /// The agent's changes to its incarnation since `B` (§3.2's `· 2 agent
+    /// changes`), as the bound board `st` counts them: its revisions since
+    /// `B` less the users' (pending ones count once bound).
     pub(crate) fn agent_changes(&self, st: &State) -> u32 {
-        0
+        let Some(b) = st.block(&self.id).filter(|b| b.tag == self.tag) else { return 0 };
+        let users = st.records_of(self.tag).filter(|r| r.rev > self.base && r.author == cards_spec::block::Author::User).count() as u32;
+        b.rev.saturating_sub(self.base).saturating_sub(users)
     }
 }
 
-/// The desk's drafts (module docs).
+/// The desk's drafts (module docs): each session's, oldest first.
 #[derive(Debug, Default)]
 pub(crate) struct Drafts {
     all: Vec<(String, Draft)>,
 }
 
 impl Drafts {
+    /// Session `session`'s drafts, oldest first.
     pub(crate) fn of<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a Draft> + 'a {
         self.all.iter().filter(move |(s, _)| s == session).map(|(_, d)| d)
     }
 
+    /// How many drafts session `session` has (holds and orphans).
     pub(crate) fn count(&self, session: &str) -> usize {
-        0
+        self.of(session).count()
     }
 
     pub(crate) fn len(&self) -> usize {
-        0
+        self.all.len()
     }
 
+    /// Session `session`'s draft of block `id`'s incarnation `tag`.
     pub(crate) fn get(&self, session: &str, id: &Ref, tag: Tag) -> Option<&Draft> {
-        None
+        self.all.iter().find(|(s, d)| s == session && &d.id == id && d.tag == tag).map(|(_, d)| d)
     }
 
     pub(crate) fn get_mut(&mut self, session: &str, id: &Ref, tag: Tag) -> Option<&mut Draft> {
-        None
+        self.all.iter_mut().find(|(s, d)| s == session && &d.id == id && d.tag == tag).map(|(_, d)| d)
     }
 
+    /// Session `session`'s draft drawn in block `id`'s row: its latest
+    /// that hasn't been orphaned (a stale one stays in its row).
     pub(crate) fn in_row(&self, session: &str, id: &Ref) -> Option<&Draft> {
-        None
+        self.all.iter().rev().find(|(s, d)| s == session && &d.id == id && d.ended != Some(Fate::Orphan)).map(|(_, d)| d)
     }
 
+    /// Take `b` (bound at its revision), of generation `generation`, for
+    /// session `session` (§3.2): its draft if it has one; else a new one,
+    /// unless the caps refuse it (why).
     pub(crate) fn take(&mut self, session: &str, b: &Arc<Block>, generation: Generation) -> Result<&mut Draft, &'static str> {
-        Err("not yet")
+        if let Some(i) = self.all.iter().position(|(s, d)| s == session && d.id == b.id && d.tag == b.tag && d.ended.is_none()) {
+            return Ok(&mut self.all[i].1);
+        }
+        if self.count(session) >= DRAFTS_MAX {
+            return Err(FULL);
+        }
+        if self.all.len() >= DESK_DRAFTS_MAX {
+            return Err(DESK_FULL);
+        }
+        let d = Draft::of(b.clone(), generation).ok_or("this block isn't editable")?;
+        self.all.push((session.to_string(), d));
+        Ok(&mut self.all.last_mut().expect("pushed").1)
     }
 
+    /// Discard session `session`'s draft of `id`'s incarnation `tag`.
     pub(crate) fn discard(&mut self, session: &str, id: &Ref, tag: Tag) -> bool {
-        false
+        let n = self.all.len();
+        self.all.retain(|(s, d)| !(s == session && &d.id == id && d.tag == tag));
+        self.all.len() < n
     }
 
+    /// Session `session`'s drafts judged on its bound board `d`: a block
+    /// that ended makes its draft stale for good, a compaction an orphan,
+    /// in place (none is dropped). Whether any changed.
     pub(crate) fn judge(&mut self, session: &str, d: &Drawn) -> bool {
-        false
+        let mut moved = false;
+        for (_, x) in self.all.iter_mut().filter(|(s, _)| s == session) {
+            if x.ended.is_none() {
+                let f = x.fate(d);
+                if f != Fate::Held {
+                    log::info!(target: "synaps_desktop::drafts", "draft of {} ended: {f:?}", x.id);
+                    x.ended = Some(f);
+                    x.serial += 1;
+                    moved = true;
+                }
+            }
+        }
+        moved
     }
 
+    /// Session `session`'s board is gone (no block call is left): its
+    /// held drafts' blocks are gone. Whether any were.
     pub(crate) fn gone(&mut self, session: &str) -> bool {
-        false
+        self.end(session, Fate::Gone)
     }
 
+    /// Session `session` was compacted (§5.2): its held drafts are orphans,
+    /// in place. Whether any were.
     pub(crate) fn compacted(&mut self, session: &str) -> bool {
-        false
+        self.end(session, Fate::Orphan)
     }
 
+    fn end(&mut self, session: &str, f: Fate) -> bool {
+        let mut any = false;
+        for (_, x) in self.all.iter_mut().filter(|(s, x)| s == session && x.ended.is_none()) {
+            log::info!(target: "synaps_desktop::drafts", "draft of {} ended: {f:?}", x.id);
+            x.ended = Some(f);
+            x.serial += 1;
+            any = true;
+        }
+        any
+    }
+
+    /// Session `from`'s drafts are session `to`'s now (a worker tab that
+    /// followed its session, [`crate::tabs::Tabs::take_rekeys`]). None is
+    /// dropped: past 8 there, a take is refused until one goes.
+    pub(crate) fn rekey(&mut self, from: &str, to: &str) {
+        for (s, _) in self.all.iter_mut().filter(|(s, _)| s == from) {
+            *s = to.to_string();
+        }
+    }
+
+    /// Whether session `session` holds a draft whose block is live (its
+    /// board's jobs keep the bound board for its pre-check).
     pub(crate) fn holds(&self, session: &str) -> bool {
-        false
+        self.of(session).any(|d| d.ended.is_none())
     }
 
+    /// What they keep (bytes): each draft's, and the list's own.
     pub(crate) fn bytes(&self) -> usize {
-        0
+        self.all.capacity() * std::mem::size_of::<(String, Draft)>()
+            + self.all.iter().map(|(s, d)| s.capacity() + d.bytes() - std::mem::size_of::<Draft>()).sum::<usize>()
     }
 }
 

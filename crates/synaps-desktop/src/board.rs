@@ -85,6 +85,12 @@ impl Work {
         self.waiting = None;
     }
 
+    /// Its next frame asks for a board again, its input moved or not (D8:
+    /// the bound board kept, or let go, from that job on).
+    pub(crate) fn again(&mut self) {
+        self.asked = None;
+    }
+
     /// Its transcript's board, revision `rev`, is the one drawn: nothing to
     /// fold (a closing pane's rows).
     pub(crate) fn settled(&mut self, rev: u64) {

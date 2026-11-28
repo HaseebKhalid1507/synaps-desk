@@ -93,6 +93,8 @@ pub(crate) enum Act {
     More,
     /// A header's hover action (D7, [`crate::walk::Hover`]).
     Hover(crate::walk::Hover),
+    /// An editable part, or a draft's button (D8, [`crate::draft_view::Part`]).
+    Edit(crate::draft_view::Part),
 }
 
 /// A press's painted target: the block row it was painted as (a group's
@@ -627,8 +629,8 @@ impl AppView {
                                 this.panes.cur.block_more.insert(row);
                             }
                         }
-                        // Its own up ([`AppView::hover_up`]).
-                        Act::Hover(_) => {}
+                        // Their own ups ([`AppView::hover_up`], [`AppView::draft_up`]).
+                        Act::Hover(_) | Act::Edit(_) => {}
                     }
                     this.panes.cur.list.remeasure_items(ix..ix + 1);
                 }

@@ -706,6 +706,24 @@ impl AppView {
         }
     }
 
+    /// `e`: the walked block taken (D8, §3.2), on its painted target: a
+    /// transcript block drawn whole ([`AppView::take_block`] checks the rest). A
+    /// rail section is edited in the transcript (`p` puts it there).
+    fn walk_take(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.walk_painted_at() else { return };
+        let Some((_, f)) = self.walk_target() else {
+            self.walk_says(at, CHANGED, window, cx);
+            return;
+        };
+        match at {
+            At::Block(row) if f.tomb.is_none() && self.drawn_look(&f.s) == crate::rail_wishes::Look::Full => {
+                self.take_block(row, f.s.block.tag, crate::draft_view::Part::Take, window, cx);
+            }
+            At::Block(_) => {}
+            At::Rail(_) => self.walk_says(at, RAIL_TAKE, window, cx),
+        }
+    }
+
     /// Block `s` (at `at`) folded or unfolded, locally: in this pane's
     /// transcript, or in the rail; its undo kept, what it set and what it
     /// was before (§3.5). `false`: not drawn here now.
@@ -1027,7 +1045,7 @@ impl AppView {
             "u" => self.walk_wish(Wish::Show, window, cx),
             "p" => self.walk_wish(Wish::Pin, window, cx),
             "m" => self.walk_wish(Wish::Slot, window, cx),
-            // `e` takes the block: D8's.
+            "e" => self.walk_take(window, cx),
             _ => {}
         }
     }
@@ -1235,6 +1253,9 @@ impl AppView {
         if rail && d.offers(Wish::Slot, &s.block, rail) {
             v.push((Hover::Slot, "⇅"));
         }
+        if !rail && !s.block.pending && crate::drafts::editable(s.block.kind) {
+            v.push((Hover::Edit, "edit"));
+        }
         v.push((Hover::Fold, "fold"));
         if d.offers(Wish::Dismiss, &s.block, rail) {
             v.push((Hover::Dismiss, "×"));
@@ -1249,6 +1270,11 @@ impl AppView {
         match act {
             Hover::Fold => {
                 self.fold_now(at, s, cx);
+            }
+            Hover::Edit => {
+                if let At::Block(row) = at {
+                    self.take_block(row, s.block.tag, crate::draft_view::Part::Take, window, cx);
+                }
             }
             Hover::Rev => {
                 if self.walk_to(at, window, cx)
@@ -1403,6 +1429,9 @@ impl AppView {
 /// A D6b action refused (its reason in the log).
 pub(crate) const REFUSED: &str = "not done · try again";
 
+/// `e` on a rail section (D8a): it is edited in the transcript.
+pub(crate) const RAIL_TAKE: &str = "edit it in the transcript · p puts it there";
+
 /// The status line's height.
 pub(crate) const STATUS_H: f32 = 24.;
 
@@ -1435,6 +1464,8 @@ pub(crate) enum Hover {
     Dismiss,
     /// A transcript tombstone's click (`u`), its token as painted.
     Show(u64),
+    /// Take it (D8, §3.2): an editable block's `e`.
+    Edit,
 }
 
 /// A past revision as drawn (§3.6): its label, a later revision landed

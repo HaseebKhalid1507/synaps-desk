@@ -664,6 +664,18 @@ impl Transcript {
         crate::blocks::Input::of(&self.blocks, &self.live_log)
     }
 
+    /// Whether the board's jobs keep the bound board itself, from the next
+    /// one on ([`crate::blocks::HistoryBlocks::keep_bound`]): while a draft
+    /// is held over this history's board (D8's pre-check).
+    pub fn blocks_keep_bound(&self, on: bool) {
+        self.blocks.keep_bound(on);
+    }
+
+    /// See [`Transcript::blocks_keep_bound`].
+    pub fn blocks_keeps_bound(&self) -> bool {
+        self.blocks.keeps_bound()
+    }
+
     /// A block call in the history or the live turn: the board draws them.
     pub fn has_blocks(&self) -> bool {
         self.blocks.has_blocks() || self.live_log.has_blocks()

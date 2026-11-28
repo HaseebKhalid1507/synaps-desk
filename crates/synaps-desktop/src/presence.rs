@@ -755,6 +755,12 @@ impl AppView {
             lines.extend(d.note.iter().chain(d.lines.values()));
             areas.extend(d.longs.values());
         }
+        // A draft's open field (D8), in each pane.
+        for p in self.panes.iter() {
+            let (l, a) = p.edit.inputs();
+            lines.extend(l);
+            areas.extend(a);
+        }
         (lines, areas)
     }
 

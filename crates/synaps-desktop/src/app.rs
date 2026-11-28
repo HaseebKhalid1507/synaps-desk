@@ -525,7 +525,7 @@ pub fn bind_keys(cx: &mut App) {
     // no binding (not the kit's focus cycling, nor an input's indent), so
     // they come as keys, whose repeats are known (`ask_keys::ask_tab_key`).
     // The op log's Tab flips its tabs (D7), the same way.
-    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX, crate::oplog::LOG_CTX] {
+    for ctx in [crate::ask_keys::ASK_CTX, crate::ask_keys::ASK_INPUT_CTX, crate::oplog::LOG_CTX, crate::draft_view::EDIT_INPUT_CTX] {
         keys.push(KeyBinding::new("tab", gpui_kit::NoAction, Some(ctx)));
         keys.push(KeyBinding::new("shift-tab", gpui_kit::NoAction, Some(ctx)));
     }
@@ -3202,6 +3202,10 @@ impl AppView {
                 && let Some(live) = self.model.lives.ids().into_iter().find(|l| self.model.lives[*l].current(*attach_seq))
             {
                 self.archive_boundary(live, journal);
+                // Its held drafts are orphans now, in place (§5.2).
+                if let Some(session) = self.model.lives[live].active.as_ref().map(|a| a.session_id.clone()) {
+                    self.block_drafts.compacted(&session);
+                }
             }
             // The store's attachment detached: what its panes held for its
             // blocks goes (Shady #101 P2-4).
@@ -3391,6 +3395,7 @@ impl AppView {
         // Worker tabs that followed their session: their drafts with them.
         for (from, to) in self.model.tabs.take_rekeys() {
             self.drafts.rekey(&from, &to);
+            self.block_drafts.rekey(&from, &to);
         }
         // A refused steer's text, once the thread it is for is on screen
         // and the composer is that tab's (never in the frame of a switch:
@@ -9377,6 +9382,8 @@ impl AppView {
                 // The card off screen (scrolled away, or a worker's view):
                 // NEEDS YOU, folded, over the chips.
                 .children(dock)
+                // The session's drafts with no row here (D8): over the composer.
+                .children(self.drafts_dock(&p, &m, cx))
                 .children(crate::motion::probe(&self.fx, "composer"))
                 .child(self.render_composer(
                     &p,
@@ -9385,9 +9392,11 @@ impl AppView {
                     window,
                     cx,
                 ))
-                // An agent card's keys (D2b), the block walk's (D7).
+                // An agent card's keys (D2b), the block walk's (D7), a
+                // draft's (D8).
                 .map(|d| self.ask_hooks(d, cx))
                 .map(|d| self.walk_hooks(d, cx))
+                .map(|d| self.edit_hooks(d, cx))
         }
     }
 
@@ -9488,6 +9497,7 @@ impl AppView {
         self.read_card_on_screen();
         self.sync_ask(window, cx);
         self.sync_walk(window, cx);
+        self.sync_edit(window, cx);
         if self.panes.cur.stub_away.is_some()
             && (self.card_on_screen() || self.panes.cur.stub_away != self.model.lives[self.panes.cur.live].card_key())
         {
