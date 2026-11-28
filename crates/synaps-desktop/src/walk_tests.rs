@@ -1172,6 +1172,166 @@ fn a_failed_undo_keeps_both_stores_together_however_many_undos_follow(cx: &mut T
     assert!(desires(cx, &view) == 1 && !is_soft(cx, &view, "r1") && is_soft(cx, &view, "r2"));
 }
 
+/// The rail demo's history (`first` its first message: its generation),
+/// `plan`'s dismissal shared: a notice of it in the history.
+fn plan_shared(first: Option<&str>) -> Vec<Value> {
+    let mut h = synaps_client::synthetic::rail_history();
+    if let Some(first) = first {
+        h[0] = json!({"role": "user", "content": first});
+    }
+    h.push(json!({"role": "user", "content": "noted\n[block plan v1 dismissed]"}));
+    h.push(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}));
+    h
+}
+
+/// The footer's `show`, clicked (come a moment after the board, D6a's
+/// guard).
+fn footer_show(cx: &mut TestAppContext, w: AnyWindowHandle, view: &Entity<AppView>) {
+    wait(cx, w, view, 700);
+    let show = drawn(cx, w, "agent-footer 1 dismissed · show".into()).center();
+    click(cx, w, show);
+    wait(cx, w, view, 300);
+    away(cx, w);
+}
+
+/// Shady #106 P2-2, round 3: an undo's recovery is its own write's, by
+/// that write's ticket. `plan` soft, its dismissal shared; the footer's
+/// Show saved (its tombstone draws), `x` on the tombstone saved (the Show
+/// cancelled to none, the tombstone ended), and Ctrl+Z with the writer
+/// held (the Show again, the tombstone back). The history's generation
+/// switches, retiring that write; then the footer's Show in the new one,
+/// and the disk refuses: that Show changed no presentation, so the
+/// tombstone stays, in memory and in the files.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_retired_undos_recovery_never_acts_on_another_generations_write(cx: &mut TestAppContext) {
+    let (w, view) = rail(cx);
+    history_now(cx, w, &view, plan_shared(None));
+    landed(cx, w, &view);
+    assert_eq!(sec(cx, &view, "plan"), None, "shared: dismissed");
+    softly(cx, w, &view, &["plan".into()]);
+    footer_show(cx, w, &view);
+    landed(cx, w, &view);
+    assert_eq!(desires(cx, &view), 1, "a local show");
+    assert_eq!(sec(cx, &view, "plan").map(|s| s.2), Some(true), "shown: its soft tombstone");
+    enter(cx, w, &view);
+    walk_on(cx, w, &view, At::Rail(row("plan")));
+    press(cx, w, "x");
+    landed(cx, w, &view);
+    assert!(desires(cx, &view) == 0 && !is_soft(cx, &view, "plan"), "the show cancelled, the tombstone ended");
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(is_soft(cx, &view, "plan"), "the tombstone back");
+    assert_eq!(view.read_with(cx, |v, _| (v.wishes.undoing(), v.wishes.desires.queued_wishes())), (1, 1), "its show a write away");
+    // Another generation: the undo's write retired.
+    history_now(cx, w, &view, plan_shared(Some("another start")));
+    wait(cx, w, &view, 300);
+    let kept = mark(cx, &view, "plan");
+    footer_show(cx, w, &view);
+    assert_eq!(view.read_with(cx, |v, _| v.wishes.desires.queued_wishes()), 1, "the new generation's show, a write away");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(desires(cx, &view), 0, "the show not kept");
+    assert_eq!(sec(cx, &view, "plan"), None, "dismissed, as shared");
+    assert_eq!(mark(cx, &view, "plan"), kept, "the show's failure touched no presentation");
+    assert!(is_soft(cx, &view, "plan"), "its soft dismissal stays");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert!(is_soft(cx, &view, "plan"), "and in the files");
+}
+
+/// Shady #106 P2-2, round 3: an undo's recovery goes with its write, and
+/// only its own: retired by another generation's settle, or by a
+/// compaction, it goes too (records never outnumber the writes queued),
+/// and nothing is put back.
+fn a_retired_write_retires_its_recovery(cx: &mut TestAppContext, how: &str) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    let counts = |cx: &mut TestAppContext| view.read_with(cx, |v, _| (v.wishes.undoing(), v.wishes.desires.queued_wishes()));
+    assert_eq!(counts(cx), (1, 1), "the undo's cancel a write away, and its recovery");
+    let marks = |cx: &mut TestAppContext| (is_soft(cx, &view, "r1"), is_soft(cx, &view, "r2"));
+    assert_eq!(marks(cx), (true, true), "r1's tombstone back");
+    match how {
+        "switch" => {
+            let mut h = synaps_client::synthetic::blocks_history();
+            h[0] = json!({"role": "user", "content": "another start"});
+            history_now(cx, w, &view, h);
+        }
+        _ => {
+            let batch = compaction_onto(cx, &view, "j-next", synaps_client::synthetic::blocks_history());
+            view.update(cx, |v, cx| v.apply_batch(batch, cx));
+            cx.run_until_parked();
+            wait(cx, w, &view, 300);
+        }
+    }
+    assert_eq!(counts(cx), (0, 0), "{how}: the write retired, its recovery too");
+    let before = view.read_with(cx, |v, _| v.wishes.pres.mark("j-next", &Ref::parse("r1").expect("an id")));
+    release(cx, w, &view, hold);
+    assert_eq!(counts(cx), (0, 0), "{how}");
+    if how == "switch" {
+        assert_eq!(marks(cx), (true, true), "{how}: nothing put back");
+    } else {
+        let after = view.read_with(cx, |v, _| v.wishes.pres.mark("j-next", &Ref::parse("r1").expect("an id")));
+        assert_eq!(after, before, "{how}: nothing put back");
+    }
+}
+
+#[gpui_kit::test]
+fn a_generation_switch_retires_an_undos_recovery_with_its_write(cx: &mut TestAppContext) {
+    a_retired_write_retires_its_recovery(cx, "switch");
+}
+
+#[gpui_kit::test]
+fn a_compaction_retires_an_undos_recovery_with_its_write(cx: &mut TestAppContext) {
+    a_retired_write_retires_its_recovery(cx, "compaction");
+}
+
+/// Shady #106 P2-2, round 3: `r1` hidden while its undo's write waits
+/// (the dismissal `x` saved draws until then), the agent moves it into
+/// the transcript, and `p` pins it there: a newer placement. The disk
+/// refusing the undo's write leaves that placement, in memory and in the
+/// files (its key left the mark another one).
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_failed_undo_leaves_a_placement_made_since(cx: &mut TestAppContext) {
+    let (w, view) = x_on_a_tombstone(cx);
+    let path = view.read_with(cx, |v, _| v.wishes.desires.path().expect("a file").to_path_buf());
+    let file = std::fs::read(&path).expect("x's dismissal, written");
+    let hold = view.read_with(cx, |v, _| v.wishes.home.writer.clone()).hold();
+    press(cx, w, "ctrl-z");
+    wait(cx, w, &view, 300);
+    assert!(sec(cx, &view, "r1").is_none() && is_soft(cx, &view, "r1"), "hidden until written, its tombstone back");
+    let undone = mark(cx, &view, "r1");
+    ops(cx, w, &view, "toolu_mv", json!([{"op":"move","id":"r1","target":"transcript"}]));
+    wait(cx, w, &view, 1000);
+    walk_again(cx, w, &view);
+    walk_to(cx, w, &view, At::Block(row("r1")));
+    press(cx, w, "p");
+    wait(cx, w, &view, 300);
+    let pinned = mark(cx, &view, "r1");
+    assert_ne!(pinned, undone, "p: a newer placement");
+    // The disk refuses: a folder where the file goes.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release(cx, w, &view, hold);
+    assert!(said(cx, &view).contains("not saved"), "{}", said(cx, &view));
+    assert_eq!(desires(cx, &view), 1, "r1's dismissal, as x left it");
+    assert_eq!(mark(cx, &view, "r1"), pinned, "the pin stays");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, file).unwrap();
+    restart(cx, w, &view);
+    assert_eq!(mark(cx, &view, "r1"), pinned, "and in the files");
+}
+
 /// The pane's conversation's presentation entries.
 fn entries(cx: &mut TestAppContext, view: &Entity<AppView>) -> usize {
     view.read_with(cx, |v, _| {

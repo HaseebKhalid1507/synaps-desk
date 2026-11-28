@@ -31,8 +31,11 @@
 //!   is a write away puts its presentation back at once (the desire draws
 //!   as before until it is written); that write failing puts both back as
 //!   the key left them ([`Stores::undo_landed`]). What that takes is kept
-//!   with the write, never dropped for room: one per id waiting, until
-//!   its write lands. A key's token names its undo ([`UNDO_KEPT`] kept).
+//!   with the write, by its ticket ([`Desires::queued`]), never dropped for
+//!   room: at most one per write queued, until it lands (and only its own
+//!   landing acts on it) or is retired (a settle of another generation, a
+//!   compaction: it goes, nothing put back). A key's token names its undo
+//!   ([`UNDO_KEPT`] kept).
 //! - **Riding** ([`AppView::ride_notices`]): the composer's `Submit` (idle)
 //!   or `Steer` (a turn runs) carries what [`Desires::ride`] attaches; one
 //!   whose marks aren't written yet goes once they are ([`Landed::Send`]),
@@ -57,7 +60,7 @@
 //!   for as long as this desk doesn't own its files, that it keeps its
 //!   changes in memory only ([`Stores::memory_only`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -173,10 +176,10 @@ pub(crate) struct Stores {
     /// D7's undo of each key's change, by its token, oldest first.
     undos: VecDeque<(u64, Undo)>,
     next_undo: u64,
-    /// Undos whose desire's write is out, their presentation put back:
-    /// at most one per id with a wish not written (≤ `desires::QUEUE_MAX`),
-    /// each until that wish lands.
-    undoing: VecDeque<Undoing>,
+    /// Undos whose desire's write is out, their presentation put back, by
+    /// that write's ticket: at most one per write queued
+    /// (≤ `desires::QUEUE_MAX`), each until it lands or is retired.
+    undoing: BTreeMap<u64, Undoing>,
     /// Tests: every message sent to a session, as it went.
     #[cfg(test)]
     pub(crate) outbox: Vec<String>,
@@ -210,6 +213,7 @@ struct Undo {
 /// that can be: a failed write puts the desire back to what drew before
 /// its id's first wish not written, so an undo whose key's own wish isn't
 /// written either needs none (both stores go back to before that key).
+/// Kept by its write's ticket: no other write's landing touches it.
 struct Undoing {
     conv: String,
     generation: Generation,
@@ -276,7 +280,7 @@ impl Stores {
             said: None,
             undos: VecDeque::new(),
             next_undo: 0,
-            undoing: VecDeque::new(),
+            undoing: BTreeMap::new(),
             #[cfg(test)]
             outbox: Vec::new(),
         }
@@ -465,6 +469,7 @@ impl BlockDesires for Stores {
     /// its desire are what the key left, and no notice of that desire may
     /// have gone (a delivered dismissal is undone with Show).
     fn undo(&mut self, aim: &Aim, wish: Wish, token: u64) -> Asked {
+        self.retire();
         let Some(k) = self.undos.iter().position(|(t, _)| *t == token) else {
             return Asked::Refused("too long ago to undo".into());
         };
@@ -513,17 +518,15 @@ impl BlockDesires for Stores {
                     return Asked::Refused(why);
                 }
                 // A write away, and the presentation with it: what its
-                // failure needs kept (type docs), this id's newest, until
-                // the write lands. Bounded by the wishes waiting, never
-                // dropped for room.
+                // failure needs kept (type docs), its write's newest, until
+                // that write lands or is retired. One per write queued,
+                // never dropped for room.
                 Ok(Ask::Saving) if u.pres.0 != u.pres.1 => {
-                    let desires = &self.desires;
-                    self.undoing.retain(|o| {
-                        desires.pending(&o.conv, &o.generation, &o.id) && !(o.conv == u.conv && o.generation == *g && o.id == *id)
-                    });
-                    if same(desires.desire(&u.conv, g, id), left.as_ref()) {
+                    if let Some(ticket) = self.desires.queued(&u.conv, g, id)
+                        && same(self.desires.desire(&u.conv, g, id), left.as_ref())
+                    {
                         let (conv, id, r, left, pres) = (u.conv.clone(), id.clone(), u.r.clone(), left.clone(), u.pres.clone());
-                        self.undoing.push_back(Undoing { conv, generation: *g, id, r, left, pres });
+                        self.undoing.insert(ticket, Undoing { conv, generation: *g, id, r, left, pres });
                     }
                 }
                 Ok(_) => {}
@@ -536,28 +539,33 @@ impl BlockDesires for Stores {
 }
 
 impl Stores {
-    /// A desire's write landed (`kept`) or failed: an undo it carried
+    /// Desire write `ticket` landed (`kept`) or failed: an undo it carried
     /// stands, or, the desire back to what its key left, its presentation
     /// goes back too (unless it changed since): all of it, or nothing.
-    pub(crate) fn undo_landed(&mut self, conv: &str, id: &BlockId, kept: bool) {
-        // Its own: the id's whose wish landed (another generation's may
-        // still wait).
+    /// Only that write's own undo: never another's of the id.
+    pub(crate) fn undo_landed(&mut self, ticket: u64, kept: bool) {
+        let Some(u) = self.undoing.remove(&ticket) else { return };
+        if !kept
+            && same(self.desires.wish(&u.conv, &u.generation, &u.id), u.left.as_ref())
+            && self.pres.mark(&u.conv, &u.r) == u.pres.0
+            && let Err(why) = self.pres.put_back(&u.conv, &u.r, &u.pres.1)
+        {
+            log::warn!(target: "synaps_desktop::blocks", "{}: not put back as its key left it: {why}", u.r);
+        }
+    }
+
+    /// The undos whose write is no longer queued, retired (a settle of
+    /// another generation, a compaction, a discard took it): nothing put
+    /// back, as its write never landed.
+    fn retire(&mut self) {
         let desires = &self.desires;
-        let (mine, rest): (VecDeque<Undoing>, VecDeque<Undoing>) = std::mem::take(&mut self.undoing)
-            .into_iter()
-            .partition(|u| u.conv == conv && u.id == *id && !desires.pending(&u.conv, &u.generation, &u.id));
-        self.undoing = rest;
-        if kept {
-            return;
-        }
-        for u in mine.into_iter().rev() {
-            if same(self.desires.wish(&u.conv, &u.generation, &u.id), u.left.as_ref())
-                && self.pres.mark(&u.conv, &u.r) == u.pres.0
-                && let Err(why) = self.pres.put_back(&u.conv, &u.r, &u.pres.1)
-            {
-                log::warn!(target: "synaps_desktop::blocks", "{}: not put back as its key left it: {why}", u.r);
-            }
-        }
+        self.undoing.retain(|t, u| desires.queued(&u.conv, &u.generation, &u.id) == Some(*t));
+    }
+
+    /// Tests: the undos kept for their writes.
+    #[cfg(test)]
+    pub(crate) fn undoing(&self) -> usize {
+        self.undoing.len()
     }
 }
 
@@ -745,8 +753,8 @@ impl AppView {
     fn wishes_landed(&mut self, landed: Vec<Landed>, cx: &mut Context<Self>) {
         for l in landed {
             match l {
-                Landed::Wish { conv, id, done } => {
-                    self.wishes.undo_landed(&conv, &id, done.is_ok());
+                Landed::Wish { id, ticket, done, .. } => {
+                    self.wishes.undo_landed(ticket, done.is_ok());
                     if let Err(Refused(why)) = done {
                         self.wishes.said = Some(format!("{id}: {why}"));
                     }
@@ -919,6 +927,7 @@ impl AppView {
         {
             let ids = self.wishes.desires.compacted(&t.journal, &t.generation, &t.settled);
             self.wishes.pres.compacted(&t.journal, &conv, &ids);
+            self.wishes.retire();
         }
         let changed = was
             .as_ref()
@@ -938,6 +947,7 @@ impl AppView {
         for (id, f) in self.wishes.desires.settle(&conv, &g, &d.settled, &in_flight) {
             self.wishes.said = Some(format!("{id}: {}", f.text()));
         }
+        self.wishes.retire();
     }
 }
 

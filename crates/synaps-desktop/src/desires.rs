@@ -440,19 +440,23 @@ pub(crate) enum Riding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Landed {
     /// A wish: what it did, drawn now; or why it wasn't kept, what drew
-    /// before drawn again.
-    Wish { conv: String, id: BlockId, done: Result<Done, Refused> },
+    /// before drawn again. `ticket` is its queued write's
+    /// ([`Desires::queued`]), and this lands it alone.
+    Wish { conv: String, id: BlockId, ticket: u64, done: Result<Done, Refused> },
     /// A message to send now, in this order: [`Riding::Wait`]'s.
     Send { ticket: u64, ride: Ride },
 }
 
 /// The user's wishes on an id not written yet: what drew before the first
-/// (drawn until they land), and memory's now, from the change `at`.
+/// (drawn until they land), and memory's now, from the change `at`; one
+/// queued write, `ticket` its own (never another's), until it lands or is
+/// retired.
 #[derive(Clone, Debug)]
 struct Asked {
     at: u64,
     before: Option<Desire>,
     after: Option<Desire>,
+    ticket: u64,
 }
 
 /// A message waiting for its marks to be written, or for one ahead of it.
@@ -490,6 +494,7 @@ pub(crate) struct Desires {
     next_note: u64,
     /// Wishes not written yet, per id.
     asked: BTreeMap<Key, Asked>,
+    next_asked: u64,
     /// Messages waiting, in order.
     sending: VecDeque<Sending>,
     next_send: u64,
@@ -551,6 +556,7 @@ impl Desires {
             refusals: BTreeMap::new(),
             next_note: 0,
             asked: BTreeMap::new(),
+            next_asked: 0,
             sending: VecDeque::new(),
             next_send: 0,
             seq: 0,
@@ -681,7 +687,8 @@ impl Desires {
             Ok(_) => {
                 self.written = l.seq;
                 for (k, a) in self.take_asked(l.seq) {
-                    out.push(Landed::Wish { conv: k.0, id: k.2, done: Ok(a.after.map_or(Done::Cancelled, |d| Done::Wished(d.version))) });
+                    let done = Ok(a.after.map_or(Done::Cancelled, |d| Done::Wished(d.version)));
+                    out.push(Landed::Wish { conv: k.0, id: k.2, ticket: a.ticket, done });
                 }
             }
             Err(e) => {
@@ -695,7 +702,7 @@ impl Desires {
                         let _ = self.commit(|b| b.set(&conv, &g, &id, a.before.clone()));
                     }
                     self.note_refusal((conv.clone(), id.clone()), why.clone());
-                    out.push(Landed::Wish { conv, id, done: Err(Refused(why.clone())) });
+                    out.push(Landed::Wish { conv, id, ticket: a.ticket, done: Err(Refused(why.clone())) });
                 }
             }
         }
@@ -805,6 +812,19 @@ impl Desires {
     /// meanwhile (a pending look) and rides nothing.
     pub(crate) fn pending(&self, conv: &str, generation: &Generation, id: &BlockId) -> bool {
         self.asked.contains_key(&Self::key(conv, generation, id))
+    }
+
+    /// `id`'s queued write, its ticket: the same from its first wish not
+    /// written until it lands ([`Landed::Wish`]) or is retired (a settle
+    /// of another generation, a compaction, a discard), and never again.
+    pub(crate) fn queued(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<u64> {
+        self.asked.get(&Self::key(conv, generation, id)).map(|a| a.ticket)
+    }
+
+    /// Tests: the wishes queued (written or retired, each goes).
+    #[cfg(test)]
+    pub(crate) fn queued_wishes(&self) -> usize {
+        self.asked.len()
     }
 
     /// Why `id`'s last wish wasn't kept, until its next wish.
@@ -1002,8 +1022,14 @@ impl Desires {
         if let Some(d) = &after {
             self.saw(conv, &g, d.version);
         }
-        let before = self.asked.remove(&key).map_or(cur, |a| a.before);
-        self.asked.insert(key, Asked { at: self.seq, before, after });
+        let (before, ticket) = match self.asked.remove(&key) {
+            Some(a) => (a.before, a.ticket),
+            None => {
+                self.next_asked += 1;
+                (cur, self.next_asked)
+            }
+        };
+        self.asked.insert(key, Asked { at: self.seq, before, after, ticket });
         Ok(Ask::Saving)
     }
 
