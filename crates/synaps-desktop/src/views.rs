@@ -134,7 +134,8 @@ pub enum Answer {
 /// Config requests in order (one channel, many clicks): one write in
 /// flight, the latest value per key queued behind it, each request stamped
 /// and a reply older than one already applied dropped, no read while a
-/// write is out.
+/// write is out. Queued writes whose gate closed wait, nothing out, for a
+/// read to prove it again ([`ConfigOrder::park`]).
 #[derive(Default)]
 pub(crate) struct ConfigOrder {
     seq: u64,
@@ -150,7 +151,7 @@ impl ConfigOrder {
     /// A write: `Some` to send now, `None` queued (replacing an older
     /// value for its key).
     pub fn write(&mut self, key: &'static str, value: Option<String>) -> Option<Send> {
-        if self.writing.is_some() {
+        if self.writing.is_some() || !self.queued.is_empty() {
             self.queued.retain(|q| q.0 != key);
             self.queued.push((key, value));
             return None;
@@ -181,11 +182,7 @@ impl ConfigOrder {
     pub fn written(&mut self) -> (bool, Option<Send>) {
         let key = self.writing.take();
         let newer = key.is_some_and(|k| self.queued.iter().any(|q| q.0 == k));
-        if self.queued.is_empty() {
-            return (newer, None);
-        }
-        let (k, v) = self.queued.remove(0);
-        (newer, self.write(k, v))
+        (newer, self.resume())
     }
 
     /// Another dash or daemon: every reply on its way is stale and the
@@ -195,10 +192,40 @@ impl ConfigOrder {
         self.queued.clear();
     }
 
-    /// The write just taken could not be sent: nothing is out.
-    pub fn abandon(&mut self) {
+    /// The write just taken could not be sent: nothing is out, and what
+    /// waited goes (its keys).
+    pub fn abandon(&mut self) -> Vec<&'static str> {
         self.writing = None;
-        self.queued.clear();
+        self.queued.drain(..).map(|q| q.0).collect()
+    }
+
+    /// The write just taken ([`ConfigOrder::written`]) is not sent yet: it
+    /// waits first in the queue, nothing out (a read may go), until
+    /// [`ConfigOrder::resume`] or [`ConfigOrder::abandon`].
+    pub fn park(&mut self, (_, key, value): Send) {
+        self.writing = None;
+        self.queued.insert(0, (key, value));
+    }
+
+    /// Writes wait, parked: none is out.
+    pub fn parked(&self) -> bool {
+        self.writing.is_none() && !self.queued.is_empty()
+    }
+
+    /// What waits goes on, nothing out: the first to send.
+    pub fn resume(&mut self) -> Option<Send> {
+        if !self.parked() {
+            return None;
+        }
+        let (k, v) = self.queued.remove(0);
+        self.writing = Some(k);
+        self.seq += 1;
+        Some((self.seq, k, v))
+    }
+
+    /// What waits to be sent, in order.
+    pub fn waiting(&self) -> impl Iterator<Item = (&'static str, Option<&str>)> {
+        self.queued.iter().map(|(k, v)| (*k, v.as_deref()))
     }
 
     #[cfg(test)]
@@ -236,16 +263,51 @@ pub(crate) struct DashUi {
     /// Asked for while a find, a read or a write ran: done after it.
     want_config: bool,
     want_usage: bool,
+    /// Settings' REFERENCE values asked for while the daemon was not proven
+    /// here (not known yet, or a check that failed): read as a find says
+    /// ([`AppView::dash_found`]).
+    want_reference: bool,
     config_asking: bool,
     today_asking: bool,
     pub order: ConfigOrder,
+    /// Settings' and Usage's holds ([`hold`]): each moves on as its view
+    /// lets go of what it showed.
+    holds: [u64; 2],
     /// Finds started (the tests': an `--offline` view never probes).
     #[cfg(test)]
     pub finds: u32,
+    /// Tests: Settings' REFERENCE reads started outside a find.
+    #[cfg(test)]
+    pub reference_reads: u32,
     /// A poll fell while the window was in the background: done on return.
     missed_tick: bool,
     pub poll: Option<Task<()>>,
+    /// Tests: while up (`Some`), the replies as they land, held at the
+    /// gate until [`AppView::let_through`].
+    #[cfg(test)]
+    pub gate: Option<Vec<Landing>>,
+    /// Tests: this machine's Synaps folder, the daemon's, and with it a
+    /// synthetic view's finds run: the daemon found here, the channel as it
+    /// is, its config read there.
+    #[cfg(test)]
+    pub base: Option<PathBuf>,
 }
+
+/// Settings' or Usage's place in [`DashUi::holds`]. What a view shows is
+/// asked for under its hold, the view open on screen as it is asked
+/// ([`AppView::ticket`]); a reply landing after the view let go of what it
+/// showed (folded out of sight, its pane closed: [`AppView::view_shown`])
+/// is dropped, whatever is on screen by then.
+const fn hold(kind: Kind) -> usize {
+    match kind {
+        Kind::Usage => 1,
+        _ => 0,
+    }
+}
+
+/// Tests: a reply held at [`DashUi::gate`].
+#[cfg(test)]
+pub(crate) type Landing = Box<dyn FnOnce(&mut AppView, &mut Context<AppView>)>;
 
 impl DashUi {
     /// Tests: the channel as found for daemon `generation` (a synthetic
@@ -269,6 +331,20 @@ impl DashUi {
     #[cfg(test)]
     pub fn wants_config(&self) -> bool {
         self.want_config
+    }
+
+    /// Tests: `kind`'s hold set to `at`.
+    #[cfg(test)]
+    pub fn hold_at(&mut self, kind: Kind, at: u64) {
+        self.holds[hold(kind)] = at;
+    }
+
+    /// `kind`'s view let go of what it showed: what was asked for under its
+    /// hold drops as it lands. A hold is only compared for equality: it
+    /// wraps (it would alias a ticket after 2^64 releases).
+    fn release(&mut self, kind: Kind) {
+        let h = &mut self.holds[hold(kind)];
+        *h = h.wrapping_add(1);
     }
 
     pub fn target(&self) -> Option<Target> {
@@ -295,6 +371,17 @@ impl DashUi {
     /// `/api/info` names that pid and profile), it answers, and it can lock
     /// the file. `Err`: the first link that is not, in one line.
     pub fn config_gate(&self, daemon: Option<(u32, Option<&str>)>) -> Result<(), String> {
+        self.gate_on(daemon, self.serves.as_ref(), self.config.as_ref())
+    }
+
+    /// [`DashUi::config_gate`] on what `/api/info` said (`serves`) and the
+    /// config read (`config`): a reply's own, shown or not.
+    fn gate_on(
+        &self,
+        daemon: Option<(u32, Option<&str>)>,
+        serves: Option<&Result<Info, String>>,
+        config: Option<&ConfigSnapshot>,
+    ) -> Result<(), String> {
         let Some((pid, profile)) = daemon else { return Err("not connected to a daemon".into()) };
         match &self.local {
             None => return Err("checking where the daemon runs".into()),
@@ -306,7 +393,7 @@ impl DashUi {
             Some(Ok((_, src))) => return Err(format!("the dash is {}, not this daemon's own", src.describe())),
             _ => return Err("this daemon has no synaps-dash".into()),
         }
-        match &self.serves {
+        match serves {
             None => return Err("asking the dash which daemon it serves".into()),
             Some(Err(e)) => return Err(format!("the dash did not say which daemon it serves: {e}")),
             Some(Ok(i)) if !i.serves(pid, profile) => {
@@ -322,7 +409,7 @@ impl DashUi {
         if self.answer != Answer::Up {
             return Err("synaps-dash is not answering".into());
         }
-        match &self.config {
+        match config {
             None => Err("the config is not read yet".into()),
             Some(c) if !c.writable => Err("synaps-dash cannot lock the file".into()),
             Some(_) => Ok(()),
@@ -583,6 +670,16 @@ fn key_names() -> (&'static str, &'static str) {
     }
 }
 
+/// What decides [`AppView::view_shown`]: the focused pane's view and its
+/// views open; Settings, then Usage: open in a pane on screen (any tab),
+/// and its visible tab there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Shown {
+    pub(crate) focused: (Option<Kind>, usize),
+    open: [bool; 2],
+    visible: [bool; 2],
+}
+
 impl AppView {
     // ── opening the views ──────────────────────────────────────────────
 
@@ -656,35 +753,57 @@ impl AppView {
         h.finish()
     }
 
-    /// A view came on screen or a tab closed (after the frame that showed
-    /// it, never inside a render): what a closed view showed goes, and what
-    /// the one on screen shows is asked for again if stale.
-    pub(crate) fn view_shown(&mut self, cx: &mut Context<Self>) {
-        let open = |k: Kind| self.model.tabs.iter().any(|t| t.kind == k);
-        if !open(Kind::Usage) {
+    /// What [`Self::view_shown`] follows, as of this frame's layout (its
+    /// fold decided): the focused pane's view and how many views it has
+    /// open, and Settings' and Usage's place on screen.
+    pub(crate) fn shown(&self) -> Shown {
+        let focused = (self.model.tabs.view(), self.model.tabs.iter().filter(|t| t.kind != Kind::Session).count());
+        let kinds = [Kind::Settings, Kind::Usage];
+        Shown { focused, open: kinds.map(|k| self.open_on_screen(k)), visible: kinds.map(|k| self.visible_on_screen(k)) }
+    }
+
+    /// A view came on screen or went, or a tab closed (after the frame that
+    /// showed it, never inside a render; `opened`: the focused pane's view
+    /// or views changed): what a closed view showed goes, and what one on
+    /// screen shows is asked for again if stale. A view's goes only when no
+    /// pane on screen has it open: a split's other pane may show it.
+    pub(crate) fn view_shown(&mut self, opened: bool, cx: &mut Context<Self>) {
+        // Let go of: a reply asked for before drops as it lands (its hold
+        // moved on), and a load waiting for one (a selection) or for a find
+        // is not made.
+        if !self.open_on_screen(Kind::Usage) {
             let u = &mut self.usage;
-            (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
+            (u.board, u.error, u.fetched, u.hover, u.queued) = (None, None, None, None, false);
+            self.dash.want_usage = false;
+            self.dash.release(Kind::Usage);
         }
-        if !open(Kind::Settings) {
+        if !self.open_on_screen(Kind::Settings) {
             self.settings.reference = None;
             self.settings.writes.clear();
             self.dash.config = None;
             self.dash.serves = None;
+            self.dash.release(Kind::Settings);
         }
-        match self.model.tabs.view() {
-            // Each opening reads the daemon's place, URL file and config again.
-            Some(Kind::Settings) => {
-                self.dash.found_gen = None;
-                self.dash.want_config = true;
-                self.dash_find(cx);
+        // Each opening reads the daemon's place, URL file and config again;
+        // shown in a pane not focused (an unfold, a pane closed), Settings
+        // reads what it has not: its config, its REFERENCE values.
+        if opened && self.model.tabs.view() == Some(Kind::Settings) {
+            self.dash.found_gen = None;
+            self.dash.want_config = true;
+            self.dash_find(cx);
+        } else if self.visible_on_screen(Kind::Settings) {
+            if self.dash.config.is_none() {
+                self.reread_config(cx);
             }
-            Some(Kind::Usage) => {
-                let stale = self.usage.fetched.is_none_or(|t| t.elapsed() >= POLL);
-                if stale || self.usage.board.is_none() {
-                    self.usage_load(cx);
-                }
+            if self.settings.reference.is_none() {
+                self.read_reference(cx);
             }
-            _ => {}
+        }
+        if self.visible_on_screen(Kind::Usage) {
+            let stale = self.usage.fetched.is_none_or(|t| t.elapsed() >= POLL);
+            if stale || self.usage.board.is_none() {
+                self.usage_load(cx);
+            }
         }
         self.views_changed(cx);
     }
@@ -738,35 +857,80 @@ impl AppView {
             self.dash.finds += 1;
         }
         if self.synthetic {
+            // Tests: the daemon found here, the channel as it is, this
+            // machine's config read at `base`.
+            #[cfg(test)]
+            if let Some(base) = self.dash.base.clone() {
+                let found = self.dash.found.clone();
+                let profile = self.model.daemon.as_ref().and_then(|d| d.profile.clone());
+                return self.find_with(
+                    move || {
+                        let reference = Some(crate::settings::read_reference(&base, profile.as_deref()));
+                        Probe { socket: None, local: Some(Ok(())), found, reference }
+                    },
+                    cx,
+                );
+            }
             return;
         }
+        let launch = self.dash.launch.clone();
+        let daemon = self.model.daemon.clone();
+        let setting = self.app_settings.dash_url.clone();
+        self.find_with(
+            move || {
+                let env = std::env::var(dash::ENV_DASH).ok();
+                probe(&launch, daemon, env.as_deref(), setting.as_deref())
+            },
+            cx,
+        );
+    }
+
+    /// [`Self::dash_find`]'s look, `look` off the UI thread.
+    fn find_with(&mut self, look: impl FnOnce() -> Probe + std::marker::Send + 'static, cx: &mut Context<Self>) {
         if self.dash.finding {
             self.dash.refind = true;
             return;
         }
         self.dash.finding = true;
-        let g = self.model.daemon_gen;
-        let launch = self.dash.launch.clone();
-        let daemon = self.model.daemon.clone();
-        let setting = self.app_settings.dash_url.clone();
+        let (g, ticket) = (self.model.daemon_gen, self.ticket(Kind::Settings));
         cx.spawn(async move |this, cx| {
-            let p = cx
-                .background_spawn(async move {
-                    let env = std::env::var(dash::ENV_DASH).ok();
-                    probe(&launch, daemon, env.as_deref(), setting.as_deref())
-                })
-                .await;
+            let p = cx.background_spawn(async move { look() }).await;
             let _ = this.update(cx, |v, cx| {
-                v.dash.finding = false;
-                // What it looked at changed meanwhile: look again.
-                if v.model.daemon_gen != g || std::mem::take(&mut v.dash.refind) {
-                    return v.dash_find(cx);
-                }
-                v.dash.found_gen = Some(g);
-                v.dash_found(p, cx);
+                v.lands(
+                    move |v, cx| {
+                        v.dash.finding = false;
+                        // What it looked at changed meanwhile: look again.
+                        if v.model.daemon_gen != g || std::mem::take(&mut v.dash.refind) {
+                            return v.dash_find(cx);
+                        }
+                        v.dash.found_gen = Some(g);
+                        v.dash_found(p, ticket, cx);
+                    },
+                    cx,
+                )
             });
         })
         .detach();
+    }
+
+    /// A reply lands: `apply` now (tests: held while the gate is up).
+    fn lands(&mut self, apply: impl FnOnce(&mut Self, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(held) = self.dash.gate.as_mut() {
+            held.push(Box::new(apply));
+            return;
+        }
+        apply(self, cx)
+    }
+
+    /// Tests: the replies held at the gate land, in order (the gate stays
+    /// as it is).
+    #[cfg(test)]
+    pub(crate) fn let_through(&mut self, cx: &mut Context<Self>) {
+        let held = self.dash.gate.as_mut().map(std::mem::take).unwrap_or_default();
+        for apply in held {
+            apply(self, cx);
+        }
     }
 
     /// A Welcome came (the daemon is new, or back): find its channel, once
@@ -787,8 +951,9 @@ impl AppView {
     }
 
     /// A probe's answer: another dash or daemon drops all the old one said;
-    /// then what waited on it.
-    fn dash_found(&mut self, p: Probe, cx: &mut Context<Self>) {
+    /// then what waited on it. Its REFERENCE values are Settings', asked
+    /// for under `ticket`.
+    fn dash_found(&mut self, p: Probe, ticket: Option<u64>, cx: &mut Context<Self>) {
         let moved = p.found != self.dash.found;
         if moved || p.local != self.dash.local {
             self.dash.config = None;
@@ -801,16 +966,25 @@ impl AppView {
             // Another store's numbers never stand under this one's header.
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
-            u.generation += 1;
+            u.generation = u.generation.wrapping_add(1);
             self.dash.today = None;
         }
         if matches!(self.dash.answer, Answer::Down(_)) {
             // Asked again below.
             self.dash.answer = Answer::Unknown;
         }
-        (self.dash.found, self.dash.local, self.settings.reference) = (p.found, p.local, p.reference);
+        (self.dash.found, self.dash.local) = (p.found, p.local);
+        if self.holds(Kind::Settings, ticket) {
+            self.settings.reference = p.reference;
+        }
         if p.socket.is_some() {
             self.dash.socket = p.socket;
+        }
+        // Settings' REFERENCE values, asked for before this find proved the
+        // daemon here, and not brought by it (asked for under a hold
+        // Settings let go of since).
+        if std::mem::take(&mut self.dash.want_reference) && self.settings.reference.is_none() {
+            self.read_reference(cx);
         }
         let view = self.model.tabs.view();
         if std::mem::take(&mut self.dash.want_config) || view == Some(Kind::Settings) {
@@ -885,6 +1059,7 @@ impl AppView {
             return;
         };
         self.dash.config_asking = true;
+        let ticket = self.ticket(Kind::Settings);
         cx.spawn(async move |this, cx| {
             let (info, got) = cx
                 .background_spawn(
@@ -892,21 +1067,36 @@ impl AppView {
                 )
                 .await;
             let _ = this.update(cx, |v, cx| {
-                v.dash.config_asking = false;
-                if v.dash.order.fresh(seq) {
-                    v.dash.serves = Some(info.map_err(|e| v.fail_text(&e)));
-                    match got {
-                        Ok(c) => {
-                            v.dash_said(Ok(()), cx);
-                            v.dash.config = Some(c);
+                v.lands(
+                    move |v, cx| {
+                        v.dash.config_asking = false;
+                        let held = v.holds(Kind::Settings, ticket);
+                        if v.dash.order.fresh(seq) {
+                            let serves = info.map_err(|e| v.fail_text(&e));
+                            if held {
+                                v.dash.serves = Some(serves.clone());
+                            }
+                            match &got {
+                                Ok(_) => v.dash_said(Ok(()), cx),
+                                Err(e) => v.dash_said(Err(e), cx),
+                            }
+                            // Parked writes take this reply as their proof,
+                            // shown or not.
+                            let proof = v.dash.order.parked().then(|| v.dash.gate_on(v.daemon_id(), Some(&serves), got.as_ref().ok()));
+                            if let (true, Ok(c)) = (held, got) {
+                                v.dash.config = Some(c);
+                            }
+                            if let Some(proof) = proof {
+                                v.settle_writes(proof, held, cx);
+                            }
                         }
-                        Err(e) => v.dash_said(Err(&e), cx),
-                    }
-                }
-                if std::mem::take(&mut v.dash.want_config) {
-                    v.ask_config(cx);
-                }
-                v.views_changed(cx);
+                        if std::mem::take(&mut v.dash.want_config) {
+                            v.ask_config(cx);
+                        }
+                        v.views_changed(cx);
+                    },
+                    cx,
+                )
             });
         })
         .detach();
@@ -928,8 +1118,13 @@ impl AppView {
     }
 
     fn send_write(&mut self, (seq, key, value): Send, cx: &mut Context<Self>) {
-        let Some(t) = self.dash.target() else { return self.dash.order.abandon() };
+        let Some(t) = self.dash.target() else {
+            // Never: the gate it passed needs the dash's URL.
+            self.dash.order.abandon();
+            return;
+        };
         let body = dash::config_body(key, value.as_deref());
+        let ticket = self.ticket(Kind::Settings);
         cx.spawn(async move |this, cx| {
             let sent = value;
             let got = cx
@@ -939,55 +1134,100 @@ impl AppView {
                 })
                 .await;
             let _ = this.update(cx, |v, cx| {
-                let (newer, next) = v.dash.order.written();
-                if v.dash.order.fresh(seq) {
-                    match got {
-                        Ok(c) => {
-                            v.dash_said(Ok(()), cx);
-                            // A save only if the reply holds what was sent: the
-                            // dash reads the file again for it, after its lock,
-                            // and another writer's value can be there.
-                            if c.exposes(key) && c.value(key) == sent.as_deref() {
-                                v.settings.wrote.insert(v.config_owner(&c), key, sent.as_deref());
-                            }
-                            v.dash.config = Some(c);
-                            if !newer {
-                                v.settings.writes.remove(key);
+                v.lands(
+                    move |v, cx| {
+                        let (newer, next) = v.dash.order.written();
+                        // Settings let go meanwhile: the save is recorded, its
+                        // config and its row's refusal are not shown.
+                        let held = v.holds(Kind::Settings, ticket);
+                        if v.dash.order.fresh(seq) {
+                            match got {
+                                Ok(c) => {
+                                    v.dash_said(Ok(()), cx);
+                                    // A save only if the reply holds what was sent: the
+                                    // dash reads the file again for it, after its lock,
+                                    // and another writer's value can be there.
+                                    if c.exposes(key) && c.value(key) == sent.as_deref() {
+                                        v.settings.wrote.insert(v.config_owner(&c), key, sent.as_deref());
+                                    }
+                                    if held {
+                                        v.dash.config = Some(c);
+                                    }
+                                    if !newer {
+                                        v.settings.writes.remove(key);
+                                    }
+                                }
+                                Err(e) => {
+                                    if matches!(e, Fail::Token | Fail::NoToken | Fail::Unreachable(_)) {
+                                        v.dash_said(Err(&e), cx);
+                                    }
+                                    if held && !newer {
+                                        v.settings.writes.insert(key, Write::Refused(v.fail_text(&e)));
+                                    }
+                                }
                             }
                         }
-                        Err(e) => {
-                            if matches!(e, Fail::Token | Fail::NoToken | Fail::Unreachable(_)) {
-                                v.dash_said(Err(&e), cx);
+                        match next {
+                            Some(n) if v.config_gate().is_ok() => v.send_write(n, cx),
+                            Some(n) => {
+                                // The gate closed meanwhile (Settings let go of
+                                // what proved it, or the dash said it is down):
+                                // what waited is parked for a read to prove it
+                                // again ([`AppView::settle_writes`]).
+                                v.dash.order.park(n);
+                                v.dash.want_config = true;
                             }
-                            if !newer {
-                                v.settings.writes.insert(key, Write::Refused(v.fail_text(&e)));
-                            }
+                            None => {}
                         }
-                    }
-                }
-                match next {
-                    Some(n) if v.config_gate().is_ok() => v.send_write(n, cx),
-                    Some(_) => {
-                        // The gate closed meanwhile: what waited is not sent, and says why.
-                        let why = format!("not sent: {}", v.config_gate().err().unwrap_or_default());
-                        v.dash.order.abandon();
-                        for w in v.settings.writes.values_mut().filter(|w| matches!(w, Write::Sending(_))) {
-                            *w = Write::Refused(why.clone());
+                        // Every end of a write: the read that waited on it.
+                        if std::mem::take(&mut v.dash.want_config) {
+                            v.ask_config(cx);
                         }
-                    }
-                    None if std::mem::take(&mut v.dash.want_config) => v.ask_config(cx),
-                    None => {}
-                }
-                v.views_changed(cx);
+                        v.views_changed(cx);
+                    },
+                    cx,
+                )
             });
         })
         .detach();
     }
 
+    /// Parked writes ([`ConfigOrder::park`]) and a read's `proof` of the
+    /// gate (its reply's own): proven, they go on, their rows sending again
+    /// in a Settings that holds the read; not, in a Settings that holds it,
+    /// they go, and their rows say why. A Settings let go of shows nothing:
+    /// they wait for a read it holds (shown again, it reads).
+    fn settle_writes(&mut self, proof: Result<(), String>, held: bool, cx: &mut Context<Self>) {
+        match proof {
+            Ok(()) => {
+                if held {
+                    let rows: Vec<_> = self.dash.order.waiting().map(|(k, v)| (k, crate::settings::shown(k, v))).collect();
+                    for (k, shown) in rows {
+                        self.settings.writes.insert(k, Write::Sending(shown));
+                    }
+                }
+                if let Some(n) = self.dash.order.resume() {
+                    self.send_write(n, cx);
+                }
+            }
+            Err(why) if held => {
+                let why = format!("not sent: {why}");
+                for k in self.dash.order.abandon() {
+                    self.settings.writes.insert(k, Write::Refused(why.clone()));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
     /// A Usage load for the chips as they are now. One at a time: a newer
     /// selection waits for the one running, then loads.
     pub(crate) fn usage_load(&mut self, cx: &mut Context<Self>) {
-        if self.synthetic {
+        #[cfg(test)]
+        {
+            self.usage.loads += 1;
+        }
+        if self.synthetic && !self.usage.loads_live() {
             // The demo's Usage (re-gate 4): the design fixtures, where the
             // source tree is (a dev build), at the fixtures' own time.
             match demo_board(self.usage.host.as_deref(), self.usage.range) {
@@ -1005,10 +1245,14 @@ impl AppView {
             return self.dash_find(cx);
         }
         let Some(t) = self.dash.target() else {
-            self.usage.error = Some(match &self.dash.found {
-                Some(Err(e)) => e.clone(),
-                _ => "synaps-dash is not reachable: no URL for it".into(),
-            });
+            // Shown only by a Usage on screen (a load is asked for under its
+            // hold, [`AppView::ticket`]).
+            if self.ticket(Kind::Usage).is_some() {
+                self.usage.error = Some(match &self.dash.found {
+                    Some(Err(e)) => e.clone(),
+                    _ => "synaps-dash is not reachable: no URL for it".into(),
+                });
+            }
             return self.views_changed(cx);
         };
         if self.usage.loading {
@@ -1016,6 +1260,7 @@ impl AppView {
             return;
         }
         let (g, host, range, chips) = (self.usage.generation, self.usage.host.clone(), self.usage.range, self.usage.chips.clone());
+        let ticket = self.ticket(Kind::Usage);
         self.usage.loading = true;
         self.views_changed(cx);
         let want = (host.clone(), range);
@@ -1023,38 +1268,45 @@ impl AppView {
             let by = Instant::now() + LOAD;
             let got = cx.background_spawn(async move { load_usage(&t, host.as_deref(), range, now_ms(), &chips, by) }).await;
             let _ = this.update(cx, |v, cx| {
-                v.usage.loading = false;
-                // Another dash, or the chips moved meanwhile: not this one's.
-                let current = v.usage.generation == g && (v.usage.host.clone(), v.usage.range) == want;
-                if current {
-                    v.usage.fetched = Some(Instant::now());
-                    match got {
-                        Ok((board, today)) => {
-                            v.dash_said(Ok(()), cx);
-                            if !board.hosts.is_empty() {
-                                v.usage.chips = board.hosts.clone();
-                                // A saved host the store no longer has: ALL.
-                                if v.usage.host.as_ref().is_some_and(|h| !board.hosts.contains(h)) {
-                                    v.usage.host = None;
-                                    v.usage.queued = true;
+                v.lands(
+                    move |v, cx| {
+                        v.usage.loading = false;
+                        // Usage let go meanwhile, another dash, or the chips
+                        // moved: not this one's (loaded again for the last two).
+                        let held = v.holds(Kind::Usage, ticket);
+                        let current = held && v.usage.generation == g && (v.usage.host.clone(), v.usage.range) == want;
+                        if current {
+                            v.usage.fetched = Some(Instant::now());
+                            match got {
+                                Ok((board, today)) => {
+                                    v.dash_said(Ok(()), cx);
+                                    if !board.hosts.is_empty() {
+                                        v.usage.chips = board.hosts.clone();
+                                        // A saved host the store no longer has: ALL.
+                                        if v.usage.host.as_ref().is_some_and(|h| !board.hosts.contains(h)) {
+                                            v.usage.host = None;
+                                            v.usage.queued = true;
+                                        }
+                                    }
+                                    v.usage.error = None;
+                                    v.usage.hover = None;
+                                    v.usage.clear_paths();
+                                    v.usage.board = Some(board);
+                                    v.dash.today = today;
+                                }
+                                Err(e) => {
+                                    v.dash_said(Err(&e), cx);
+                                    v.usage.error = Some(v.fail_text(&e));
                                 }
                             }
-                            v.usage.error = None;
-                            v.usage.hover = None;
-                            v.usage.clear_paths();
-                            v.usage.board = Some(board);
-                            v.dash.today = today;
                         }
-                        Err(e) => {
-                            v.dash_said(Err(&e), cx);
-                            v.usage.error = Some(v.fail_text(&e));
+                        if std::mem::take(&mut v.usage.queued) || (held && !current) {
+                            v.usage_load(cx);
                         }
-                    }
-                }
-                if std::mem::take(&mut v.usage.queued) || !current {
-                    v.usage_load(cx);
-                }
-                v.views_changed(cx);
+                        v.views_changed(cx);
+                    },
+                    cx,
+                )
             });
         })
         .detach();
@@ -1144,23 +1396,94 @@ impl AppView {
         // Idle exit's comparison is the dash's to read again, Settings on
         // screen in any pane (one refresh: `/api/info`, then the config; a
         // find under way reads it as it ends).
-        if active && self.settings_on_screen() {
-            if self.dash.finding {
-                self.dash.want_config = true;
-            } else {
-                self.ask_config(cx);
-            }
+        if active && self.visible_on_screen(Kind::Settings) {
+            self.reread_config(cx);
         }
     }
 
-    /// Settings is a pane's visible tab, that pane on screen: any pane
-    /// split, the focused one folded. Open behind another tab, it isn't.
-    fn settings_on_screen(&self) -> bool {
-        let folded = !self.panes.shown_split();
-        self.panes.iter().filter(|p| !folded || p.id == self.panes.focused).any(|p| {
-            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
-            tabs.view() == Some(Kind::Settings)
+    /// Settings' config read again: as a find under way ends, or now (a
+    /// read under way takes it on after it).
+    fn reread_config(&mut self, cx: &mut Context<Self>) {
+        if self.dash.finding {
+            self.dash.want_config = true;
+        } else {
+            self.ask_config(cx);
+        }
+    }
+
+    /// Settings' REFERENCE values read again, a local daemon's (off the UI
+    /// thread; a find reads them too, [`probe`]), for a Settings on screen.
+    /// The daemon not proven here (where it runs not known yet, or a check
+    /// that failed, a find to correct it): read as a find says.
+    fn read_reference(&mut self, cx: &mut Context<Self>) {
+        let (Some(base), Some(hold)) = (self.base_dir(), self.ticket(Kind::Settings)) else { return };
+        if !self.dash.is_local() {
+            self.dash.want_reference = true;
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.dash.reference_reads += 1;
+        }
+        let ticket = Some(hold);
+        let profile = self.model.daemon.as_ref().and_then(|d| d.profile.clone());
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_spawn(async move { crate::settings::read_reference(&base, profile.as_deref()) }).await;
+            let _ = this.update(cx, |v, cx| {
+                v.lands(
+                    move |v, cx| {
+                        if v.holds(Kind::Settings, ticket) {
+                            v.settings.reference = Some(r);
+                            v.views_changed(cx);
+                        }
+                    },
+                    cx,
+                )
+            });
         })
+        .detach();
+    }
+
+    /// This machine's Synaps folder (tests: [`DashUi::base`], none
+    /// without it).
+    fn base_dir(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        return self.dash.base.clone();
+        #[cfg(not(test))]
+        Some(synaps_client::discovery::base_dir())
+    }
+
+    /// The hold a request for `kind`'s view is made under ([`hold`]):
+    /// `None`, the view not open on screen (nothing it asks for is shown).
+    fn ticket(&self, kind: Kind) -> Option<u64> {
+        self.open_on_screen(kind).then_some(self.dash.holds[hold(kind)])
+    }
+
+    /// A reply asked for under `ticket` lands: `kind`'s view has held what
+    /// it shows since (it is still the view's).
+    fn holds(&self, kind: Kind, ticket: Option<u64>) -> bool {
+        ticket == Some(self.dash.holds[hold(kind)])
+    }
+
+    /// `kind` is a pane's visible tab, that pane on screen. Open behind
+    /// another tab, it isn't.
+    fn visible_on_screen(&self, kind: Kind) -> bool {
+        self.tabs_on_screen().any(|t| t.view() == Some(kind))
+    }
+
+    /// `kind` is open in a pane on screen: its visible tab, or behind another.
+    fn open_on_screen(&self, kind: Kind) -> bool {
+        self.tabs_on_screen().any(|t| t.iter().any(|t| t.kind == kind))
+    }
+
+    /// The tabs of each pane on screen: every pane split, the focused one
+    /// folded.
+    fn tabs_on_screen(&self) -> impl Iterator<Item = &crate::tabs::Tabs> {
+        let folded = !self.panes.shown_split();
+        self.panes
+            .iter()
+            .filter(move |p| !folded || p.id == self.panes.focused)
+            .map(|p| if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs })
     }
 
     // ── the gear ───────────────────────────────────────────────────────
@@ -1516,6 +1839,32 @@ mod tests {
         o.reset();
         assert!(!o.fresh(w.0));
         assert_eq!(o.written(), (false, None));
+    }
+
+    /// Round 4 (Shady #113, P2-2): a queued write whose gate closed waits,
+    /// parked, nothing out: a read goes, a new write queues behind it, and
+    /// it resumes in order or goes whole.
+    #[test]
+    fn parked_writes_wait_for_a_read_then_go_on_in_order() {
+        let mut o = ConfigOrder::default();
+        let a = o.write("cache_ttl", Some("1h".into())).unwrap();
+        assert!(o.write("api_retries", Some("4".into())).is_none());
+        assert!(o.fresh(a.0));
+        let (_, next) = o.written();
+        o.park(next.unwrap());
+        assert!(o.parked() && !o.writing(), "parked: nothing out");
+        let get = o.read().expect("a read goes while writes are parked");
+        assert!(o.write("cache_ttl", Some("5m".into())).is_none(), "a new write queues behind the parked");
+        assert_eq!(o.waiting().collect::<Vec<_>>(), [("api_retries", Some("4")), ("cache_ttl", Some("5m"))]);
+        assert!(o.fresh(get));
+        let n = o.resume().unwrap();
+        assert_eq!((n.1, n.2.as_deref()), ("api_retries", Some("4")), "the parked first");
+        assert!(o.writing() && !o.parked() && o.resume().is_none(), "one out");
+        assert!(o.fresh(n.0));
+        let (_, next) = o.written();
+        o.park(next.unwrap());
+        assert_eq!(o.abandon(), ["cache_ttl"], "what waited goes, its keys said");
+        assert!(!o.parked() && !o.writing() && o.resume().is_none());
     }
 
     #[test]
