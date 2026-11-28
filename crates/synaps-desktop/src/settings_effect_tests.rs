@@ -594,6 +594,64 @@ fn settings_in_a_pane_not_focused_reads_again_on_activation(cx: &mut TestAppCont
     assert_eq!(dash.reads(), reads + 1, "Settings open, not shown: no read");
 }
 
+/// Settings in a split keeps its config as the session's pane beside it
+/// takes the focus: it is still on screen (Shady #112 round 2: the focused
+/// pane's tabs alone decided). Open behind a tab in a pane on screen, it
+/// keeps it too; folded out of sight, it goes.
+#[gpui_kit::test]
+fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut TestAppContext) {
+    use crate::pane::KeysTo;
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "split-kept", json!({IDLE: "600"}), "0.13.0", json!(600));
+    find(cx, &pg, IDLE);
+    let in_force = "effect daemon.idle_exit_secs = in force";
+    assert!(drawn(cx, pg.w, in_force));
+    pg.view.update(cx, |v, _| v.app_settings.split = true);
+    {
+        use gpui_kit::AppContext as _;
+        cx.update_window(pg.w, |_, window, cx| pg.view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
+    }
+    settle(cx, pg.w, 8);
+    let (left, right) = pg.view.read_with(cx, |v, _| {
+        let left = v.panes.rest.iter().find(|p| p.parked.tabs.view() == Some(Kind::Settings)).expect("Settings, in the other pane");
+        assert!(v.panes.shown_split() && v.model.tabs.view().is_none(), "the new pane, focused, on the session");
+        (left.id, v.panes.cur.id)
+    });
+    let reads = dash.reads();
+    let config = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.shown_config().map(|c| c.idle_exit_running));
+    let focus = |cx: &mut TestAppContext, id| {
+        pg.view.update(cx, |v, cx| v.focus_pane(id, KeysTo::Pane, cx));
+        settle(cx, pg.w, 8);
+    };
+    assert_eq!(config(cx), Some(Some(600)), "split: the session's pane focused, Settings keeps its config");
+    assert!(drawn(cx, pg.w, in_force), "and draws it, in the pane not focused");
+    focus(cx, left);
+    focus(cx, right);
+    assert_eq!(pg.view.read_with(cx, |v, _| v.model.tabs.view()), None, "the session's pane focused again");
+    assert_eq!(config(cx), Some(Some(600)), "focused away again: kept");
+    assert!(drawn(cx, pg.w, in_force), "drawn");
+    assert_eq!(dash.reads(), reads, "kept, not read again");
+    // Open behind its pane's session tab, that pane on screen: kept, as
+    // the focused pane's always was.
+    pg.view.update(cx, |v, _| {
+        v.in_pane(left, |v| {
+            let i = v.model.tabs.iter().position(|t| t.kind == Kind::Session).expect("its session tab");
+            v.model.tabs.focus(i);
+        });
+    });
+    settle(cx, pg.w, 8);
+    focus(cx, left);
+    focus(cx, right);
+    assert_eq!(config(cx), Some(Some(600)), "open behind a tab, in a pane on screen: kept");
+    // Folded (each frame folds it again or not, by the window's size): the
+    // focused pane alone on screen, Settings out of sight.
+    pg.view.update(cx, |v, cx| {
+        v.panes.folded = true;
+        v.view_shown(cx);
+        assert!(v.dash.config.is_none(), "folded out of sight: gone");
+    });
+}
+
 /// `daemon_version` is read as semver 2.0.0, whole: anything else is
 /// unreadable (`None`), and a new-session key says `daemon reload` with the
 /// 0.13.0 note (Shady #112 P3).

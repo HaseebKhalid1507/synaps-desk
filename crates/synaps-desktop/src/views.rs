@@ -658,14 +658,16 @@ impl AppView {
 
     /// A view came on screen or a tab closed (after the frame that showed
     /// it, never inside a render): what a closed view showed goes, and what
-    /// the one on screen shows is asked for again if stale.
+    /// the one on screen shows is asked for again if stale. Settings' goes
+    /// only when no pane on screen has it open: a split's other pane may
+    /// show it.
     pub(crate) fn view_shown(&mut self, cx: &mut Context<Self>) {
         let open = |k: Kind| self.model.tabs.iter().any(|t| t.kind == k);
         if !open(Kind::Usage) {
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
         }
-        if !open(Kind::Settings) {
+        if !self.tabs_on_screen().any(|t| t.iter().any(|t| t.kind == Kind::Settings)) {
             self.settings.reference = None;
             self.settings.writes.clear();
             self.dash.config = None;
@@ -1153,14 +1155,20 @@ impl AppView {
         }
     }
 
-    /// Settings is a pane's visible tab, that pane on screen: any pane
-    /// split, the focused one folded. Open behind another tab, it isn't.
+    /// Settings is a pane's visible tab, that pane on screen. Open behind
+    /// another tab, it isn't.
     fn settings_on_screen(&self) -> bool {
+        self.tabs_on_screen().any(|t| t.view() == Some(Kind::Settings))
+    }
+
+    /// The tabs of each pane on screen: every pane split, the focused one
+    /// folded.
+    fn tabs_on_screen(&self) -> impl Iterator<Item = &crate::tabs::Tabs> {
         let folded = !self.panes.shown_split();
-        self.panes.iter().filter(|p| !folded || p.id == self.panes.focused).any(|p| {
-            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
-            tabs.view() == Some(Kind::Settings)
-        })
+        self.panes
+            .iter()
+            .filter(move |p| !folded || p.id == self.panes.focused)
+            .map(|p| if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs })
     }
 
     // ── the gear ───────────────────────────────────────────────────────
