@@ -2378,8 +2378,8 @@ pub struct AppView {
     pub(crate) settings_retired: [Option<Entity<InputState>>; 2],
     /// Their subscriptions, replaced with them, and their edit guards
     /// (`settings_editor.rs`).
-    pub(crate) settings_find_subs: [Subscription; 2],
-    pub(crate) settings_input_subs: [Subscription; 2],
+    pub(crate) settings_find_subs: [Subscription; 3],
+    pub(crate) settings_input_subs: [Subscription; 3],
     pub(crate) settings_find_guard: crate::settings_editor::EditGuard,
     pub(crate) settings_input_guard: crate::settings_editor::EditGuard,
     pub(crate) gear_menu: bool,
@@ -9075,8 +9075,8 @@ struct Inputs {
     pub(crate) secret_input: Entity<InputState>,
     settings_find: Entity<InputState>,
     settings_input: Entity<InputState>,
-    settings_find_subs: [Subscription; 2],
-    settings_input_subs: [Subscription; 2],
+    settings_find_subs: [Subscription; 3],
+    settings_input_subs: [Subscription; 3],
     settings_pane: Entity<crate::views::ViewPane>,
     usage_pane: Entity<crate::views::ViewPane>,
     focus: FocusHandle,

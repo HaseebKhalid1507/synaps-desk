@@ -362,7 +362,7 @@ impl AppView {
             return;
         }
         self.settings.editing = Some(e);
-        self.new_field(crate::settings_editor::Field::Value, &value, false, window, cx);
+        self.new_field(crate::settings_editor::Field::Value, &value, crate::settings_editor::Keep::Nothing, window, cx);
         self.settings_input_guard.fresh();
         self.settings_input.update(cx, |s, cx| s.focus(window, cx));
         self.views_changed(cx);

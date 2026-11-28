@@ -4,9 +4,14 @@
 //! from the kit's own edit events and kept within a byte budget: past the
 //! budget the input is rebuilt from its text, its history dropped with the
 //! old entity. The kit offers no other bound but a depth of 1,000 steps.
+//! An IME's composition is charged as it is marked, preedit by preedit,
+//! as the kit keeps it ([`AppView::field_marked`]); a rebuild carries a
+//! composition under way over to the new input.
 
 use gpui_kit::component::input::{Input, InputEditsEvent, InputEvent, InputState};
-use gpui_kit::{AppContext as _, Context, Entity, Focusable as _, ParentElement as _, Styled as _, Subscription, Window};
+use gpui_kit::{
+    AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, ParentElement as _, Styled as _, Subscription, Window,
+};
 
 use crate::app::AppView;
 
@@ -33,6 +38,12 @@ pub(crate) struct EditGuard {
     pub(crate) cleared: bool,
     /// A paste would have passed the cap and was refused: the note shows.
     pub(crate) refused: bool,
+    /// The text's length as last seen (bytes), and, in a composition, a
+    /// hash of the text and its marked range then ([`Self::marked`]).
+    seen_len: u32,
+    seen_hash: u64,
+    /// A composition was under way then.
+    composing: bool,
 }
 
 const _: () = assert!(std::mem::size_of::<EditGuard>() <= 64);
@@ -51,7 +62,7 @@ pub(crate) enum Pasted {
 
 impl EditGuard {
     pub(crate) const fn new(cap: usize, budget: u32) -> EditGuard {
-        EditGuard { cap: cap as u32, budget, charge: 0, cleared: false, refused: false }
+        EditGuard { cap: cap as u32, budget, charge: 0, cleared: false, refused: false, seen_len: 0, seen_hash: 0, composing: false }
     }
 
     pub(crate) fn value() -> EditGuard {
@@ -82,13 +93,42 @@ impl EditGuard {
     /// An edit event's charge added: whether the budget is passed (the
     /// input is to be rebuilt). An undo or a redo is charged too: the
     /// event doesn't mark them, so the charge only ever overcounts.
-    pub(crate) fn edits(&mut self, ev: &InputEditsEvent) -> bool {
+    /// The text is `len` bytes after it. A composition's commit is one:
+    /// its preedits were charged as they came ([`Self::marked`]).
+    pub(crate) fn edits(&mut self, ev: &InputEditsEvent, len: usize) -> bool {
         let several = ev.edits().len() > 1;
         for (e, _) in ev.edits() {
             let replaced = e.old_end_byte.saturating_sub(e.start_byte);
             let inserted = e.new_end_byte.saturating_sub(e.start_byte);
             self.charge = self.charge.saturating_add(Self::charge_of(replaced, inserted, several));
         }
+        (self.seen_len, self.composing) = (len as u32, false);
+        self.charge > self.budget
+    }
+
+    /// The input notified with its text `len` bytes long and, in a
+    /// composition, `marked` bytes of it marked, `look` a hash of the text
+    /// and its marked range. The kit sends no edit event for a preedit,
+    /// but keeps each one in the composition's transaction until it ends:
+    /// the text it took out and the text it marked (gpui-base 0.9.1
+    /// `replace_and_mark_text_in_range`, state.rs:4892–5033, through
+    /// `push_history`, 3359–3404, into `UndoManager::record_transaction`,
+    /// undo_manager.rs:100–118; one with nothing changed is not kept). Each
+    /// is charged so, twice and a step for its records, as an edit is; a
+    /// cancel too (an empty preedit, with no event either). Whether the
+    /// budget is passed.
+    pub(crate) fn marked(&mut self, len: usize, marked: Option<(usize, u64)>) -> bool {
+        let before = self.seen_len as usize;
+        self.seen_len = len as u32;
+        let (mark, look) = match marked {
+            None if !self.composing => return false,
+            None => (0, 0),
+            Some((_, look)) if self.composing && look == self.seen_hash => return false,
+            Some(m) => m,
+        };
+        (self.seen_hash, self.composing) = (look, marked.is_some());
+        let took = (before + mark).saturating_sub(len);
+        self.charge = self.charge.saturating_add(Self::charge_of(took, mark, true));
         self.charge > self.budget
     }
 
@@ -104,16 +144,59 @@ impl EditGuard {
         }
     }
 
-    /// The input was rebuilt from its text: nothing charged.
+    /// The input was rebuilt from its text: nothing charged, and no
+    /// composition on it (unless one is [`Self::carried`] over).
     pub(crate) fn rebuilt(&mut self) {
         self.charge = 0;
         self.cleared = true;
+        self.composing = false;
+    }
+
+    /// A composition carried over to the rebuilt input, its `mark` bytes
+    /// marked again on it ([`Self::marked`]'s `look`): the one preedit
+    /// the new input keeps.
+    pub(crate) fn carried(&mut self, len: usize, mark: usize, look: u64) {
+        self.charge = Self::charge_of(0, mark, true);
+        (self.seen_len, self.seen_hash, self.composing) = (len as u32, look, true);
     }
 
     /// A fresh input (opened, or retired empty).
     pub(crate) fn fresh(&mut self) {
         *self = EditGuard::new(self.cap(), self.budget);
     }
+}
+
+/// What a rebuild keeps of the input it replaces ([`AppView::new_field`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// Nothing: a fresh input (its focus, if it had it, goes to the root).
+    Nothing,
+    /// Its caret, selection and focus, and its scroll too with `scroll`.
+    /// Without, the next edit's caret decides the scroll: a paste made on
+    /// it next (Shady #116 B2: the kit applies a set scroll over its caret
+    /// follow at the first layout, gpui-base 0.9.1 element.rs:1057–1059,
+    /// so none is set).
+    Caret { scroll: bool },
+}
+
+/// A hash of text `v` and its marked range (`EditGuard::marked`'s `look`).
+fn look(v: &str, marked: &std::ops::Range<usize>) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::hash::DefaultHasher::new();
+    (v, marked).hash(&mut h);
+    h.finish()
+}
+
+/// Text `v`'s byte offset at UTF-16 offset `at` (the kit's IME ranges).
+fn utf16_byte(v: &str, at: usize) -> usize {
+    let mut u = 0;
+    for (b, c) in v.char_indices() {
+        if u >= at {
+            return b;
+        }
+        u += c.len_utf16();
+    }
+    v.len()
 }
 
 /// Which of Settings' two short fields.
@@ -157,9 +240,9 @@ impl AppView {
 
     /// A new entity for field `f` holding `text` (capped by the kit's
     /// validator), and its subscriptions; the old one goes, with its
-    /// history and its buffers. With `keep`, the old one's caret,
-    /// selection, scroll and focus carry over (a rebuild).
-    pub(crate) fn new_field(&mut self, f: Field, text: &str, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// history and its buffers. What `keep` says of the old one carries
+    /// over (a rebuild).
+    pub(crate) fn new_field(&mut self, f: Field, text: &str, keep: Keep, window: &mut Window, cx: &mut Context<Self>) {
         let cap = self.field_guard(f).cap();
         let old = self.field_input(f).clone();
         let (sel, reversed, scroll, focused) = {
@@ -172,13 +255,24 @@ impl AppView {
             if let Some(p) = placeholder {
                 s = s.placeholder(p);
             }
-            s.set_value(text.to_string(), window, cx);
+            match keep {
+                // Fresh: the caret at the end, the start in view.
+                Keep::Nothing => s.set_value(text.to_string(), window, cx),
+                // A rebuild: its text as built, with no scroll of its own.
+                // `set_value` sets the start in view for the next paint over
+                // any caret follow (gpui-base 0.9.1 state.rs:1412–1419), so a
+                // paste made on the new input would have its caret out of
+                // view (Shady #116 B2).
+                Keep::Caret { .. } => s = s.default_value(text.to_string()),
+            }
             s
         });
-        if keep {
+        if let Keep::Caret { scroll: with } = keep {
             input.update(cx, |s, cx| {
                 s.set_selected_range_with_direction(sel, reversed, cx);
-                s.set_scroll_offset(scroll, cx);
+                if with {
+                    s.set_scroll_offset(scroll, cx);
+                }
             });
         }
         let subs = Self::field_subs(f, &input, window, cx);
@@ -187,9 +281,9 @@ impl AppView {
             Field::Find => (self.settings_find, self.settings_find_subs) = (input.clone(), subs),
         }
         match (keep, focused) {
-            (true, true) => input.update(cx, |s, cx| s.focus(window, cx)),
+            (Keep::Caret { .. }, true) => input.update(cx, |s, cx| s.focus(window, cx)),
             // Not left on an input that is gone.
-            (false, true) => window.focus(&self.focus, cx),
+            (Keep::Nothing, true) => window.focus(&self.focus, cx),
             _ => {}
         }
         // The old input goes through one more frame (see `render_retired`).
@@ -202,8 +296,9 @@ impl AppView {
         cx.notify();
     }
 
-    /// Field `f`'s subscriptions: its events, and its edits charged.
-    pub(crate) fn field_subs(f: Field, input: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> [Subscription; 2] {
+    /// Field `f`'s subscriptions: its events, its edits charged, and its
+    /// compositions charged as they are marked.
+    pub(crate) fn field_subs(f: Field, input: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> [Subscription; 3] {
         let events = match f {
             Field::Find => cx.subscribe_in(input, window, |this: &mut Self, input, ev: &InputEvent, _window, cx| {
                 if let InputEvent::Change = ev {
@@ -228,20 +323,84 @@ impl AppView {
                 _ => {}
             }),
         };
-        let edits = cx.subscribe_in(input, window, move |this: &mut Self, _input, ev: &InputEditsEvent, window, cx| {
-            if this.field_guard(f).edits(ev) {
+        let edits = cx.subscribe_in(input, window, move |this: &mut Self, input, ev: &InputEditsEvent, window, cx| {
+            let len = input.read(cx).text().len();
+            if this.field_guard(f).edits(ev, len) {
                 // Never inside the input's own handler.
                 cx.defer_in(window, move |this, window, cx| this.rebuild_field(f, window, cx));
             }
         });
-        [events, edits]
+        let marked = cx.observe_in(input, window, move |this: &mut Self, input, window, cx| {
+            if this.field_marked(f, &input, window, cx) {
+                cx.defer_in(window, move |this, window, cx| this.rebuild_field(f, window, cx));
+            }
+        });
+        [events, edits, marked]
     }
 
-    /// Field `f` rebuilt from its own text, at its budget.
+    /// Field `f`'s input notified: a composition's preedit charged as the
+    /// kit keeps it ([`EditGuard::marked`]); whether the budget is passed.
+    /// Out of a composition only the text's length is read.
+    fn field_marked(&mut self, f: Field, input: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // A field replaced since: its old input is not this field's.
+        if self.field_input(f) != input {
+            return false;
+        }
+        let marked = input.update(cx, |s, cx| s.marked_text_range(window, cx));
+        let s = input.read(cx);
+        let len = s.text().len();
+        let composition = marked.map(|m| {
+            let v = s.value();
+            let bytes = utf16_byte(&v, m.end) - utf16_byte(&v, m.start);
+            (bytes, look(&v, &m))
+        });
+        self.field_guard(f).marked(len, composition)
+    }
+
+    /// Field `f` rebuilt from its own text, at its budget. A composition
+    /// under way carries over: the new input holds the text around it and
+    /// marks its text again, its caret where it was, so the composition
+    /// goes on (its next preedit replaces that, its commit or cancel ends
+    /// it) and the new input's history is that one preedit.
     pub(crate) fn rebuild_field(&mut self, f: Field, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.field_input(f).read(cx).value().to_string();
-        self.new_field(f, &text, true, window, cx);
-        self.field_guard(f).rebuilt();
+        self.rebuild(f, true, window, cx);
+    }
+
+    /// [`Self::rebuild_field`]; without `scroll`, the scroll is not kept.
+    fn rebuild(&mut self, f: Field, scroll: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let old = self.field_input(f).clone();
+        let marked = old.update(cx, |s, cx| s.marked_text_range(window, cx));
+        let (text, sel) = {
+            let s = old.read(cx);
+            (s.value().to_string(), s.selected_range())
+        };
+        let Some(m16) = marked else {
+            self.new_field(f, &text, Keep::Caret { scroll }, window, cx);
+            let g = self.field_guard(f);
+            g.rebuilt();
+            g.seen_len = text.len() as u32;
+            self.views_changed(cx);
+            return;
+        };
+        let m = utf16_byte(&text, m16.start)..utf16_byte(&text, m16.end);
+        let around = format!("{}{}", &text[..m.start], &text[m.end..]);
+        // The caret within the marked text, in UTF-16 (as the kit takes it).
+        let within = |b: usize| text[m.start..b.clamp(m.start, m.end)].encode_utf16().count();
+        let caret = within(sel.start)..within(sel.end);
+        self.new_field(f, &around, Keep::Caret { scroll }, window, cx);
+        let input = self.field_input(f).clone();
+        let preedit = &text[m.clone()];
+        let (len, again) = input.update(cx, |s, cx| {
+            s.set_selected_range(m.start..m.start, cx);
+            s.replace_and_mark_text_in_range(None, preedit, Some(caret), window, cx);
+            (s.text().len(), s.marked_text_range(window, cx))
+        });
+        let g = self.field_guard(f);
+        g.rebuilt();
+        g.seen_len = len as u32;
+        if let Some(r) = again {
+            g.carried(len, preedit.len(), look(&text, &r));
+        }
         self.views_changed(cx);
     }
 
@@ -250,7 +409,7 @@ impl AppView {
     pub(crate) fn retire_value_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.defer_in(window, |this, window, cx| {
             if this.settings.editing.is_none() {
-                this.new_field(Field::Value, "", false, window, cx);
+                this.new_field(Field::Value, "", Keep::Nothing, window, cx);
                 this.settings_input_guard.fresh();
             }
         });
@@ -269,7 +428,7 @@ impl AppView {
             let used = g != EditGuard::new(g.cap(), self.field_budget(f)) || !self.field_input(f).read(cx).value().is_empty();
             if used {
                 self.settings.editing = None;
-                self.new_field(f, "", false, window, cx);
+                self.new_field(f, "", Keep::Nothing, window, cx);
                 self.field_guard(f).fresh();
             }
         }
@@ -304,10 +463,12 @@ impl AppView {
             Pasted::RebuildFirst => {
                 // The new input isn't drawn yet, so no action reaches it:
                 // the paste is made on it as the kit makes one, one atomic
-                // edit over the selection the rebuild kept.
+                // edit over the selection the rebuild kept. Its scroll is
+                // not kept: the paste's caret decides it, as it does an
+                // ordinary paste's (Shady #116 B2).
                 cx.stop_propagation();
                 cx.defer_in(window, move |this, window, cx| {
-                    this.rebuild_field(f, window, cx);
+                    this.rebuild(f, false, window, cx);
                     this.field_input(f).clone().update(cx, |s, cx| s.replace(text, window, cx));
                 });
             }
