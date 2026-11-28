@@ -2764,7 +2764,6 @@ impl Worker {
         let tombstones: Arc<[Tombstone]> = view.tombstones().cloned().collect();
         let outcomes: Arc<[Handed]> = view
             .outcomes()
-            .filter(|_| false)
             .map(|o| {
                 let body = match self.journal.get(o.at.event) {
                     Some(Event::User { text }) => body_hash(cards_spec::block::message::split(text).0),

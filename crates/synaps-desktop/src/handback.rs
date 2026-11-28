@@ -68,8 +68,8 @@ fn names(body: &str, id: &Ref) -> bool {
 /// Whether user text `text` is an edit message (§3.3): its body, all of
 /// it the grammar. A row draws it as a hand-back.
 pub(crate) fn is_edit(text: &str) -> bool {
-    let _ = text;
-    false
+    let body = message::split(text).0;
+    body.starts_with("[block ") && message::parse(body).is_some()
 }
 
 /// What the session holds, for the memo (§3.7): its rows' edits, then
@@ -235,17 +235,58 @@ impl HandBacks {
     /// route). An attach ends what was taken in (its history is the
     /// daemon's word now); an `Idle`, the turn that took each in.
     pub(crate) fn on(&mut self, session: &str, ev: Heard<'_>, now: Instant) {
-        let _ = (session, ev, now);
+        match ev {
+            Heard::Attached => {
+                self.taken.remove(session);
+            }
+            Heard::Idle => self.taken.get_mut(session).into_iter().flatten().for_each(|k| k.ended = true),
+            _ => {}
+        }
+        self.with(session, |m| m.on(ev, now));
+        if let Heard::Delivered { text } = ev
+            && let Some(e) = self.by.get(session).and_then(|m| m.get(text)).filter(|e| e.state == State::InChat)
+        {
+            let body = e.text.clone();
+            let v = self.taken.entry(session.to_string()).or_default();
+            if let Some(k) = v.iter_mut().find(|k| k.body == body) {
+                k.ended = false;
+            } else if v.len() < bm::CAP {
+                v.push(Taken { body, ended: false });
+            }
+        }
     }
 
     pub(crate) fn tick(&mut self, now: Instant) {
-        let _ = now;
+        let ids: Vec<String> = self.by.keys().cloned().collect();
+        for s in ids {
+            self.with(&s, |m| m.tick(now));
+        }
     }
 
     /// `session`'s transcript as it stands (its board `drawn`): each entry
     /// follows it.
     pub(crate) fn observe(&mut self, session: &str, t: &Transcript, drawn: Option<&Drawn>, now: Instant) {
-        let _ = (session, t, drawn, now);
+        if !self.by.contains_key(session) {
+            return;
+        }
+        let settled = crate::deliver::settled(t);
+        // What a settled view settles: one its rows show is there; one
+        // whose turn ended that they don't, the turn's end lost.
+        if settled && let Some(v) = self.taken.get_mut(session) {
+            v.retain(|k| !k.ended && !shows(t, &k.body));
+            if v.is_empty() {
+                self.taken.remove(session);
+            }
+        }
+        let Self { by, taken, changes } = self;
+        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
+        let view = bm::View { edits: &edits, settled, queued: t.queued_message(), streaming: t.busy() };
+        let Some(m) = by.get_mut(session) else { return };
+        let before = m.entries().to_vec();
+        m.observe(&view, now);
+        if m.entries() != before.as_slice() {
+            *changes += 1;
+        }
     }
 
     /// `session`'s view, for a send: its rows and what was taken in.
@@ -279,8 +320,15 @@ impl HandBacks {
         t: &Transcript,
         drawn: Option<&Drawn>,
     ) -> Result<(), String> {
-        let _ = (session, edit, l1, t, drawn);
-        Err("stand-in (the tests first) · nothing was sent".into())
+        if !self.by.contains_key(session)
+            && self.by.len() >= SESSIONS_MAX
+            && self.by.values().all(|m| m.entries().iter().any(bm::Entry::recoverable))
+        {
+            return Err(SESSIONS_FULL.into());
+        }
+        let empty = Memo::default();
+        let edits = self.edits(session, t, drawn);
+        self.by.get(session).unwrap_or(&empty).may_hand_back(edit, &l1.summary(), &edits).map_err(|r| refusal(&r))
     }
 
     /// A hand-back of `edit` on `session`, `trailer` riding it: the
@@ -296,18 +344,26 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Result<String, String> {
-        let _ = (session, edit, l1, trailer, t, drawn, now);
-        Err("stand-in (the tests first) · nothing was sent".into())
+        self.room(session)?;
+        let Self { by, taken, changes } = self;
+        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
+        let m = by.entry(session.to_string()).or_default();
+        let r = m.hand_back(edit, &l1.summary(), trailer, &edits, now).map_err(|r| refusal(&r));
+        if m.entries().is_empty() {
+            by.remove(session);
+        }
+        if r.is_ok() {
+            *changes += 1;
+        }
+        r
     }
 
     pub(crate) fn may_retry(&self, session: &str, body: &str, t: &Transcript, drawn: Option<&Drawn>) -> bool {
-        let _ = (session, body, t, drawn);
-        false
+        self.by.get(session).is_some_and(|m| m.may_retry(body, &self.edits(session, t, drawn)))
     }
 
     pub(crate) fn may_resend(&self, session: &str, body: &str, t: &Transcript, drawn: Option<&Drawn>) -> bool {
-        let _ = (session, body, t, drawn);
-        false
+        self.by.get(session).is_some_and(|m| m.may_resend(body, &self.edits(session, t, drawn)))
     }
 
     /// Retry hand-back `body` (not sent), `trailer` riding it.
@@ -320,8 +376,11 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Option<String> {
-        let _ = (session, body, trailer, t, drawn, now);
-        None
+        let Self { by, taken, changes } = self;
+        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
+        let r = by.get_mut(session)?.retry(body, trailer, &edits, now);
+        *changes += 1;
+        r
     }
 
     /// A Resend of hand-back `body` (not confirmed) against the view as it
@@ -335,14 +394,17 @@ impl HandBacks {
         drawn: Option<&Drawn>,
         now: Instant,
     ) -> Resend {
-        let _ = (session, body, trailer, t, drawn, now);
-        Resend::No
+        let Self { by, taken, changes } = self;
+        let edits = DeskEdits::of(t, drawn).with(taken.get(session));
+        let view = bm::View { edits: &edits, settled: crate::deliver::settled(t), queued: t.queued_message(), streaming: t.busy() };
+        let Some(m) = by.get_mut(session) else { return Resend::No };
+        *changes += 1;
+        m.resend(body, trailer, &view, now)
     }
 
     /// Discard (§3.7, `Memo::forget`): the entry goes, nothing else.
     pub(crate) fn forget(&mut self, session: &str, body: &str) -> bool {
-        let _ = (session, body);
-        false
+        self.with(session, |m| m.forget(body).is_some()).unwrap_or(false)
     }
 
     /// This desk's latest entry of incarnation `of` of `id` on `session`.
@@ -408,8 +470,31 @@ fn why(k: &Key, c: Code) -> Option<String> {
 /// (§5.2: the queued message moved to the successor, where its id names
 /// no block).
 pub(crate) fn outcome_words(o: &EditOutcome, edit: Option<&Edit>, compacted: bool) -> String {
-    let _ = (o, edit, compacted);
-    String::new()
+    match o.result {
+        EditResult::Rewritten => return "not applied: the block was rewritten".into(),
+        EditResult::Gone if compacted => return COMPACTED_AWAY.into(),
+        EditResult::Gone => return "not applied: the block is gone".into(),
+        EditResult::Revisions => return "not applied: replace the block or use a new id".into(),
+        EditResult::Applied => {}
+    }
+    let n = o.codes.len();
+    let applied = o.codes.iter().filter(|c| matches!(c, Code::Applied | Code::Unchanged | Code::Overwritten)).count();
+    let over = o.codes.iter().filter(|c| **c == Code::Overwritten).count();
+    let mut out = if applied == n { "applied".to_string() } else { format!("applied {applied} of {n}") };
+    if let Some(e) = edit {
+        let mut said: Vec<String> = Vec::new();
+        for (k, c) in keys(e).iter().zip(&o.codes) {
+            if let Some(w) = why(k, *c).filter(|w| !said.contains(w)) {
+                out.push_str(" · ");
+                out.push_str(&w);
+                said.push(w);
+            }
+        }
+    }
+    if over > 0 {
+        out.push_str(&format!(" · {over} overwritten by the agent"));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -742,8 +742,9 @@ impl Draft {
     /// revision it is at now (`another edit arrived · r7`). A hold is this
     /// desk's, so one landing while it is held is another's.
     pub(crate) fn other_edit(&self, st: &State) -> Option<u32> {
-        let _ = st;
-        None
+        let b = st.block(&self.id).filter(|b| b.tag == self.tag)?;
+        let from = st.records_of(self.tag).find(|r| r.rev == self.base).map(|r| r.at)?;
+        st.outcomes().any(|o| o.id == self.id && o.at > from).then_some(b.rev)
     }
 
     /// A restore (§3.6) of `now` (the current incarnation, bound) back to
@@ -752,8 +753,52 @@ impl Draft {
     /// notes don't come back, nor items removed since (their ids are
     /// spent); the steps added since keep their order after `then`'s.
     pub(crate) fn restore(now: Arc<Block>, then: &Block, generation: Generation) -> Option<Self> {
-        let _ = (now, then, generation);
-        None
+        let mut d = Draft::of(now, generation)?;
+        d.back_to = Some(then.rev);
+        match (&mut d.intents, &d.base_block.body, &then.body) {
+            (Intents::Plan(p), Body::Plan(cur), Body::Plan(old)) => {
+                let live = |id: &ItemId| cur.steps.iter().any(|s| &s.id == id);
+                let mut order: Vec<ItemId> = old.steps.iter().map(|s| s.id.clone()).filter(live).collect();
+                let added: Vec<ItemId> = cur.steps.iter().map(|s| s.id.clone()).filter(|id| !order.contains(id)).collect();
+                order.extend(added);
+                p.order = order;
+                for s in &cur.steps {
+                    let Some(o) = old.steps.iter().find(|o| o.id == s.id) else { continue };
+                    if o.label != s.label {
+                        p.label.insert(s.id.clone(), o.label.clone());
+                    }
+                    match (s.state, o.state) {
+                        (StepState::Todo, StepState::Skipped) => {
+                            p.skip.insert(s.id.clone(), true);
+                        }
+                        (StepState::Skipped, StepState::Todo) => {
+                            p.skip.insert(s.id.clone(), false);
+                        }
+                        _ => {}
+                    }
+                    if o.stop != s.stop {
+                        p.stop.insert(s.id.clone(), o.stop);
+                    }
+                }
+            }
+            (Intents::Note { text, title }, Body::Note(cur), Body::Note(old)) => {
+                *text = (old.text != cur.text).then(|| old.text.clone());
+                let (t0, t1) = (then.title.clone().unwrap_or_default(), d.base_block.title.clone().unwrap_or_default());
+                *title = (t0 != t1).then_some(t0);
+            }
+            (Intents::Diff(h), Body::Diff(cur), Body::Diff(old)) => {
+                for k in &cur.hunks {
+                    if let Some(o) = old.hunks.iter().find(|o| o.id == k.id)
+                        && o.state != k.state
+                        && matches!(o.state, HunkState::Kept | HunkState::Dropped)
+                    {
+                        h.insert(k.id.clone(), o.state);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(d)
     }
 
     /// The agent's changes to its incarnation since `B` (§3.2's `· 2 agent
@@ -882,15 +927,25 @@ impl Drafts {
     /// Session `session`'s draft of `id`'s incarnation `tag` was handed
     /// back as `body` (`None`: it wasn't, after all: held again).
     pub(crate) fn sent(&mut self, session: &str, id: &Ref, tag: Tag, body: Option<String>) {
-        let _ = (session, id, tag, body);
+        if let Some(d) = self.get_mut(session, id, tag) {
+            d.sent = body;
+            d.serial += 1;
+        }
     }
 
     /// Session `session`'s handed-back drafts that `drawn` says are done
     /// with (their edit not in flight, and the board holding the history
     /// it is in): they go, and the board draws the block. Their rows.
     pub(crate) fn settle_sent(&mut self, session: &str, done: &dyn Fn(&str) -> bool) -> Vec<u64> {
-        let _ = (session, done);
-        Vec::new()
+        let mut rows = Vec::new();
+        self.all.retain(|(s, d)| {
+            let go = s == session && d.sent.as_deref().is_some_and(done);
+            if go {
+                rows.push(crate::blocks::row_id(&d.id));
+            }
+            !go
+        });
+        rows
     }
 
     /// Session `from`'s drafts are session `to`'s now (a worker tab that

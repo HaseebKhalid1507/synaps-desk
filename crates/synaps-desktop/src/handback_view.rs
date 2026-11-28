@@ -88,8 +88,20 @@ impl AppView {
     /// Enter on the held block the pane edits, or its Hand back: `Err`,
     /// why nothing went.
     pub(crate) fn edit_hand_back(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        let _ = cx;
-        Err("stand-in (the tests first) · nothing was sent".into())
+        let Some(e) = self.panes.cur.edit.at.as_ref() else { return Ok(()) };
+        let (session, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
+        let lid = self.panes.cur.live;
+        let (seq, _) = self.model.card_gate(lid)?;
+        let d = self.block_drafts.get(&session, &id, tag).ok_or(crate::lease::CHANGED)?;
+        if d.sent.is_some() {
+            return Err(SENDING.into());
+        }
+        if let Some(f) = d.ended {
+            return Err(f.says().unwrap_or_default());
+        }
+        let st = self.bound_board().and_then(|b| b.board.clone()).ok_or("checking…")?;
+        let (edit, l1) = d.handing(&st)?;
+        self.send_edit(EditSend { lid, seq, session, id, tag, body: String::new(), what: What::New { edit: Box::new(edit), l1 } }, cx)
     }
 
     /// `s`, checked, its notices riding (now, or once their marks are
@@ -134,8 +146,13 @@ impl AppView {
     /// The notices' marks landed for the edit waiting on `ticket`: it goes
     /// now, `ride` its message. `false`: not an edit's ticket.
     pub(crate) fn edit_landed(&mut self, ticket: u64, ride: Ride, cx: &mut Context<Self>) -> bool {
-        let _ = (ticket, ride, cx);
-        false
+        let Some(s) = self.edit_waits.remove(&ticket) else { return false };
+        let row = crate::blocks::row_id(&s.id);
+        if let Err(why) = self.edit_go(s, ride, cx) {
+            self.panes.cur.edit.note = Some((row, why));
+            self.remeasure_draft(row);
+        }
+        true
     }
 
     /// `s` to the wire as `ride` says (its body, the notices then): the
@@ -215,20 +232,91 @@ impl AppView {
     /// Retry, Resend or Discard on block `id`'s incarnation `tag` in the
     /// pane acted on: this desk's latest hand-back of it.
     pub(crate) fn edit_again(&mut self, id: &Ref, tag: Tag, what: Option<What>, cx: &mut Context<Self>) {
-        let _ = (id, tag, what, cx);
+        let lid = self.panes.cur.live;
+        let row = crate::blocks::row_id(id);
+        let Some(session) = self.model.lives[lid].active.as_ref().map(|a| a.session_id.clone()) else { return };
+        let Some(body) = self.model.memos.edits.latest(&session, id, tag).map(|e| e.text.clone()) else { return };
+        let Some(what) = what else {
+            self.model.memos.edits.forget(&session, &body);
+            log::info!(target: "synaps_desktop::handback", "hand-back of {id}: discarded");
+            self.after_card(row, cx);
+            return;
+        };
+        let r = self
+            .model
+            .card_gate(lid)
+            .and_then(|(seq, _)| self.send_edit(EditSend { lid, seq, session, id: id.clone(), tag, body, what }, cx));
+        if let Err(why) = r {
+            self.panes.cur.edit.note = Some((row, why));
+        }
+        self.after_card(row, cx);
     }
 
     /// `R` on the walked block's past revision (§3.6): a restore of the
     /// current incarnation to it, sent as an edit. `Err`: why not.
     pub(crate) fn restore(&mut self, row: u64, cx: &mut Context<Self>) -> Result<(), String> {
-        let _ = (row, cx);
-        Err("stand-in (the tests first) · nothing was sent".into())
+        let lid = self.panes.cur.live;
+        let past = self.walk_past(row).ok_or("walk to a past revision first ([)")?;
+        let then = past.ready().cloned().ok_or("loading…")?;
+        let (seq, session) = self.model.card_gate(lid)?;
+        let d = self.bound_board().ok_or("checking…")?;
+        let st = d.board.clone().ok_or("checking…")?;
+        let now = st.block(&then.block.id).cloned().ok_or(VIEW_ONLY)?;
+        if now.tag != then.block.tag {
+            return Err(VIEW_ONLY.into());
+        }
+        if self.model.memos.edits.in_flight(&session, &now.id, now.tag).is_some() {
+            return Err(SENDING.into());
+        }
+        let generation = d.generation.ok_or("checking…")?;
+        let draft = crate::drafts::Draft::restore(Arc::new(now.clone()), &then.block, generation).ok_or(crate::draft_view::NOT_EDITABLE)?;
+        if !draft.changed() {
+            return Err(NOTHING_TO_RESTORE.replace("{}", &then.block.rev.to_string()));
+        }
+        let (edit, l1) = draft.handing(&st)?;
+        self.send_edit(
+            EditSend {
+                lid,
+                seq,
+                session,
+                id: now.id.clone(),
+                tag: now.tag,
+                body: String::new(),
+                what: What::New { edit: Box::new(edit), l1 },
+            },
+            cx,
+        )
     }
 
     /// Each session's handed-back drafts that are done with go (module
     /// docs): their edit out of flight, and the board holding the history
     /// it is in (an outcome on its row; or it never got there).
-    pub(crate) fn settle_sent_drafts(&mut self) {}
+    pub(crate) fn settle_sent_drafts(&mut self) {
+        for live in self.model.lives.ids() {
+            let l = &self.model.lives[live];
+            let Some(session) = l.active.as_ref().map(|a| a.session_id.clone()) else { continue };
+            if !self.block_drafts.of(&session).any(|d| d.sent.is_some()) {
+                continue;
+            }
+            let memo = &self.model.memos.edits;
+            let drawn = l.transcript.drawn().cloned();
+            let held = |body: &str| {
+                let h = synaps_client::blocks::body_hash(body);
+                drawn.as_deref().is_some_and(|d| d.outcomes.iter().any(|o| o.body == h))
+            };
+            let done = |body: &str| match memo.get(&session, body) {
+                None => true,
+                Some(e) if e.in_flight() => false,
+                Some(e) if e.state == State::InChat && e.retired.is_none() => held(body),
+                Some(_) => true,
+            };
+            let rows = self.block_drafts.settle_sent(&session, &done);
+            for r in rows {
+                self.remeasure_draft(r);
+                self.remeasure_block(r);
+            }
+        }
+    }
 
     /// Block row `row` measured again in every pane that draws it.
     pub(crate) fn remeasure_block(&mut self, row: u64) {
@@ -242,28 +330,111 @@ impl AppView {
     /// The draft's header while it is sent (module docs): its delivery
     /// word.
     pub(crate) fn sent_head(&self, d: &crate::drafts::Draft) -> Option<String> {
-        let _ = d;
-        None
+        let body = d.sent.as_deref()?;
+        let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
+        let word = match self.model.memos.edits.get(session, body).map(|e| e.state) {
+            Some(State::Queued) => "QUEUED",
+            Some(State::Held) => "HELD",
+            Some(State::Checking) => "CHECKING",
+            Some(State::InChat) => "IN THE CHAT",
+            _ => "SENDING",
+        };
+        Some(format!("{word} · r{}", d.base))
     }
 
     /// The words under a sent draft: its delivery's, as the memo says.
     pub(crate) fn sent_words(&self, d: &crate::drafts::Draft) -> Option<String> {
-        let _ = d;
-        None
+        let body = d.sent.as_deref()?;
+        let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
+        Some(match self.model.memos.edits.get(session, body) {
+            Some(e) => crate::handback::words(e).0.to_string(),
+            None => "waiting for the rail's notices to be saved".into(),
+        })
     }
 
     /// Whether the memo admits the hand-back of the draft the pane edits
     /// now (the button's `on`), or why not.
     pub(crate) fn may_hand_back(&self, d: &crate::drafts::Draft) -> Result<(), String> {
-        let _ = d;
-        Err("stand-in (the tests first) · nothing was sent".into())
+        let lid = self.panes.cur.live;
+        let l = &self.model.lives[lid];
+        self.model.card_gate(lid)?;
+        let session = l.active.as_ref().map(|a| a.session_id.as_str()).ok_or("not attached")?;
+        let st = self.bound_board().and_then(|b| b.board.clone()).ok_or("checking…")?;
+        let (edit, l1) = d.handing(&st)?;
+        let drawn = l.transcript.drawn().cloned();
+        self.model.memos.edits.may_hand_back(session, &edit, &l1, &l.transcript, drawn.as_deref())
     }
 
     /// Block `s`'s delivery line (row `id`): this desk's latest hand-back of
     /// its incarnation, while it says something (module docs).
     pub(crate) fn edit_delivery(&self, s: &Shown, id: u64, p: &Palette, m: &Metrics, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let _ = (s, id, p, m, cx);
-        None
+        let lid = self.panes.cur.live;
+        let l = &self.model.lives[lid];
+        let session = l.active.as_ref()?.session_id.clone();
+        let e = self.model.memos.edits.latest(&session, &s.block.id, s.block.tag)?;
+        if (e.state == State::InChat && e.retired.is_none()) || e.retired == Some(bm::Retired::Here) {
+            return None;
+        }
+        let (word, cause) = crate::handback::words(e);
+        let text = match cause {
+            Some(c) => format!("{word} · {c}"),
+            None => word.to_string(),
+        };
+        let drawn = l.transcript.drawn().cloned();
+        let gate = self.model.card_gate(lid).is_ok();
+        let retry = gate && self.model.memos.edits.may_retry(&session, &e.text, &l.transcript, drawn.as_deref());
+        let resend = gate && self.model.memos.edits.may_resend(&session, &e.text, &l.transcript, drawn.as_deref());
+        let discard = !e.in_flight();
+        let (bid, tag) = (s.block.id.clone(), s.block.tag);
+        let pane = self.panes.cur.id;
+        let tt = text.clone();
+        let button = |label: &'static str, what: fn() -> Option<What>| {
+            let bid = bid.clone();
+            div()
+                .id((label, id))
+                .flex_none()
+                .px(px(8.))
+                .cursor_pointer()
+                .font_family(fonts::SANS)
+                .text_px(m.meta)
+                .text_color(p.prose_t)
+                .bg(p.well_d)
+                .debug_selector(move || format!("edit-button {id} {label}"))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.in_pane(pane, |this| this.edit_again(&bid, tag, what(), cx));
+                }))
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .gap(px(2.))
+                .pb(px((6. * m.r).round()))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .items_center()
+                        .whitespace_nowrap()
+                        .debug_selector(move || format!("edit-delivery {id} {tt}"))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .font_family(fonts::SANS)
+                                .text_px(m.meta)
+                                .text_color(if e.in_flight() { p.dim_t } else { p.warn })
+                                .child(text),
+                        )
+                        .when(retry, |d| d.child(button("Retry", || Some(What::Retry))))
+                        .when(resend, |d| d.child(button("Resend", || Some(What::Resend))))
+                        .when(discard, |d| d.child(button("Discard", || None))),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A hand-back's row (module docs): line 1's words, then what the
@@ -335,14 +506,24 @@ impl AppView {
     /// The `changed your edit` chip of block `s`, if it shows (module
     /// docs): its path, for the hover.
     pub(crate) fn changed_your_edit(&self, s: &Shown) -> Option<Path> {
-        let _ = s;
-        None
+        let path = s.block.changed_your_edit.clone()?;
+        let session = self.model.lives[self.panes.cur.live].active.as_ref()?.session_id.as_str();
+        let seen = self.changed_seen.iter().any(|(ss, id, tag, p)| ss == session && *id == s.block.id && *tag == s.block.tag && *p == path);
+        (!seen).then_some(path)
     }
 
     /// The user focused block row `row` (the walk's ring on it, or a
     /// take): its `changed your edit`, seen.
     pub(crate) fn saw_changed(&mut self, row: u64) {
-        let _ = row;
+        let Some(session) = self.model.lives[self.panes.cur.live].active.as_ref().map(|a| a.session_id.clone()) else { return };
+        let Some((_, s)) = self.block_drawn(row) else { return };
+        let Some(path) = self.changed_your_edit(&s) else { return };
+        if self.changed_seen.len() >= SEEN_MAX {
+            self.changed_seen.remove(0);
+        }
+        self.changed_seen.push((session, s.block.id.clone(), s.block.tag, path));
+        log::debug!(target: "synaps_desktop::handback", "changed your edit on {}: seen; {} kept, {} bytes", s.block.id, self.changed_seen.len(), self.changed_seen_bytes());
+        self.remeasure_block(row);
     }
 
     /// What the `changed your edit` chips seen keep (bytes).
