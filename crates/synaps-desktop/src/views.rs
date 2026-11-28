@@ -475,6 +475,14 @@ pub(crate) struct ViewCx<'a> {
     cx: &'a App,
 }
 
+#[cfg(test)]
+impl<'a> ViewCx<'a> {
+    /// The pane's context, for a bench that draws the page by itself.
+    pub(crate) fn of(view: WeakEntity<AppView>, cx: &'a App) -> Self {
+        ViewCx { view, cx }
+    }
+}
+
 impl Deref for ViewCx<'_> {
     type Target = App;
 
