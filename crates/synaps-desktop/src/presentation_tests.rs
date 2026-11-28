@@ -508,6 +508,89 @@ fn a_load_sweeps_and_sets_an_unreadable_file_aside() {
     assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), "[]");
 }
 
+/// A file of `conversations` (key, touched, soft ids with their seqs) as a
+/// hand would write it.
+fn hand_written(conversations: impl IntoIterator<Item = (String, u64, Vec<(String, u64)>)>) -> String {
+    let convs: serde_json::Map<String, serde_json::Value> = conversations
+        .into_iter()
+        .map(|(k, touched, entries)| {
+            let entries: Vec<_> = entries.into_iter().map(|(id, seq)| json!({"soft": id, "seq": seq})).collect();
+            (k, json!({"touched": touched, "seq": 0, "entries": entries}))
+        })
+        .collect();
+    json!({"version": 1, "conversations": convs}).to_string()
+}
+
+/// A hand-written file past [`FILE_BYTES_MAX`] (no desk writes one) isn't
+/// read: it reads as empty, said, and is moved aside (never copied). One
+/// at the bound is read; one byte more isn't.
+#[test]
+fn a_file_past_its_bound_isnt_read() {
+    let d = dir("p-oversized");
+    let ids = |n: u64| (0..n).map(|i| (format!("s{i:02}"), i + 1)).collect::<Vec<_>>();
+    let text = hand_written((0..1000).map(|c| (format!("c{c:03}"), c + 1, ids(ENTRIES_MAX as u64))));
+    assert!(text.len() > FILE_BYTES_MAX, "{}", text.len());
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let p = presentation(&d);
+    assert_eq!(p.book.conversations.len(), 0, "not read");
+    assert!(p.trouble.as_deref().is_some_and(|t| t.contains(FILE) && t.contains("too big")), "said: {:?}", p.trouble);
+    assert!(!d.join(FILE).exists(), "moved aside");
+    assert_eq!(std::fs::metadata(d.join(format!("{FILE}.bad"))).unwrap().len(), text.len() as u64, "whole");
+    drop(p);
+
+    let one = hand_written([(J.to_string(), 1, ids(1))]);
+    for (pad, read) in [(FILE_BYTES_MAX - one.len(), true), (FILE_BYTES_MAX + 1 - one.len(), false)] {
+        let d = dir(&format!("p-oversized-{pad}"));
+        std::fs::write(d.join(FILE), format!("{one}{}", " ".repeat(pad))).unwrap();
+        let p = presentation(&d);
+        assert_eq!((p.book.conversations.len(), p.trouble.is_none()), (usize::from(read), read), "{} bytes", one.len() + pad);
+    }
+}
+
+/// A pipe where the file goes isn't opened (opening one waits for a
+/// writer, forever): its read says so at once.
+#[cfg(unix)]
+#[test]
+fn a_pipe_where_the_file_goes_is_never_opened() {
+    let d = dir("p-pipe");
+    let path = d.join(FILE);
+    assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(crate::blockfiles::peek::<Book>(&path)).unwrap());
+    let (book, why) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("not waiting on the pipe");
+    assert!(book.conversations.is_empty() && why.is_some(), "{why:?}");
+}
+
+/// A hand-written file past the counts reads as the writer fits memory:
+/// a conversation's oldest entries go past [`ENTRIES_MAX`] (by their
+/// order, not the file's), the least recently touched conversations past
+/// [`CONVERSATIONS_MAX`]. What's left out is said, and the file is copied
+/// aside before anything is written over it.
+#[test]
+fn a_file_past_the_counts_reads_as_the_writer_fits_it() {
+    let d = dir("p-past-the-counts");
+    // 100 entries, newest first in the file; and 300 conversations of one.
+    let big = (0..100u64).rev().map(|i| (format!("s{i:02}"), i + 1)).collect();
+    let mut convs = vec![(J.to_string(), 10_000, big)];
+    convs.extend((0..300u64).map(|c| (format!("c{c:03}"), c + 1, vec![("plan".to_string(), 1)])));
+    let text = hand_written(convs);
+    assert!(text.len() < FILE_BYTES_MAX);
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let p = presentation(&d);
+    let c = &p.book.conversations[J];
+    assert_eq!(c.entries.len(), ENTRIES_MAX);
+    assert!(c.entries.iter().all(|k| k.seq > 36), "the newest kept");
+    assert_eq!(p.book.conversations.len(), CONVERSATIONS_MAX);
+    assert!(!p.book.conversations.contains_key("c044") && p.book.conversations.contains_key("c045"), "the most recently touched kept");
+    assert!(p.trouble.as_deref().is_some_and(|t| t.contains("81 entries past its caps")), "said: {:?}", p.trouble);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), text, "set aside");
+    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), text, "not written over yet");
+    let mut fitted = p.book.clone();
+    fitted.fit();
+    assert_eq!(fitted, p.book, "within the writer's caps");
+    assert_eq!(reread(&d).book, p.book, "a restart reads the same");
+}
+
 /// Shady #103 R3-P2-3, the presentation's file too: a write issued holds
 /// its lock until it ran, its store dropped or not; the last write carries
 /// what memory changed behind the one out.

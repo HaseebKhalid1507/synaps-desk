@@ -86,6 +86,9 @@
 //! **The file**, `block-desires.json` next to `settings.json`: per
 //! conversation, per generation (the first 16 hex digits), its desires,
 //! ≤ [`ENTRY_MAX`] bytes each, and nothing else. **No cap evicts a desire**.
+//! A file past them was never this desk's: past [`RESERVE`] it isn't read,
+//! and past the counts it reads as the writer would have admitted it, the
+//! rest left out, said, the file set aside first ([`crate::blockfiles`]).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -95,7 +98,7 @@ use cards_spec::block::{BlockId, Generation};
 use cards_spec::board::Visibility;
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, NotOwned, Owned, Stored};
+use crate::blockfiles::{self, Left, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "block-desires.json";
@@ -252,14 +255,19 @@ impl Book {
 }
 
 impl Stored for Book {
-    fn parse(text: &str) -> Result<(Self, usize), String> {
+    const BYTES_MAX: usize = RESERVE;
+
+    /// The caps as the writer admits a new id ([`PER_CONVERSATION`],
+    /// [`PER_DESK`]), one desire at a time: the ones that may have been
+    /// sent first (obligations), then the file's order; the rest left out.
+    fn parse(text: &str) -> Result<(Self, Left), String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if v["version"].as_u64() != Some(FORMAT) {
             return Err(format!("not format {FORMAT}"));
         }
         let convs = v["conversations"].as_object().ok_or("no conversations")?;
         let gen_ok = |g: &str| g.len() == 16 && g.bytes().all(|b| b.is_ascii_hexdigit());
-        let (mut book, mut bad) = (Book::default(), 0);
+        let (mut read, mut bad) = (Vec::new(), 0);
         for (key, gens) in convs {
             let Some(gens) = gens.as_object().filter(|_| key_ok(key)) else {
                 bad += 1;
@@ -274,14 +282,25 @@ impl Stored for Book {
                     let bit = |k: &str| d[k].as_u64().filter(|b| *b <= 1).map(|b| b == 1);
                     let version = d["v"].as_u64().filter(|v| (1..=u64::from(VERSION_MAX)).contains(v)).map(|v| v as u32);
                     match (BlockId::parse(id), bit("d"), version, bit("s")) {
-                        (Some(id), Some(dismissed), Some(v), Some(sent)) => book.set(key, g, &id, Some(Desire::new(dismissed, v, sent))),
+                        (Some(id), Some(dismissed), Some(v), Some(sent)) => read.push((key, g, id, Desire::new(dismissed, v, sent))),
                         _ => bad += 1,
                     }
                 }
             }
         }
+        read.sort_by_key(|(.., d)| !d.sent);
+        let (mut book, mut per, mut all, mut over) = (Book::default(), BTreeMap::<&str, usize>::new(), 0, 0);
+        for (key, g, id, d) in read {
+            let here = per.entry(key.as_str()).or_default();
+            if *here >= PER_CONVERSATION || all >= PER_DESK {
+                over += 1;
+                continue;
+            }
+            (*here, all) = (*here + 1, all + 1);
+            book.set(key, g, &id, Some(d));
+        }
         book.tidy();
-        Ok((book, bad))
+        Ok((book, Left { bad, over }))
     }
 
     fn text(&self) -> String {

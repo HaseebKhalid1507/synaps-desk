@@ -966,6 +966,75 @@ fn an_unreadable_file_is_set_aside() {
     assert_eq!(desires(&d).len(), 1);
 }
 
+/// A file of `desires` (conversation, id, sent), each dismissed at v1 in
+/// [`generation`]'s generation, as a hand would write it.
+fn hand_written(desires: impl IntoIterator<Item = (String, String, bool)>) -> String {
+    let g = generation_key(&generation());
+    let mut convs = serde_json::Map::new();
+    for (conv, id, sent) in desires {
+        let gens = convs.entry(conv).or_insert_with(|| json!({ g.as_str(): {} }));
+        gens[g.as_str()][id] = json!({"d": 1, "v": 1, "s": u8::from(sent)});
+    }
+    json!({"version": 3, "conversations": convs}).to_string()
+}
+
+/// A hand-written file past the reserve (§1.8: no desk writes one) isn't
+/// read: it reads as empty, said, and is moved aside (never copied: its
+/// size is anyone's). One at the reserve is read; one byte more isn't.
+#[test]
+fn a_file_past_the_reserve_isnt_read() {
+    let d = dir("oversized");
+    let text = hand_written((0..3000).map(|i| (format!("c{i:04}"), format!("b{i:04}"), false)));
+    assert!(text.len() > RESERVE, "{}", text.len());
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), 0, "not read");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains(FILE) && t.contains("too big")), "said: {:?}", a.trouble);
+    assert!(!d.join(FILE).exists(), "moved aside");
+    assert_eq!(std::fs::metadata(d.join(format!("{FILE}.bad"))).unwrap().len(), text.len() as u64, "whole");
+    drop(a);
+
+    let one = hand_written([(J.to_string(), "tests".to_string(), false)]);
+    for (pad, read) in [(RESERVE - one.len(), true), (RESERVE + 1 - one.len(), false)] {
+        let d = dir(&format!("oversized-{pad}"));
+        std::fs::write(d.join(FILE), format!("{one}{}", " ".repeat(pad))).unwrap();
+        let a = desires(&d);
+        assert_eq!((a.len(), a.trouble.is_none()), (usize::from(read), read), "{} bytes", one.len() + pad);
+    }
+}
+
+/// A hand-written file past the counts (§1.8: no desk writes one) reads as
+/// the writer would have admitted it, one desire at a time: those that may
+/// have been sent first, then the file's order; [`PER_CONVERSATION`] and
+/// [`PER_DESK`] at most. What's left out is said, and the file is copied
+/// aside before anything is written over it.
+#[test]
+fn a_file_past_the_counts_reads_as_the_writer_admits_it() {
+    let g = generation();
+    let d = dir("past-the-counts");
+    // 100 in one conversation, its last ten sent.
+    let text = hand_written((0..100).map(|i| (J.to_string(), format!("b{i:03}"), i >= 90)));
+    std::fs::write(d.join(FILE), &text).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), PER_CONVERSATION);
+    let kept = |i: usize| a.desire(J, &g, &id(&format!("b{i:03}"))).is_some();
+    assert!((90..100).all(kept), "the sent first");
+    assert!((0..54).all(kept) && !(54..90).any(kept), "then the file's order");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains("36 entries past its caps")), "said: {:?}", a.trouble);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{FILE}.bad"))).unwrap(), text, "set aside");
+    assert_eq!(std::fs::read_to_string(d.join(FILE)).unwrap(), text, "not written over yet");
+    drop(a);
+    assert_eq!(in_file(&d).len(), PER_CONVERSATION, "a restart reads the same");
+
+    // 600 conversations, one each.
+    let d = dir("past-the-desk");
+    std::fs::write(d.join(FILE), hand_written((0..600).map(|i| (format!("c{i:03}"), "plan".to_string(), false)))).unwrap();
+    let a = desires(&d);
+    assert_eq!(a.len(), PER_DESK);
+    assert!(a.desire("c511", &g, &id("plan")).is_some() && a.desire("c512", &g, &id("plan")).is_none(), "the file's order");
+    assert!(a.trouble.as_deref().is_some_and(|t| t.contains("88 entries past its caps")), "said: {:?}", a.trouble);
+}
+
 /// What crashes left beside the file is swept by its owner's first write:
 /// regular files of exactly `<file>.tmp.<pid>.<n>`, never a link (nor what
 /// it names), a folder or another name.

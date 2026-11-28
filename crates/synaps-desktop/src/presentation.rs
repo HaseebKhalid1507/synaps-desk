@@ -32,7 +32,8 @@
 //! [`CONVERSATION_BYTES_MAX`] bytes, the oldest entry going first; at most
 //! [`CONVERSATIONS_MAX`] conversations and [`FILE_BYTES_MAX`] bytes, the
 //! least recently touched conversation going first. It's presentation: no
-//! wish is lost.
+//! wish is lost. A file read is fitted the same way (one past
+//! [`FILE_BYTES_MAX`] isn't read), what went said ([`crate::blockfiles`]).
 //! **Drawn at once, written off the UI thread:** memory is the truth. A
 //! change draws now, and a snapshot of memory, whole, is written
 //! ([`Presentation::next_write`], run on the process's writer, holding the
@@ -51,7 +52,7 @@ use cards_spec::block::{BlockId, Ref, Slot};
 use cards_spec::board::{Block, Place, State};
 use serde_json::{Value, json};
 
-use crate::blockfiles::{self, NotOwned, Owned, Stored};
+use crate::blockfiles::{self, Left, NotOwned, Owned, Stored};
 
 /// The file, next to `settings.json`.
 pub(crate) const FILE: &str = "blocks.json";
@@ -206,7 +207,9 @@ pub(crate) struct Book {
 }
 
 impl Stored for Book {
-    fn parse(text: &str) -> Result<(Self, usize), String> {
+    const BYTES_MAX: usize = FILE_BYTES_MAX;
+
+    fn parse(text: &str) -> Result<(Self, Left), String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if v["version"].as_u64() != Some(FORMAT) {
             return Err(format!("not format {FORMAT}"));
@@ -231,7 +234,8 @@ impl Stored for Book {
             conv.seq = conv.seq.max(conv.entries.iter().map(|k| k.seq).max().unwrap_or(0));
             book.conversations.insert(key.clone(), conv);
         }
-        Ok((book, bad))
+        let over = book.fit_read();
+        Ok((book, Left { bad, over }))
     }
 
     fn text(&self) -> String {
@@ -265,6 +269,41 @@ impl Book {
             let lru = self.conversations.iter().min_by_key(|(k, c)| (c.touched, (*k).clone())).map(|(k, _)| k.clone()).expect("not empty");
             self.conversations.remove(&lru);
         }
+    }
+}
+
+impl Book {
+    /// A file read fitted to the caps as the writer fits memory
+    /// ([`Book::fit`]): the same entries and conversations go, but each
+    /// count's excess at once (a file's counts are anyone's). How many
+    /// entries went.
+    fn fit_read(&mut self) -> usize {
+        let entries = |b: &Book| b.conversations.values().map(|c| c.entries.len()).sum::<usize>();
+        let had = entries(self);
+        for c in self.conversations.values_mut() {
+            let excess = c.entries.len().saturating_sub(ENTRIES_MAX);
+            if excess > 0 {
+                // The oldest first, the first of equals first: `fit`'s order.
+                let mut by_age: Vec<usize> = (0..c.entries.len()).collect();
+                by_age.sort_by_key(|&i| c.entries[i].seq);
+                let mut keep = vec![true; c.entries.len()];
+                by_age[..excess].iter().for_each(|&i| keep[i] = false);
+                let mut keep = keep.into_iter();
+                c.entries.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
+        self.conversations.retain(|_, c| !c.entries.is_empty());
+        let excess = self.conversations.len().saturating_sub(CONVERSATIONS_MAX);
+        if excess > 0 {
+            // The least recently touched first, `fit`'s order.
+            let mut by_touch: Vec<(u64, String)> = self.conversations.iter().map(|(k, c)| (c.touched, k.clone())).collect();
+            by_touch.sort();
+            for (_, k) in &by_touch[..excess] {
+                self.conversations.remove(k);
+            }
+        }
+        self.fit();
+        had - entries(self)
     }
 }
 
