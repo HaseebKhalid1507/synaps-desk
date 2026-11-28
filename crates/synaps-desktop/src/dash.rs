@@ -445,8 +445,17 @@ pub struct ConfigSnapshot {
     pub pending: Vec<String>,
     #[serde(rename = "reloadCmd")]
     pub reload_cmd: String,
+    /// The running daemon's `--idle-exit`, as the dash read it (Linux, a
+    /// daemon started with the flag); `None`: anything but a whole number.
+    #[serde(rename = "idleExitRunning", deserialize_with = "whole")]
+    pub idle_exit_running: Option<u64>,
     pub plugins: Vec<Plugin>,
     pub providers: Vec<Provider>,
+}
+
+/// A whole number, else `None` (a string, a negative or a fraction too).
+fn whole<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_u64())
 }
 
 impl ConfigSnapshot {

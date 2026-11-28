@@ -28,6 +28,8 @@ mod cards_d_tests;
 mod change_tests;
 #[path = "drafts_ui_tests.rs"]
 mod drafts_ui_tests;
+#[path = "settings_effect_tests.rs"]
+mod effect_tests;
 #[path = "entry_tests.rs"]
 mod entry_tests;
 #[path = "gate_clock_tests.rs"]

@@ -282,16 +282,6 @@ pub fn unit(key: &str) -> &'static str {
     }
 }
 
-/// The tag under a row whose change is not immediate (the dash's `applies`).
-pub fn applies_tag(applies: &str) -> Option<&'static str> {
-    match applies {
-        "reload" => Some("AFTER RELOAD"),
-        "start" => Some("NEXT DAEMON START"),
-        "launch" => Some("NEXT LAUNCH"),
-        _ => None,
-    }
-}
-
 /// The help's first sentence (the rest shows when the row is clicked).
 pub fn first_sentence(help: &str) -> &str {
     let mut from = 0;
@@ -511,13 +501,11 @@ mod tests {
     }
 
     #[test]
-    fn units_tags_and_first_sentences() {
+    fn units_and_first_sentences() {
         assert_eq!(
             (unit("bash_timeout"), unit("max_tool_output"), unit("daemon.idle_exit_secs"), unit("api_retries")),
             ("s", "bytes", "s", "")
         );
-        assert_eq!(applies_tag("reload"), Some("AFTER RELOAD"));
-        assert_eq!(applies_tag("live"), None);
         assert_eq!(first_sentence("One. Two."), "One.");
         assert_eq!(first_sentence("US dollars (decimal, e.g. 2.50) per turn. More."), "US dollars (decimal, e.g. 2.50) per turn.");
         assert_eq!(first_sentence("No stop"), "No stop");
