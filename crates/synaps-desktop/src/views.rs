@@ -255,6 +255,22 @@ impl DashUi {
         self.found_gen = Some(generation);
     }
 
+    /// Tests: a config read (`asking`) or a find under way, as if one ran;
+    /// neither, what waited on them dropped.
+    #[cfg(test)]
+    pub fn under_way(&mut self, asking: bool, finding: bool) {
+        (self.config_asking, self.finding) = (asking, finding);
+        if !asking && !finding {
+            self.want_config = false;
+        }
+    }
+
+    /// Tests: a config read waits to run.
+    #[cfg(test)]
+    pub fn wants_config(&self) -> bool {
+        self.want_config
+    }
+
     pub fn target(&self) -> Option<Target> {
         match &self.found {
             Some(Ok((t, _))) => Some(t.clone()),
@@ -907,6 +923,7 @@ impl AppView {
         let Some(t) = self.dash.target() else { return self.dash.order.abandon() };
         let body = dash::config_body(key, value.as_deref());
         cx.spawn(async move |this, cx| {
+            let sent = value;
             let got = cx
                 .background_spawn(async move {
                     let text = dash::post_json(&t, "/api/config", &body)?;
@@ -919,7 +936,12 @@ impl AppView {
                     match got {
                         Ok(c) => {
                             v.dash_said(Ok(()), cx);
-                            v.settings.wrote.insert((v.config_owner(&c), key), c.value(key).map(String::from));
+                            // A save only if the reply holds what was sent: the
+                            // dash reads the file again for it, after its lock,
+                            // and another writer's value can be there.
+                            if c.exposes(key) && c.value(key) == sent.as_deref() {
+                                v.settings.wrote.insert(v.config_owner(&c), key, sent.as_deref());
+                            }
                             v.dash.config = Some(c);
                             if !newer {
                                 v.settings.writes.remove(key);
@@ -1111,11 +1133,26 @@ impl AppView {
         if active && std::mem::take(&mut self.dash.missed_tick) {
             self.dash_tick(cx);
         }
-        // Idle exit's comparison is the dash's to read again (one GET; a
+        // Idle exit's comparison is the dash's to read again, Settings on
+        // screen in any pane (one refresh: `/api/info`, then the config; a
         // find under way reads it as it ends).
-        if active && self.model.tabs.view() == Some(Kind::Settings) && !self.dash.finding {
-            self.ask_config(cx);
+        if active && self.settings_on_screen() {
+            if self.dash.finding {
+                self.dash.want_config = true;
+            } else {
+                self.ask_config(cx);
+            }
         }
+    }
+
+    /// Settings is a pane's visible tab, that pane on screen: any pane
+    /// split, the focused one folded. Open behind another tab, it isn't.
+    fn settings_on_screen(&self) -> bool {
+        let folded = !self.panes.shown_split();
+        self.panes.iter().filter(|p| !folded || p.id == self.panes.focused).any(|p| {
+            let tabs = if p.id == self.panes.cur.id { &self.model.tabs } else { &p.parked.tabs };
+            tabs.view() == Some(Kind::Settings)
+        })
     }
 
     // ── the gear ───────────────────────────────────────────────────────

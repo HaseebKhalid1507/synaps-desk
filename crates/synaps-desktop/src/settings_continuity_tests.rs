@@ -187,8 +187,9 @@ fn file_keys(pg: &Page) -> Vec<String> {
 /// A synaps-dash on loopback, as `dash.rs`' own fake but for every
 /// request: `POST /api/config` sets the key in its config (its file) and
 /// answers with the config, or, refusing, a 400 in its words; a `GET`
-/// answers the config or `/api/info`. It keeps what each `POST` carried.
-/// Its answer's other fields (`idleExitRunning`, `pending`) are the test's.
+/// answers the config or `/api/info`. It keeps what each `POST` carried
+/// and counts the config's reads. Its answer's other fields
+/// (`idleExitRunning`, `pending`, `writePath`) are the test's.
 pub(super) struct Dash {
     port: u16,
     state: Arc<Mutex<DashState>>,
@@ -199,6 +200,10 @@ struct DashState {
     refuse: Option<String>,
     posts: Vec<Value>,
     extra: serde_json::Map<String, Value>,
+    /// Set by something else as the next `POST` has written, before its
+    /// reply reads the file (the real dash's lock covers the write only).
+    during_post: Option<(String, Value)>,
+    reads: usize,
     stop: bool,
 }
 
@@ -207,7 +212,15 @@ impl Dash {
         let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let port = l.local_addr().expect("its address").port();
         let values = values.as_object().cloned().unwrap_or_default();
-        let state = Arc::new(Mutex::new(DashState { values, refuse: None, posts: Vec::new(), extra: serde_json::Map::new(), stop: false }));
+        let state = Arc::new(Mutex::new(DashState {
+            values,
+            refuse: None,
+            posts: Vec::new(),
+            extra: serde_json::Map::new(),
+            during_post: None,
+            reads: 0,
+            stop: false,
+        }));
         let s = state.clone();
         std::thread::spawn(move || {
             for conn in l.incoming() {
@@ -237,13 +250,24 @@ impl Dash {
         self.state.lock().unwrap().values.get(key).cloned().unwrap_or(Value::Null)
     }
 
-    fn refuse(&self, why: &str) {
+    pub(super) fn refuse(&self, why: &str) {
         self.state.lock().unwrap().refuse = Some(why.into());
     }
 
     /// Its file's `key` changed by something else (`Null`: removed).
     pub(super) fn set(&self, key: &str, value: Value) {
         self.state.lock().unwrap().values.insert(key.into(), value);
+    }
+
+    /// The next `POST` written, `key` set to `value` by something else
+    /// before its reply is read.
+    pub(super) fn during_post(&self, key: &str, value: Value) {
+        self.state.lock().unwrap().during_post = Some((key.into(), value));
+    }
+
+    /// How many times `GET /api/config` was answered.
+    pub(super) fn reads(&self) -> usize {
+        self.state.lock().unwrap().reads
     }
 
     /// Its answer's field `field` from now on.
@@ -300,12 +324,16 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<DashState>) -> Option<()> {
                 None => {
                     let key = got["key"].as_str().unwrap_or_default().to_string();
                     s.values.insert(key, got["value"].clone());
+                    if let Some((k, v)) = s.during_post.take() {
+                        s.values.insert(k, v);
+                    }
                     ("200 OK", config_json(&s))
                 }
             }
         } else if line.starts_with("GET /api/info") {
             ("200 OK", json!({"pid": 7, "profile": null}))
         } else {
+            s.reads += 1;
             ("200 OK", config_json(&s))
         }
     };

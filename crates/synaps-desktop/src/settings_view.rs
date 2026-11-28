@@ -178,13 +178,57 @@ pub(crate) struct SettingsUi {
     /// it finished): a value's afterglow starts there, never on a guess.
     app_gen: u64,
     pub(crate) app_wrote: Option<(u64, Instant)>,
-    /// The daemon values this app wrote in this run, by whose config
-    /// ([`AppView::config_owner`]) and key: what the file held after the
-    /// dash's 200. A row says it was saved while the file still holds it.
-    pub(crate) wrote: HashMap<(u64, &'static str), Option<String>>,
+    /// The daemon values this app saved in this run ([`Saves`]). A row
+    /// says it was saved while the file still holds it.
+    pub(crate) wrote: Saves,
 }
 
 type AppBatch = BTreeMap<&'static str, Option<String>>;
+
+/// The daemon values this app saved in this run: a `POST` whose reply held
+/// the value it sent. By whose config ([`AppView::config_owner`]) and key,
+/// the last [`Saves::CAP`] of them, each value's digest (none of its text
+/// kept). A save that leaves only takes its row's `saved ·` with it; what
+/// the dash read of the running daemon is never this.
+#[derive(Default)]
+pub(crate) struct Saves(std::collections::VecDeque<(u64, &'static str, [u8; 32])>);
+
+impl Saves {
+    /// As PR 5's receipts (PLAN §2.2).
+    pub(crate) const CAP: usize = 256;
+
+    fn digest(value: Option<&str>) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        match value {
+            None => h.update([0]),
+            Some(v) => {
+                h.update([1]);
+                h.update(v.as_bytes());
+            }
+        }
+        h.finalize().into()
+    }
+
+    /// `value` saved as `key` in `owner`'s config: its pair's last save,
+    /// the oldest pair's going past [`Saves::CAP`].
+    pub(crate) fn insert(&mut self, owner: u64, key: &'static str, value: Option<&str>) {
+        self.0.retain(|&(o, k, _)| (o, k) != (owner, key));
+        if self.0.len() == Self::CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back((owner, key, Self::digest(value)));
+    }
+
+    /// This run's last save of `key` in `owner`'s config was `value`.
+    pub(crate) fn holds(&self, owner: u64, key: &str, value: Option<&str>) -> bool {
+        self.0.iter().find(|&&(o, k, _)| (o, k) == (owner, key)).is_some_and(|e| e.2 == Self::digest(value))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
 
 /// A batch as the settings file takes it.
 fn app_pairs(keys: &AppBatch) -> Vec<(&'static str, serde_json::Value)> {
@@ -742,7 +786,7 @@ impl AppView {
             out.push(mono(m.clone(), 12., p.err).whitespace_normal().debug_selector(|| format!("refused {key} = {m}")).into_any_element());
         }
         if let Some(c) = self.shown_config().filter(|c| c.exposes(key)) {
-            let wrote = self.settings.wrote.get(&(self.config_owner(c), key)).is_some_and(|v| v.as_deref() == c.value(key));
+            let wrote = self.settings.wrote.holds(self.config_owner(c), key, c.value(key));
             let seen = crate::settings_effect::Observed { idle_exit_running: c.idle_exit_running };
             let lines =
                 crate::settings_effect::lines(key, self.daemon_version(), c.value(key), &seen, wrote, self.settings.open_help == Some(key));

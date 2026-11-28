@@ -101,8 +101,18 @@ fn saved(event: &str) -> String {
 
 /// `POST {key, value}` from the page, its reply landed.
 fn write(cx: &mut TestAppContext, pg: &Page, key: &'static str, value: &str) {
-    pg.view.update(cx, |v, cx| v.config_write(key, Some(value.into()), cx));
+    post(cx, pg, key, Some(value));
+}
+
+/// [`write`], `None` unsetting.
+fn post(cx: &mut TestAppContext, pg: &Page, key: &'static str, value: Option<&str>) {
+    pg.view.update(cx, |v, cx| v.config_write(key, value.map(String::from), cx));
     settle(cx, pg.w, 8);
+}
+
+/// What the config shown holds for `key`.
+fn shows(cx: &mut TestAppContext, pg: &Page, key: &str) -> Option<String> {
+    pg.view.read_with(cx, |v, _| v.shown_config().and_then(|c| c.value(key)).map(String::from))
 }
 
 /// The dash's config read again, as a read lands.
@@ -390,7 +400,7 @@ fn same_boot_new_session_after_editing_context_window(cx: &mut TestAppContext) {
 /// at once.
 #[gpui_kit::test]
 fn unknown_version_says_reload_with_the_0_13_note(cx: &mut TestAppContext) {
-    for version in ["", "x", "0.13"] {
+    for version in ["", "x", "0.13", "00.13.0", "0.13.0+", "0.12.9-"] {
         let (pg, _dash) = effect_page(cx, &format!("unknown-{version}"), json!({"cache_ttl": "1h"}), version, Value::Null);
         assert!(tagged(cx, &pg, "cache_ttl", "daemon reload"), "{version:?}");
         click(cx, pg.w, "help cache_ttl");
@@ -399,4 +409,265 @@ fn unknown_version_says_reload_with_the_0_13_note(cx: &mut TestAppContext) {
         assert!(under(cx, &pg, "cache_ttl", &[&saved("the next daemon reload"), NOTE]), "{version:?}: saved");
         assert!(!warned(cx, &pg, "cache_ttl"), "{version:?}: no wait");
     }
+}
+
+/// A `POST` is this app's save only if its reply holds what it sent. The
+/// dash's lock covers its write, not the read of the file its reply is
+/// (`main.ts` `handleConfigPost`): another writer's value can land
+/// between. That value shows, never as this app's save; so for an unset
+/// sent, or found. A refusal saves nothing (Shady #112 P2-1).
+#[gpui_kit::test]
+fn a_post_is_a_save_only_if_its_reply_holds_what_it_sent(cx: &mut TestAppContext) {
+    let (pg, dash) = effect_page(cx, "race", json!({"api_retries": "1"}), "0.13.0", Value::Null);
+    let said = saved("the next new session");
+    dash.during_post("api_retries", json!("5"));
+    write(cx, &pg, "api_retries", "3");
+    assert_eq!(dash.posts().last(), Some(&json!({"key": "api_retries", "value": "3"})), "3 sent");
+    assert_eq!(shows(cx, &pg, "api_retries").as_deref(), Some("5"), "the reply's 5 shows");
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "3 sent, 5 replied: not this app's save");
+    dash.during_post("api_retries", json!("5"));
+    post(cx, &pg, "api_retries", None);
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "unset sent, 5 replied: not this app's save");
+    dash.during_post("api_retries", Value::Null);
+    write(cx, &pg, "api_retries", "3");
+    assert_eq!(shows(cx, &pg, "api_retries"), None, "the reply has it unset");
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "3 sent, unset replied: not this app's save");
+    write(cx, &pg, "api_retries", "4");
+    assert!(under(cx, &pg, "api_retries", &[&said]), "a reply holding what was sent: saved");
+    post(cx, &pg, "api_retries", None);
+    assert!(under(cx, &pg, "api_retries", &[&said]), "an unset that stuck: saved");
+    dash.during_post("api_retries", json!("6"));
+    write(cx, &pg, "api_retries", "8");
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "8 sent, 6 replied: the earlier save never becomes 6's");
+    dash.refuse("refusal_retries: not a number");
+    write(cx, &pg, "refusal_retries", "2");
+    find(cx, &pg, "refusal_retries");
+    assert!(drawn(cx, pg.w, "refused refusal_retries = refusal_retries: not a number"), "refused");
+    assert!(!under(cx, &pg, "refusal_retries", &[&said]), "a refusal saves nothing");
+}
+
+/// The record of this run's saves keeps the last 256 (whose config, key)
+/// pairs, a digest of each value, not the value (Shady #112 P2-2): 300
+/// saves of 1 KiB values to 300 files keep 256, the first 44 gone with
+/// their `saved ·`, the rest there; a save of a pair held replaces it.
+#[gpui_kit::test]
+fn the_record_of_saves_is_bounded(cx: &mut TestAppContext) {
+    let (pg, dash) = effect_page(cx, "cap", json!({}), "0.13.0", Value::Null);
+    let said = saved("the next new session");
+    let value = |i: usize| format!("{}-{i}", "m".repeat(1024));
+    let file = |i: usize| json!(format!("/home/u/{i}/.synaps-cli/config"));
+    let kept = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.settings.wrote.len());
+    for i in 0..300 {
+        dash.answer("writePath", file(i));
+        pg.view.update(cx, |v, cx| v.config_write("model", Some(value(i)), cx));
+        cx.run_until_parked();
+        assert_eq!(dash.posts().len(), i + 1, "save {i} sent");
+    }
+    assert_eq!(kept(cx), 256, "the last 256");
+    for i in [299, 299, 100] {
+        dash.answer("writePath", file(i));
+        write(cx, &pg, "model", &value(i));
+    }
+    assert_eq!(kept(cx), 256, "a pair held again: replaced");
+    let saved_in = |cx: &mut TestAppContext, i: usize| {
+        dash.answer("writePath", file(i));
+        dash.set("model", json!(value(i)));
+        reread(cx, &pg, &dash);
+        assert_eq!(shows(cx, &pg, "model"), Some(value(i)), "file {i} read");
+        under(cx, &pg, "model", &[&said])
+    };
+    for i in [0, 43] {
+        assert!(!saved_in(cx, i), "save {i}: gone, its line with it");
+    }
+    for i in [44, 100, 299] {
+        assert!(saved_in(cx, i), "save {i}: kept");
+    }
+}
+
+/// A save is the config it went to's: the dash's socket, the daemon's
+/// profile and the file. The same value in another's is no save of this
+/// app's; another pid or life of the same daemon keeps it (Shady #112
+/// P2-2).
+#[gpui_kit::test]
+fn a_save_is_its_daemons_and_files_whatever_the_pid(cx: &mut TestAppContext) {
+    let (pg, dash) = effect_page(cx, "owner", json!({"api_retries": "1"}), "0.13.0", Value::Null);
+    let said = saved("the next new session");
+    dash.answer("writePath", json!("/a/config"));
+    write(cx, &pg, "api_retries", "3");
+    assert!(under(cx, &pg, "api_retries", &[&said]), "saved");
+    dash.answer("writePath", json!("/b/config"));
+    reread(cx, &pg, &dash);
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "another file holding 3");
+    dash.answer("writePath", json!("/a/config"));
+    reread(cx, &pg, &dash);
+    assert!(under(cx, &pg, "api_retries", &[&said]), "its file again");
+    let socket = pg.view.read_with(cx, |v, _| v.dash.socket.clone());
+    changed(cx, &pg, |v| v.dash.socket = Some("/run/user/1000/other.sock".into()));
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "another daemon's socket");
+    changed(cx, &pg, |v| v.dash.socket = socket);
+    assert!(under(cx, &pg, "api_retries", &[&said]), "its socket again");
+    let serving = |pid: u32, profile: Option<&'static str>| {
+        move |v: &mut crate::app::AppView| {
+            let d = v.model.daemon.as_mut().expect("connected");
+            (d.pid, d.profile) = (pid, profile.map(String::from));
+            v.dash.serves = Some(Ok(crate::dash::Info { pid, profile: profile.map(String::from) }));
+        }
+    };
+    changed(cx, &pg, serving(7, Some("work")));
+    assert_eq!(shows(cx, &pg, "api_retries").as_deref(), Some("3"), "the work profile's config shown");
+    assert!(!under(cx, &pg, "api_retries", &[&said]), "another profile");
+    changed(cx, &pg, serving(8, None));
+    assert_eq!(shows(cx, &pg, "api_retries").as_deref(), Some("3"));
+    assert!(under(cx, &pg, "api_retries", &[&said]), "another pid of the same daemon: kept");
+    welcome(cx, &pg, "0.13.0", "b-2", 2);
+    changed(cx, &pg, serving(8, None));
+    assert!(under(cx, &pg, "api_retries", &[&said]), "another life: kept");
+}
+
+/// Settings on screen in a pane that isn't focused is read again as the
+/// window comes back to the front (Shady #112 P2-3). Folded out of sight,
+/// or open behind a session tab, it isn't. A read under way takes the
+/// activation's on; a find under way does, with no find started again.
+#[gpui_kit::test]
+fn settings_in_a_pane_not_focused_reads_again_on_activation(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "panes", json!({IDLE: "600"}), "0.13.0", json!(30));
+    find(cx, &pg, IDLE);
+    assert!(under(cx, &pg, IDLE, &[&running(30)]));
+    pg.view.update(cx, |v, _| v.app_settings.split = true);
+    {
+        use gpui_kit::AppContext as _;
+        cx.update_window(pg.w, |_, window, cx| pg.view.update(cx, |v, cx| v.split_pane(None, window, cx))).expect("the window");
+    }
+    settle(cx, pg.w, 8);
+    let left = pg.view.read_with(cx, |v, _| {
+        assert_eq!(v.panes.len(), 2, "split");
+        assert_eq!(v.model.tabs.view(), None, "the new pane, focused, on the session");
+        let left = v.panes.rest.iter().find(|p| p.parked.tabs.view() == Some(Kind::Settings)).expect("Settings, in the other pane");
+        assert!(v.panes.shown_split(), "both on screen");
+        left.id
+    });
+    // Found (a synthetic view never finds: the read its opening asked for
+    // still waits).
+    let activate = |cx: &mut TestAppContext, before: fn(&mut crate::app::AppView)| {
+        pg.view.update(cx, |v, cx| {
+            let g = v.model.daemon_gen;
+            v.dash.found_now(g);
+            v.dash.under_way(false, false);
+            v.window_activated(false, cx);
+            before(v);
+            v.window_activated(true, cx);
+        });
+        settle(cx, pg.w, 8);
+    };
+    let reads = dash.reads();
+    dash.answer("idleExitRunning", json!(600));
+    activate(cx, |_| {});
+    assert_eq!(dash.reads(), reads + 1, "read again");
+    let running = pg.view.read_with(cx, |v, _| v.shown_config().map(|c| c.idle_exit_running));
+    assert_eq!(running, Some(Some(600)), "the running value read");
+    assert!(drawn(cx, pg.w, "effect daemon.idle_exit_secs = in force"), "in force, in the pane not focused");
+    // Folded: the focused pane alone on screen.
+    activate(cx, |v| v.panes.folded = true);
+    assert_eq!(dash.reads(), reads + 1, "folded out of sight: no read");
+    // A read under way takes it on; a find under way does, none started.
+    activate(cx, |v| v.dash.under_way(true, false));
+    let (wants, finds) = pg.view.read_with(cx, |v, _| (v.dash.wants_config(), v.dash.finds));
+    assert!(wants && dash.reads() == reads + 1, "a read under way: one after it, none beside it");
+    pg.view.update(cx, |v, _| v.dash.under_way(false, false));
+    activate(cx, |v| v.dash.under_way(false, true));
+    let (wants, finds_then) = pg.view.read_with(cx, |v, _| (v.dash.wants_config(), v.dash.finds));
+    assert!(wants && finds_then == finds && dash.reads() == reads + 1, "a find under way: it reads as it ends; no find again");
+    pg.view.update(cx, |v, _| v.dash.under_way(false, false));
+    // Open behind the session tab in the other pane: not on screen.
+    pg.view.update(cx, |v, _| {
+        v.in_pane(left, |v| {
+            let i = v.model.tabs.iter().position(|t| t.kind == Kind::Session).expect("its session tab");
+            v.model.tabs.focus(i);
+        });
+    });
+    settle(cx, pg.w, 8);
+    activate(cx, |_| {});
+    assert_eq!(dash.reads(), reads + 1, "Settings open, not shown: no read");
+}
+
+/// `daemon_version` is read as semver 2.0.0, whole: anything else is
+/// unreadable (`None`), and a new-session key says `daemon reload` with the
+/// 0.13.0 note (Shady #112 P3).
+#[test]
+fn versions_are_read_as_semver_whole() {
+    use crate::settings_effect::from_0_13;
+    let valid = [
+        ("0.12.9", false),
+        ("0.13.0", true),
+        ("0.13.10", true),
+        ("1.0.0", true),
+        ("0.13.0-rc.1", false),
+        ("0.13.0-0", false),
+        ("0.13.0-x-y.0a", false),
+        ("0.13.0+build.5", true),
+        ("0.13.0+001.-", true),
+        ("0.13.0-rc.1+b", false),
+        ("0.14.0-rc.1", true),
+        ("0.12.99999999999999999", false),
+    ];
+    for (v, from) in valid {
+        assert_eq!(from_0_13(v), Some(from), "{v:?}");
+    }
+    let invalid = [
+        "",
+        "x",
+        "0.13",
+        "0.13.0.1",
+        "00.13.0",
+        "0.013.0",
+        "0.13.00",
+        "0.13.0+",
+        "0.13.0+bad!",
+        "0.13.0+one+two",
+        "0.13.0+a..b",
+        "0.13.1-",
+        "0.12.9-",
+        "0.13.0-rc..1",
+        "0.13.0-01",
+        "0.13.0-rc.1+",
+        "0.13.0-é",
+        "v0.13.0",
+        " 0.13.0",
+        "0.13.0 ",
+        "-0.13.0",
+        "+0.13.0",
+        "0.18446744073709551616.0",
+        "0.13.18446744073709551616",
+    ];
+    for v in invalid {
+        assert_eq!(from_0_13(v), None, "{v:?}");
+    }
+}
+
+/// Idle exit's evidence, whole: unset is 10; 0 is a value like any (never
+/// exits idle); a file value that isn't a whole number, or nothing read of
+/// the running one, is unobserved. No other key has any.
+#[test]
+fn idle_exit_evidence_table() {
+    use crate::settings_effect::{Evidence, Observed, evidence, lines};
+    let seen = |n: Option<u64>| Observed { idle_exit_running: n };
+    let table = [
+        (None, Some(10), Evidence::InForce),
+        (None, Some(0), Evidence::Waits { running: 0 }),
+        (Some("0"), Some(0), Evidence::InForce),
+        (Some("0"), Some(10), Evidence::Waits { running: 10 }),
+        (Some("600"), Some(30), Evidence::Waits { running: 30 }),
+        (Some("600"), None, Evidence::Unobserved),
+        (Some("-1"), Some(10), Evidence::Unobserved),
+        (Some("1.5"), Some(10), Evidence::Unobserved),
+        (Some(" 10"), Some(10), Evidence::Unobserved),
+    ];
+    for (file, running, want) in table {
+        assert_eq!(evidence(IDLE, file, &seen(running)), want, "file {file:?}, running {running:?}");
+        assert_eq!(evidence("api_retries", file, &seen(running)), Evidence::Unobserved, "api_retries: never observed");
+    }
+    let open = lines(IDLE, "0.13.0", Some("0"), &seen(Some(0)), false, true);
+    let open: Vec<&str> = open.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(open, ["in force", "The running daemon never exits idle (its --idle-exit 0).", OVERRIDES], "0, open");
 }

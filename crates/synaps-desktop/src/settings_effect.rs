@@ -82,14 +82,29 @@ const IDLE_EXIT_OPEN: &str = "A daemon a client starts on its own reads this, un
 /// A new-session key's open row when the daemon's version can't be read.
 const VERSION_NOTE: &str = "on 0.13.0 and later, new sessions use it at once";
 
-/// `version` (a `Welcome`'s `daemon_version`, semver) is 0.13.0 or later.
-/// `None`: it can't be read. A pre-release of 0.13.0 comes before it.
+/// `version` (a `Welcome`'s `daemon_version`) is 0.13.0 or later. `None`:
+/// it isn't a semver 2.0.0 version, whole. A pre-release of 0.13.0 comes
+/// before it; build metadata changes nothing.
 pub(crate) fn from_0_13(version: &str) -> Option<bool> {
-    let core = version.split('+').next().unwrap_or_default();
-    let (core, pre) = core.split_once('-').map_or((core, false), |(c, _)| (c, true));
-    let mut n = core.split('.').map(|s| s.parse::<u64>().ok());
+    let (rest, build) = version.split_once('+').map_or((version, None), |(r, b)| (r, Some(b)));
+    let (core, pre) = rest.split_once('-').map_or((rest, None), |(c, p)| (c, Some(p)));
+    let digits = |i: &str| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit());
+    // Dot-separated, none empty, `[0-9A-Za-z-]` only; a pre-release's
+    // numeric ones without a leading zero.
+    let ids = |s: &str, pre: bool| {
+        s.split('.').all(|i| {
+            !i.is_empty()
+                && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !(pre && digits(i) && i.len() > 1 && i.starts_with('0'))
+        })
+    };
+    if !pre.is_none_or(|p| ids(p, true)) || !build.is_none_or(|b| ids(b, false)) {
+        return None;
+    }
+    let num = |i: &str| if digits(i) && (i == "0" || !i.starts_with('0')) { i.parse::<u64>().ok() } else { None };
+    let mut n = core.split('.').map(num);
     let (Some(Some(a)), Some(Some(b)), Some(Some(c)), None) = (n.next(), n.next(), n.next(), n.next()) else { return None };
-    Some((a, b, c) > (0, 13, 0) || ((a, b, c) == (0, 13, 0) && !pre))
+    Some((a, b, c) > (0, 13, 0) || ((a, b, c) == (0, 13, 0) && pre.is_none()))
 }
 
 /// When a change to `key` takes effect on a daemon of `version`; `None`:
