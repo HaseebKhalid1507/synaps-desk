@@ -583,6 +583,16 @@ fn key_names() -> (&'static str, &'static str) {
     }
 }
 
+/// What decides [`AppView::view_shown`]: the focused pane's view and its
+/// views open; Settings, then Usage: open in a pane on screen (any tab),
+/// and its visible tab there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Shown {
+    pub(crate) focused: (Option<Kind>, usize),
+    open: [bool; 2],
+    visible: [bool; 2],
+}
+
 impl AppView {
     // ── opening the views ──────────────────────────────────────────────
 
@@ -656,12 +666,21 @@ impl AppView {
         h.finish()
     }
 
-    /// A view came on screen or a tab closed (after the frame that showed
-    /// it, never inside a render): what a closed view showed goes, and what
-    /// the one on screen shows is asked for again if stale. A view's goes
-    /// only when no pane on screen has it open: a split's other pane may
-    /// show it.
-    pub(crate) fn view_shown(&mut self, cx: &mut Context<Self>) {
+    /// What [`Self::view_shown`] follows, as of this frame's layout (its
+    /// fold decided): the focused pane's view and how many views it has
+    /// open, and Settings' and Usage's place on screen.
+    pub(crate) fn shown(&self) -> Shown {
+        let focused = (self.model.tabs.view(), self.model.tabs.iter().filter(|t| t.kind != Kind::Session).count());
+        let kinds = [Kind::Settings, Kind::Usage];
+        Shown { focused, open: kinds.map(|k| self.open_on_screen(k)), visible: kinds.map(|k| self.visible_on_screen(k)) }
+    }
+
+    /// A view came on screen or went, or a tab closed (after the frame that
+    /// showed it, never inside a render; `opened`: the focused pane's view
+    /// or views changed): what a closed view showed goes, and what one on
+    /// screen shows is asked for again if stale. A view's goes only when no
+    /// pane on screen has it open: a split's other pane may show it.
+    pub(crate) fn view_shown(&mut self, opened: bool, cx: &mut Context<Self>) {
         if !self.open_on_screen(Kind::Usage) {
             let u = &mut self.usage;
             (u.board, u.error, u.fetched, u.hover) = (None, None, None, None);
@@ -672,20 +691,21 @@ impl AppView {
             self.dash.config = None;
             self.dash.serves = None;
         }
-        match self.model.tabs.view() {
-            // Each opening reads the daemon's place, URL file and config again.
-            Some(Kind::Settings) => {
-                self.dash.found_gen = None;
-                self.dash.want_config = true;
-                self.dash_find(cx);
+        // Each opening reads the daemon's place, URL file and config again;
+        // shown in a pane not focused (an unfold, a pane closed), Settings
+        // reads its config if it has none.
+        if opened && self.model.tabs.view() == Some(Kind::Settings) {
+            self.dash.found_gen = None;
+            self.dash.want_config = true;
+            self.dash_find(cx);
+        } else if self.dash.config.is_none() && self.visible_on_screen(Kind::Settings) {
+            self.reread_config(cx);
+        }
+        if self.visible_on_screen(Kind::Usage) {
+            let stale = self.usage.fetched.is_none_or(|t| t.elapsed() >= POLL);
+            if stale || self.usage.board.is_none() {
+                self.usage_load(cx);
             }
-            Some(Kind::Usage) => {
-                let stale = self.usage.fetched.is_none_or(|t| t.elapsed() >= POLL);
-                if stale || self.usage.board.is_none() {
-                    self.usage_load(cx);
-                }
-            }
-            _ => {}
         }
         self.views_changed(cx);
     }
@@ -988,6 +1008,10 @@ impl AppView {
     /// A Usage load for the chips as they are now. One at a time: a newer
     /// selection waits for the one running, then loads.
     pub(crate) fn usage_load(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.usage.loads += 1;
+        }
         if self.synthetic {
             // The demo's Usage (re-gate 4): the design fixtures, where the
             // source tree is (a dev build), at the fixtures' own time.
@@ -1145,19 +1169,25 @@ impl AppView {
         // Idle exit's comparison is the dash's to read again, Settings on
         // screen in any pane (one refresh: `/api/info`, then the config; a
         // find under way reads it as it ends).
-        if active && self.settings_on_screen() {
-            if self.dash.finding {
-                self.dash.want_config = true;
-            } else {
-                self.ask_config(cx);
-            }
+        if active && self.visible_on_screen(Kind::Settings) {
+            self.reread_config(cx);
         }
     }
 
-    /// Settings is a pane's visible tab, that pane on screen. Open behind
+    /// Settings' config read again: as a find under way ends, or now (a
+    /// read under way takes it on after it).
+    fn reread_config(&mut self, cx: &mut Context<Self>) {
+        if self.dash.finding {
+            self.dash.want_config = true;
+        } else {
+            self.ask_config(cx);
+        }
+    }
+
+    /// `kind` is a pane's visible tab, that pane on screen. Open behind
     /// another tab, it isn't.
-    fn settings_on_screen(&self) -> bool {
-        self.tabs_on_screen().any(|t| t.view() == Some(Kind::Settings))
+    fn visible_on_screen(&self, kind: Kind) -> bool {
+        self.tabs_on_screen().any(|t| t.view() == Some(kind))
     }
 
     /// `kind` is open in a pane on screen: its visible tab, or behind another.

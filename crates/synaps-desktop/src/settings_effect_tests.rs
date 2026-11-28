@@ -615,6 +615,47 @@ fn focus(cx: &mut TestAppContext, pg: &Page, id: crate::pane::PaneId) {
     settle(cx, pg.w, 8);
 }
 
+/// Two panes side by side fold under this width (each 320 at least).
+const FOLDS: f32 = 640.;
+
+/// The window resized to `w` wide (900 high), and its frames run.
+fn resize(cx: &mut TestAppContext, pg: &Page, w: f32) {
+    resize_frame(cx, pg, w);
+    settle(cx, pg.w, 8);
+}
+
+/// The window resized to `w` wide (900 high): the one frame the resize
+/// draws, and what it deferred (the fold is that frame's).
+fn resize_frame(cx: &mut TestAppContext, pg: &Page, w: f32) {
+    use gpui_kit::{px, size};
+    VisualTestContext::from_window(pg.w, cx).simulate_resize(size(px(w), px(900.)));
+    assert_eq!(pg.view.read_with(cx, |v, _| v.width), w, "drawn at its new size");
+    cx.run_until_parked();
+}
+
+fn folded(cx: &mut TestAppContext, pg: &Page) -> bool {
+    pg.view.read_with(cx, |v, _| v.panes.split() && !v.panes.shown_split())
+}
+
+/// What Settings holds that goes with it: the config, what the dash
+/// serves, the reference, the writes; [`hold_settings`] gives it each.
+fn settings_held(v: &crate::app::AppView) -> [bool; 4] {
+    [v.dash.config.is_some(), v.dash.serves.is_some(), v.settings.reference.is_some(), !v.settings.writes.is_empty()]
+}
+
+fn hold_settings(v: &mut crate::app::AppView) {
+    v.dash.serves = Some(Err("held".into()));
+    v.settings.reference = Some(crate::settings::Reference { path: "held".into(), values: Ok(Default::default()) });
+    v.settings.writes.insert(IDLE, crate::settings_view::Write::Refused("held".into()));
+}
+
+/// What Usage holds that goes with it: the board, its error, when it was
+/// fetched, the hover.
+fn usage_held(v: &crate::app::AppView) -> [bool; 4] {
+    let u = &v.usage;
+    [u.board.is_some(), u.error.is_some(), u.fetched.is_some(), u.hover.is_some()]
+}
+
 /// Settings in a split keeps its config as the session's pane beside it
 /// takes the focus: it is still on screen (Shady #112 round 2: the focused
 /// pane's tabs alone decided). Open behind a tab in a pane on screen, it
@@ -649,13 +690,15 @@ fn settings_in_a_split_keeps_its_config_as_the_session_pane_takes_focus(cx: &mut
     focus(cx, &pg, left);
     focus(cx, &pg, right);
     assert_eq!(config(cx), Some(Some(600)), "open behind a tab, in a pane on screen: kept");
-    // Folded (each frame folds it again or not, by the window's size): the
-    // focused pane alone on screen, Settings out of sight.
-    pg.view.update(cx, |v, cx| {
-        v.panes.folded = true;
-        v.view_shown(cx);
-        assert!(v.dash.config.is_none(), "folded out of sight: gone");
-    });
+    // A resize folds the split: the session's pane alone on screen,
+    // Settings out of sight; all it held goes, focus and tabs untouched
+    // (Shady #113 P2-1: the focused pane's tabs alone decided when).
+    pg.view.update(cx, |v, _| hold_settings(v));
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [true; 4]);
+    resize_frame(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session's pane, focused");
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [false; 4], "folded out of sight, its first frame: all Settings held goes");
 }
 
 /// Usage in a split keeps its board as the session's pane beside it takes
@@ -668,16 +711,157 @@ fn usage_in_a_split_keeps_its_board_as_the_session_pane_takes_focus(cx: &mut Tes
     settle(cx, pg.w, 8);
     let board = |cx: &mut TestAppContext| pg.view.read_with(cx, |v, _| v.usage.board.clone());
     let first = board(cx).expect("the demo's board, read as Usage opened");
+    // Fetched now (a synthetic load never says when): fresh.
+    pg.view.update(cx, |v, _| v.usage.fetched = Some(std::time::Instant::now()));
+    let loads = pg.view.read_with(cx, |v, _| v.usage.loads);
     let (left, right) = split_beside(cx, &pg, Kind::Usage);
     assert!(board(cx).is_some_and(|b| std::sync::Arc::ptr_eq(&b, &first)), "split: the session's pane focused, Usage keeps its board");
     focus(cx, &pg, left);
     focus(cx, &pg, right);
     assert_eq!(pg.view.read_with(cx, |v, _| v.model.tabs.view()), None, "the session's pane focused again");
-    assert!(board(cx).is_some(), "focused away again: kept");
+    assert!(board(cx).is_some_and(|b| std::sync::Arc::ptr_eq(&b, &first)), "focused away again: kept");
+    assert_eq!(pg.view.read_with(cx, |v, _| v.usage.loads), loads, "fresh: never loaded again");
+    // A resize folds the split: all Usage held goes.
+    pg.view.update(cx, |v, _| {
+        v.usage.error = Some("held".into());
+        v.usage.hover = Some((crate::usage_view::Chart::Spend, 0));
+    });
+    assert_eq!(pg.view.read_with(cx, |v, _| usage_held(v)), [true; 4]);
+    resize_frame(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session's pane, focused");
+    assert_eq!(pg.view.read_with(cx, |v, _| usage_held(v)), [false; 4], "folded out of sight, its first frame: all Usage held goes");
+}
+
+/// Settings let go as a fold put it out of sight, then shown again as the
+/// window widens, its pane not focused: its config is read, once, and
+/// drawn; no focus, no activation (Shady #113 P2-2).
+#[gpui_kit::test]
+fn settings_shown_again_by_an_unfold_reads_its_config(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, dash) = effect_page(cx, "unfold", json!({IDLE: "600"}), "0.13.0", json!(600));
+    find(cx, &pg, IDLE);
+    let in_force = "effect daemon.idle_exit_secs = in force";
+    let (left, right) = split_beside(cx, &pg, Kind::Settings);
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
+    assert!(pg.view.read_with(cx, |v, _| v.dash.config.is_none()), "folded, the session's pane focused: Settings' config gone");
+    // Found (a synthetic view never finds).
+    pg.view.update(cx, |v, _| {
+        let g = v.model.daemon_gen;
+        v.dash.found_now(g);
+        v.dash.under_way(false, false);
+    });
+    let (reads, finds) = (dash.reads(), pg.view.read_with(cx, |v, _| v.dash.finds));
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session's pane, still focused");
+    assert_eq!(dash.reads(), reads + 1, "shown again: read, once");
+    assert_eq!(pg.view.read_with(cx, |v, _| v.dash.finds), finds, "found: no find");
+    let running = pg.view.read_with(cx, |v, _| v.shown_config().map(|c| c.idle_exit_running));
+    assert_eq!(running, Some(Some(600)), "its config again");
+    assert!(drawn(cx, pg.w, in_force), "drawn, in the pane not focused");
+    // Focused away and back: shown all along, nothing read.
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
+    assert_eq!(dash.reads(), reads + 1, "kept: not read again");
+}
+
+/// Usage let go as a fold put it out of sight, then shown again as the
+/// window widens, its pane not focused: its board is loaded, once, and
+/// drawn (Shady #113 P2-2).
+#[gpui_kit::test]
+fn usage_shown_again_by_an_unfold_loads_its_board(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let pg = super::settings_continuity_tests::window(cx, "usage-unfold", (1440., 900.));
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    pg.view.update(cx, |v, _| v.usage.fetched = Some(std::time::Instant::now()));
+    let (left, right) = split_beside(cx, &pg, Kind::Usage);
+    resize(cx, &pg, FOLDS);
+    assert!(folded(cx, &pg), "folded");
+    focus(cx, &pg, left);
+    focus(cx, &pg, right);
+    assert!(pg.view.read_with(cx, |v, _| v.usage.board.is_none()), "folded, the session's pane focused: the board gone");
+    assert!(!drawn(cx, pg.w, "usage-board"));
+    let loads = pg.view.read_with(cx, |v, _| v.usage.loads);
+    resize(cx, &pg, 1440.);
+    assert!(!folded(cx, &pg), "unfolded");
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (right, None), "the session's pane, still focused");
+    assert_eq!(pg.view.read_with(cx, |v, _| v.usage.loads), loads + 1, "shown again: loaded, once");
+    assert!(pg.view.read_with(cx, |v, _| v.usage.board.is_some()), "its board again");
+    assert!(drawn(cx, pg.w, "usage-board"), "drawn, in the pane not focused");
+    // Its pane's session tab in front, then Usage again, stale by then, its
+    // pane still not focused: loaded, once.
+    let front = |cx: &mut TestAppContext, kind: Kind| {
+        pg.view.update(cx, |v, cx| {
+            v.in_pane(left, |v| {
+                let i = v.model.tabs.iter().position(|t| t.kind == kind).expect("the tab");
+                v.model.tabs.focus(i);
+            });
+            cx.notify();
+        });
+        settle(cx, pg.w, 8);
+    };
+    pg.view.update(cx, |v, _| v.usage.fetched = Some(std::time::Instant::now()));
+    front(cx, Kind::Session);
+    let loads = pg.view.read_with(cx, |v, _| v.usage.loads);
+    pg.view.update(cx, |v, _| v.usage.fetched = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)));
+    front(cx, Kind::Usage);
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.usage.loads)), (right, loads + 1), "in front again, stale: loaded, once");
+}
+
+/// The focused pane closes, the one left focused with the same visible
+/// view and as many views open (a session tab in front, one view behind
+/// it): the closed pane's view goes, all it held; the other's stays
+/// (Shady #113 P2-1).
+#[gpui_kit::test]
+fn closing_a_pane_lets_go_of_its_view_whatever_the_focused_tabs(cx: &mut TestAppContext) {
+    use crate::tabs::Kind;
+    let (pg, _dash) = effect_page(cx, "close", json!({IDLE: "600"}), "0.13.0", json!(600));
+    let (a, b) = split_beside(cx, &pg, Kind::Settings);
+    let front = |v: &mut crate::app::AppView| {
+        let i = v.model.tabs.iter().position(|t| t.kind == Kind::Session).expect("its session tab");
+        v.model.tabs.focus(i);
+    };
+    // B: Usage behind its session tab; A: Settings behind its own.
+    pg.view.update(cx, |v, cx| v.open_view(Kind::Usage, cx));
+    settle(cx, pg.w, 8);
+    assert_eq!(pg.view.read_with(cx, |v, _| (v.panes.focused, v.model.tabs.view())), (b, Some(Kind::Usage)), "Usage, in B");
     pg.view.update(cx, |v, cx| {
-        v.panes.folded = true;
-        v.view_shown(cx);
-        assert!(v.usage.board.is_none(), "folded out of sight: gone");
+        v.usage.fetched = Some(std::time::Instant::now());
+        front(v);
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    let board = pg.view.read_with(cx, |v, _| v.usage.board.clone()).expect("Usage's board");
+    pg.view.update(cx, |v, cx| {
+        v.in_pane(a, front);
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    focus(cx, &pg, a);
+    // What the trigger watched alone (af9a9e8): the focused pane's view and
+    // its views open.
+    let sig = |v: &crate::app::AppView| (v.model.tabs.view(), v.model.tabs.iter().filter(|t| t.kind != Kind::Session).count());
+    let before = pg.view.read_with(cx, |v, _| sig(v));
+    assert_eq!(before, (None, 1), "A: a session tab in front, one view behind");
+    pg.view.update(cx, |v, _| hold_settings(v));
+    assert_eq!(pg.view.read_with(cx, |v, _| settings_held(v)), [true; 4]);
+    // Close pane (the palette's): A's tabs, then A.
+    pg.view.update(cx, |v, cx| {
+        v.close_pane_tabs();
+        cx.notify();
+    });
+    settle(cx, pg.w, 8);
+    pg.view.read_with(cx, |v, _| {
+        assert_eq!((v.panes.len(), v.panes.focused), (1, b), "B alone, focused");
+        assert_eq!(sig(v), before, "B: as A was");
+        assert!(!v.model.tabs.iter().any(|t| t.kind == Kind::Settings), "Settings closed with A");
+        assert_eq!(settings_held(v), [false; 4], "all Settings held goes");
+        assert!(v.usage.board.as_ref().is_some_and(|b| std::sync::Arc::ptr_eq(b, &board)), "Usage, open in B: its board kept");
     });
 }
 

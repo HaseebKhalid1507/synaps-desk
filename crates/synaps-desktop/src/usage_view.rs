@@ -55,6 +55,9 @@ pub(crate) struct UsageUi {
     pub scroll: ScrollHandle,
     /// A selection made while a load ran: loaded after it.
     pub queued: bool,
+    /// Tests: the loads asked for.
+    #[cfg(test)]
+    pub loads: usize,
     /// The board last drawn, what it shows (its range and host), and when
     /// its charts' reveal began (motion.md §6.8).
     revealed: std::cell::Cell<Option<(usize, u64, Option<Instant>)>>,
@@ -77,6 +80,8 @@ impl UsageUi {
             hover: None,
             scroll: ScrollHandle::new(),
             queued: false,
+            #[cfg(test)]
+            loads: 0,
             revealed: Default::default(),
             spots: Default::default(),
             paths: Default::default(),
@@ -253,13 +258,14 @@ impl AppView {
                 sans(if self.usage.loading { "Reading the telemetry store…" } else { NONE }, 14., 22., p.dim).pt(px(32.)).into_any_element()
             }
         };
+        let column = div().w(px(w)).flex_none().pb(px(64.)).when(self.usage.board.is_some(), |d| d.debug_selector(|| "usage-board".into()));
         let scroll = div()
             .id("usage-scroll")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.usage.scroll)
-            .child(h_flex().w_full().pl(px(left)).child(div().w(px(w)).flex_none().pb(px(64.)).child(body)));
+            .child(h_flex().w_full().pl(px(left)).child(column.child(body)));
         let bar = crate::scrollbar::Bar::new(self.usage.scroll.clone(), &self.bars.usage);
         v_flex().size_full().bg(p.canvas).child(header).child(scroll).child(bar).into_any_element()
     }
