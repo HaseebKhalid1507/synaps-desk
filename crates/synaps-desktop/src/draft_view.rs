@@ -49,12 +49,36 @@
 //!   Tab, and Esc leave the field to the block's keys, each only on a new,
 //!   bare press that met no composition (an entered card's [`FieldKey`]
 //!   rule).
+//! - **A field holds what the draft holds** (§1.8). A one-line field (a
+//!   label, a title) takes no text past its cap, typed, pasted or marked
+//!   by an IME: its characters (B1's) and the draft's bytes; the block
+//!   says why (`at most 100 characters`, or the draft's cap). The text
+//!   area (a note's text) and every field after the draft took a change
+//!   hold the draft's value, cut or refused as the draft took it, in the
+//!   same event, the caret kept. A field's copy is one: a pane has one
+//!   field, and one draft is edited in one field on the desk (opening it
+//!   in another pane closes the first, its text the draft's). The kit's
+//!   undo history is cleared once the changes it may hold pass
+//!   [`FIELD_HISTORY_MAX`] (each counted at its text before and after),
+//!   the text and caret kept. A field holds at most its draft's value, so
+//!   at most [`crate::drafts::DRAFT_MAX_BYTES`], and its history twice
+//!   that, plus one change.
 //! - **Stale and orphaned.** A draft whose incarnation ended draws in its
 //!   row with the header's `the agent rewrote this block (r1)` or `this
 //!   block is gone`, and one with no row here (gone from the transcript,
-//!   or compacted: `compacted · this draft has no block`) in the drafts
-//!   dock over the composer. Either offers Copy to composer (line 1's
-//!   words) and Discard, by click, `c` and `Esc` twice.
+//!   or compacted: `compacted · this draft has no block`, or doubled by a
+//!   follow) in the drafts dock over the composer. Either offers Copy to
+//!   composer (line 1's words) and Discard, by click, `c` and `Esc` twice.
+//! - **Held in place** (§3.4). The board the desk draws keeps each block a
+//!   draft is drawn in where it was taken ([`crate::drafts::hold_places`],
+//!   [`AppView::drafts_in_place`]): the agent's `move` waits, and so does
+//!   its `collapse` (a draft draws whole). Let go, the next board draws it
+//!   where the agent put it, once.
+//! - **A session that follows to a new id** takes its drafts with it, and
+//!   every pane's editing of them ([`AppView::drafts_follow`]).
+//! - **The footer's height** is the pre-check's: when what it says changes
+//!   (the bound board arrived, or another one), the row is measured again
+//!   in every pane.
 //!
 //! [`FieldKey`]: crate::ask_keys::FieldKey
 
@@ -90,6 +114,15 @@ pub(crate) const KEEPS_WORKING: &str = "the agent keeps working";
 /// Not a kind the user edits.
 pub(crate) const NOT_EDITABLE: &str = "this block isn't editable";
 
+/// The changes a field's undo history may hold (bytes: each at its text
+/// before and after) before it is cleared ([`Field::history`]).
+pub(crate) const FIELD_HISTORY_MAX: usize = 2 * crate::drafts::DRAFT_MAX_BYTES;
+
+/// A field's text past its characters' cap.
+pub(crate) fn at_most(n: usize) -> String {
+    format!("at most {n} characters")
+}
+
 /// An editable part of a block: the action a click on it takes (an item
 /// by its id's hash, as painted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,11 +149,31 @@ pub(crate) enum FieldOf {
     Text,
 }
 
+impl FieldOf {
+    /// Its text's cap in characters (B1's).
+    pub(crate) fn chars(&self) -> usize {
+        match self {
+            FieldOf::Label(_) => cards_spec::block::STEP_LABEL_MAX,
+            FieldOf::Title => cards_spec::block::TITLE_MAX,
+            FieldOf::Text => cards_spec::block::NOTE_TEXT_MAX,
+        }
+    }
+}
+
 /// An open draft field: the kit's input, one line or a text area.
 pub(crate) struct Field {
     pub of: FieldOf,
     pub line: Option<Entity<InputState>>,
     pub long: Option<Entity<TextareaState>>,
+    /// The bytes its text may have: the draft's value's and the draft's
+    /// room ([`AppView::field_room`]), what a one-line field takes.
+    pub room: Rc<Cell<usize>>,
+    /// What the one-line field refused, as it came (1: past its
+    /// characters, 2: past the draft's room), said at the next frame.
+    pub refused: Rc<Cell<u8>>,
+    /// What the kit's undo history may hold since it was last cleared
+    /// (bytes, [`FIELD_HISTORY_MAX`]).
+    pub history: usize,
     _sub: Subscription,
 }
 
@@ -128,7 +181,8 @@ pub(crate) struct Field {
 pub(crate) struct Editing {
     pub session: String,
     pub id: Ref,
-    pub tag: Tag,
+    /// Its draft's key ([`Draft::key`]).
+    pub key: u64,
     pub row: u64,
     /// The step or hunk under the cursor, by id.
     pub cursor: Option<ItemId>,
@@ -152,6 +206,10 @@ pub(crate) struct EditMode {
     /// its Esc, and the platform may commit one before an Enter's
     /// `PressEnter`). Taken at its key-down (Esc) or its `PressEnter`.
     pub key: Option<(&'static str, bool)>,
+    /// Its session followed to a new id with its field open
+    /// ([`AppView::drafts_follow`]): the field closes at the pane's next
+    /// frame, the draft keys kept.
+    pub followed: bool,
 }
 
 impl EditMode {
@@ -196,6 +254,16 @@ fn items(b: &cards_spec::board::Block) -> Vec<ItemId> {
     }
 }
 
+/// What field `of` edits, in block `b` (a draft's view).
+fn field_value(b: &cards_spec::board::Block, of: &FieldOf) -> Option<String> {
+    match (of, &b.body) {
+        (FieldOf::Label(i), Body::Plan(p)) => p.steps.iter().find(|s| &s.id == i).map(|s| s.label.clone()),
+        (FieldOf::Title, _) => Some(b.title.clone().unwrap_or_default()),
+        (FieldOf::Text, Body::Note(n)) => Some(n.text.clone()),
+        _ => None,
+    }
+}
+
 /// The read-only words for the gate's reason (§3.1, design §3.2): whose
 /// the session's input is in an exclusive session, and how to take it.
 fn read_only(gate: &str, l: &crate::live::Live) -> String {
@@ -218,13 +286,12 @@ impl AppView {
     /// The draft the pane edits.
     pub(crate) fn editing_draft(&self) -> Option<&Draft> {
         let e = self.panes.cur.edit.at.as_ref()?;
-        self.block_drafts.get(&e.session, &e.id, e.tag)
+        self.block_drafts.by_key(e.key).map(|(_, d)| d)
     }
 
     fn editing_draft_mut(&mut self) -> Option<&mut Draft> {
-        let e = self.panes.cur.edit.at.as_ref()?;
-        let (s, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
-        self.block_drafts.get_mut(&s, &id, tag)
+        let k = self.panes.cur.edit.at.as_ref()?.key;
+        self.block_drafts.by_key_mut(k)
     }
 
     /// The block's note in the pane acted on, until the next input.
@@ -269,9 +336,9 @@ impl AppView {
             .block_drafts
             .in_row(&session, &s.block.id)
             .filter(|d| d.ended.is_some() && (d.tag == tag || now == Some(tag)))
-            .map(|d| (d.id.clone(), d.tag));
-        let (id, tag, first, rev) = match stale {
-            Some((id, dtag)) => (id, dtag, None, None),
+            .map(|d| (d.id.clone(), d.key));
+        let (id, key, first, rev) = match stale {
+            Some((id, key)) => (id, key, None, None),
             None => {
                 let Some(bound) = s.bound.clone().filter(|b| b.tag == tag) else {
                     self.edit_says(row, crate::lease::CHANGED, cx);
@@ -287,8 +354,16 @@ impl AppView {
                     return false;
                 }
                 let Some(generation) = board.generation else { return false };
+                // Where it is drawn now: where it stays while held (§3.4).
+                let shown = self.model.lives[self.panes.cur.live].transcript.drawn().cloned();
+                let place = shown.as_deref().and_then(|d| crate::drafts::Place::of(d, &bound.id));
                 match self.block_drafts.take(&session, &bound, generation) {
-                    Ok(d) => (d.id.clone(), tag, items(&d.view()).into_iter().next(), Some(bound.rev)),
+                    Ok(d) => {
+                        if d.place.is_none() {
+                            d.place = place;
+                        }
+                        (d.id.clone(), d.key, items(&d.view()).into_iter().next(), Some(bound.rev))
+                    }
                     Err(why) => {
                         self.edit_says(row, why, cx);
                         return false;
@@ -302,11 +377,11 @@ impl AppView {
         if self.panes.cur.ask.entry.is_some() {
             self.leave_ask(false, window, cx);
         }
-        let again = self.panes.cur.edit.at.as_ref().is_some_and(|e| e.id == id && e.tag == tag);
+        let again = self.panes.cur.edit.at.as_ref().is_some_and(|e| e.key == key);
         if !again {
             self.edit_close_field(false, window, cx);
             self.panes.cur.edit.at =
-                Some(Editing { session: session.clone(), id, tag, row, cursor: first, field: None, esc: false, shown: Rc::default() });
+                Some(Editing { session: session.clone(), id, key, row, cursor: first, field: None, esc: false, shown: Rc::default() });
             log::info!(
                 target: "synaps_desktop::drafts",
                 "draft {row}: taken at r{rev:?}; the desk holds {} drafts, {} bytes",
@@ -345,19 +420,31 @@ impl AppView {
     /// The draft the pane edits discarded (§3.2), the keys to the composer.
     fn edit_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(e) = self.panes.cur.edit.at.as_ref() {
-            let (s, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
-            self.block_drafts.discard(&s, &id, tag);
+            let (key, id) = (e.key, e.id.clone());
+            self.block_drafts.discard_key(key);
             log::info!(target: "synaps_desktop::drafts", "draft of {id}: discarded");
         }
         self.edit_leave(true, window, cx);
         self.sync_drafts(cx);
     }
 
-    /// Copy to composer (§3.2): line 1's words of draft `(session, id,
-    /// tag)` into the pane's composer, after what it holds, and the draft
+    /// Discard the draft of key `key` (a button's, the dock's), and every
+    /// pane's editing of it.
+    pub(crate) fn draft_discard(&mut self, key: u64, cx: &mut Context<Self>) {
+        let row = self.block_drafts.by_key(key).map(|(_, d)| crate::blocks::row_id(&d.id));
+        self.block_drafts.discard_key(key);
+        if let Some(row) = row {
+            self.remeasure_draft(row);
+        }
+        self.sync_drafts(cx);
+        cx.notify();
+    }
+
+    /// Copy to composer (§3.2): line 1's words of the draft of key `key`
+    /// into the pane's composer, after what it holds, and the draft
     /// discarded: its words are the user's now, to send as typed text.
-    pub(crate) fn draft_copy(&mut self, session: &str, id: &Ref, tag: Tag, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(words) = self.block_drafts.get(session, id, tag).map(Draft::words) else { return };
+    pub(crate) fn draft_copy(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((words, id)) = self.block_drafts.by_key(key).map(|(_, d)| (d.words(), d.id.clone())) else { return };
         let c = self.panes.cur.composer.clone();
         c.update(cx, |s, cx| {
             let had = s.value().to_string();
@@ -365,9 +452,9 @@ impl AppView {
             s.set_value(text, window, cx);
             s.focus(window, cx);
         });
-        self.block_drafts.discard(session, id, tag);
-        self.remeasure_draft(crate::blocks::row_id(id));
-        if self.panes.cur.edit.at.as_ref().is_some_and(|e| e.session == session && &e.id == id && e.tag == tag) {
+        self.block_drafts.discard_key(key);
+        self.remeasure_draft(crate::blocks::row_id(&id));
+        if self.panes.cur.edit.at.as_ref().is_some_and(|e| e.key == key) {
             self.edit_close_field(false, window, cx);
             self.panes.cur.edit.at = None;
         }
@@ -379,8 +466,7 @@ impl AppView {
     /// Part `part` of the draft the pane edits, as a key or a click does it.
     fn edit_part(&mut self, part: Part, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
-        let row = e.row;
-        let (session, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
+        let (row, key) = (e.row, e.key);
         let Some(d) = self.editing_draft() else { return };
         if d.sent.is_some() && d.ended.is_none() {
             self.edit_says(row, crate::handback::SENDING, cx);
@@ -447,11 +533,11 @@ impl AppView {
             }
             Part::HandBack => Ok(()),
             Part::Copy => {
-                self.draft_copy(&session, &id, tag, window, cx);
+                self.draft_copy(key, window, cx);
                 return;
             }
             Part::Discard => {
-                self.block_drafts.discard(&session, &id, tag);
+                self.block_drafts.discard_key(key);
                 self.edit_leave(true, window, cx);
                 self.sync_drafts(cx);
                 return;
@@ -545,9 +631,8 @@ impl AppView {
             ("enter", _) if ended => self.edit_says(row, d_ended_words(&self.editing_draft()), cx),
             ("enter", _) => self.edit_part(Part::HandBack, window, cx),
             ("c", _) if ended => {
-                if let Some(e) = self.panes.cur.edit.at.as_ref() {
-                    let (s, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
-                    self.draft_copy(&s, &id, tag, window, cx);
+                if let Some(key) = self.panes.cur.edit.at.as_ref().map(|e| e.key) {
+                    self.draft_copy(key, window, cx);
                 }
             }
             (_, _) if ended => self.edit_says(row, d_ended_words(&self.editing_draft()), cx),
@@ -618,20 +703,23 @@ impl AppView {
     /// with the keys (module docs).
     fn edit_open_field(&mut self, of: FieldOf, window: &mut Window, cx: &mut Context<Self>) {
         self.edit_close_field(false, window, cx);
-        let Some(d) = self.editing_draft() else { return };
-        let view = d.view();
-        let value = match &of {
-            FieldOf::Label(i) => match &view.body {
-                Body::Plan(p) => p.steps.iter().find(|s| &s.id == i).map(|s| s.label.clone()).unwrap_or_default(),
-                _ => return,
-            },
-            FieldOf::Title => view.title.clone().unwrap_or_default(),
-            FieldOf::Text => match &view.body {
-                Body::Note(n) => n.text.clone(),
-                _ => return,
-            },
-        };
+        let Some(key) = self.panes.cur.edit.at.as_ref().map(|e| e.key) else { return };
+        // One field a draft on the desk: another pane's on it closes, what
+        // it holds the draft's (module docs).
         let pane = self.panes.cur.id;
+        let others: Vec<crate::pane::PaneId> = self
+            .panes
+            .iter()
+            .filter(|p| p.id != pane && p.edit.at.as_ref().is_some_and(|e| e.key == key && e.field.is_some()))
+            .map(|p| p.id)
+            .collect();
+        for o in others {
+            self.in_pane(o, |this| this.edit_close_field(false, window, cx));
+        }
+        let Some(d) = self.editing_draft() else { return };
+        let Some(value) = field_value(&d.view(), &of) else { return };
+        let room = Rc::new(Cell::new(self.field_room(&value)));
+        let refused = Rc::new(Cell::new(0u8));
         let field = if of == FieldOf::Text {
             let e = cx.new(|cx| {
                 let mut s = TextareaState::new(window, cx).auto_grow(2, 6);
@@ -645,10 +733,27 @@ impl AppView {
                 }
             });
             e.update(cx, |s, cx| s.focus(window, cx));
-            Field { of, line: None, long: Some(e), _sub: sub }
+            Field { of, line: None, long: Some(e), room, refused, history: 0, _sub: sub }
         } else {
+            // No text past its cap is taken, typed, pasted or marked: the
+            // kit refuses it, and the block says why at the next frame.
+            let (n, r, why, view) = (of.chars(), room.clone(), refused.clone(), cx.entity_id());
             let e = cx.new(|cx| {
-                let mut s = InputState::new(window, cx);
+                let mut s = InputState::new(window, cx).validate(move |text, cx: &mut App| {
+                    let w = if text.chars().count() > n {
+                        1
+                    } else if text.len() > r.get() {
+                        2
+                    } else {
+                        0
+                    };
+                    if w != 0 {
+                        why.set(w);
+                        // Said at the view's next frame.
+                        cx.notify(view);
+                    }
+                    w == 0
+                });
                 s.set_value(value, window, cx);
                 s
             });
@@ -663,7 +768,7 @@ impl AppView {
                 _ => {}
             });
             e.update(cx, |s, cx| s.focus(window, cx));
-            Field { of, line: Some(e), long: None, _sub: sub }
+            Field { of, line: Some(e), long: None, room, refused, history: 0, _sub: sub }
         };
         if let Some(ed) = self.panes.cur.edit.at.as_mut() {
             ed.field = Some(field);
@@ -671,33 +776,75 @@ impl AppView {
         cx.notify();
     }
 
-    /// The open field's text `v`, as typed: the draft's. Past the draft's
-    /// cap, the field goes back to what the draft holds.
+    /// The bytes a field whose text is `value` may hold: those, and the
+    /// draft's room.
+    fn field_room(&self, value: &str) -> usize {
+        let own = self.editing_draft().map_or(0, Draft::own_bytes);
+        value.len() + crate::drafts::DRAFT_MAX_BYTES.saturating_sub(own)
+    }
+
+    /// The open field's text `v`, as typed: the draft's, as the draft took
+    /// it. The field holds what the draft holds: cut or refused there, the
+    /// field that was edited gets the draft's value back, in this event,
+    /// the caret kept, and the block says why (module docs). Its undo
+    /// history is cleared once it may hold [`FIELD_HISTORY_MAX`].
     fn edit_typed(&mut self, v: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
         let Some(of) = e.field.as_ref().map(|f| f.of.clone()) else { return };
         let row = e.row;
+        let held = |this: &Self| this.editing_draft().and_then(|d| field_value(&d.view(), &of)).unwrap_or_default();
+        let before = held(self);
         let done = match (&of, self.editing_draft_mut()) {
             (FieldOf::Label(i), Some(d)) => d.rename(i, v),
             (FieldOf::Title, Some(d)) => d.note(true, v),
             (FieldOf::Text, Some(d)) => d.note(false, v),
             (_, None) => return,
         };
-        if let Err(why) = done {
-            let back = self.editing_draft().map(Draft::view).map(|b| match (&of, &b.body) {
-                (FieldOf::Label(i), Body::Plan(p)) => p.steps.iter().find(|s| &s.id == i).map(|s| s.label.clone()).unwrap_or_default(),
-                (FieldOf::Title, _) => b.title.clone().unwrap_or_default(),
-                (FieldOf::Text, Body::Note(n)) => n.text.clone(),
-                _ => String::new(),
-            });
-            if let (Some(back), (Some(l), _)) = (back, self.panes.cur.edit.inputs()) {
-                let l = l.clone();
-                l.update(cx, |s, cx| s.set_value(back, window, cx));
+        let now = held(self);
+        let room = self.field_room(&now);
+        let says = match done {
+            Err(why) => Some(why.to_string()),
+            Ok(()) if now != v => Some(at_most(of.chars())),
+            Ok(()) => None,
+        };
+        let set = match self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) {
+            Some(f) => {
+                f.room.set(room);
+                f.history += before.len() + v.len();
+                now != v || f.history > FIELD_HISTORY_MAX
             }
+            None => false,
+        };
+        if set {
+            self.field_set(&now, window, cx);
+        }
+        if let Some(why) = says {
             self.edit_says(row, why, cx);
         }
         self.remeasure_draft(row);
         cx.notify();
+    }
+
+    /// The open field's text set to `value`, the caret where it was (at
+    /// most at the end), its undo history cleared (the kit's `set_value`).
+    fn field_set(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.as_mut()) else { return };
+        f.history = 0;
+        let (line, long) = (f.line.clone(), f.long.clone());
+        if let Some(l) = line {
+            l.update(cx, |s, cx| {
+                let at = s.cursor().min(value.len());
+                s.set_value(value.to_string(), window, cx);
+                s.set_selected_range(at..at, cx);
+            });
+        }
+        if let Some(a) = long {
+            a.update(cx, |s, cx| {
+                let at = s.cursor().min(value.len());
+                s.set_value(value.to_string(), window, cx);
+                s.set_selected_range(at..at, cx);
+            });
+        }
     }
 
     /// The open field closes; `refocus`: the block's keys have the focus
@@ -707,7 +854,6 @@ impl AppView {
         self.edit_committed(window, cx);
         let Some(f) = self.panes.cur.edit.at.as_mut().and_then(|e| e.field.take()) else { return };
         if let FieldOf::Label(i) = &f.of
-            && i.is_user()
             && let Some(d) = self.editing_draft_mut()
             && let crate::drafts::Intents::Plan(p) = &d.intents
             && p.added.iter().any(|(x, l)| x == i && l.trim().is_empty())
@@ -834,15 +980,30 @@ impl AppView {
             }
         }
         self.sync_outcomes(cx);
+        // Followed to a new id: the rows are drawn again from the new
+        // attachment's history, the open field's too, and a frame without
+        // it loses its focus to the window. So the field closes, its text
+        // the draft's, and the draft keys stay (`r` opens it again).
+        if std::mem::take(&mut self.panes.cur.edit.followed) {
+            let (a, l) = self.panes.cur.edit.inputs();
+            let in_field = a.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window))
+                || l.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window));
+            self.edit_close_field(in_field, window, cx);
+        }
         let Some(e) = self.panes.cur.edit.at.as_ref() else {
             if self.panes.cur.edit.holds(window) {
                 self.edit_leave(true, window, cx);
             }
             return;
         };
+        // What the open one-line field refused, said (module docs).
+        if let Some((why, n, row)) = e.field.as_ref().map(|f| (f.refused.replace(0), f.of.chars(), e.row)).filter(|w| w.0 != 0) {
+            self.edit_says(row, if why == 1 { at_most(n) } else { crate::drafts::DRAFT_FULL.to_string() }, cx);
+        }
+        let Some(e) = self.panes.cur.edit.at.as_ref() else { return };
         let here = self.edit_session().as_deref() == Some(e.session.as_str()) && self.model.tabs.view().is_none();
         // An orphan has no row to draw in: its keys are the dock's buttons.
-        let have = self.block_drafts.get(&e.session, &e.id, e.tag).is_some_and(|d| d.ended != Some(Fate::Orphan));
+        let have = self.block_drafts.by_key(e.key).is_some_and(|(s, d)| s == e.session && Fate::in_row(d.ended));
         let (a, l) = self.panes.cur.edit.inputs();
         let in_field = a.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window))
             || l.is_some_and(|x| x.read(cx).focus_handle(cx).is_focused(window));
@@ -858,8 +1019,14 @@ impl AppView {
 
     /// The pane's session's drafts judged on its bound board (module docs
     /// of [`crate::drafts`]), and each store's jobs keeping the bound board
-    /// while its session holds a draft (a job asked for when that changes).
+    /// while its session holds a draft (a job asked for when that changes,
+    /// or where its held blocks are kept). A session followed to a new id
+    /// takes its drafts first. A draft whose footer would say another thing
+    /// now is measured again, in every pane.
     pub(crate) fn sync_drafts(&mut self, cx: &mut Context<Self>) {
+        for (from, to) in self.model.tabs.take_followed() {
+            self.drafts_follow(&from, &to, cx);
+        }
         self.settle_sent_drafts();
         for live in self.model.lives.ids() {
             let l = &self.model.lives[live];
@@ -871,24 +1038,126 @@ impl AppView {
                 None if !l.transcript.has_blocks() => self.block_drafts.gone(&session),
                 _ => false,
             };
+            // A held block whose row its history no longer has (a
+            // reattach): its place is where the board draws it now.
+            if let Some(d) = l.transcript.drawn() {
+                let items = l.shown().items();
+                for (id, p) in self.block_drafts.places(&session) {
+                    if let crate::drafts::Place::Row { item, .. } = p
+                        && !items.iter().any(|i| i.id == item)
+                    {
+                        self.block_drafts.re_place(&session, &id, crate::drafts::Place::of(d, &id));
+                    }
+                }
+            }
             // And for a restore asked for (§3.6): its pre-check is the
             // same ([`AppView::restore`]).
             // A hand-back waiting for its notices' marks: its pre-check runs
             // again at the wire, on the bound board then.
             let restoring = self.restore_wanted.as_ref().is_some_and(|w| self.panes.iter().any(|p| p.id == w.pane && p.live == live));
             let want = self.block_drafts.holds(&session) || restoring || self.edit_waits.values().any(|w| w.lid() == live);
+            let places = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                self.block_drafts.places(&session).hash(&mut h);
+                h.finish()
+            };
             let l = &mut self.model.lives[live];
-            if l.transcript.blocks_keeps_bound() != want {
+            if l.transcript.blocks_keeps_bound() != want || l.board.places != places {
+                // Another job: the bound board kept or let go; a block let
+                // go drawn where the agent put it.
                 l.transcript.blocks_keep_bound(want);
+                l.board.places = places;
                 l.board.again();
             }
-            if moved {
-                let rows: Vec<u64> = self.block_drafts.of(&session).map(|d| crate::blocks::row_id(&d.id)).collect();
+            let mut rows: Vec<u64> =
+                if moved { self.block_drafts.of(&session).map(|d| crate::blocks::row_id(&d.id)).collect() } else { Vec::new() };
+            rows.extend(self.draft_feet(live, &session));
+            if !rows.is_empty() {
                 for row in rows {
                     self.remeasure_draft(row);
                 }
                 cx.notify();
             }
+        }
+    }
+
+    /// Session `session`'s held drafts whose footer says another thing on
+    /// store `live`'s bound board now than when last judged (the pre-check
+    /// arrived, or changed: its lines are its height), by row. Judged once
+    /// a board ([`crate::board::Work::landed`]) and a change.
+    fn draft_feet(&mut self, live: crate::live::LiveId, session: &str) -> Vec<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let l = &self.model.lives[live];
+        let st = l.board.waiting.clone().or_else(|| l.transcript.drawn().cloned()).and_then(|d| d.board.clone());
+        let landed = l.board.landed;
+        let mut rows = Vec::new();
+        for d in self.block_drafts.of_mut(session) {
+            let memo = (landed, d.serial);
+            if d.foot.is_some_and(|f| f.0 == memo) {
+                continue;
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            match (d.ended, st.as_deref()) {
+                (Some(f), _) => f.says().hash(&mut h),
+                (None, None) => "checking".hash(&mut h),
+                (None, Some(st)) => {
+                    let c = d.check(st);
+                    (c.footer(), c.off, c.message.is_some(), d.agent_changes(st)).hash(&mut h);
+                }
+            }
+            let look = h.finish();
+            if d.foot.is_some_and(|f| f.1 != look) {
+                rows.push(crate::blocks::row_id(&d.id));
+            }
+            d.foot = Some((memo, look));
+        }
+        rows
+    }
+
+    /// Session `from` followed to a new id `to` (the same conversation): its
+    /// drafts are `to`'s ([`crate::drafts::Drafts::follow`]), and so is
+    /// every pane's editing of them, its open field and text kept.
+    pub(crate) fn drafts_follow(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let gone = self.block_drafts.follow(from, to);
+        for p in self.panes.iter_mut() {
+            if let Some(e) = p.edit.at.as_mut().filter(|e| e.session == from && !gone.contains(&e.key)) {
+                e.session = to.to_string();
+                p.edit.followed |= e.field.is_some();
+            }
+        }
+        let rows: Vec<u64> = self.block_drafts.of(to).map(|d| crate::blocks::row_id(&d.id)).collect();
+        for row in rows {
+            self.remeasure_draft(row);
+        }
+        cx.notify();
+    }
+
+    /// Board `d` for store `live` as this desk draws it: the blocks its
+    /// session's drafts are drawn in, where they were taken (§3.4,
+    /// [`crate::drafts::hold_places`]).
+    pub(crate) fn drafts_in_place(
+        &self,
+        live: crate::live::LiveId,
+        d: std::sync::Arc<synaps_client::blocks::Drawn>,
+    ) -> std::sync::Arc<synaps_client::blocks::Drawn> {
+        let l = &self.model.lives[live];
+        let Some(session) = l.active.as_ref().map(|a| a.session_id.as_str()) else { return d };
+        // A row its history no longer has (a reattach numbers its rows
+        // anew): drawn where the agent put it, and taken as its place
+        // ([`AppView::sync_drafts`]).
+        let items = l.shown().items();
+        let mut holds = self.block_drafts.places(session);
+        holds.retain(|(_, p)| match p {
+            crate::drafts::Place::Row { item, .. } => items.iter().any(|i| i.id == *item),
+            crate::drafts::Place::Rail { .. } => true,
+        });
+        if holds.is_empty() {
+            return d;
+        }
+        match crate::drafts::hold_places(&d, &holds) {
+            Some(x) => std::sync::Arc::new(x),
+            None => d,
         }
     }
 
@@ -940,7 +1209,9 @@ impl AppView {
         let pane = self.panes.cur.id;
         let view = d.view();
         let tag = d.tag;
-        let editing = self.panes.cur.edit.at.as_ref().filter(|e| e.row == id && e.tag == tag);
+        let editing = self.panes.cur.edit.at.as_ref().filter(|e| e.row == id && e.key == d.key);
+        // The steps this draft added (a bound `u-` step is `B`'s).
+        let added = |i: &ItemId| matches!(&d.intents, crate::drafts::Intents::Plan(p) if p.adds(i));
         let cursor = editing.and_then(|e| e.cursor.clone());
         let field = editing.and_then(|e| e.field.as_ref());
         let board = self.bound_board();
@@ -1027,7 +1298,7 @@ impl AppView {
                         .h_full()
                         .when(s.stop, |d| d.child(div().w(px(3.)).h_full().bg(p.warn)))
                         .debug_selector(move || format!("draft-stop-gutter {id} {h}"));
-                    let gutter = if ran(s.state) || s.id.is_user() {
+                    let gutter = if ran(s.state) || added(&s.id) {
                         gutter.into_any_element()
                     } else {
                         clicks(gutter, Part::Stop(h)).into_any_element()
@@ -1081,15 +1352,11 @@ impl AppView {
                             .when(at, |d| d.bg(p.well_d))
                             .debug_selector(move || format!("draft-step {id} {sid} {state}{stop}{} {label_t}", if at { " at" } else { "" }))
                             .child(gutter)
-                            .child(if s.id.is_user() {
-                                glyph.into_any_element()
-                            } else {
-                                clicks(glyph, Part::Strike(h)).into_any_element()
-                            })
+                            .child(if added(&s.id) { glyph.into_any_element() } else { clicks(glyph, Part::Strike(h)).into_any_element() })
                             .child(label)
                             .child(div().flex_1().min_w(px(8.)))
                             .when(s.stop, |d| d.child(div().flex_none().text_px(m.meta).text_color(p.warn).child("stop")))
-                            .when(s.id.is_user(), |d| d.child(div().flex_none().text_px(m.meta).text_color(p.dim_t).child("added")))
+                            .when(added(&s.id), |d| d.child(div().flex_none().text_px(m.meta).text_color(p.dim_t).child("added")))
                             .child(div().flex_none().text_px(m.meta).text_color(p.dim_t).child(s.state.as_str())),
                     );
                 }
@@ -1334,23 +1601,19 @@ impl AppView {
             self.edit_says(row, crate::lease::CHANGED, cx);
             return;
         };
-        let held = self.block_drafts.in_row(&session, &s.block.id).filter(|d| d.tag == down.at.tag).map(|d| (d.id.clone(), d.tag));
+        let held = self.block_drafts.in_row(&session, &s.block.id).filter(|d| d.tag == down.at.tag).map(|d| (d.key, d.tag));
         match held {
-            Some((id, tag)) => {
+            Some((key, tag)) => {
                 // Its keys come here: the block's.
-                let editing = self.panes.cur.edit.at.as_ref().is_some_and(|e| e.id == id && e.tag == tag);
+                let editing = self.panes.cur.edit.at.as_ref().is_some_and(|e| e.key == key);
                 if !editing && !matches!(part, Part::Copy | Part::Discard) {
                     self.take_block(row, tag, part, window, cx);
                     return;
                 }
                 if !editing {
                     match part {
-                        Part::Copy => self.draft_copy(&session, &id, tag, window, cx),
-                        _ => {
-                            self.block_drafts.discard(&session, &id, tag);
-                            self.remeasure_draft(row);
-                            self.sync_drafts(cx);
-                        }
+                        Part::Copy => self.draft_copy(key, window, cx),
+                        _ => self.draft_discard(key, cx),
                     }
                     return;
                 }
@@ -1394,7 +1657,7 @@ impl AppView {
         let rowless: Vec<&Draft> = self
             .block_drafts
             .of(&session)
-            .filter(|d| self.block_drawn(crate::blocks::row_id(&d.id)).is_none() || d.ended == Some(Fate::Orphan))
+            .filter(|d| self.block_drawn(crate::blocks::row_id(&d.id)).is_none() || !Fate::in_row(d.ended))
             .collect();
         let ended = self.ended_hand_backs();
         if rowless.is_empty() && ended.is_empty() {
@@ -1411,17 +1674,15 @@ impl AppView {
             .border_color(p.frame)
             .debug_selector(|| "drafts-dock".into());
         for d in rowless {
-            let (id, tag, s) = (d.id.clone(), d.tag, session.clone());
+            let dk = d.key;
             let why = d.ended.and_then(Fate::says).unwrap_or_else(|| "held · its block isn't drawn here".into());
             let title = d.base_block.title.clone().unwrap_or_else(|| d.id.to_string());
             let t = format!("{title} · {why}");
             let tt = t.clone();
-            let key = crate::blocks::row_id(&d.id) ^ crate::blocks::hash_of(&tag.to_string());
             let act = |label: &'static str, copy: bool| {
-                let (id, s) = (id.clone(), s.clone());
                 let of = title.clone();
                 div()
-                    .id((label, key))
+                    .id((label, dk))
                     .flex_none()
                     .px(px(8.))
                     .cursor_pointer()
@@ -1434,11 +1695,9 @@ impl AppView {
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.in_pane(pane, |this| {
                             if copy {
-                                this.draft_copy(&s, &id, tag, window, cx);
+                                this.draft_copy(dk, window, cx);
                             } else {
-                                this.block_drafts.discard(&s, &id, tag);
-                                this.sync_drafts(cx);
-                                cx.notify();
+                                this.draft_discard(dk, cx);
                             }
                         });
                     }))

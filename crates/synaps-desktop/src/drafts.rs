@@ -34,11 +34,23 @@
 //!   line 1's words in the composer ([`Draft::words`]), or Discard.
 //! - **Bounded** (§1.8): [`DRAFTS_MAX`] per session, holds and orphans
 //!   together, across compactions: a 9th take is refused, and no draft is
-//!   ever dropped for space. A draft's own bytes (its intents and field
-//!   text) are at most [`DRAFT_MAX_BYTES`]; a change past that is refused.
-//!   The base block it draws over is charged at B2's ceiling for a block
-//!   ([`cards_spec::board::BLOCK_MAX_OWNED`]). Across sessions, at most
-//!   [`DESK_DRAFTS_MAX`].
+//!   ever dropped for space. A draft's own bytes (its intents) are at most
+//!   [`DRAFT_MAX_BYTES`], at every change that can grow them (a label, an
+//!   added step, a strike, a stop, a note's text or title, a hunk's keep
+//!   or drop) and at the take: a change past that is refused and leaves
+//!   the draft as it was. The base block it draws over is charged at B2's
+//!   ceiling for a block ([`cards_spec::board::BLOCK_MAX_OWNED`]). Across
+//!   sessions, at most [`DESK_DRAFTS_MAX`]. An open field's own copy of
+//!   the text it edits is the view's ([`crate::draft_view`]).
+//! - **Held in place** (§3.4): an agent's `move` or `collapse` of a held
+//!   block waits in drawing until the hold ends. A draft keeps where its
+//!   block was drawn when taken ([`Place`]), and the board the desk draws
+//!   puts it back there ([`hold_places`]); let go, the next board draws it
+//!   where the agent put it.
+//! - **A draft follows its session** to a new id, the same conversation
+//!   ([`Drafts::follow`]): none is dropped; one of the same incarnation as
+//!   a draft already there is kept as [`Fate::Doubled`], in the dock, for
+//!   Copy to composer or Discard.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -81,6 +93,17 @@ pub(crate) const NOTHING_LEFT: &str = "nothing left to hand back";
 /// An orphan's header (§5.2).
 pub(crate) const ORPHAN: &str = "compacted · this draft has no block";
 
+/// A draft that followed its session onto another draft of its block.
+pub(crate) const DOUBLED: &str = "another draft of this block is held · copy or discard this one";
+
+/// `s` cut at `n` characters (a character's boundary), kept at its length
+/// (what [`Draft::own_bytes`] counts is what it holds).
+pub(crate) fn cut(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    out.shrink_to_fit();
+    out
+}
+
 /// The kinds a user edits (§3.2): status, metric and file aren't.
 pub(crate) fn editable(kind: Kind) -> bool {
     matches!(kind, Kind::Plan | Kind::Note | Kind::Diff)
@@ -98,6 +121,10 @@ pub(crate) enum Fate {
     Gone,
     /// Another conversation generation (a compaction): an orphan (§5.2).
     Orphan,
+    /// Its session followed to a new id that held a draft of the same
+    /// incarnation already, with changes too ([`Drafts::follow`]): this
+    /// one is in the dock, for Copy to composer or Discard.
+    Doubled,
 }
 
 impl Fate {
@@ -108,7 +135,14 @@ impl Fate {
             Fate::Rewritten(r) => Some(format!("the agent rewrote this block (r{r})")),
             Fate::Gone => Some("this block is gone".into()),
             Fate::Orphan => Some(ORPHAN.into()),
+            Fate::Doubled => Some(DOUBLED.into()),
         }
+    }
+
+    /// Whether a draft of this fate draws in its block's row (else in the
+    /// dock): held, or stale there.
+    pub(crate) fn in_row(f: Option<Self>) -> bool {
+        !matches!(f, Some(Fate::Orphan | Fate::Doubled))
     }
 }
 
@@ -123,8 +157,17 @@ pub(crate) struct PlanIntents {
     pub stop: BTreeMap<ItemId, bool>,
     /// Its label, unlike `B`.
     pub label: BTreeMap<ItemId, String>,
-    /// The steps the user added (`u-` ids), with their labels.
+    /// The steps the user added in this draft (minted `u-` ids), with
+    /// their labels. Only these are additions: a bound `u-` step, an
+    /// earlier edit's, is one of `B`'s like any other.
     pub added: Vec<(ItemId, String)>,
+}
+
+impl PlanIntents {
+    /// Whether step `id` is one this draft added.
+    pub(crate) fn adds(&self, id: &ItemId) -> bool {
+        self.added.iter().any(|(i, _)| i == id)
+    }
 }
 
 /// The user's intents (§3.2's editors).
@@ -220,6 +263,14 @@ pub(crate) struct Draft {
     /// Another hand-back of its incarnation landed since `B` (§5.4): kept
     /// once seen, until the history rolls back below it.
     pub other: bool,
+    /// Its key on this desk, unique ([`Drafts::take`]): a draft doubled by a
+    /// follow has its block's id and tag, never its key.
+    pub key: u64,
+    /// Where its block was drawn when it was taken (§3.4).
+    pub place: Option<Place>,
+    /// Its footer as last drawn: the board and serial it was judged on, and
+    /// what it said ([`crate::draft_view`]: a change remeasures its row).
+    pub foot: Option<((u64, u64), u64)>,
 }
 
 impl Draft {
@@ -246,6 +297,9 @@ impl Draft {
             shown_at: None,
             checked: 0,
             other: false,
+            key: 0,
+            place: None,
+            foot: None,
         })
     }
 
@@ -275,11 +329,12 @@ impl Draft {
         }
     }
 
-    /// Whether the user moved one of `B`'s steps (an added step placed
-    /// anywhere but last is an order too: [`Draft::placed`]).
+    /// Whether the user moved one of `B`'s steps, a bound `u-` one included
+    /// (an added step placed anywhere but last is an order too:
+    /// [`Draft::placed`]).
     fn reordered(&self) -> bool {
         let Intents::Plan(p) = &self.intents else { return false };
-        p.order.iter().filter(|i| !i.is_user()).ne(self.base_steps().iter().map(|s| &s.id))
+        p.order.iter().filter(|i| !p.adds(i)).ne(self.base_steps().iter().map(|s| &s.id))
     }
 
     /// Whether line 2 carries an order: the drawn order isn't `B`'s with
@@ -343,6 +398,7 @@ impl Draft {
     /// ran). An added step struck is taken out of the draft.
     pub(crate) fn strike(&mut self, id: &ItemId) -> Result<(), &'static str> {
         let base = self.base_step(id).map(|s| s.state);
+        let before = self.intents.clone();
         let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
         match base {
             None if p.added.iter().any(|(i, _)| i == id) => {
@@ -361,14 +417,14 @@ impl Draft {
             }
             Some(_) => return Err(RAN),
         }
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// Toggle a stop before step `id` (§3.2): only a `todo` or `skipped`
     /// step of `B` takes one; an added step never does.
     pub(crate) fn stop(&mut self, id: &ItemId) -> Result<(), &'static str> {
         let Some(base) = self.base_step(id).map(|s| (s.state, s.stop)) else { return Err("an added step takes no stop") };
+        let before = self.intents.clone();
         let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
         if !matches!(base.0, StepState::Todo | StepState::Skipped) {
             return Err(RAN);
@@ -379,8 +435,7 @@ impl Draft {
         } else {
             p.stop.insert(id.clone(), now);
         }
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// Move step `id` one place up (`-1`) or down (`1`): text and order
@@ -397,7 +452,7 @@ impl Draft {
     /// Step `id`'s label as the user typed it (cut at B1's cap): a label
     /// back to `B`'s is no intent. `Err`: the draft would pass its cap.
     pub(crate) fn rename(&mut self, id: &ItemId, label: &str) -> Result<(), &'static str> {
-        let label: String = label.chars().take(cards_spec::block::STEP_LABEL_MAX).collect();
+        let label = cut(label, cards_spec::block::STEP_LABEL_MAX);
         let was = self.base_step(id).map(|s| s.label.clone());
         let before = self.intents.clone();
         let Intents::Plan(p) = &mut self.intents else { return Err("not a plan") };
@@ -424,7 +479,7 @@ impl Draft {
         }
         let at = after.and_then(|a| p.order.iter().position(|x| x == a)).map_or(0, |i| i + 1);
         p.order.insert(at, id.clone());
-        p.added.push((id, label.chars().take(cards_spec::block::STEP_LABEL_MAX).collect()));
+        p.added.push((id, cut(label, cards_spec::block::STEP_LABEL_MAX)));
         self.within(before)
     }
 
@@ -434,10 +489,10 @@ impl Draft {
         let before = self.intents.clone();
         let Intents::Note { text, title: t } = &mut self.intents else { return Err("not a note") };
         if title {
-            let s: String = s.chars().take(cards_spec::block::TITLE_MAX).collect();
+            let s = cut(s, cards_spec::block::TITLE_MAX);
             *t = (s != bt).then_some(s);
         } else {
-            let s: String = s.chars().take(cards_spec::block::NOTE_TEXT_MAX).collect();
+            let s = cut(s, cards_spec::block::NOTE_TEXT_MAX);
             *text = (s != bx).then_some(s);
         }
         self.within(before)
@@ -459,6 +514,7 @@ impl Draft {
             return Err(NOT_PROPOSAL);
         }
         let Some(base) = d.hunks.iter().find(|h| &h.id == id).map(|h| h.state) else { return Err("not a hunk") };
+        let before = self.intents.clone();
         let Intents::Diff(h) = &mut self.intents else { return Err("not a diff") };
         let want = if keep { HunkState::Kept } else { HunkState::Dropped };
         let now = h.get(id).copied().unwrap_or(base);
@@ -467,12 +523,12 @@ impl Draft {
         } else {
             h.insert(id.clone(), want);
         }
-        self.serial += 1;
-        Ok(())
+        self.within(before)
     }
 
     /// The change just made stands if the draft is within its cap; else it
-    /// is taken back (`before`).
+    /// is taken back (`before`), its serial as it was: every editor that
+    /// can grow the draft comes through here.
     fn within(&mut self, before: Intents) -> Result<(), &'static str> {
         if self.own_bytes() > DRAFT_MAX_BYTES {
             self.intents = before;
@@ -484,7 +540,7 @@ impl Draft {
 
     /// Its own bytes (§1.8's model: inline sizes, strings and vectors by
     /// capacity, a map entry at twice its key and value plus a node's
-    /// share): its intents and field text, not the base block.
+    /// share): its intents, not the base block.
     pub(crate) fn own_bytes(&self) -> usize {
         fn id(i: &ItemId) -> usize {
             i.as_str().len()
@@ -553,11 +609,12 @@ impl Draft {
                     }
                 }
                 if self.placed() && keep(&Key::Order(path("steps"))) {
-                    // An added step left out isn't named.
+                    // A step this draft added, left out, isn't named; every
+                    // step of `B` is, a bound `u-` one too.
                     let named: Vec<&str> = p
                         .order
                         .iter()
-                        .filter(|i| !i.is_user() || keep(&Key::Item(path(&format!("steps.{}", i.as_str())))))
+                        .filter(|i| !p.adds(i) || keep(&Key::Item(path(&format!("steps.{}", i.as_str())))))
                         .map(ItemId::as_str)
                         .collect();
                     order = Some(json!({"steps": named}));
@@ -604,7 +661,7 @@ impl Draft {
         match &self.intents {
             Intents::Plan(p) => {
                 if self.reordered() && keep(&Key::Order(path("steps"))) {
-                    out.push(format!("order {}", list(p.order.iter().filter(|i| !i.is_user()).collect())));
+                    out.push(format!("order {}", list(p.order.iter().filter(|i| !p.adds(i)).collect())));
                 }
                 let pick = |m: &BTreeMap<ItemId, bool>, on: bool, field: &str| -> Vec<&ItemId> {
                     p.order.iter().filter(|i| m.get(*i) == Some(&on) && set(format!("steps.{}.{field}", i.as_str()))).collect()
@@ -627,7 +684,7 @@ impl Draft {
                 for (i, l) in &p.added {
                     if keep(&Key::Item(path(&format!("steps.{}", i.as_str())))) {
                         let at = p.order.iter().position(|x| x == i).unwrap_or(0);
-                        let after = p.order[..at].iter().rev().find(|x| !x.is_user()).or(at.checked_sub(1).map(|k| &p.order[k]));
+                        let after = p.order[..at].iter().rev().find(|x| !p.adds(x)).or(at.checked_sub(1).map(|k| &p.order[k]));
                         out.push(match after {
                             Some(a) => format!("add “{l}” after {}", a.as_str()),
                             None => format!("add “{l}” first"),
@@ -738,7 +795,10 @@ impl Draft {
 
     /// What became of its block on `d` (module docs): a draft that ended
     /// stays ended. Judged on the bound board, the board itself when `d`
-    /// keeps it (never a pending op); else the block's bound copy.
+    /// keeps it (never a pending op); else the block's bound copy, where
+    /// `d` draws it. Without the board, a block `d` doesn't draw says
+    /// nothing: the live overlay hides one a pending `remove` or `move`
+    /// names, and the bound board can't say yet (held, until it does).
     pub(crate) fn fate(&self, d: &Drawn) -> Fate {
         if let Some(f) = self.ended {
             return f;
@@ -752,7 +812,7 @@ impl Draft {
                 None => return Fate::Gone,
             },
             None => {
-                let Some((s, _)) = crate::lease::find_any(d, crate::blocks::row_id(&self.id)) else { return Fate::Gone };
+                let Some((s, _)) = crate::lease::find_any(d, crate::blocks::row_id(&self.id)) else { return Fate::Held };
                 match s.bound.as_ref() {
                     Some(b) => (b.tag, b.rev),
                     // Pending only: the bound board can't say yet.
@@ -863,10 +923,141 @@ impl Draft {
     }
 }
 
+/// Where a held block is drawn, as it was when taken (§3.4: the agent's
+/// `move` and `collapse` of it wait in drawing until the hold ends): its
+/// list (a transcript row's blocks, or a rail slot's sections), its place
+/// in it, and the block before it there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Place {
+    /// The `at`th block anchored at transcript row `item`.
+    Row { item: u64, at: usize, after: Option<Ref> },
+    /// The `at`th section of rail slot `slot` (its creating call's row
+    /// `row`: a section the user put into the transcript draws there).
+    Rail { slot: usize, at: usize, row: Option<u64>, after: Option<Ref> },
+}
+
+impl Place {
+    /// Where top-level block `id` is on board `d`.
+    pub(crate) fn of(d: &Drawn, id: &Ref) -> Option<Place> {
+        for (item, rb) in &d.rows {
+            if let Some(at) = rb.blocks.iter().position(|s| &s.block.id == id) {
+                let after = at.checked_sub(1).map(|k| rb.blocks[k].block.id.clone());
+                return Some(Place::Row { item: *item, at, after });
+            }
+        }
+        for (slot, list) in d.rail.iter().enumerate() {
+            if let Some(at) = list.iter().position(|s| &s.block.id == id) {
+                let row = d.rail_rows[slot].get(at).copied().flatten();
+                let after = at.checked_sub(1).map(|k| list[k].block.id.clone());
+                return Some(Place::Rail { slot, at, row, after });
+            }
+        }
+        None
+    }
+}
+
+/// Board `d` with each of `holds`' blocks (`(id, place)`) put back where it
+/// was when its draft was taken (§3.4), a group's member taken out of its
+/// group, none drawn twice; `None`: each is in its place, or gone (its
+/// draft is in the dock). What the board says of each block is the
+/// board's: only where it draws changes.
+pub(crate) fn hold_places(d: &Drawn, holds: &[(Ref, Place)]) -> Option<Drawn> {
+    let mut out: Option<Drawn> = None;
+    for (id, place) in holds {
+        let cur = out.as_ref().unwrap_or(d);
+        let now = Place::of(cur, id);
+        let after_there = |x: &Drawn, after: &Option<Ref>| match (place, after) {
+            (_, None) => false,
+            (Place::Row { item, .. }, Some(a)) => x.rows.get(item).is_some_and(|r| r.blocks.iter().any(|s| &s.block.id == a)),
+            (Place::Rail { slot, .. }, Some(a)) => x.rail[*slot].iter().any(|s| &s.block.id == a),
+        };
+        let after = match place {
+            Place::Row { after, .. } | Place::Rail { after, .. } => after,
+        };
+        let in_place = match (place, now.as_ref()) {
+            (Place::Row { item, .. }, Some(Place::Row { item: i, after: a, .. })) => item == i && (a == after || !after_there(cur, after)),
+            (Place::Rail { slot, .. }, Some(Place::Rail { slot: s, after: a, .. })) => {
+                slot == s && (a == after || !after_there(cur, after))
+            }
+            _ => false,
+        };
+        // In its place, or gone (its draft is in the dock): as it is.
+        if in_place || (now.is_none() && !member(cur, id)) {
+            continue;
+        }
+        let x = out.get_or_insert_with(|| d.clone());
+        let Some(s) = take_out(x, id) else { continue };
+        let there = after_there(x, after);
+        match place {
+            Place::Row { item, at, after } => {
+                let rb = std::sync::Arc::make_mut(x.rows.entry(*item).or_default());
+                let k = match after.as_ref().filter(|_| there) {
+                    Some(a) => rb.blocks.iter().position(|s| &s.block.id == a).map_or(0, |k| k + 1),
+                    None if after.is_none() => 0,
+                    None => (*at).min(rb.blocks.len()),
+                };
+                rb.blocks.insert(k, s);
+            }
+            Place::Rail { slot, at, row, after } => {
+                let list = &mut x.rail[*slot];
+                let k = match after.as_ref().filter(|_| there) {
+                    Some(a) => list.iter().position(|s| &s.block.id == a).map_or(0, |k| k + 1),
+                    None if after.is_none() => 0,
+                    None => (*at).min(list.len()),
+                };
+                list.insert(k, s);
+                let rows = &mut x.rail_rows[*slot];
+                rows.insert(k.min(rows.len()), *row);
+            }
+        }
+    }
+    out
+}
+
+/// Whether block `id` is a group's member on board `d`.
+fn member(d: &Drawn, id: &Ref) -> bool {
+    d.rows.values().flat_map(|r| r.blocks.iter()).chain(d.rail.iter().flatten()).any(|g| g.members.iter().any(|m| &m.block.id == id))
+}
+
+/// Block `id` taken out of board `d`, wherever it draws: a transcript
+/// row's, a rail slot's (its creating call's row with it), or a group's
+/// member.
+fn take_out(d: &mut Drawn, id: &Ref) -> Option<synaps_client::blocks::Shown> {
+    let row_of = |rb: &synaps_client::blocks::RowBlocks| {
+        rb.blocks.iter().position(|s| &s.block.id == id || s.members.iter().any(|m| &m.block.id == id))
+    };
+    if let Some(item) = d.rows.iter().find_map(|(item, rb)| row_of(rb).map(|_| *item)) {
+        let rb = std::sync::Arc::make_mut(d.rows.get_mut(&item)?);
+        let j = row_of(rb)?;
+        if &rb.blocks[j].block.id == id {
+            return Some(rb.blocks.remove(j));
+        }
+        let g = &mut rb.blocks[j];
+        let m = g.members.iter().position(|m| &m.block.id == id)?;
+        return Some(g.members.remove(m));
+    }
+    for slot in 0..d.rail.len() {
+        if let Some(j) = d.rail[slot].iter().position(|s| &s.block.id == id) {
+            if j < d.rail_rows[slot].len() {
+                d.rail_rows[slot].remove(j);
+            }
+            return Some(d.rail[slot].remove(j));
+        }
+        for g in &mut d.rail[slot] {
+            if let Some(m) = g.members.iter().position(|m| &m.block.id == id) {
+                return Some(g.members.remove(m));
+            }
+        }
+    }
+    None
+}
+
 /// The desk's drafts (module docs): each session's, oldest first.
 #[derive(Debug, Default)]
 pub(crate) struct Drafts {
     all: Vec<(String, Draft)>,
+    /// The last key given ([`Draft::key`]).
+    keys: u64,
 }
 
 impl Drafts {
@@ -884,19 +1075,57 @@ impl Drafts {
         self.all.len()
     }
 
-    /// Session `session`'s draft of block `id`'s incarnation `tag`.
+    /// Session `session`'s draft of block `id`'s incarnation `tag` (not
+    /// one doubled by a follow: that one's key names it). Tests'.
+    #[cfg(test)]
     pub(crate) fn get(&self, session: &str, id: &Ref, tag: Tag) -> Option<&Draft> {
-        self.all.iter().find(|(s, d)| s == session && &d.id == id && d.tag == tag).map(|(_, d)| d)
+        self.all.iter().find(|(s, d)| s == session && &d.id == id && d.tag == tag && d.ended != Some(Fate::Doubled)).map(|(_, d)| d)
     }
 
-    pub(crate) fn get_mut(&mut self, session: &str, id: &Ref, tag: Tag) -> Option<&mut Draft> {
-        self.all.iter_mut().find(|(s, d)| s == session && &d.id == id && d.tag == tag).map(|(_, d)| d)
+    fn get_mut(&mut self, session: &str, id: &Ref, tag: Tag) -> Option<&mut Draft> {
+        self.all.iter_mut().find(|(s, d)| s == session && &d.id == id && d.tag == tag && d.ended != Some(Fate::Doubled)).map(|(_, d)| d)
+    }
+
+    /// The draft of key `key` ([`Draft::key`]), and its session.
+    pub(crate) fn by_key(&self, key: u64) -> Option<(&str, &Draft)> {
+        self.all.iter().find(|(_, d)| d.key == key).map(|(s, d)| (s.as_str(), d))
+    }
+
+    pub(crate) fn by_key_mut(&mut self, key: u64) -> Option<&mut Draft> {
+        self.all.iter_mut().find(|(_, d)| d.key == key).map(|(_, d)| d)
+    }
+
+    /// Session `session`'s drafts, to change their view state.
+    pub(crate) fn of_mut<'a>(&'a mut self, session: &'a str) -> impl Iterator<Item = &'a mut Draft> + 'a {
+        self.all.iter_mut().filter(move |(s, _)| s == session).map(|(_, d)| d)
     }
 
     /// Session `session`'s draft drawn in block `id`'s row: its latest
-    /// that hasn't been orphaned (a stale one stays in its row).
+    /// that draws in a row ([`Fate::in_row`]: a stale one stays in its row).
     pub(crate) fn in_row(&self, session: &str, id: &Ref) -> Option<&Draft> {
-        self.all.iter().rev().find(|(s, d)| s == session && &d.id == id && d.ended != Some(Fate::Orphan)).map(|(_, d)| d)
+        self.all.iter().rev().find(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)).map(|(_, d)| d)
+    }
+
+    /// Where session `session`'s drafts drawn in a row keep their blocks
+    /// ([`hold_places`]), one a block.
+    pub(crate) fn places(&self, session: &str) -> Vec<(Ref, Place)> {
+        let mut out: Vec<(Ref, Place)> = Vec::new();
+        for (_, d) in self.all.iter().rev().filter(|(s, d)| s == session && Fate::in_row(d.ended)) {
+            if let Some(p) = d.place.as_ref()
+                && !out.iter().any(|(id, _)| id == &d.id)
+            {
+                out.push((d.id.clone(), p.clone()));
+            }
+        }
+        out
+    }
+
+    /// Session `session`'s drafts of block `id` drawn in a row keep it at
+    /// `place` now (`None`: where the agent puts it).
+    pub(crate) fn re_place(&mut self, session: &str, id: &Ref, place: Option<Place>) {
+        for (_, d) in self.all.iter_mut().filter(|(s, d)| s == session && &d.id == id && Fate::in_row(d.ended)) {
+            d.place.clone_from(&place);
+        }
     }
 
     /// Take `b` (bound at its revision), of generation `generation`, for
@@ -915,15 +1144,30 @@ impl Drafts {
         if self.all.len() >= DESK_DRAFTS_MAX {
             return Err(DESK_FULL);
         }
-        let d = Draft::of(b.clone(), generation).ok_or("this block isn't editable")?;
+        let mut d = Draft::of(b.clone(), generation).ok_or("this block isn't editable")?;
+        if d.own_bytes() > DRAFT_MAX_BYTES {
+            return Err(DRAFT_FULL);
+        }
+        self.keys += 1;
+        d.key = self.keys;
         self.all.push((session.to_string(), d));
         Ok(&mut self.all.last_mut().expect("pushed").1)
     }
 
-    /// Discard session `session`'s draft of `id`'s incarnation `tag`.
+    /// Discard session `session`'s draft of `id`'s incarnation `tag` (not
+    /// one doubled by a follow). Tests'.
+    #[cfg(test)]
     pub(crate) fn discard(&mut self, session: &str, id: &Ref, tag: Tag) -> bool {
+        match self.get(session, id, tag).map(|d| d.key) {
+            Some(k) => self.discard_key(k),
+            None => false,
+        }
+    }
+
+    /// Discard the draft of key `key`.
+    pub(crate) fn discard_key(&mut self, key: u64) -> bool {
         let n = self.all.len();
-        self.all.retain(|(s, d)| !(s == session && &d.id == id && d.tag == tag));
+        self.all.retain(|(_, d)| d.key != key);
         self.all.len() < n
     }
 
@@ -1016,9 +1260,18 @@ impl Drafts {
         }
     }
 
-    /// Session `session`'s draft of incarnation `tag`, whatever its id.
+    /// Session `session`'s draft of incarnation `tag`, whatever its id (not
+    /// one doubled by a follow).
     pub(crate) fn of_tag(&self, session: &str, tag: Tag) -> Option<&Draft> {
-        self.all.iter().find(|(s, d)| s == session && d.tag == tag).map(|(_, d)| d)
+        self.all.iter().find(|(s, d)| s == session && d.tag == tag && d.ended != Some(Fate::Doubled)).map(|(_, d)| d)
+    }
+
+    /// The draft a send of `body` on session `session`'s incarnation `tag`
+    /// is: the one waiting to send it (doubled by a follow meanwhile, or
+    /// not), else the one held.
+    pub(crate) fn for_send(&self, session: &str, tag: Tag, body: &str) -> Option<&Draft> {
+        let mine = |d: &Draft| d.tag == tag && d.waiting && d.sent.as_deref() == Some(body);
+        self.all.iter().find(|(s, d)| s == session && mine(d)).map(|(_, d)| d).or_else(|| self.of_tag(session, tag))
     }
 
     /// Session `session`'s handed-back drafts on the wire that `done` says
@@ -1037,13 +1290,40 @@ impl Drafts {
         rows
     }
 
-    /// Session `from`'s drafts are session `to`'s now (a worker tab that
-    /// followed its session, [`crate::tabs::Tabs::take_rekeys`]). None is
-    /// dropped: past 8 there, a take is refused until one goes.
-    pub(crate) fn rekey(&mut self, from: &str, to: &str) {
-        for (s, _) in self.all.iter_mut().filter(|(s, _)| s == from) {
-            *s = to.to_string();
+    /// Session `from` followed to a new id `to`, the same conversation
+    /// ([`crate::tabs::Tabs::take_followed`]): its drafts are `to`'s, in
+    /// their places, the open ones still open. One of the same incarnation
+    /// as a draft `to` holds already: if either has no change, that one
+    /// goes (nothing of the user's is lost); else the one that came is
+    /// [`Fate::Doubled`], in the dock. None else is dropped: past
+    /// [`DRAFTS_MAX`] there, a take is refused until some go. The keys
+    /// let go of (drafts with no change).
+    pub(crate) fn follow(&mut self, from: &str, to: &str) -> Vec<u64> {
+        let mut gone = Vec::new();
+        if from == to {
+            return gone;
         }
+        let came: Vec<usize> = (0..self.all.len()).filter(|&i| self.all[i].0 == from).collect();
+        for i in came {
+            let (id, tag) = (self.all[i].1.id.clone(), self.all[i].1.tag);
+            let twin = self.all.iter().position(|(s, d)| s == to && d.id == id && d.tag == tag && d.ended != Some(Fate::Doubled));
+            if let Some(j) = twin {
+                let (a, b) = (&self.all[i].1, &self.all[j].1);
+                if !a.changed() {
+                    gone.push(a.key);
+                } else if !b.changed() {
+                    gone.push(b.key);
+                } else {
+                    let a = &mut self.all[i].1;
+                    a.ended = Some(Fate::Doubled);
+                    a.serial += 1;
+                }
+            }
+            self.all[i].0 = to.to_string();
+        }
+        self.all.retain(|(_, d)| !gone.contains(&d.key));
+        log::info!(target: "synaps_desktop::drafts", "drafts followed {from} to {to}; {} let go (no change)", gone.len());
+        gone
     }
 
     /// Whether session `session` holds a draft whose block is live (its
@@ -1062,3 +1342,7 @@ impl Drafts {
 #[cfg(test)]
 #[path = "drafts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "drafts_edge_tests.rs"]
+mod edge_tests;

@@ -3418,10 +3418,10 @@ impl AppView {
     /// with its tab. Nothing is read or allocated on a frame with neither.
     fn sync_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_placeholder(window, cx);
-        // Worker tabs that followed their session: their drafts with them.
+        // Worker tabs that followed their session: their drafts with them
+        // (a session's block drafts: [`AppView::sync_drafts`]).
         for (from, to) in self.model.tabs.take_rekeys() {
             self.drafts.rekey(&from, &to);
-            self.block_drafts.rekey(&from, &to);
         }
         // A refused steer's text, once the thread it is for is on screen
         // and the composer is that tab's (never in the frame of a switch:

@@ -240,11 +240,11 @@ impl AppView {
     /// Enter on the held block the pane edits, or its Hand back: `Err`,
     /// why nothing went.
     pub(crate) fn edit_hand_back(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        let Some(e) = self.panes.cur.edit.at.as_ref() else { return Ok(()) };
-        let (session, id, tag) = (e.session.clone(), e.id.clone(), e.tag);
+        let Some(key) = self.panes.cur.edit.at.as_ref().map(|e| e.key) else { return Ok(()) };
         let lid = self.panes.cur.live;
         let (seq, _) = self.model.card_gate(lid)?;
-        let d = self.block_drafts.get(&session, &id, tag).ok_or(crate::lease::CHANGED)?;
+        let (session, d) = self.block_drafts.by_key(key).ok_or(crate::lease::CHANGED)?;
+        let (session, id, tag) = (session.to_string(), d.id.clone(), d.tag);
         if d.sent.is_some() {
             return Err(SENDING.into());
         }
@@ -385,7 +385,7 @@ impl AppView {
                 let draft = match restore {
                     Some(r) => &**r,
                     None => {
-                        let d = self.block_drafts.of_tag(&session, s.tag).ok_or(crate::lease::CHANGED)?;
+                        let d = self.block_drafts.for_send(&session, s.tag, &s.body).ok_or(crate::lease::CHANGED)?;
                         if d.on_wire() || d.sent.as_deref().is_some_and(|b| b != s.body) {
                             return Err(SENDING.into());
                         }
