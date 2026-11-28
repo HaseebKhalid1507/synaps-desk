@@ -2711,6 +2711,7 @@ impl AppView {
         let swatch = |c: u32| div().size(px(10.)).flex_none().bg(rgb(c));
         let config = h_flex()
             .id("theme-config")
+            .debug_selector(|| "picker-follow".into())
             .mt(px(12.))
             .h(px(26.))
             .px(px(6.))
@@ -2731,6 +2732,7 @@ impl AppView {
             grid = grid.child(
                 h_flex()
                     .id(("theme", i))
+                    .debug_selector(move || format!("picker-theme {name}"))
                     .w(relative(0.5))
                     .h(px(26.))
                     .px(px(6.))
@@ -2757,6 +2759,7 @@ impl AppView {
         presets = presets.child(
             h_flex()
                 .id("accent-off")
+                .debug_selector(|| "picker-accent-off".into())
                 .w(relative(0.5))
                 .h(px(26.))
                 .px(px(6.))
@@ -2774,6 +2777,7 @@ impl AppView {
             presets = presets.child(
                 h_flex()
                     .id(("preset", i))
+                    .debug_selector(move || format!("picker-preset {name}"))
                     .w(relative(0.5))
                     .h(px(26.))
                     .px(px(6.))
@@ -2832,9 +2836,10 @@ impl AppView {
                     .gap(px(12.))
                     .items_center()
                     .child(display(label::CUSTOM, size::D_S, p.dim_ch).w(px(62.)))
-                    .child(div().flex_1().child(Input::new(&self.hex_input)))
+                    .child(div().flex_1().debug_selector(|| "picker-hex".into()).child(Input::new(&self.hex_input)))
                     .child(
                         tbtn("picker-apply", label::APPLY, p.prose_ch, p.ink)
+                            .debug_selector(|| "picker-apply".into())
                             .on_click(cx.listener(|this, _, _, cx| this.apply_custom_accent(cx))),
                     ),
             )
@@ -2846,6 +2851,7 @@ impl AppView {
             .when_some(self.picker_note.clone(), |el, n| el.child(mono(n, size::META, p.dim_ch).mt(px(10.)).whitespace_normal()));
         v_flex()
             .id("picker")
+            .debug_selector(|| "picker".into())
             .absolute()
             .map(|d| match place {
                 PickerAt::Top(w) => d.top(px(top)).right_0().w(px(w)),

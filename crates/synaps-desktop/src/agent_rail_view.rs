@@ -507,12 +507,20 @@ impl AppView {
 
     /// The rail of board `d` for store `live`, with the panel's local state.
     pub(crate) fn rail_of(&self, live: LiveId, d: &Drawn) -> Layout {
+        self.rail_as(live, d, false)
+    }
+
+    /// [`AppView::rail_of`] as it draws once board `d` landed (its settle
+    /// run: [`crate::rail_wishes::Stores::vis_landed`]; the lease's).
+    fn rail_as(&self, live: LiveId, d: &Drawn, landed: bool) -> Layout {
         let local = self.model.lives[live].active.as_ref().map_or(&*EMPTY, |a| self.agent_rail.local(&a.session_id));
         #[cfg(test)]
         if let Some(v) = self.agent_rail.vis.as_deref() {
             return ar::layout(d, v, local);
         }
-        ar::layout(d, &self.rail_visibility(live, d), local)
+        let conv = self.conversation(live);
+        let vis = if landed { self.wishes.vis_landed(&conv, d) } else { self.wishes.vis(&conv, d) };
+        ar::layout(d, &vis, local)
     }
 
     /// The board the panel's rail draws (the focused pane's session's) and
@@ -584,8 +592,8 @@ impl AppView {
     }
 
     /// The rail's structure for store `live` on board `d` (the lease's).
-    fn rail_shape(&self, live: LiveId, d: &Drawn) -> u64 {
-        let l = self.rail_of(live, d);
+    fn rail_shape(&self, live: LiveId, d: &Drawn, landed: bool) -> u64 {
+        let l = self.rail_as(live, d, landed);
         let local = self.model.lives[live].active.as_ref().map_or(&*EMPTY, |a| self.agent_rail.local(&a.session_id));
         ar::shape(&l, local, &|t| self.rail_note_lines(t), &|s| self.rail_diff(live, s))
     }
@@ -601,7 +609,9 @@ impl AppView {
             return false;
         }
         let Some(old) = old else { return false };
-        self.rail_shape(live, old) != self.rail_shape(live, new)
+        // What draws now, against what `new` draws once it landed (its
+        // settle may end a desire that drew).
+        self.rail_shape(live, old, false) != self.rail_shape(live, new, true)
     }
 
     /// Board `d` drawn for store `live`: its session's local state keeps

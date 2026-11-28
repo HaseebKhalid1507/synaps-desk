@@ -905,6 +905,16 @@ impl Desires {
         }
     }
 
+    /// [`Desires::desire`] once a settle against `settled` ran
+    /// ([`Desires::settle`]): one at or below `effective_version(id)` there
+    /// is gone (a wish not written yet still draws what was before it).
+    pub(crate) fn desire_after(&self, conv: &str, generation: &Generation, id: &BlockId, settled: &Visibility) -> Option<&Desire> {
+        match self.asked.get(&Self::key(conv, generation, id)) {
+            Some(a) => a.before.as_ref(),
+            None => self.book.get(conv, &generation_key(generation), id).filter(|d| settled.effective_version(id) < d.version),
+        }
+    }
+
     /// `id`'s last wish in `conv` (of `generation`'s history), written or
     /// not: memory's.
     pub(crate) fn wish(&self, conv: &str, generation: &Generation, id: &BlockId) -> Option<&Desire> {

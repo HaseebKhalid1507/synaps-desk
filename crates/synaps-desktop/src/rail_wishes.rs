@@ -8,7 +8,16 @@
 //!   it (`N dismissed · show` in its footer); a soft dismissal (carried
 //!   across a compaction) is its tombstone, `dismissed before compaction ·
 //!   u show`, its token the id's visibility version as drawn; the user's
-//!   placements draw first in their slots.
+//!   placements draw first in their slots; an agent's section the user
+//!   put into the transcript (`p`) isn't drawn (nor counted) here.
+//! - **What the transcript draws** ([`Stores::look`], §3.5): a block
+//!   dismissed shrinks to its 24 px tombstone, `◇ tests · dismissed · u
+//!   show` (a soft one's, `dismissed before compaction · u show`), its
+//!   token the id's desire and effective version as drawn; one pinned into
+//!   the rail leaves its stub, `◇ plan · in the rail · p` (`· the agent
+//!   moved it`); an agent's rail section the user put there draws as a
+//!   block at its creating call ([`AppView::pinned_in`]). A tombstone's
+//!   click is its `u`, a stub's its `p`.
 //! - **The rail's actions** (a section header's hover actions, the footer,
 //!   a tombstone): `×` dismisses (on a soft one, a real notice of the new
 //!   generation, and the tombstone ends), `⇅` moves it to the other slot
@@ -17,11 +26,13 @@
 //!   board first, as D6a's targets are.
 //! - **D7's keys** (`x u p m`, the hover's `×` `rail` `⇅`, and their undo)
 //!   are D7's seam, answered here ([`Stores`]'s `BlockDesires`) where this
-//!   desk draws what they do: `x` and `u` on the agent's rail sections
-//!   (`u` on a soft tombstone ends it), `p` on a transcript block (into
-//!   the rail's upper slot, and `p` again back), `m` on a rail section.
-//!   Elsewhere nothing, and the hover doesn't offer it: the transcript's
-//!   tombstone and pin stub aren't drawn yet. Ctrl+Z puts back what one
+//!   desk draws what they do: `x` and `u` on any block (the rail hides a
+//!   dismissed section, the transcript draws its tombstone; `u` on a soft
+//!   tombstone ends it, on a dismissed one shows it), `p` on a transcript
+//!   block (into the rail's upper slot, its stub left) and on an agent's
+//!   rail section (into the transcript), and `p` again back, `m` on a rail
+//!   section; the palette's block commands are the same keys on the block
+//!   walked when it opened. Ctrl+Z puts back what one
 //!   did, all of it or nothing, only while it holds: a dismissal (or a
 //!   show) no notice of which may have gone, a pin, a slot move, a soft
 //!   tombstone ended; and only where its key is offered now (a block the
@@ -82,6 +93,26 @@ use crate::walk::{Aim, Asked, BlockDesires, Wish};
 
 /// A soft dismissal's tombstone (§3.5).
 pub(crate) const SOFT: &str = "dismissed before compaction · u show";
+/// A dismissed transcript block's tombstone (§3.5), after its id.
+pub(crate) const DISMISSED: &str = "dismissed · u show";
+/// A transcript block pinned into the rail: its stub (§3.5), after its id.
+pub(crate) const IN_THE_RAIL: &str = "in the rail · p";
+/// The stub's word once the agent placed it elsewhere since the pin.
+pub(crate) const AGENT_MOVED: &str = "the agent moved it";
+
+/// How a transcript row's block draws on this desk (§3.5, [`Stores::look`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Look {
+    /// As the board has it.
+    Full,
+    /// A fixed one-line tombstone: `◇ tests · dismissed · u show`, or a
+    /// soft one's words; its token the id's visibility as drawn (a key or
+    /// a click acts only on that one).
+    Tomb { text: Arc<str>, token: u64 },
+    /// A transcript block pinned into the rail: its one-line stub,
+    /// `◇ plan · in the rail · p` (`· the agent moved it`).
+    Stub { text: Arc<str> },
+}
 /// Carriers remembered as sent, at most: the oldest is forgotten first
 /// (its notices then ride again at the same version; a second copy is
 /// stale).
@@ -187,6 +218,10 @@ pub(crate) struct Stores {
     /// Tests: every message sent to a session, as it went.
     #[cfg(test)]
     pub(crate) outbox: Vec<String>,
+    /// Tests: a message the socketless test window sends
+    /// ([`AppView::send_socketless`]) goes as if its socket took it.
+    #[cfg(test)]
+    pub(crate) socketless: bool,
 }
 
 /// An undo refused: what the key did doesn't hold now.
@@ -287,6 +322,8 @@ impl Stores {
             undoing: BTreeMap::new(),
             #[cfg(test)]
             outbox: Vec::new(),
+            #[cfg(test)]
+            socketless: false,
         }
     }
 
@@ -350,23 +387,45 @@ impl Stores {
     /// What this desk draws of board `d` of conversation `conv` (module
     /// docs).
     pub(crate) fn vis(&self, conv: &str, d: &Drawn) -> DeskVis {
+        self.vis_as(conv, d, false)
+    }
+
+    /// [`Stores::vis`] as it draws once board `d` landed (its settle run,
+    /// [`Stores::look_landed`]).
+    pub(crate) fn vis_landed(&self, conv: &str, d: &Drawn) -> DeskVis {
+        self.vis_as(conv, d, true)
+    }
+
+    fn vis_as(&self, conv: &str, d: &Drawn, landed: bool) -> DeskVis {
         let mut out = DeskVis { placed: self.pres.user_rail(conv), ..DeskVis::default() };
         let Some(g) = d.generation else { return out };
         let mut hidden = Vec::new();
         let shared = &d.visibility;
-        let rail = d.rail.iter().flatten().flat_map(|s| std::iter::once(s).chain(&s.members));
+        // The rail's sections and their members, and whether the rail draws
+        // them: an agent's section the user put into the transcript draws
+        // there (its tombstone, if dismissed), its members with it, and
+        // isn't counted here. Then the transcript's rows.
+        let rail = d.rail.iter().flatten().flat_map(|s| {
+            let here = !matches!(self.pres.placed(conv, &s.block).place, Place::Transcript(_));
+            std::iter::once(s).chain(&s.members).map(move |m| (true, here, m))
+        });
         let rows = d.rows.values().flat_map(|r| r.blocks.iter()).flat_map(|s| std::iter::once(s).chain(&s.members));
-        for (in_rail, s) in rail.map(|s| (true, s)).chain(rows.map(|s| (false, s))) {
+        for (in_rail, here, s) in rail.chain(rows.map(|s| (false, false, s))) {
             let Ref::Block(id) = &s.block.id else { continue };
             if out.seen.contains_key(id) {
                 continue;
             }
-            if self.desires.dismissed(conv, &g, id, shared) {
+            let wish = self.wish_on(conv, &g, id, d, landed);
+            if in_rail && !here {
                 out.seen.insert(id.clone(), Seen::Hidden);
-                out.dismissed += usize::from(in_rail);
+            } else if wish.map_or_else(|| shared.dismissed(id), |w| w.dismissed) {
+                out.seen.insert(id.clone(), Seen::Hidden);
                 if in_rail {
-                    let wish = self.desires.desire(conv, &g, id).map(|w| (w.version, w.dismissed));
-                    hidden.push((id.to_string(), s.block.tag, wish, shared.effective_version(id)));
+                    // What the footer counts, its tag, and what its `show`
+                    // shows: one set.
+                    out.dismissed += 1;
+                    out.shows.push(id.clone());
+                    hidden.push((id.to_string(), s.block.tag, wish.map(|w| (w.version, w.dismissed)), shared.effective_version(id)));
                 }
             } else if self.pres.soft(conv, id) {
                 let token = u64::from(shared.effective_version(id));
@@ -385,6 +444,56 @@ impl Stores {
 }
 
 impl Stores {
+    /// How block `s`, drawn in conversation `conv`'s transcript from board
+    /// `d` (a top-level block, or a group's member), draws on this desk
+    /// (§3.5): a block id dismissed (this desk's desire, else the shared
+    /// record), its tombstone, `◇ tests · dismissed · u show`, its token
+    /// its desire and its effective version as drawn; softly dismissed
+    /// (across a compaction), the rail's words; a top-level block or card
+    /// pinned into the rail, its stub (a member draws in its group: the
+    /// rail draws no member alone); else the block.
+    pub(crate) fn look(&self, conv: &str, d: &Drawn, s: &Shown) -> Look {
+        self.look_as(conv, d, s, false)
+    }
+
+    /// [`Stores::look`] as it draws once board `d` landed: its settle run
+    /// against `d.settled` ([`Desires::settle`]), a desire it settles gone
+    /// (the lease's, before it lets the board draw).
+    pub(crate) fn look_landed(&self, conv: &str, d: &Drawn, s: &Shown) -> Look {
+        self.look_as(conv, d, s, true)
+    }
+
+    /// `id`'s desire on board `d` as drawn now, or (`landed`) once `d`
+    /// landed ([`Stores::look_landed`]).
+    fn wish_on(&self, conv: &str, g: &Generation, id: &BlockId, d: &Drawn, landed: bool) -> Option<&Desire> {
+        if landed { self.desires.desire_after(conv, g, id, &d.settled) } else { self.desires.desire(conv, g, id) }
+    }
+
+    fn look_as(&self, conv: &str, d: &Drawn, s: &Shown, landed: bool) -> Look {
+        if let (Ref::Block(id), Some(g)) = (&s.block.id, d.generation) {
+            let shared = &d.visibility;
+            let wish = self.wish_on(conv, &g, id, d, landed);
+            if wish.map_or_else(|| shared.dismissed(id), |w| w.dismissed) {
+                let token = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (wish.map(|w| (w.version, w.dismissed)), shared.effective_version(id)).hash(&mut h);
+                    h.finish()
+                };
+                return Look::Tomb { text: format!("◇ {id} · {DISMISSED}").into(), token };
+            }
+            if self.pres.soft(conv, id) {
+                return Look::Tomb { text: format!("◇ {id} · {SOFT}").into(), token: u64::from(shared.effective_version(id)) };
+            }
+        }
+        let placed = self.pres.placed(conv, &s.block);
+        if s.block.group.is_none() && placed.by_user && matches!(placed.place, Place::Rail(_)) {
+            let moved = if placed.agent_moved { format!(" · {AGENT_MOVED}") } else { String::new() };
+            return Look::Stub { text: format!("◇ {} · {IN_THE_RAIL}{moved}", s.block.id).into() };
+        }
+        Look::Full
+    }
+
     /// `aim`'s change made by `f` (it says what happened), kept to undo:
     /// its presentation before and after, and its desire after, if `f`
     /// made one (its generation, its id).
@@ -421,10 +530,12 @@ impl Stores {
             return Asked::Off;
         }
         self.said = None;
-        if !dismiss && aim.tomb.is_some() {
+        let shared = aim.drawn.visibility.clone();
+        // A soft tombstone's `u` ends it; a dismissed one's (the
+        // transcript's) is a Show.
+        if !dismiss && aim.tomb.is_some() && self.pres.soft(aim.conv, id) && !self.desires.dismissed(aim.conv, &g, id, &shared) {
             return self.keep(aim, None, |s| Ok(s.pres.unsoft(aim.conv, id)));
         }
-        let shared = aim.drawn.visibility.clone();
         self.keep(aim, Some((g, id.clone())), |s| {
             let asked = if dismiss { s.desires.dismiss(aim.conv, &g, id, &shared) } else { s.desires.show(aim.conv, &g, id, &shared) };
             match asked {
@@ -448,12 +559,13 @@ impl BlockDesires for Stores {
 
     fn offers(&self, wish: Wish, b: &Block, rail: bool) -> bool {
         match wish {
-            // The rail draws a dismissal; the transcript's tombstone isn't
-            // drawn yet.
-            Wish::Dismiss | Wish::Show => matches!(b.place, Place::Rail(_)),
-            // A transcript block into the rail, and back; nothing draws an
-            // agent's rail section in the transcript yet.
-            Wish::Pin => matches!(b.place, Place::Transcript(_)),
+            // The rail hides a dismissal (its footer counts it), the
+            // transcript draws its tombstone; a block's (a card is no
+            // desire's).
+            Wish::Dismiss | Wish::Show => matches!(b.id, Ref::Block(_)),
+            // A transcript block into the rail (its stub stays), an
+            // agent's section into the transcript, and back.
+            Wish::Pin => true,
             Wish::Slot => rail,
         }
     }
@@ -599,6 +711,8 @@ pub(crate) struct DeskVis {
     dismissed: usize,
     /// The rail's hidden blocks, as one tag ([`RailVisibility::hidden`]).
     hidden: u64,
+    /// Those blocks: what the footer counts, and what its `show` shows.
+    pub(crate) shows: Vec<BlockId>,
 }
 
 impl RailVisibility for DeskVis {
@@ -633,6 +747,107 @@ pub(crate) fn tells(riding: &[(BlockId, Notice, u32)]) -> Option<String> {
 }
 
 impl AppView {
+    /// How block `s` draws in the pane acted on's transcript, on board `d`
+    /// ([`Stores::look`]; D7's stand-in draws every block).
+    pub(crate) fn look_on(&self, d: &Drawn, s: &Shown) -> Look {
+        #[cfg(test)]
+        if self.desires.is_some() {
+            return Look::Full;
+        }
+        self.wishes.look(&self.conversation(self.panes.cur.live), d, s)
+    }
+
+    /// [`AppView::look_on`] once board `d` landed ([`Stores::look_landed`]).
+    pub(crate) fn look_landed(&self, d: &Drawn, s: &Shown) -> Look {
+        #[cfg(test)]
+        if self.desires.is_some() {
+            return Look::Full;
+        }
+        self.wishes.look_landed(&self.conversation(self.panes.cur.live), d, s)
+    }
+
+    /// How block `s` draws in the pane acted on's transcript now: on the
+    /// board its rows draw.
+    pub(crate) fn drawn_look(&self, s: &Shown) -> Look {
+        match self.model.lives[self.panes.cur.live].transcript.drawn() {
+            Some(d) => self.look_on(d, s),
+            None => Look::Full,
+        }
+    }
+
+    /// The agent's rail sections the user put into store `live`'s
+    /// transcript (§3.5's `p`), on board `d`, by their creating call's row
+    /// ([`crate::blocks::Pinned`]).
+    pub(crate) fn pinned_in(&self, live: LiveId, d: &Drawn) -> crate::blocks::Pinned {
+        let mut out = crate::blocks::Pinned::new();
+        let conv = self.conversation(live);
+        let desk = self.block_desires();
+        for (list, rows) in d.rail.iter().zip(&d.rail_rows) {
+            for (s, row) in list.iter().zip(rows) {
+                if let Some(row) = row
+                    && matches!(desk.placed(&conv, &s.block), Place::Transcript(_))
+                {
+                    out.entry(*row).or_default().push(s.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The pane acted on's sections put into its transcript, as its board
+    /// has them now (its session's own transcript; a worker's view has
+    /// none): what changed since the list was built takes them, and the
+    /// first item whose row has them, then or now, is where it's built
+    /// again from.
+    pub(crate) fn sync_pinned(&mut self) -> Option<usize> {
+        let live = self.panes.cur.live;
+        let l = &self.model.lives[live];
+        let board = l.shown().has_blocks() && l.watch.focused().is_none();
+        let now = match l.transcript.drawn().filter(|_| board).cloned() {
+            Some(d) => self.pinned_in(live, &d),
+            None => crate::blocks::Pinned::new(),
+        };
+        if now == self.panes.cur.pinned_in {
+            return None;
+        }
+        let rows: std::collections::HashSet<u64> = now.keys().chain(self.panes.cur.pinned_in.keys()).copied().collect();
+        let items = self.model.lives[live].shown().items();
+        let first = items.iter().position(|it| rows.contains(&it.id)).unwrap_or(items.len());
+        self.panes.cur.pinned_in = now;
+        Some(first)
+    }
+
+    /// The pane acted on's block rows this desk draws in one line (a
+    /// tombstone, a stub), against the board its rows draw: a row whose
+    /// look changed since its last measure is measured again (its height
+    /// is its look's).
+    pub(crate) fn sync_looks(&mut self) {
+        let d = self.model.lives[self.panes.cur.live].transcript.drawn().cloned();
+        let items = self.model.lives[self.panes.cur.live].shown().items();
+        let mut now = HashMap::new();
+        let mut changed = Vec::new();
+        for (ix, row) in self.panes.cur.disp.iter().enumerate() {
+            let crate::turns::Kind::Block { at } = row.kind else { continue };
+            let shown = items.get(row.item).and_then(|it| crate::blocks::row_block(it, at, &self.panes.cur.pinned_in));
+            // The block, and a group's members: each is a line or whole in
+            // the group's row (Shady #110 P2-1).
+            let looks: Vec<(u64, Look)> = match (&d, shown) {
+                (Some(d), Some(s)) => std::iter::once((row.id, self.look_on(d, s)))
+                    .chain(s.members.iter().map(|m| (crate::blocks::row_id(&m.block.id), self.look_on(d, m))))
+                    .collect(),
+                _ => vec![(row.id, Look::Full)],
+            };
+            if looks.iter().any(|(id, look)| self.panes.cur.looks.get(id).unwrap_or(&Look::Full) != look) {
+                changed.push(ix);
+            }
+            now.extend(looks.into_iter().filter(|(_, look)| *look != Look::Full));
+        }
+        self.panes.cur.looks = now;
+        for ix in changed {
+            self.panes.cur.list.remeasure_items(ix..ix + 1);
+        }
+    }
+
     /// Store `live`'s conversation: its journal (a daemon that names none:
     /// its session).
     pub(crate) fn conversation(&self, live: LiveId) -> String {
@@ -816,6 +1031,8 @@ impl AppView {
                     c.on(seq).submit(ride.text.clone()).is_ok()
                 }
             }
+            #[cfg(test)]
+            None if live.is_some() && self.wishes.socketless => true,
             _ => false,
         };
         match live {
@@ -840,6 +1057,30 @@ impl AppView {
         }
         if let (false, Some(l)) = (sent, live) {
             self.model.lives[l].last_error = Some("the connection thread has stopped".into());
+        }
+    }
+
+    /// Tests, on every platform: `text` sent from the pane acted on as
+    /// [`AppView::submit`] sends a message to its session, the notices
+    /// that ride it and their sent marks written first
+    /// ([`AppView::ride_notices`]), its socket taken as having it (the view
+    /// tests' daemon is a unix socket: [`AppView::enter`]). `false`: not
+    /// sent.
+    #[cfg(test)]
+    #[cfg_attr(unix, expect(dead_code, reason = "unix sends through the view tests' daemon"))]
+    pub(crate) fn send_socketless(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        let live = self.panes.cur.live;
+        let Some(seq) = self.model.lives[live].attachment() else { return false };
+        let busy = self.model.lives[live].transcript.busy();
+        self.wishes.socketless = true;
+        match self.ride_notices(live, self.panes.cur.id, seq, busy, text, cx) {
+            Ok(Riding::Go(r)) => {
+                self.ride_went(live, &r.text, r.carrier, true);
+                true
+            }
+            // It goes once its marks are written ([`AppView::send_ride`]).
+            Ok(Riding::Wait(_)) => true,
+            Err(_) => false,
         }
     }
 
@@ -922,20 +1163,14 @@ impl AppView {
         self.pump_wishes(cx);
     }
 
-    /// The footer's `show`: every section of store `live`'s rail this desk
-    /// hides, shown.
+    /// The footer's `show`: the sections of store `live`'s rail (of board
+    /// `d`, the one its press was checked on) this desk hides, shown: the
+    /// set the footer counted and tagged ([`DeskVis::shows`]), nothing
+    /// else (an agent's section put into the transcript draws its
+    /// tombstone there, and isn't one).
     pub(crate) fn show_dismissed(&mut self, live: LiveId, d: &Drawn, cx: &mut Context<Self>) {
         let Some((conv, g, shared)) = self.wish_board(live) else { return };
-        let hidden: Vec<BlockId> = d
-            .rail
-            .iter()
-            .flatten()
-            .flat_map(|s: &Shown| std::iter::once(s).chain(&s.members))
-            .filter_map(|s| match &s.block.id {
-                Ref::Block(id) if self.wishes.desires.dismissed(&conv, &g, id, &shared) => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
+        let hidden = self.rail_visibility(live, d).shows;
         self.wishes.said = None;
         for id in hidden {
             if let Err(Refused(why)) = self.wishes.desires.show(&conv, &g, &id, &shared) {
